@@ -88,4 +88,7 @@ pub enum Commands {
 
     /// Run health checks
     Doctor,
+
+    /// Open the gist snapshot history for restore
+    Undo,
 }
