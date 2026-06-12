@@ -1,0 +1,232 @@
+# stitch
+
+A dotfile manager. You keep your config files in one repo; `stitch` reads a TOML config and symlinks them into place.
+
+Symlinks point from the target (`~/.bashrc`, `~/.config/nvim`) back to the repo. Edits hit the repo file directly — no source/target split, no drift, no re-add step. Agents, scripts, whatever — if it writes to a symlink, it writes to the repo.
+
+## Config
+
+`.stitch/config.toml` at the repo root. Declared explicitly — directory layout is freeform.
+
+```toml
+[vars]
+editor = "nvim"
+email = "you@example.com"
+
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.shells]
+target = "~"
+files = [".bashrc", ".zshrc"]
+
+[stores.shells.when]
+os = "linux"
+
+[stores.git]
+target = "~/.config/git"
+hooks = { post = "git config --global core.editor nvim" }
+```
+
+Multi-target (one store, multiple destinations):
+
+```toml
+[[stores.helix.targets]]
+target = "~/.config/helix"
+when = { os = "linux" }
+
+[[stores.helix.targets]]
+target = "~/AppData/Roaming/helix"
+when = { os = "windows" }
+```
+
+## Core concepts
+
+- **Store** — a top-level directory in the repo. One unit of config.
+- **Target** — where the symlink(s) land on disk. Declared explicitly.
+- **Whole-directory mode** — no `files` or `patterns` → the entire store dir is one symlink.
+- **File mode** — `files` and/or `patterns` → individual files are symlinked into the target dir.
+- **when** — platform filter. All specified fields must match. Omit = always applies.
+- **Hooks** — `pre` and `post` shell commands per store.
+- **Config is truth** — `stitch apply` reconciles the filesystem to match. The entire update loop.
+
+## Commands
+
+### `stitch init`
+
+Create `.stitch/config.toml` in the current directory.
+
+### `stitch apply`
+
+Reconcile all stores. Creates missing symlinks, replaces broken ones, reports conflicts.
+
+| Flag | Short | Description |
+|---|---|---|
+| `--only` | `-o` | Apply only named stores (repeatable) |
+| `--dry-run` | | Preview without changes |
+| `--force` | | Auto-create `.bak` backups for conflicts |
+
+### `stitch status [name]`
+
+Show symlink state for one or all stores. States: `linked`, `missing`, `conflict`, `broken`.
+
+### `stitch diff`
+
+Preview what `stitch apply` would do. Reports `ok`, `create`, `conflict`, `replace` per target.
+
+### `stitch list`
+
+Print all configured stores and their targets.
+
+### `stitch adopt <path>`
+
+Move an existing file or directory into the repo, create a config entry, symlink back.
+
+| Flag | Short | Description |
+|---|---|---|
+| `--name` | `-n` | Override derived store name |
+| `--dry-run` | | Preview |
+
+### `stitch add <name> [target]`
+
+Create a store directory and config entry. Links immediately if target provided.
+
+| Flag | Short | Description |
+|---|---|---|
+| `--target` | `-t` | Target path (or pass positionally) |
+| `--files` | `-f` | Files to link individually (repeatable) |
+| `--patterns` | `-p` | Glob patterns (repeatable) |
+
+### `stitch remove <name>`
+
+Remove store symlinks and config entry. Store directory left untouched.
+
+### `stitch edit`
+
+Open `.stitch/config.toml` in `$EDITOR`.
+
+### `stitch doctor`
+
+Health check: missing store dirs, broken symlinks, conflicting targets, empty stores.
+
+### `stitch import`
+
+Scan for existing symlinks pointing into the repo and import them into config.
+
+| Flag | Description |
+|---|---|
+| `--scan-dir` | Directories to scan (repeatable). Default: `~`, `~/.config`, `~/.local/share` |
+| `--dry-run` | Preview |
+
+## Platform conditionals (`when`)
+
+All fields optional. All specified must match.
+
+| Field | Values |
+|---|---|
+| `os` | `linux`, `darwin`, `windows` |
+| `arch` | `x86_64`, `aarch64`, ... |
+| `distro` | `ubuntu`, `arch`, `macos`, ... |
+| `hostname` | Machine hostname |
+| `shell` | `zsh`, `bash`, `fish`, `nu` |
+
+## Templates & secrets (v0.3)
+
+Files containing `{{ ... }}` references are rendered through a template engine and symlinked from a staging dir. Files without template expressions are symlinked directly.
+
+| Expression | Description |
+|---|---|
+| `{{ env "VAR" }}` | Environment variable |
+| `{{ secret "name" }}` | Encrypted secret |
+| `{{ .Hostname }}` | Hostname |
+| `{{ .OS }}` | Operating system |
+| `{{ .Vars.key }}` | User-defined variable |
+
+Secrets stored encrypted in `.stitch/secrets.enc`. Rendered files go to `~/.local/state/stitch/<repo-hash>/`.
+
+## Hooks (v0.2)
+
+Per-store `pre` and `post` shell commands. `pre` failure aborts the store. `post` failure warns.
+
+Global hooks in `.stitch/hooks/`:
+- `pre-apply` / `post-apply` — run before/after all stores
+- `pre-remove` / `post-remove` — run before/after removals
+
+Hooks receive env vars: `STITCH_ROOT`, `STITCH_STORE`, `STITCH_TARGET`, `STITCH_ACTION`, plus platform vars.
+
+## Ignore patterns (v0.2)
+
+```toml
+[stores.nvim]
+target = "~/.config/nvim"
+ignore = ["*.bak", "scratch/"]
+```
+
+Global ignores always active: `.stitch`, `.stitch/**`, `.git`, `.git/**`, `.gitignore`, `.DS_Store`.
+
+If ignored content exists, whole-directory mode is promoted to file mode.
+
+## Conflict handling
+
+Before linking, if a real file/dir exists at the target (not a stitch-managed symlink):
+1. Stop.
+2. Offer to move it into the repo (store `adopt` behavior).
+3. Then symlink back.
+
+Nothing overwritten silently. `--force` auto-creates `.bak` backups.
+
+## Architecture
+
+```
+src/
+  main.rs       CLI entry point (clap)
+  cli.rs        Command definitions
+  config.rs     Serde types, TOML parsing
+  store.rs      Store model, apply/remove logic
+  linker.rs     Symlink create/remove/verify
+  platform.rs   OS, arch, distro, hostname detection
+  conflict.rs   Conflict detection + resolution
+  adopt.rs      Adopt existing files into repo
+  doctor.rs     Health checks
+  template.rs   Template rendering (v0.3)
+  secrets.rs    Encrypted secrets (v0.3)
+```
+
+## Roadmap
+
+### v0.1 — Core
+- [x] Config parsing (TOML + serde)
+- [x] `init`, `apply`, `status`, `list`, `doctor`
+- [x] Whole-directory and file mode
+- [x] Platform conditionals
+- [x] Conflict detection
+- [x] Absolute symlinks
+- [x] Root discovery (walk up to `.stitch/`)
+
+### v0.2 — Management
+- [ ] `adopt`, `add`, `remove`, `modify`, `edit`
+- [ ] `diff` (dry run)
+- [ ] `import` (scan existing symlinks)
+- [ ] Hooks (pre/post per store + global)
+- [ ] Ignore patterns
+- [ ] Multi-target stores
+
+### v0.3 — Templates & secrets
+- [ ] Go-style text/template engine
+- [ ] `{{ env }}`, `{{ .Vars }}`, `{{ .Hostname }}` etc.
+- [ ] Encrypted secrets (`age` or XChaCha20-Poly1305)
+- [ ] Template staging dir
+
+### v0.4 — TUI
+- [ ] Interactive dashboard (ratatui)
+- [ ] Command palette
+- [ ] Activity log
+
+## Design decisions
+
+- **TOML over YAML** — no quoting gotchas for `~` paths, Rust-idiomatic, unambiguous.
+- **Symlinks, not copies** — edits hit the repo directly. No drift possible.
+- **Explicit config** — no inferring targets from directory layout. You declare it.
+- **Absolute symlinks** — resolved to absolute source paths so cwd doesn't matter.
+- **Config is truth** — `apply` reconciles to match. Change config, re-apply. That's the loop.
+- **Non-destructive by default** — conflicts stop, not clobber. `--force` for scripted use.
