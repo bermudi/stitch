@@ -1,7 +1,8 @@
 use crate::config::{self, Config, Store, StoreMode};
 use crate::linker::{self, LinkStatus};
 use crate::platform::Platform;
-use std::collections::BTreeMap;
+use globset::{GlobBuilder, GlobSetBuilder};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +80,7 @@ pub fn apply_store(
                 mode,
                 &target_entry.files,
                 &target_entry.patterns,
+                &target_entry.ignore,
                 dry_run,
             ));
         }
@@ -90,6 +92,7 @@ pub fn apply_store(
             store.mode(),
             &store.files,
             &store.patterns,
+            &store.ignore,
             dry_run,
         ));
     } else {
@@ -107,7 +110,8 @@ fn apply_target(
     target_path: &Path,
     mode: StoreMode,
     files: &[String],
-    _patterns: &[String],
+    patterns: &[String],
+    ignore: &[String],
     dry_run: bool,
 ) -> Vec<ApplyAction> {
     match mode {
@@ -115,13 +119,13 @@ fn apply_target(
             vec![apply_single_link(store_dir, target_path, dry_run)]
         }
         StoreMode::File => {
+            let resolved = resolve_files(store_dir, files, patterns, ignore);
             let mut actions = Vec::new();
-            for file_name in files {
+            for file_name in &resolved {
                 let source = store_dir.join(file_name);
                 let target = target_path.join(file_name);
                 actions.push(apply_single_link(&source, &target, dry_run));
             }
-            // TODO: pattern matching (v0.2, needs globset)
             actions
         }
     }
@@ -206,6 +210,8 @@ pub fn status_all(
                     &target_path,
                     mode,
                     &target_entry.files,
+                    &target_entry.patterns,
+                    &target_entry.ignore,
                     name,
                     &mut entries,
                 );
@@ -217,6 +223,8 @@ pub fn status_all(
                 &target_path,
                 store.mode(),
                 &store.files,
+                &store.patterns,
+                &store.ignore,
                 name,
                 &mut entries,
             );
@@ -231,6 +239,8 @@ fn collect_statuses(
     target_path: &Path,
     mode: StoreMode,
     files: &[String],
+    patterns: &[String],
+    ignore: &[String],
     name: &str,
     entries: &mut Vec<StatusEntry>,
 ) {
@@ -245,7 +255,8 @@ fn collect_statuses(
             });
         }
         StoreMode::File => {
-            for file_name in files {
+            let resolved = resolve_files(store_dir, files, patterns, ignore);
+            for file_name in &resolved {
                 let source = store_dir.join(file_name);
                 let target = target_path.join(file_name);
                 entries.push(StatusEntry {
@@ -350,5 +361,183 @@ pub fn doctor(
         errors,
         warnings,
         info,
+    }
+}
+
+/// Resolve the complete file list for a file-mode store.
+///
+/// Combines explicit `files` with glob `patterns` matched against the store directory,
+/// then removes anything matched by `ignore` patterns. Returns deduplicated, sorted paths
+/// relative to `store_dir`.
+fn resolve_files(
+    store_dir: &Path,
+    files: &[String],
+    patterns: &[String],
+    ignore: &[String],
+) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    // Explicit files always included.
+    for f in files {
+        seen.insert(f.clone());
+    }
+
+    // Build the include globset from patterns.
+    if !patterns.is_empty() {
+        let mut builder = GlobSetBuilder::new();
+        let mut valid = true;
+        for pat in patterns {
+            match GlobBuilder::new(pat)
+                .literal_separator(false)
+                .build()
+            {
+                Ok(glob) => { builder.add(glob); }
+                Err(e) => {
+                    eprintln!("warning: invalid glob pattern '{}': {}", pat, e);
+                    valid = false;
+                }
+            }
+        }
+
+        if valid {
+            if let Ok(globset) = builder.build() {
+                // Walk the store directory and match against patterns.
+                if let Ok(entries) = std::fs::read_dir(store_dir) {
+                    for entry in entries.flatten() {
+                        let file_name = entry.file_name();
+                        let name_str = file_name.to_string_lossy();
+                        if globset.is_match(name_str.as_ref()) {
+                            seen.insert(name_str.into_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build the ignore globset and filter.
+    if !ignore.is_empty() {
+        let mut builder = GlobSetBuilder::new();
+        let mut valid = true;
+        for pat in ignore {
+            match GlobBuilder::new(pat)
+                .literal_separator(false)
+                .build()
+            {
+                Ok(glob) => { builder.add(glob); }
+                Err(e) => {
+                    eprintln!("warning: invalid ignore pattern '{}': {}", pat, e);
+                    valid = false;
+                }
+            }
+        }
+
+        if valid {
+            if let Ok(globset) = builder.build() {
+                seen.retain(|name| !globset.is_match(name.as_str()));
+            }
+        }
+    }
+
+    seen.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_files_explicit_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        // Create some files in the store dir.
+        std::fs::write(store_dir.join(".bashrc"), "...").unwrap();
+        std::fs::write(store_dir.join(".zshrc"), "...").unwrap();
+        std::fs::write(store_dir.join(".profile"), "...").unwrap();
+
+        let resolved = resolve_files(&store_dir, &[".bashrc".into()], &[], &[]);
+        assert_eq!(resolved, vec![".bashrc"]);
+    }
+
+    #[test]
+    fn test_resolve_files_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        std::fs::write(store_dir.join(".bashrc"), "...").unwrap();
+        std::fs::write(store_dir.join(".zshrc"), "...").unwrap();
+        std::fs::write(store_dir.join(".profile"), "...").unwrap();
+        std::fs::write(store_dir.join("config.toml"), "...").unwrap();
+
+        let resolved = resolve_files(
+            &store_dir,
+            &[],
+            &[".*".into()], // match dotfiles
+            &[],
+        );
+        assert_eq!(
+            resolved,
+            vec![".bashrc", ".profile", ".zshrc"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_files_patterns_with_ignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        std::fs::write(store_dir.join(".bashrc"), "...").unwrap();
+        std::fs::write(store_dir.join(".zshrc"), "...").unwrap();
+        std::fs::write(store_dir.join(".profile"), "...").unwrap();
+
+        let resolved = resolve_files(
+            &store_dir,
+            &[],
+            &[".*".into()],
+            &[".profile".into()], // ignore .profile
+        );
+        assert_eq!(resolved, vec![".bashrc", ".zshrc"]);
+    }
+
+    #[test]
+    fn test_resolve_files_explicit_and_patterns_dedup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        std::fs::write(store_dir.join(".bashrc"), "...").unwrap();
+        std::fs::write(store_dir.join(".zshrc"), "...").unwrap();
+
+        // .bashrc appears in both explicit files and pattern match — should dedup.
+        let resolved = resolve_files(
+            &store_dir,
+            &[".bashrc".into()],
+            &[".*".into()],
+            &[],
+        );
+        assert_eq!(resolved, vec![".bashrc", ".zshrc"]);
+    }
+
+    #[test]
+    fn test_resolve_files_ignore_wildcard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        std::fs::write(store_dir.join("app.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("app.local.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("app.prod.conf"), "...").unwrap();
+
+        let resolved = resolve_files(
+            &store_dir,
+            &[],
+            &["*.conf".into()],
+            &["*.local.conf".into()],
+        );
+        assert_eq!(resolved, vec!["app.conf", "app.prod.conf"]);
     }
 }
