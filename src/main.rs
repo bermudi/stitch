@@ -236,15 +236,15 @@ fn cmd_adopt(
     let mut config = Config::load(&root)?;
 
     let source = expand_home(path);
-    if !source.exists() {
-        return Err(format!("path does not exist: {}", source.display()).into());
-    }
     if source.is_symlink() {
         return Err(format!(
             "{} is already a symlink — use `stitch import` instead",
             source.display()
         )
         .into());
+    }
+    if !source.exists() {
+        return Err(format!("path does not exist: {}", source.display()).into());
     }
 
     // Determine store name: strip leading dot for the directory name in the repo.
@@ -276,13 +276,21 @@ fn cmd_adopt(
             .unwrap_or_else(|| "~".into())
     };
 
-    // Move the file/dir into the repo.
-    std::fs::rename(&source, &store_dir)?;
+    // Move the file/dir into the repo. For a file, place it inside a
+    // same-named subdirectory so File mode can resolve `store_dir/<name>`.
+    let adopted_files: Vec<String> = if is_dir {
+        std::fs::rename(&source, &store_dir)?;
+        vec![]
+    } else {
+        std::fs::create_dir_all(&store_dir)?;
+        std::fs::rename(&source, &store_dir.join(&raw_name))?;
+        vec![raw_name.clone()]
+    };
 
     // Add to config.
     let new_store = config::Store {
         target: Some(target_str),
-        files: vec![],
+        files: adopted_files,
         patterns: vec![],
         ignore: vec![],
         when: config::WhenClause::default(),
