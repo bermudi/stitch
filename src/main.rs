@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod linker;
 mod platform;
+mod snapshot;
 mod store;
 
 use clap::Parser;
@@ -43,6 +44,7 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli::Commands::Remove { name } => cmd_remove(&name),
         cli::Commands::Edit => cmd_edit(),
         cli::Commands::Doctor => cmd_doctor(),
+        cli::Commands::Undo => cmd_undo(),
     }
 }
 
@@ -266,6 +268,19 @@ fn cmd_adopt(
         return Ok(());
     }
 
+    // Snapshot the original before mutating.
+    snapshot::ensure_gh()?;
+    let snap_files = if is_dir {
+        collect_dir_files(&source, "adopt")?
+    } else {
+        vec![snapshot::SnapshotFile {
+            path: source.clone(),
+            gist_name: snapshot::gist_filename("adopt", &source.canonicalize()?),
+        }]
+    };
+    let gist_url = snapshot::snapshot(&root, &snap_files)?;
+    println!("  snapshot → {}", gist_url);
+
     // Determine target path BEFORE moving the file.
     let target_str = if is_dir {
         source.to_string_lossy().into_owned()
@@ -325,6 +340,34 @@ fn cmd_adopt(
     }
 
     Ok(())
+}
+
+/// Recursively collect all files under `dir` as snapshot entries.
+fn collect_dir_files(
+    dir: &std::path::Path,
+    tag: &str,
+) -> Result<Vec<snapshot::SnapshotFile>, Box<dyn std::error::Error>> {
+    let canon = dir.canonicalize()?;
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                let p = entry.path();
+                let rel = p.strip_prefix(&canon).unwrap_or(&p);
+                out.push(snapshot::SnapshotFile {
+                    path: p.clone(),
+                    gist_name: snapshot::gist_filename(tag, &p.canonicalize()?),
+                });
+                let _ = (rel, &canon); // used for gist_name only
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn cmd_add(
@@ -399,14 +442,14 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("store '{}' not found in config", name))?;
 
     // Remove symlinks for this store.
-    for entry in statuses.iter().filter(|e| e.store_name == *name) {
-        if entry.skipped_platform {
-            continue;
-        }
-        if entry.status == linker::LinkStatus::Linked {
-            linker::remove_link(&entry.target, &root)?;
-            println!("  removed {}", entry.target.display());
-        }
+    let linked: Vec<_> = statuses
+        .iter()
+        .filter(|e| e.store_name == *name && !e.skipped_platform)
+        .filter(|e| e.status == linker::LinkStatus::Linked)
+        .collect();
+    for entry in &linked {
+        linker::remove_link(&entry.target, &root)?;
+        println!("  removed {}", entry.target.display());
     }
 
     config.save(&root)?;
@@ -466,4 +509,14 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Ok(())
     }
+}
+
+fn cmd_undo() -> Result<(), Box<dyn std::error::Error>> {
+    let root = resolve_root()?;
+    let url = snapshot::gist_url(&root)
+        .ok_or("no snapshot gist found for this repo")?;
+    println!("Snapshot history:
+  {}", url);
+    println!("\nOpen the 'Revisions' tab to browse and restore previous file states.");
+    Ok(())
 }
