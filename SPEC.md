@@ -33,11 +33,11 @@ Multi-target (one store, multiple destinations):
 ```toml
 [[stores.helix.targets]]
 target = "~/.config/helix"
-when = { os = "linux" }
+when = { hostname = "laptop" }
 
 [[stores.helix.targets]]
-target = "~/AppData/Roaming/helix"
-when = { os = "windows" }
+target = "~/.config/helix"
+when = { hostname = "server" }
 ```
 
 ## Core concepts
@@ -64,7 +64,7 @@ Reconcile all stores. Creates missing symlinks, replaces broken ones, reports co
 |---|---|---|
 | `--only` | `-o` | Apply only named stores (repeatable) |
 | `--dry-run` | | Preview without changes |
-| `--force` | | Auto-create `.bak` backups for conflicts |
+| `--force` | | Auto-create `.bak` backups for conflicts *(planned — currently a no-op)* |
 
 ### `stitch status [name]`
 
@@ -109,7 +109,7 @@ Open `.stitch/config.toml` in `$EDITOR`.
 
 Health check: missing store dirs, broken symlinks, conflicting targets, empty stores.
 
-### `stitch import`
+### `stitch import` *(planned — not yet implemented)*
 
 Scan for existing symlinks pointing into the repo and import them into config.
 
@@ -118,15 +118,19 @@ Scan for existing symlinks pointing into the repo and import them into config.
 | `--scan-dir` | Directories to scan (repeatable). Default: `~`, `~/.config`, `~/.local/share` |
 | `--dry-run` | Preview |
 
+## Platform support
+
+**Linux only.** stitch is built on POSIX symlinks (`std::os::unix::fs::symlink`) and does not compile on Windows. macOS is not officially supported or tested. The `when.os` / `when.distro` conditionals are Linux-targeted; `os` mirrors `std::env::consts::OS`.
+
 ## Platform conditionals (`when`)
 
 All fields optional. All specified must match.
 
 | Field | Values |
 |---|---|
-| `os` | `linux`, `darwin`, `windows` |
+| `os` | `linux` |
 | `arch` | `x86_64`, `aarch64`, ... |
-| `distro` | `ubuntu`, `arch`, `macos`, ... |
+| `distro` | `ubuntu`, `arch`, `debian`, ... |
 | `hostname` | Machine hostname |
 | `shell` | `zsh`, `bash`, `fish`, `nu` |
 
@@ -177,20 +181,21 @@ Nothing overwritten silently. `--force` auto-creates `.bak` backups.
 
 ## Architecture
 
+Current source modules:
+
 ```
 src/
-  main.rs       CLI entry point (clap)
+  main.rs       CLI entry point (clap) + command handlers (apply, add, adopt, remove, status, diff, list, doctor, edit)
   cli.rs        Command definitions
   config.rs     Serde types, TOML parsing
   store.rs      Store model, apply/remove logic
   linker.rs     Symlink create/remove/verify
   platform.rs   OS, arch, distro, hostname detection
-  conflict.rs   Conflict detection + resolution
-  adopt.rs      Adopt existing files into repo
-  doctor.rs     Health checks
-  template.rs   Template rendering (v0.3)
-  secrets.rs    Encrypted secrets (v0.3)
 ```
+
+`conflict.rs`, `adopt.rs`, `doctor.rs`, `template.rs`, `secrets.rs` appear in the roadmap
+(v0.2–v0.3) and are not yet implemented as separate modules — that logic currently lives
+inline in `main.rs` / `store.rs`.
 
 ## Roadmap
 
@@ -204,12 +209,13 @@ src/
 - [x] Root discovery (walk up to `.stitch/`)
 
 ### v0.2 — Management
-- [ ] `adopt`, `add`, `remove`, `modify`, `edit`
-- [ ] `diff` (dry run)
+- [x] `adopt`, `add`, `remove`, `edit`
+- [ ] `modify`
+- [x] `diff` (dry run)
 - [ ] `import` (scan existing symlinks)
-- [ ] Hooks (pre/post per store + global)
-- [ ] Ignore patterns
-- [ ] Multi-target stores
+- [ ] Hooks (execution — parsed, not yet run)
+- [~] Ignore patterns (per-store only; global ignores not active)
+- [x] Multi-target stores
 
 ### v0.3 — Templates & secrets
 - [ ] Go-style text/template engine
