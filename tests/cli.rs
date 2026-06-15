@@ -352,6 +352,97 @@ target = "{target_str}"
 }
 
 #[test]
+fn apply_rejects_traversal_in_files() {
+    // A `../` file entry would symlink outside the target dir. Config load
+    // must reject it before any link is created.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.shells]
+target = "{target_str}"
+files = ["../escape"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("invalid file entry"))
+        .stderr(contains("'../escape'"));
+
+    // Validation happened at load, before apply ran — nothing was linked.
+    assert!(!target.exists());
+}
+
+#[test]
+fn apply_rejects_absolute_in_files() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.shells]
+target = "{target_str}"
+files = ["/etc/passwd"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("invalid file entry"))
+        .stderr(contains("'/etc/passwd'"));
+}
+
+#[test]
+fn apply_allows_nested_file_entries() {
+    // Regression guard: nested relative paths are legitimate and must still
+    // link correctly now that validation runs at load time.
+    let repo = Repo::new();
+    let store_dir = repo.path().join("nvim");
+    fs::create_dir_all(store_dir.join("lua")).unwrap();
+    fs::write(store_dir.join("lua").join("init.lua"), "...").unwrap();
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+files = ["lua/init.lua"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.join("lua").join("init.lua").is_symlink());
+}
+
+#[test]
+fn add_rejects_traversal_in_files() {
+    // `add --file ../escape` must fail before the store dir is created, so no
+    // orphaned directory is left behind and nothing escapes the target.
+    let repo = Repo::new();
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+
+    repo.cmd()
+        .args(["add", "shells", &target_str, "--file", "../escape"])
+        .assert()
+        .failure()
+        .stderr(contains("invalid file entry"));
+
+    // Validation ran before create_dir_all — no orphaned store dir, no link.
+    assert!(!repo.path().join("shells").exists());
+    assert!(!target.exists());
+}
+
+#[test]
 fn apply_only_filter_restricts_to_named_stores() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);

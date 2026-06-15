@@ -9,11 +9,12 @@ This doc records the *current-state* findings with file/function references. The
 safety principles derived from it live in the root `AGENTS.md`. When you fix items below,
 update or strike them here.
 
-**Resolved 2026-06-15:** P0#1, P0#2, P0#3, P0#4, P0#7 — gist machinery deleted, adopt
+**Resolved 2026-06-15:** P0#1, P0#2, P0#3, P0#4, P0#7, and P1#6 — gist machinery deleted, adopt
 made atomic with rollback + collision pre-checks, `add`/`adopt` exit codes made honest
-(`apply`/`diff` were already correct), and foreign symlinks are now conflicts rather
-than silent clobbers. All P0 blockers are clear; see commit history. Remaining: the
-P1/P2 items below.
+(`apply`/`diff` were already correct), foreign symlinks are now conflicts rather
+than silent clobbers, and path fragments are validated at config load (rejecting
+absolute and `..`-containing `files`/`patterns` entries). All P0 blockers and the
+P1 path-traversal gap are clear; see commit history. Remaining: the P1/P2 items below.
 
 State at review time: 17 unit + 35 CLI tests pass. `cargo fmt --check` fails.
 `cargo clippy --all-targets --all-features -- -D warnings` fails (style nits + one
@@ -59,11 +60,16 @@ Removed with the gist code. `cargo test` is now local-only.
   auto-creates `.bak` backups for conflicts. A no-op safety flag misleads scripted users.
 - **Fix:** implement backups, or remove the flag/claim. Effort: S–M.
 
-### 6. Path traversal unguarded in file mode
-- `store_dir.join(file_name)` / `target_path.join(file_name)`. `../` or absolute entries
-  escape the intended dirs. Config repo may be shared/malicious.
-- **Fix:** reject absolute entries and any `..` component; allow nested paths only if
-  they stay under store/target after normalization. Effort: S–M.
+### 6. ~~Path traversal unguarded in file mode~~ ✅ RESOLVED
+- `Config::load` now calls `Config::validate`, which rejects any `files`/`patterns`
+  entry (on a `Store` **or** a `TargetEntry`) that is absolute or contains a `..`
+  component. Validation is lexical via `Path::components()` (TOCTOU-free, works for
+  not-yet-existing entries); nested relative paths like `config/app.conf` remain
+  valid. `cmd_add` validates its `--file`/`--pattern` args before creating the store
+  dir, so a bad fragment can't escape during apply or leave an orphan dir. Covered by
+  unit tests (`is_safe_fragment` truth table, per-store/per-target reject cases) and
+  CLI tests (`apply_rejects_traversal_in_files`, `apply_rejects_absolute_in_files`,
+  `apply_allows_nested_file_entries`, `add_rejects_traversal_in_files`).
 
 ### 7. ~~`add`/`adopt` print errors but return success~~ ✅ RESOLVED
 Both now return non-zero when `apply_store` reports `Conflict`/`Error`. (`apply`/`diff`
@@ -125,7 +131,7 @@ usage and Unix-only tests are correct for scope, not a defect.
    if relinking fails. *(covered: `adopt_rejects_store_name_already_in_config`,
    `adopt_rejects_when_store_dir_already_exists`, `adopt_rolls_back_file_when_record_fails`)*
 5. ✅ `add` returns failure on apply conflict/error.
-6. `files = ["../x"]` / absolute file entries are rejected.
+6. ✅ `files = ["../x"]` / absolute file entries are rejected. *(covered: `apply_rejects_traversal_in_files`, `apply_rejects_absolute_in_files`, `add_rejects_traversal_in_files`; unit `test_is_safe_fragment` / `test_validate_*`)*
 7. Recursive glob + ignore behavior.
 8. Multi-target `apply`/`status`/`doctor` (not just `list`).
 9. Unknown store names fail.

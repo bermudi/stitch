@@ -29,9 +29,11 @@ order — are in `docs/reviews/2026-06-15-trust-review.md`. Read it before touch
 
 **Resolved (2026-06-15):** gist uploads deleted (P0#1/#2); `adopt` made atomic with
 rollback + collision pre-checks (P0#4); `add`/`adopt` exit codes made honest (P0#7);
-foreign symlinks treated as conflicts, not clobbers (P0#3). All P0 blockers are clear.
-**Still open:** the P1/P2 items in the review doc (path-fragment validation P1#6 is the
-next remaining safety gap).
+foreign symlinks treated as conflicts, not clobbers (P0#3); path fragments validated
+at config load — absolute and `..`-containing `files`/`patterns` entries are rejected
+(P1#6). All P0 blockers and the P1 path-traversal gap are clear; every red line below
+is now upheld by the code. **Still open:** the remaining P1/P2 items in the review doc
+(P1#5 `apply --force` is the next remaining gap).
 
 ## Constraints & red lines
 `stitch` mutates `$HOME`. The core safety contract: **never surprise the user with data
@@ -46,11 +48,12 @@ movement, data exposure, or silent replacement.** New code must uphold:
   escapes the store/target dirs.
 - **No destructive overwrite of existing repo content.** Collisions are rejected.
 
-Note: some current code still violates these (see the review doc). As of 2026-06-15 the
-gist-upload, adopt-collision, dishonest-exit-code, and foreign-symlink-clobbering
-violations are all fixed; the remaining violation is **path-fragment validation
-(P1#6)**, which is not yet implemented. When fixing, bring the code into line — don't
-preserve the violation.
+Note: as of 2026-06-15 every red-line violation flagged in the review is resolved —
+gist-upload, adopt-collision, dishonest-exit-code, foreign-symlink-clobbering, and
+path-fragment-validation (P1#6) are all fixed. The remaining open items (P1#5
+`--force`, P1#8 SPEC reconciliation, the P2s) are feature/spec gaps, not red-line
+breaches. When touching `adopt`, the linker, `apply`, or config parsing, keep the code
+in line with these red lines — don't reintroduce a violation.
 
 ## Quality bar
 Target: zero warnings. For a change to count as "done", `cargo fmt` and `cargo clippy`
