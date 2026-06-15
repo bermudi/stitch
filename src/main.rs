@@ -2,7 +2,6 @@ mod cli;
 mod config;
 mod linker;
 mod platform;
-mod snapshot;
 mod store;
 
 use clap::Parser;
@@ -44,7 +43,6 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli::Commands::Remove { name } => cmd_remove(&name),
         cli::Commands::Edit => cmd_edit(),
         cli::Commands::Doctor => cmd_doctor(),
-        cli::Commands::Undo => cmd_undo(),
     }
 }
 
@@ -229,6 +227,28 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Reverse the move step of adopt: restore the user's file/dir to its
+/// original path and clean up the store dir created for file mode.
+/// Propagates the io::Error only if restoring the original fails — a
+/// leftover empty store dir is non-critical and ignored.
+fn rollback_adopt_move(
+    source: &std::path::Path,
+    store_dir: &std::path::Path,
+    raw_name: &str,
+    is_dir: bool,
+) -> Result<(), std::io::Error> {
+    if is_dir {
+        // Dir mode: store_dir is the moved directory itself.
+        std::fs::rename(store_dir, source)
+    } else {
+        // File mode: the file lives at store_dir/<raw_name>. Move it back,
+        // then remove the (now empty) store dir we created.
+        std::fs::rename(store_dir.join(raw_name), source)?;
+        let _ = std::fs::remove_dir(store_dir);
+        Ok(())
+    }
+}
+
 fn cmd_adopt(
     path: &str,
     name: &Option<String>,
@@ -261,26 +281,6 @@ fn cmd_adopt(
     let store_dir = root.join(&store_name);
     let is_dir = source.is_dir();
 
-    if dry_run {
-        println!("Would adopt:");
-        println!("  {} → {}/", source.display(), store_dir.display());
-        println!("  then symlink back");
-        return Ok(());
-    }
-
-    // Snapshot the original before mutating.
-    snapshot::ensure_gh()?;
-    let snap_files = if is_dir {
-        collect_dir_files(&source, "adopt")?
-    } else {
-        vec![snapshot::SnapshotFile {
-            path: source.clone(),
-            gist_name: snapshot::gist_filename("adopt", &source.canonicalize()?),
-        }]
-    };
-    let gist_url = snapshot::snapshot(&root, &snap_files)?;
-    println!("  snapshot → {}", gist_url);
-
     // Determine target path BEFORE moving the file.
     let target_str = if is_dir {
         source.to_string_lossy().into_owned()
@@ -291,39 +291,99 @@ fn cmd_adopt(
             .unwrap_or_else(|| "~".into())
     };
 
-    // Move the file/dir into the repo. For a file, place it inside a
-    // same-named subdirectory so File mode can resolve `store_dir/<name>`.
-    let adopted_files: Vec<String> = if is_dir {
-        std::fs::rename(&source, &store_dir)?;
-        vec![]
-    } else {
-        std::fs::create_dir_all(&store_dir)?;
-        std::fs::rename(&source, &store_dir.join(&raw_name))?;
-        vec![raw_name.clone()]
-    };
+    if dry_run {
+        println!("Would adopt:");
+        println!("  {} → {}/", source.display(), store_dir.display());
+        println!(
+            "  then symlink back to {}",
+            expand_home(&target_str).display()
+        );
+        return Ok(());
+    }
 
-    // Add to config.
+    // --- Pre-checks: reject any collision BEFORE mutating anything. ---
+    if config.stores.contains_key(&store_name) {
+        return Err(format!("store '{}' already exists in config", store_name).into());
+    }
+    if store_dir.exists() {
+        return Err(format!("destination already exists: {}", store_dir.display()).into());
+    }
+
+    // Build the store record in memory. Persisted only after both move and
+    // link succeed, so adopt is all-or-nothing.
     let new_store = config::Store {
-        target: Some(target_str),
-        files: adopted_files,
+        target: Some(target_str.clone()),
+        files: if is_dir {
+            vec![]
+        } else {
+            vec![raw_name.clone()]
+        },
         patterns: vec![],
         ignore: vec![],
         when: config::WhenClause::default(),
         hooks: config::Hooks::default(),
         targets: vec![],
     };
-    config.stores.insert(store_name.clone(), new_store);
-    config.save(&root)?;
 
-    // Create the symlink.
+    // --- Move: relocate the file/dir into the repo. ---
+    if is_dir {
+        std::fs::rename(&source, &store_dir)?;
+    } else {
+        std::fs::create_dir_all(&store_dir)?;
+        std::fs::rename(&source, store_dir.join(&raw_name))?;
+    }
+
+    // --- Link: create the return symlink using the in-memory store. ---
+    // If this fails, roll back the move so the user's file is back where it
+    // was. config was never touched.
     let platform = Platform::detect();
-    let results = store::apply_store(
-        &root,
-        &store_name,
-        config.stores.get(&store_name).unwrap(),
-        &platform,
-        false,
-    );
+    let results = store::apply_store(&root, &store_name, &new_store, &platform, false);
+    if results.actions.iter().any(|a| {
+        matches!(
+            a,
+            store::ApplyAction::Conflict(_) | store::ApplyAction::Error(_)
+        )
+    }) {
+        // Roll back: remove any link that was created, then move back.
+        for action in &results.actions {
+            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+                let _ = linker::remove_link(p, &root);
+            }
+        }
+        rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|e| {
+            format!(
+                "ADOPT FAILED and rollback also failed: {} is stranded in {} ({})",
+                source.display(),
+                store_dir.display(),
+                e
+            )
+        })?;
+        return Err(format!(
+            "could not link {} back; rolled back (file restored to {})",
+            store_name,
+            source.display()
+        )
+        .into());
+    }
+
+    // --- Record: persist the config. ---
+    // If save fails, roll back the link and the move to stay all-or-nothing.
+    config.stores.insert(store_name.clone(), new_store);
+    if let Err(e) = config.save(&root) {
+        for action in &results.actions {
+            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+                let _ = linker::remove_link(p, &root);
+            }
+        }
+        rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|re| {
+            format!(
+                "config save failed ({e}) and rollback also failed: {} is stranded in {} ({re})",
+                source.display(),
+                store_dir.display(),
+            )
+        })?;
+        return Err(e.into());
+    }
 
     println!("Adopted:");
     for action in &results.actions {
@@ -334,40 +394,10 @@ fn cmd_adopt(
             store::ApplyAction::AlreadyLinked => {
                 println!("  {} → already linked", store_name)
             }
-            store::ApplyAction::Error(e) => println!("  {} → error: {e}", store_name),
             _ => {}
         }
     }
-
     Ok(())
-}
-
-/// Recursively collect all files under `dir` as snapshot entries.
-fn collect_dir_files(
-    dir: &std::path::Path,
-    tag: &str,
-) -> Result<Vec<snapshot::SnapshotFile>, Box<dyn std::error::Error>> {
-    let canon = dir.canonicalize()?;
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        for entry in std::fs::read_dir(&current)? {
-            let entry = entry?;
-            let ft = entry.file_type()?;
-            if ft.is_dir() {
-                stack.push(entry.path());
-            } else if ft.is_file() {
-                let p = entry.path();
-                let rel = p.strip_prefix(&canon).unwrap_or(&p);
-                out.push(snapshot::SnapshotFile {
-                    path: p.clone(),
-                    gist_name: snapshot::gist_filename(tag, &p.canonicalize()?),
-                });
-                let _ = (rel, &canon); // used for gist_name only
-            }
-        }
-    }
-    Ok(out)
 }
 
 fn cmd_add(
@@ -399,6 +429,7 @@ fn cmd_add(
     config.stores.insert(name.to_string(), new_store);
     config.save(&root)?;
 
+    let mut failed = false;
     if target.is_some() {
         let platform = Platform::detect();
         let results = store::apply_store(
@@ -415,15 +446,22 @@ fn cmd_add(
                 }
                 store::ApplyAction::AlreadyLinked => println!("  already linked"),
                 store::ApplyAction::Conflict(p) => {
-                    println!("  conflict at {}", p.display())
+                    println!("  conflict at {}", p.display());
+                    failed = true;
                 }
-                store::ApplyAction::Error(e) => println!("  error: {e}"),
+                store::ApplyAction::Error(e) => {
+                    println!("  error: {e}");
+                    failed = true;
+                }
                 _ => {}
             }
         }
     }
 
     println!("Added store '{}'", name);
+    if failed {
+        return Err("apply reported conflicts or errors".into());
+    }
     Ok(())
 }
 
@@ -509,14 +547,4 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Ok(())
     }
-}
-
-fn cmd_undo() -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let url = snapshot::gist_url(&root)
-        .ok_or("no snapshot gist found for this repo")?;
-    println!("Snapshot history:
-  {}", url);
-    println!("\nOpen the 'Revisions' tab to browse and restore previous file states.");
-    Ok(())
 }

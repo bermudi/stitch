@@ -5,6 +5,7 @@
 //! directly (bypassing the `init` command) to keep the test bodies focused.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -53,6 +54,20 @@ impl Repo {
         c.env_remove("EDITOR"); // avoid any inherited editor
         c
     }
+}
+
+/// If running as root, file mode bits don't constrain writes, so tests that
+/// rely on making config.toml read-only can't trigger the failure path
+/// they're meant to exercise. Returns true to indicate the caller should
+/// skip (loudly) rather than pass spuriously.
+fn is_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +640,118 @@ fn adopt_missing_path_errors() {
         .assert()
         .failure()
         .stderr(contains("path does not exist"));
+}
+
+#[test]
+fn adopt_rejects_store_name_already_in_config() {
+    // Pre-existing config entry for "bashrc" must block adoption of .bashrc,
+    // which would derive the same store name. Nothing should be moved.
+    let repo = Repo::new();
+    repo.write_config("vars = {}\n\n[stores.bashrc]\ntarget = \"~/.bashrc\"\n");
+
+    let src = repo.path().join("external").join(".bashrc");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(&src, "data").unwrap();
+
+    repo.cmd()
+        .args(["adopt", src.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("already exists in config"));
+
+    // File untouched.
+    assert!(src.exists());
+    assert_eq!(fs::read_to_string(&src).unwrap(), "data");
+}
+
+#[test]
+fn adopt_rejects_when_store_dir_already_exists() {
+    // A directory for the derived store name already sits in the repo.
+    let repo = Repo::new();
+    repo.make_store("myrc", &["stale"]); // creates <repo>/myrc/
+
+    let src = repo.path().join("external").join(".myrc");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(&src, "data").unwrap();
+
+    repo.cmd()
+        .args(["adopt", src.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("destination already exists"));
+
+    // File untouched; the existing store dir not overwritten.
+    assert!(src.exists());
+    assert_eq!(fs::read_to_string(&src).unwrap(), "data");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("myrc").join("stale")).unwrap(),
+        "contents of stale"
+    );
+}
+
+#[test]
+fn adopt_rolls_back_file_when_record_fails() {
+    // Force the config-save step to fail (after move + link succeed) by making
+    // config.toml unwritable. adopt must roll back: file restored to its
+    // original path, the store dir removed, no partial state left.
+    // Skipped under root: root ignores file mode bits, so the failure path
+    // can't be triggered and the test would give false confidence.
+    if is_root() {
+        eprintln!("note: adopt_rolls_back_file_when_record_fails skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let src = repo.path().join("external").join(".myrc");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(&src, "data").unwrap();
+
+    let cfg = repo.path().join(".stitch").join("config.toml");
+    let mut perms = fs::metadata(&cfg).unwrap().permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&cfg, perms).unwrap();
+
+    repo.cmd()
+        .args(["adopt", src.to_str().unwrap()])
+        .assert()
+        .failure();
+
+    // The file is back where it started, intact.
+    assert!(src.exists(), "file must be restored on rollback");
+    assert_eq!(fs::read_to_string(&src).unwrap(), "data");
+    // No orphaned store dir or symlink left in the repo.
+    assert!(!repo.path().join("myrc").exists());
+    assert!(!src.is_symlink());
+}
+
+#[test]
+fn adopt_rolls_back_dir_when_record_fails() {
+    // Symmetric to the file-mode rollback test, but exercising the dir branch
+    // of rollback_adopt_move (rename(store_dir, source) directly).
+    if is_root() {
+        eprintln!("note: adopt_rolls_back_dir_when_record_fails skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let src = repo.path().join("external").join("myconfig");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.conf"), "a").unwrap();
+
+    let cfg = repo.path().join(".stitch").join("config.toml");
+    let mut perms = fs::metadata(&cfg).unwrap().permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&cfg, perms).unwrap();
+
+    repo.cmd()
+        .args(["adopt", src.to_str().unwrap()])
+        .assert()
+        .failure();
+
+    // The directory is back where it started, intact.
+    assert!(src.exists(), "dir must be restored on rollback");
+    assert_eq!(fs::read_to_string(src.join("a.conf")).unwrap(), "a");
+    // No orphaned store dir or symlink.
+    assert!(!repo.path().join("myconfig").exists());
+    assert!(!src.is_symlink());
 }
 
 // ---------------------------------------------------------------------------
