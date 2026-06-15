@@ -21,7 +21,9 @@ pub fn check_link(target: &Path, source: &Path) -> LinkStatus {
                 match std::fs::read_link(target) {
                     Ok(resolved) => {
                         let source_abs = if source.exists() {
-                            source.canonicalize().unwrap_or_else(|_| source.to_path_buf())
+                            source
+                                .canonicalize()
+                                .unwrap_or_else(|_| source.to_path_buf())
                         } else {
                             source.to_path_buf()
                         };
@@ -63,8 +65,7 @@ pub fn create_link(target: &Path, source: &Path) -> Result<(), LinkError> {
 
     // Create parent directory for the target.
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| LinkError::Mkdir(e, parent.to_path_buf()))?;
+        std::fs::create_dir_all(parent).map_err(|e| LinkError::Mkdir(e, parent.to_path_buf()))?;
     }
 
     let source_abs = source
@@ -83,22 +84,18 @@ pub fn remove_link(target: &Path, repo_root: &Path) -> Result<bool, LinkError> {
         return Ok(false);
     }
 
-    let resolved = std::fs::read_link(target)
-        .map_err(|e| LinkError::Read(e, target.to_path_buf()))?;
+    let resolved =
+        std::fs::read_link(target).map_err(|e| LinkError::Read(e, target.to_path_buf()))?;
 
     // Only remove if it points into our repo.
     let resolved_abs = if resolved.is_absolute() {
         resolved.clone()
     } else {
-        target
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(&resolved)
+        target.parent().unwrap_or(Path::new(".")).join(&resolved)
     };
 
     if resolved_abs.starts_with(repo_root) || resolved.starts_with(repo_root) {
-        std::fs::remove_file(target)
-            .map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
+        std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
         Ok(true)
     } else {
         Ok(false)
@@ -138,10 +135,7 @@ mod tests {
         let target_file = target_dir.join("test.txt");
 
         // Missing before creation.
-        assert_eq!(
-            check_link(&target_file, &source_file),
-            LinkStatus::Missing
-        );
+        assert_eq!(check_link(&target_file, &source_file), LinkStatus::Missing);
 
         // Create the link.
         create_link(&target_file, &source_file).unwrap();
@@ -155,10 +149,7 @@ mod tests {
 
         // Remove the link.
         assert!(remove_link(&target_file, tmp.path()).unwrap());
-        assert_eq!(
-            check_link(&target_file, &source_file),
-            LinkStatus::Missing
-        );
+        assert_eq!(check_link(&target_file, &source_file), LinkStatus::Missing);
     }
 
     #[test]

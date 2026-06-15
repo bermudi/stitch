@@ -34,8 +34,7 @@ impl Repo {
 
     /// Write a complete config.toml from a TOML string.
     fn write_config(&self, toml: &str) {
-        fs::write(self.dir.path().join(".stitch").join("config.toml"), toml)
-            .expect("write config");
+        fs::write(self.dir.path().join(".stitch").join("config.toml"), toml).expect("write config");
     }
 
     /// Convenience: create a directory with some files inside the repo.
@@ -770,8 +769,7 @@ fn add_creates_store_without_immediate_link() {
     // Store directory should be created.
     assert!(repo.path().join("shells").is_dir());
     // Config should have the entry.
-    let config_text =
-        fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
+    let config_text = fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
     assert!(config_text.contains("shells"));
 }
 
@@ -831,8 +829,7 @@ fn remove_drops_store_and_unlinks() {
     // Config entry gone, symlink gone, repo directory left untouched.
     assert!(!target.exists());
     assert!(repo.path().join("nvim").is_dir());
-    let config_text =
-        fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
+    let config_text = fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
     assert!(!config_text.contains("nvim"));
 }
 

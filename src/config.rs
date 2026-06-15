@@ -94,8 +94,8 @@ impl Config {
         }
         let contents = std::fs::read_to_string(&config_path)
             .map_err(|e| ConfigError::Read(e, config_path.clone()))?;
-        let config: Config = toml::from_str(&contents)
-            .map_err(|e| ConfigError::Parse(e, config_path))?;
+        let config: Config =
+            toml::from_str(&contents).map_err(|e| ConfigError::Parse(e, config_path))?;
         Ok(config)
     }
 
@@ -104,10 +104,8 @@ impl Config {
         std::fs::create_dir_all(&config_dir)
             .map_err(|e| ConfigError::Write(e, config_dir.clone()))?;
         let config_path = config_dir.join("config.toml");
-        let contents = toml::to_string_pretty(self)
-            .map_err(ConfigError::Serialize)?;
-        std::fs::write(&config_path, contents)
-            .map_err(|e| ConfigError::Write(e, config_path))?;
+        let contents = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
+        std::fs::write(&config_path, contents).map_err(|e| ConfigError::Write(e, config_path))?;
         Ok(())
     }
 }
@@ -166,7 +164,10 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_home("~"), home);
         assert_eq!(expand_home("~/foo/bar"), home.join("foo/bar"));
-        assert_eq!(expand_home("/absolute/path"), PathBuf::from("/absolute/path"));
+        assert_eq!(
+            expand_home("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
     }
 
     #[test]
@@ -190,24 +191,33 @@ mod tests {
                 ("email".into(), "test@example.com".into()),
             ]),
             stores: HashMap::from([
-                ("nvim".into(), Store {
-                    target: Some("~/.config/nvim".into()),
-                    files: vec![],
-                    patterns: vec![],
-                    ignore: vec![],
-                    when: WhenClause::default(),
-                    hooks: Hooks::default(),
-                    targets: vec![],
-                }),
-                ("shells".into(), Store {
-                    target: Some("~".into()),
-                    files: vec![".bashrc".into(), ".zshrc".into()],
-                    patterns: vec![],
-                    ignore: vec![],
-                    when: WhenClause { os: Some("linux".into()), ..Default::default() },
-                    hooks: Hooks::default(),
-                    targets: vec![],
-                }),
+                (
+                    "nvim".into(),
+                    Store {
+                        target: Some("~/.config/nvim".into()),
+                        files: vec![],
+                        patterns: vec![],
+                        ignore: vec![],
+                        when: WhenClause::default(),
+                        hooks: Hooks::default(),
+                        targets: vec![],
+                    },
+                ),
+                (
+                    "shells".into(),
+                    Store {
+                        target: Some("~".into()),
+                        files: vec![".bashrc".into(), ".zshrc".into()],
+                        patterns: vec![],
+                        ignore: vec![],
+                        when: WhenClause {
+                            os: Some("linux".into()),
+                            ..Default::default()
+                        },
+                        hooks: Hooks::default(),
+                        targets: vec![],
+                    },
+                ),
             ]),
         };
 
