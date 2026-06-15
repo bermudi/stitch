@@ -406,7 +406,7 @@ fn cmd_adopt(
 /// created and an empty dir we made are torn down. Errors are ignored: this is
 /// best-effort cleanup on an already-failing path, and a leftover empty dir or
 /// stale link is far less harmful than a half-recorded store.
-fn undo_partial_add(
+fn discard_uncommitted_add(
     results: Option<&store::ApplyResult>,
     store_dir: &std::path::Path,
     repo_root: &std::path::Path,
@@ -479,7 +479,7 @@ fn cmd_add(
     });
 
     if failed {
-        undo_partial_add(results.as_ref(), &store_dir, &root);
+        discard_uncommitted_add(results.as_ref(), &store_dir, &root);
         return Err("apply reported conflicts or errors".into());
     }
 
@@ -488,7 +488,7 @@ fn cmd_add(
     // config entry — same all-or-nothing contract as adopt.
     config.stores.insert(name.to_string(), new_store);
     if let Err(e) = config.save(&root) {
-        undo_partial_add(results.as_ref(), &store_dir, &root);
+        discard_uncommitted_add(results.as_ref(), &store_dir, &root);
         return Err(e.into());
     }
 
