@@ -400,6 +400,27 @@ fn cmd_adopt(
     Ok(())
 }
 
+/// Undo a partial `add`: remove any links `apply_store` managed to create,
+/// then remove the (empty) store directory. Unlike `rollback_adopt_move`, add
+/// relocates no user data, so there is nothing to rename back — only links we
+/// created and an empty dir we made are torn down. Errors are ignored: this is
+/// best-effort cleanup on an already-failing path, and a leftover empty dir or
+/// stale link is far less harmful than a half-recorded store.
+fn undo_partial_add(
+    results: Option<&store::ApplyResult>,
+    store_dir: &std::path::Path,
+    repo_root: &std::path::Path,
+) {
+    if let Some(results) = results {
+        for action in &results.actions {
+            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+                let _ = linker::remove_link(p, repo_root);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(store_dir);
+}
+
 fn cmd_add(
     name: &str,
     target: Option<&str>,
@@ -426,42 +447,52 @@ fn cmd_add(
         targets: vec![],
     };
 
-    config.stores.insert(name.to_string(), new_store);
-    config.save(&root)?;
-
-    let mut failed = false;
-    if target.is_some() {
+    // Apply first against the in-memory store, BEFORE persisting config — so a
+    // failed add leaves no trace. A store with a target must link cleanly or
+    // the add aborts; a store with no target has nothing to link and persists
+    // directly. add moves no user data, so the unwind is unlinking anything
+    // apply created plus removing the empty store dir, not adopt's rename-back.
+    let results = target.is_some().then(|| {
         let platform = Platform::detect();
-        let results = store::apply_store(
-            &root,
-            name,
-            config.stores.get(name).unwrap(),
-            &platform,
-            false,
-        );
+        store::apply_store(&root, name, &new_store, &platform, false)
+    });
+
+    if let Some(results) = results.as_ref() {
         for action in &results.actions {
             match action {
-                store::ApplyAction::Created(p) => {
-                    println!("  linked {}", p.display())
-                }
+                store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
                 store::ApplyAction::AlreadyLinked => println!("  already linked"),
-                store::ApplyAction::Conflict(p) => {
-                    println!("  conflict at {}", p.display());
-                    failed = true;
-                }
-                store::ApplyAction::Error(e) => {
-                    println!("  error: {e}");
-                    failed = true;
-                }
+                store::ApplyAction::Conflict(p) => println!("  conflict at {}", p.display()),
+                store::ApplyAction::Error(e) => println!("  error: {e}"),
                 _ => {}
             }
         }
     }
 
-    println!("Added store '{}'", name);
+    let failed = results.as_ref().is_some_and(|r| {
+        r.actions.iter().any(|a| {
+            matches!(
+                a,
+                store::ApplyAction::Conflict(_) | store::ApplyAction::Error(_)
+            )
+        })
+    });
+
     if failed {
+        undo_partial_add(results.as_ref(), &store_dir, &root);
         return Err("apply reported conflicts or errors".into());
     }
+
+    // Persist config. If save fails after apply already created links, undo
+    // them and the empty store dir so no half-applied store is left without a
+    // config entry — same all-or-nothing contract as adopt.
+    config.stores.insert(name.to_string(), new_store);
+    if let Err(e) = config.save(&root) {
+        undo_partial_add(results.as_ref(), &store_dir, &root);
+        return Err(e.into());
+    }
+
+    println!("Added store '{}'", name);
     Ok(())
 }
 

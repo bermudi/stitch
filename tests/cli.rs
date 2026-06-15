@@ -802,6 +802,70 @@ fn add_duplicate_store_errors() {
         .stderr(contains("already exists"));
 }
 
+#[test]
+fn add_target_conflict_leaves_no_config_or_store_dir() {
+    // A pre-existing real file at the target forces apply into Conflict. The
+    // add must abort atomically: config never records the store, the empty
+    // store dir is removed, and the pre-existing target file is untouched.
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "existing").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+
+    repo.cmd()
+        .args(["add", "nvim", &target_str])
+        .assert()
+        .failure()
+        .stderr(contains("conflicts or errors"));
+
+    // No config entry, no orphaned store dir.
+    let config_text = fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
+    assert!(!config_text.contains("nvim"));
+    assert!(
+        !repo.path().join("nvim").exists(),
+        "store dir must be removed on conflict"
+    );
+    // The conflicting target file is left exactly as it was.
+    assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+    assert!(!target.is_symlink());
+}
+
+#[test]
+fn add_rolls_back_when_config_save_fails() {
+    // apply succeeds (link created) but config.save fails: adopt-style
+    // all-or-nothing must undo the link and the empty store dir so no
+    // half-applied store is left without a config entry.
+    // Skipped under root: root ignores file mode bits, so the failure path
+    // can't be triggered and the test would give false confidence.
+    if is_root() {
+        eprintln!("note: add_rolls_back_when_config_save_fails skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+
+    let cfg = repo.path().join(".stitch").join("config.toml");
+    let mut perms = fs::metadata(&cfg).unwrap().permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&cfg, perms).unwrap();
+
+    repo.cmd()
+        .args(["add", "nvim", &target_str])
+        .assert()
+        .failure();
+
+    // Link undone, store dir removed, config has no entry.
+    assert!(!target.is_symlink(), "symlink must be removed on rollback");
+    assert!(
+        !repo.path().join("nvim").exists(),
+        "store dir must be removed on rollback"
+    );
+    let config_text = fs::read_to_string(&cfg).unwrap();
+    assert!(!config_text.contains("nvim"));
+}
+
 // ---------------------------------------------------------------------------
 // remove
 // ---------------------------------------------------------------------------
