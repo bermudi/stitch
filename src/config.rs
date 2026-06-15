@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -96,6 +96,7 @@ impl Config {
             .map_err(|e| ConfigError::Read(e, config_path.clone()))?;
         let config: Config =
             toml::from_str(&contents).map_err(|e| ConfigError::Parse(e, config_path))?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -108,6 +109,69 @@ impl Config {
         std::fs::write(&config_path, contents).map_err(|e| ConfigError::Write(e, config_path))?;
         Ok(())
     }
+
+    /// Validate that no `files`/`patterns` fragment can escape its store or target dir.
+    ///
+    /// Every entry across all stores and target entries must be a relative path
+    /// with no `..` component and no leading `/`. Entries are joined directly
+    /// onto `store_dir`/`target_path` at apply time, so a `../` or absolute
+    /// fragment would symlink outside the intended dirs. Checked once at load
+    /// so a malformed (or malicious, shared) config fails loudly before any
+    /// filesystem mutation.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, store) in &self.stores {
+            validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            for te in &store.targets {
+                validate_fragments(
+                    &te.files,
+                    &te.patterns,
+                    &format!("store '{name}' (target '{}')", te.target),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `fragment` is safe to join onto a store or target directory.
+///
+/// Safe means: non-empty, relative (no leading `/`), and containing no `..`
+/// component. Nested paths like `config/app.conf` are allowed; a leading `./`
+/// is harmless and accepted. The check is lexical — it inspects
+/// [`Path::components`] without touching the filesystem, so it is TOCTOU-free
+/// and accepts entries for files that do not exist yet.
+pub fn is_safe_fragment(fragment: &str) -> bool {
+    !fragment.is_empty()
+        && Path::new(fragment)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Reject any `files`/`patterns` entry that is not a safe fragment.
+///
+/// `context` names where the entries came from (e.g. `store 'shells'`) so the
+/// error points at the offending config section. Shared by [`Config::validate`]
+/// (load-time, whole config) and `cmd_add` (before mutating the filesystem).
+pub fn validate_fragments(
+    files: &[String],
+    patterns: &[String],
+    context: &str,
+) -> Result<(), ConfigError> {
+    for f in files {
+        if !is_safe_fragment(f) {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid file entry '{f}' in {context}: paths must be relative to the store and contain no '..' or leading '/'"
+            )));
+        }
+    }
+    for p in patterns {
+        if !is_safe_fragment(p) {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid pattern '{p}' in {context}: patterns must be relative to the store and contain no '..' or leading '/'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Walk upward from `start` to find a directory containing `.stitch/`.
@@ -153,6 +217,8 @@ pub enum ConfigError {
     Serialize(toml::ser::Error),
     #[error("could not write config: {0}")]
     Write(std::io::Error, PathBuf),
+    #[error("{0}")]
+    InvalidPath(String),
 }
 
 #[cfg(test)]
@@ -253,5 +319,124 @@ mod tests {
             targets: vec![],
         };
         assert_eq!(file_mode.mode(), StoreMode::File);
+    }
+
+    // --- path-fragment validation (P1#6) ---
+
+    #[test]
+    fn test_is_safe_fragment() {
+        // Allowed: flat names, nested paths, and a harmless leading './'.
+        assert!(is_safe_fragment(".bashrc"));
+        assert!(is_safe_fragment(".zshrc"));
+        assert!(is_safe_fragment("config/app.conf"));
+        assert!(is_safe_fragment("deep/nested/path.conf"));
+        assert!(is_safe_fragment("./bashrc"));
+
+        // Rejected: empty, absolute, and any '..' component in any position.
+        assert!(!is_safe_fragment(""));
+        assert!(!is_safe_fragment("/"));
+        assert!(!is_safe_fragment("/etc/passwd"));
+        assert!(!is_safe_fragment(".."));
+        assert!(!is_safe_fragment("../escape"));
+        assert!(!is_safe_fragment("foo/../bar"));
+        assert!(!is_safe_fragment("foo/../.."));
+        assert!(!is_safe_fragment("ok/../../escape"));
+    }
+
+    #[test]
+    fn test_validate_rejects_traversal_in_store_files() {
+        let config = config_with_files(vec!["../escape".into()]);
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid file entry"), "got: {msg}");
+        assert!(msg.contains("'../escape'"), "got: {msg}");
+        assert!(msg.contains("store 's'"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_rejects_absolute_in_store_files() {
+        let config = config_with_files(vec!["/etc/passwd".into()]);
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("'/etc/passwd'"));
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_patterns() {
+        let config = config_with_patterns(vec!["../**".into()]);
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid pattern"));
+        assert!(err.to_string().contains("'../**'"));
+    }
+
+    #[test]
+    fn test_validate_rejects_target_entry_files() {
+        let mut config = Config::empty();
+        config.stores.insert(
+            "s".into(),
+            Store {
+                target: None,
+                files: vec![],
+                patterns: vec![],
+                ignore: vec![],
+                when: WhenClause::default(),
+                hooks: Hooks::default(),
+                targets: vec![TargetEntry {
+                    target: "~/.config/x".into(),
+                    files: vec!["../escape".into()],
+                    patterns: vec![],
+                    ignore: vec![],
+                    when: WhenClause::default(),
+                }],
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("store 's' (target '~/.config/x')"));
+    }
+
+    #[test]
+    fn test_validate_allows_nested_and_flat() {
+        // Nested relative paths are legitimate (SPEC's ignore examples use them).
+        let config = config_with_files(vec!["config/app.conf".into(), ".bashrc".into()]);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_empty_config_ok() {
+        Config::empty().validate().unwrap();
+    }
+
+    /// Helper: a single-store config with the given file entries.
+    fn config_with_files(files: Vec<String>) -> Config {
+        let mut config = Config::empty();
+        config.stores.insert(
+            "s".into(),
+            Store {
+                target: Some("~".into()),
+                files,
+                patterns: vec![],
+                ignore: vec![],
+                when: WhenClause::default(),
+                hooks: Hooks::default(),
+                targets: vec![],
+            },
+        );
+        config
+    }
+
+    fn config_with_patterns(patterns: Vec<String>) -> Config {
+        let mut config = Config::empty();
+        config.stores.insert(
+            "s".into(),
+            Store {
+                target: Some("~".into()),
+                files: vec![],
+                patterns,
+                ignore: vec![],
+                when: WhenClause::default(),
+                hooks: Hooks::default(),
+                targets: vec![],
+            },
+        );
+        config
     }
 }

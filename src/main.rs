@@ -434,6 +434,11 @@ fn cmd_add(
         return Err(format!("store '{}' already exists", name).into());
     }
 
+    // Validate user-supplied fragments before touching the filesystem: a
+    // `--file ../x` would otherwise escape the store/target dirs during the
+    // apply below (and leave an orphaned store dir on failure).
+    config::validate_fragments(files, patterns, &format!("store '{name}'"))?;
+
     let store_dir = root.join(name);
     std::fs::create_dir_all(&store_dir)?;
 
