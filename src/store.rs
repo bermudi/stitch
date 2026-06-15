@@ -171,11 +171,7 @@ pub struct StatusEntry {
 }
 
 /// Get status for all stores.
-pub fn status_all(
-    repo_root: &Path,
-    config: &Config,
-    platform: &Platform,
-) -> Vec<StatusEntry> {
+pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec<StatusEntry> {
     let mut entries = Vec::new();
     let sorted: BTreeMap<_, _> = config.stores.iter().collect();
 
@@ -198,14 +194,12 @@ pub fn status_all(
                     continue;
                 }
                 let target_path = config::expand_home(&target_entry.target);
-                let mode = if target_entry.files.is_empty()
-                    && target_entry.patterns.is_empty()
-                {
+                let mode = if target_entry.files.is_empty() && target_entry.patterns.is_empty() {
                     StoreMode::WholeDir
                 } else {
                     StoreMode::File
                 };
-                collect_statuses(
+                entries.extend(collect_statuses(
                     &store_dir,
                     &target_path,
                     mode,
@@ -213,12 +207,11 @@ pub fn status_all(
                     &target_entry.patterns,
                     &target_entry.ignore,
                     name,
-                    &mut entries,
-                );
+                ));
             }
         } else if let Some(ref target_str) = store.target {
             let target_path = config::expand_home(target_str);
-            collect_statuses(
+            entries.extend(collect_statuses(
                 &store_dir,
                 &target_path,
                 store.mode(),
@@ -226,8 +219,7 @@ pub fn status_all(
                 &store.patterns,
                 &store.ignore,
                 name,
-                &mut entries,
-            );
+            ));
         }
     }
 
@@ -242,8 +234,8 @@ fn collect_statuses(
     patterns: &[String],
     ignore: &[String],
     name: &str,
-    entries: &mut Vec<StatusEntry>,
-) {
+) -> Vec<StatusEntry> {
+    let mut entries = Vec::new();
     match mode {
         StoreMode::WholeDir => {
             entries.push(StatusEntry {
@@ -269,6 +261,7 @@ fn collect_statuses(
             }
         }
     }
+    entries
 }
 
 #[derive(Debug)]
@@ -279,11 +272,7 @@ pub struct DoctorResult {
 }
 
 /// Run health checks.
-pub fn doctor(
-    repo_root: &Path,
-    config: &Config,
-    platform: &Platform,
-) -> DoctorResult {
+pub fn doctor(repo_root: &Path, config: &Config, platform: &Platform) -> DoctorResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut info = Vec::new();
@@ -387,11 +376,10 @@ fn resolve_files(
         let mut builder = GlobSetBuilder::new();
         let mut valid = true;
         for pat in patterns {
-            match GlobBuilder::new(pat)
-                .literal_separator(false)
-                .build()
-            {
-                Ok(glob) => { builder.add(glob); }
+            match GlobBuilder::new(pat).literal_separator(false).build() {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
                 Err(e) => {
                     eprintln!("warning: invalid glob pattern '{}': {}", pat, e);
                     valid = false;
@@ -399,16 +387,14 @@ fn resolve_files(
             }
         }
 
-        if valid {
-            if let Ok(globset) = builder.build() {
-                // Walk the store directory and match against patterns.
-                if let Ok(entries) = std::fs::read_dir(store_dir) {
-                    for entry in entries.flatten() {
-                        let file_name = entry.file_name();
-                        let name_str = file_name.to_string_lossy();
-                        if globset.is_match(name_str.as_ref()) {
-                            seen.insert(name_str.into_owned());
-                        }
+        if valid && let Ok(globset) = builder.build() {
+            // Walk the store directory and match against patterns.
+            if let Ok(entries) = std::fs::read_dir(store_dir) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let name_str = file_name.to_string_lossy();
+                    if globset.is_match(name_str.as_ref()) {
+                        seen.insert(name_str.into_owned());
                     }
                 }
             }
@@ -420,11 +406,10 @@ fn resolve_files(
         let mut builder = GlobSetBuilder::new();
         let mut valid = true;
         for pat in ignore {
-            match GlobBuilder::new(pat)
-                .literal_separator(false)
-                .build()
-            {
-                Ok(glob) => { builder.add(glob); }
+            match GlobBuilder::new(pat).literal_separator(false).build() {
+                Ok(glob) => {
+                    builder.add(glob);
+                }
                 Err(e) => {
                     eprintln!("warning: invalid ignore pattern '{}': {}", pat, e);
                     valid = false;
@@ -432,10 +417,8 @@ fn resolve_files(
             }
         }
 
-        if valid {
-            if let Ok(globset) = builder.build() {
-                seen.retain(|name| !globset.is_match(name.as_str()));
-            }
+        if valid && let Ok(globset) = builder.build() {
+            seen.retain(|name| !globset.is_match(name.as_str()));
         }
     }
 
@@ -478,10 +461,7 @@ mod tests {
             &[".*".into()], // match dotfiles
             &[],
         );
-        assert_eq!(
-            resolved,
-            vec![".bashrc", ".profile", ".zshrc"]
-        );
+        assert_eq!(resolved, vec![".bashrc", ".profile", ".zshrc"]);
     }
 
     #[test]
@@ -513,12 +493,7 @@ mod tests {
         std::fs::write(store_dir.join(".zshrc"), "...").unwrap();
 
         // .bashrc appears in both explicit files and pattern match — should dedup.
-        let resolved = resolve_files(
-            &store_dir,
-            &[".bashrc".into()],
-            &[".*".into()],
-            &[],
-        );
+        let resolved = resolve_files(&store_dir, &[".bashrc".into()], &[".*".into()], &[]);
         assert_eq!(resolved, vec![".bashrc", ".zshrc"]);
     }
 

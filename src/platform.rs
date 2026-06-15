@@ -22,24 +22,40 @@ impl Platform {
         let shell = detect_shell();
         let distro = detect_distro();
 
-        Self { os, arch, distro, hostname, shell }
+        Self {
+            os,
+            arch,
+            distro,
+            hostname,
+            shell,
+        }
     }
 
     pub fn matches_when(&self, when: &crate::config::WhenClause) -> bool {
-        if let Some(ref os) = when.os {
-            if &self.os != os { return false; }
+        if let Some(ref os) = when.os
+            && &self.os != os
+        {
+            return false;
         }
-        if let Some(ref arch) = when.arch {
-            if &self.arch != arch { return false; }
+        if let Some(ref arch) = when.arch
+            && &self.arch != arch
+        {
+            return false;
         }
-        if let Some(ref distro) = when.distro {
-            if self.distro.as_deref() != Some(distro.as_str()) { return false; }
+        if let Some(ref distro) = when.distro
+            && self.distro.as_deref() != Some(distro.as_str())
+        {
+            return false;
         }
-        if let Some(ref hostname) = when.hostname {
-            if &self.hostname != hostname { return false; }
+        if let Some(ref hostname) = when.hostname
+            && &self.hostname != hostname
+        {
+            return false;
         }
-        if let Some(ref shell) = when.shell {
-            if &self.shell != shell { return false; }
+        if let Some(ref shell) = when.shell
+            && &self.shell != shell
+        {
+            return false;
         }
         true
     }
@@ -79,7 +95,6 @@ fn detect_distro() -> Option<String> {
             None
         }
         "macos" => Some("macos".into()),
-        "windows" => Some("windows".into()),
         _ => None,
     }
 }

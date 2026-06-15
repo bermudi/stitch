@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "stitch", version, about = "A dotfile manager that symlinks your configs into place")]
+#[command(
+    name = "stitch",
+    version,
+    about = "A dotfile manager that symlinks your configs into place"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,

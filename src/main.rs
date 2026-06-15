@@ -19,15 +19,19 @@ fn main() {
 fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         cli::Commands::Init => cmd_init(),
-        cli::Commands::Apply { only, dry_run, force } => {
-            cmd_apply(&only, dry_run, force)
-        }
+        cli::Commands::Apply {
+            only,
+            dry_run,
+            force,
+        } => cmd_apply(&only, dry_run, force),
         cli::Commands::Status { name } => cmd_status(&name),
         cli::Commands::Diff { only } => cmd_diff(&only),
         cli::Commands::List => cmd_list(),
-        cli::Commands::Adopt { path, name, dry_run } => {
-            cmd_adopt(&path, &name, dry_run)
-        }
+        cli::Commands::Adopt {
+            path,
+            name,
+            dry_run,
+        } => cmd_adopt(&path, &name, dry_run),
         cli::Commands::Add {
             name,
             target,
@@ -59,9 +63,7 @@ fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_path = stitch_dir.join("config.toml");
     if config_path.exists() {
-        return Err(
-            format!("config already exists at {}", config_path.display()).into(),
-        );
+        return Err(format!("config already exists at {}", config_path.display()).into());
     }
 
     let config = Config::empty();
@@ -81,9 +83,7 @@ fn cmd_apply(
 
     let mut filtered_config = config.clone();
     if !only.is_empty() {
-        filtered_config
-            .stores
-            .retain(|name, _| only.contains(name));
+        filtered_config.stores.retain(|name, _| only.contains(name));
     }
 
     if dry_run {
@@ -151,10 +151,10 @@ fn cmd_status(name: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let entries = store::status_all(&root, &config, &platform);
 
     for entry in &entries {
-        if let Some(filter) = name {
-            if &entry.store_name != filter {
-                continue;
-            }
+        if let Some(filter) = name
+            && &entry.store_name != filter
+        {
+            continue;
         }
 
         if entry.skipped_platform {
