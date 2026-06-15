@@ -92,7 +92,7 @@ pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
     } else {
         target.parent().unwrap_or(Path::new(".")).join(&resolved)
     };
-    resolved_abs.starts_with(repo_root) || resolved.starts_with(repo_root)
+    resolved_abs.starts_with(repo_root)
 }
 
 /// Remove a symlink at `target` if it points into the given repo root.
