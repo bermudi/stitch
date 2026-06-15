@@ -77,29 +77,32 @@ pub fn create_link(target: &Path, source: &Path) -> Result<(), LinkError> {
     Ok(())
 }
 
-/// Remove a symlink at `target` if it points into the given repo root.
-/// Returns true if something was removed.
-pub fn remove_link(target: &Path, repo_root: &Path) -> Result<bool, LinkError> {
-    if !target.is_symlink() {
-        return Ok(false);
-    }
-
-    let resolved =
-        std::fs::read_link(target).map_err(|e| LinkError::Read(e, target.to_path_buf()))?;
-
-    // Only remove if it points into our repo.
+/// Whether the symlink at `target` points into `repo_root`.
+///
+/// Distinguishes stitch-owned links (safe to replace/remove) from foreign ones
+/// (stow/chezmoi/Nix/Home-Manager/hand-managed — must never be silently
+/// clobbered). Relative symlink targets are resolved against the symlink's own
+/// parent directory. Returns `false` for non-symlinks or unreadable links.
+pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
+    let Ok(resolved) = std::fs::read_link(target) else {
+        return false;
+    };
     let resolved_abs = if resolved.is_absolute() {
         resolved.clone()
     } else {
         target.parent().unwrap_or(Path::new(".")).join(&resolved)
     };
+    resolved_abs.starts_with(repo_root) || resolved.starts_with(repo_root)
+}
 
-    if resolved_abs.starts_with(repo_root) || resolved.starts_with(repo_root) {
-        std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
-        Ok(true)
-    } else {
-        Ok(false)
+/// Remove a symlink at `target` if it points into the given repo root.
+/// Returns true if something was removed.
+pub fn remove_link(target: &Path, repo_root: &Path) -> Result<bool, LinkError> {
+    if !points_into_repo(target, repo_root) {
+        return Ok(false);
     }
+    std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
+    Ok(true)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -114,8 +117,6 @@ pub enum LinkError {
     Create(std::io::Error, PathBuf),
     #[error("could not remove existing symlink at {1}: {0}")]
     Remove(std::io::Error, PathBuf),
-    #[error("could not read symlink at {1}: {0}")]
-    Read(std::io::Error, PathBuf),
 }
 
 #[cfg(test)]

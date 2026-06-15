@@ -69,15 +69,10 @@ pub fn apply_store(
                 continue;
             }
             let target_path = config::expand_home(&target_entry.target);
-            let mode = if target_entry.files.is_empty() && target_entry.patterns.is_empty() {
-                StoreMode::WholeDir
-            } else {
-                StoreMode::File
-            };
             actions.extend(apply_target(
                 &store_dir,
                 &target_path,
-                mode,
+                repo_root,
                 &target_entry.files,
                 &target_entry.patterns,
                 &target_entry.ignore,
@@ -89,7 +84,7 @@ pub fn apply_store(
         actions.extend(apply_target(
             &store_dir,
             &target_path,
-            store.mode(),
+            repo_root,
             &store.files,
             &store.patterns,
             &store.ignore,
@@ -108,15 +103,25 @@ pub fn apply_store(
 fn apply_target(
     store_dir: &Path,
     target_path: &Path,
-    mode: StoreMode,
+    repo_root: &Path,
     files: &[String],
     patterns: &[String],
     ignore: &[String],
     dry_run: bool,
 ) -> Vec<ApplyAction> {
+    let mode = if files.is_empty() && patterns.is_empty() {
+        StoreMode::WholeDir
+    } else {
+        StoreMode::File
+    };
     match mode {
         StoreMode::WholeDir => {
-            vec![apply_single_link(store_dir, target_path, dry_run)]
+            vec![apply_single_link(
+                store_dir,
+                target_path,
+                repo_root,
+                dry_run,
+            )]
         }
         StoreMode::File => {
             let resolved = resolve_files(store_dir, files, patterns, ignore);
@@ -124,14 +129,14 @@ fn apply_target(
             for file_name in &resolved {
                 let source = store_dir.join(file_name);
                 let target = target_path.join(file_name);
-                actions.push(apply_single_link(&source, &target, dry_run));
+                actions.push(apply_single_link(&source, &target, repo_root, dry_run));
             }
             actions
         }
     }
 }
 
-fn apply_single_link(source: &Path, target: &Path, dry_run: bool) -> ApplyAction {
+fn apply_single_link(source: &Path, target: &Path, repo_root: &Path, dry_run: bool) -> ApplyAction {
     let status = linker::check_link(target, source);
 
     match status {
@@ -148,14 +153,22 @@ fn apply_single_link(source: &Path, target: &Path, dry_run: bool) -> ApplyAction
         }
         LinkStatus::Conflict(p) => ApplyAction::Conflict(p),
         LinkStatus::Broken(_) => {
+            // A symlink that isn't ours. Relink only if it points into this
+            // repo (stale stitch state — the store moved or a file was
+            // renamed); a foreign symlink (stow/chezmoi/Nix/Home-Manager, or
+            // a dangling user link) is a conflict, never silently clobbered.
+            if !linker::points_into_repo(target, repo_root) {
+                return ApplyAction::Conflict(target.to_path_buf());
+            }
             if dry_run {
-                ApplyAction::Replaced(target.to_path_buf())
-            } else {
-                let _ = std::fs::remove_file(target);
-                match linker::create_link(target, source) {
-                    Ok(()) => ApplyAction::Replaced(target.to_path_buf()),
-                    Err(e) => ApplyAction::Error(e.to_string()),
-                }
+                return ApplyAction::Replaced(target.to_path_buf());
+            }
+            if let Err(e) = std::fs::remove_file(target) {
+                return ApplyAction::Error(e.to_string());
+            }
+            match linker::create_link(target, source) {
+                Ok(()) => ApplyAction::Replaced(target.to_path_buf()),
+                Err(e) => ApplyAction::Error(e.to_string()),
             }
         }
     }

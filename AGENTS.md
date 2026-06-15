@@ -28,9 +28,10 @@ order — are in `docs/reviews/2026-06-15-trust-review.md`. Read it before touch
 `adopt`, the linker, or `apply`.
 
 **Resolved (2026-06-15):** gist uploads deleted (P0#1/#2); `adopt` made atomic with
-rollback + collision pre-checks (P0#4); `add`/`adopt` exit codes made honest (P0#7).
-**Still open:** P0#3 (foreign symlinks clobbered in `apply_single_link`) is the next
-blocker, plus the P1/P2 items in the review doc.
+rollback + collision pre-checks (P0#4); `add`/`adopt` exit codes made honest (P0#7);
+foreign symlinks treated as conflicts, not clobbers (P0#3). All P0 blockers are clear.
+**Still open:** the P1/P2 items in the review doc (path-fragment validation P1#6 is the
+next remaining safety gap).
 
 ## Constraints & red lines
 `stitch` mutates `$HOME`. The core safety contract: **never surprise the user with data
@@ -46,10 +47,10 @@ movement, data exposure, or silent replacement.** New code must uphold:
 - **No destructive overwrite of existing repo content.** Collisions are rejected.
 
 Note: some current code still violates these (see the review doc). As of 2026-06-15 the
-gist-upload, adopt-collision, and dishonest-exit-code violations are fixed; the remaining
-violations are **foreign-symlink clobbering (P0#3)** in `apply_single_link`, and
-**path-fragment validation (P1#6)** is not yet implemented. When fixing, bring the code
-into line — don't preserve the violation.
+gist-upload, adopt-collision, dishonest-exit-code, and foreign-symlink-clobbering
+violations are all fixed; the remaining violation is **path-fragment validation
+(P1#6)**, which is not yet implemented. When fixing, bring the code into line — don't
+preserve the violation.
 
 ## Quality bar
 Target: zero warnings. For a change to count as "done", `cargo fmt` and `cargo clippy`

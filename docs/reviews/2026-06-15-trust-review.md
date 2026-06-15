@@ -9,10 +9,11 @@ This doc records the *current-state* findings with file/function references. The
 safety principles derived from it live in the root `AGENTS.md`. When you fix items below,
 update or strike them here.
 
-**Resolved 2026-06-15:** P0#1, P0#2, P0#4, P0#7 — gist machinery deleted, adopt made
-atomic with rollback + collision pre-checks, `add`/`adopt` exit codes made honest
-(`apply`/`diff` were already correct). See commit history. Remaining blockers: P0#3
-(foreign symlinks clobbered in `apply_single_link`), plus the P1/P2 items below.
+**Resolved 2026-06-15:** P0#1, P0#2, P0#3, P0#4, P0#7 — gist machinery deleted, adopt
+made atomic with rollback + collision pre-checks, `add`/`adopt` exit codes made honest
+(`apply`/`diff` were already correct), and foreign symlinks are now conflicts rather
+than silent clobbers. All P0 blockers are clear; see commit history. Remaining: the
+P1/P2 items below.
 
 State at review time: 17 unit + 35 CLI tests pass. `cargo fmt --check` fails.
 `cargo clippy --all-targets --all-features -- -D warnings` fails (style nits + one
@@ -29,15 +30,19 @@ makes any network call. Git (the repo the file is moved into) is the historical 
 ### 2. ~~Tests have external side effects~~ ✅ RESOLVED
 Removed with the gist code. `cargo test` is now local-only.
 
-### 3. Non-owned symlinks are silently replaced
-- `linker::check_link()` returns `Broken` for any symlink not resolving to the expected
-  source; `store::apply_single_link()` removes it and relinks.
-- A stow/chezmoi/Nix/Home-Manager symlink at the target gets clobbered with no
-  backup/confirm — contradicting `LinkStatus::Conflict`'s own doc comment ("Something
-  else (file, dir, different symlink) occupies the path").
-- `store.rs` swallows the `remove_file` error when replacing broken links.
-- **Fix:** only auto-replace links known to point into this repo; otherwise report
-  conflict. Propagate remove errors. Effort: M. **← next blocker**
+### 3. ~~Non-owned symlinks are silently replaced~~ ✅ RESOLVED
+- `apply_single_link` now checks `linker::points_into_repo(target, repo_root)` on the
+  `Broken` arm. A broken/mismatched symlink that points into this repo (stale stitch
+  state — store moved or a file renamed) is self-healed by relinking; one pointing
+  elsewhere (stow/chezmoi/Nix/Home-Manager/hand-managed, or a dangling user link) is
+  reported as `Conflict` and left untouched. The `remove_file` error is now propagated
+  as `ApplyAction::Error` instead of being swallowed. The `dry_run` path mirrors this
+  (foreign → `Conflict`, not `Replaced`), so `stitch diff` no longer misleads.
+- `check_link` is deliberately left returning `Broken` for any non-matching symlink:
+  `status`/`doctor` report the honest user-facing state ("broken") regardless of
+  ownership; only `apply`'s *action* (replace vs conflict) is ownership-aware. Covered
+  by `apply_replaces_repo_owned_broken_symlink`, `apply_conflicts_on_foreign_symlink`,
+  and `apply_conflicts_on_dangling_foreign_symlink`.
 
 ### 4. ~~`adopt` can overwrite / half-mutate state~~ ✅ RESOLVED
 `cmd_adopt` now: (a) pre-checks collisions (store name in config, store dir exists)
@@ -114,8 +119,8 @@ usage and Unix-only tests are correct for scope, not a defect.
 ## Test gaps (high-value)
 
 1. `apply --force` actually creates `.bak` and preserves conflict content.
-2. Existing symlink → another manager is treated as conflict, not replaced.
-3. Broken symlink outside the repo is not blindly clobbered (or behavior is documented + tested).
+2. ✅ Existing symlink → another manager is treated as conflict, not replaced. *(covered: `apply_conflicts_on_foreign_symlink`)*
+3. ✅ Broken/dangling symlink outside the repo is not blindly clobbered. *(covered: `apply_conflicts_on_dangling_foreign_symlink`; repo-owned self-heal covered by `apply_replaces_repo_owned_broken_symlink`)*
 4. ✅ `adopt` rejects store/config collisions; does not overwrite existing repo files; fails
    if relinking fails. *(covered: `adopt_rejects_store_name_already_in_config`,
    `adopt_rejects_when_store_dir_already_exists`, `adopt_rolls_back_file_when_record_fails`)*
