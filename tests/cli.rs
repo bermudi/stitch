@@ -251,13 +251,17 @@ target = "{target_str}"
 }
 
 #[test]
-fn apply_replaces_broken_symlink() {
+fn apply_replaces_repo_owned_broken_symlink() {
+    // A symlink pointing into THIS repo (but at a now-missing path) is stale
+    // stitch state — the store was moved or a file renamed. apply self-heals by
+    // relinking rather than treating it as a conflict.
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
-    // Plant a symlink pointing somewhere that doesn't exist (broken).
-    std::os::unix::fs::symlink("/nonexistent/path/that/does/not/exist", &target).unwrap();
+    // Broken, but repo-owned: points into the store at a path that no longer exists.
+    let stale = repo.path().join("nvim").join("does-not-exist");
+    std::os::unix::fs::symlink(&stale, &target).unwrap();
     let target_str = target.to_string_lossy().into_owned();
     repo.write_config(&format!(
         r#"
@@ -272,10 +276,79 @@ target = "{target_str}"
         .success()
         .stdout(contains("replaced"));
 
-    // After apply, the link should now resolve to our store.
+    // After apply, the link resolves into our store.
     assert!(target.is_symlink());
     let resolved = fs::read_link(&target).unwrap();
     assert!(resolved.starts_with(repo.path()));
+}
+
+#[test]
+fn apply_conflicts_on_foreign_symlink() {
+    // A symlink managed by another tool (stow/chezmoi/Nix/Home-Manager) points
+    // outside this repo — even when its target is valid. apply must report a
+    // conflict and leave it untouched, never silently clobber it.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    // A valid foreign link: another manager's store lives outside this repo.
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("nvim");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("init.lua"), "not ours").unwrap();
+    std::os::unix::fs::symlink(&foreign, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    // The foreign symlink is untouched and still resolves into the foreign store.
+    assert!(target.is_symlink(), "foreign symlink must not be clobbered");
+    assert_eq!(fs::read_link(&target).unwrap(), foreign);
+    assert_eq!(
+        fs::read_to_string(target.join("init.lua")).unwrap(),
+        "not ours"
+    );
+}
+
+#[test]
+fn apply_conflicts_on_dangling_foreign_symlink() {
+    // A dangling symlink to a path outside this repo (stale user link, leftover
+    // from another tool) is foreign, so it's a conflict — not silently replaced.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/path/that/does/not/exist", &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    // Untouched: still the same dangling foreign symlink.
+    assert!(target.is_symlink());
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        Path::new("/nonexistent/path/that/does/not/exist")
+    );
 }
 
 #[test]
