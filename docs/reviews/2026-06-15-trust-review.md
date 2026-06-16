@@ -85,7 +85,7 @@ Removed with the gist code. `cargo test` is now local-only.
 Both now return non-zero when `apply_store` reports `Conflict`/`Error`. (`apply`/`diff`
 were already honest.)
 
-### 8. SPEC ↔ implementation drift
+### 8. ~~SPEC ↔ implementation drift~~ ✅ RESOLVED
 Missing vs SPEC: `import`, `modify`, hook execution (per-store + global), full ignore
 behavior, global ignores (`.git`/`.stitch`/`.DS_Store`), whole-dir→file-mode promotion
 when ignored content exists, a distinct `diff` report
@@ -96,6 +96,16 @@ Additional, verified against source: the `add` flags are `--file`/`-f` and
 `--target-flag`/`-t` in code but documented as `--files`/`--target` (`cli.rs`). The
 code names look like the bug; SPEC is likely the intended contract.
 - **Fix:** implement v0.2 behavior, or mark it clearly future/unsupported. Effort: L.
+
+**Resolved by (2026-06-15):** Implemented — hook execution (per-store `pre`/`post`
++ global `.stitch/hooks/` executables, with `STITCH_*` env vars; new `src/hooks.rs`);
+global ignores (`.git`, `.stitch`, `.gitignore`, `.DS_Store`) now always active with
+whole-dir→file-mode promotion when ignored content is present; `add` flag naming
+aligned to SPEC (`--files`/`-f`, `--target`/`-t` via a clap `ArgGroup`); dangling
+`stitch import` reference removed from `cmd_adopt`; review-doc `undo` contradiction
+struck. Deferred items (`import`, `modify`, distinct `diff` report format) are now
+explicitly marked future on the v0.2 roadmap. Commits `fac97d2` (A/H), `105acd3` (G),
+`a781530` (D/E), `118d834` (C).
 
 ---
 
