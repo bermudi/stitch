@@ -217,12 +217,11 @@ fn force_backup_link(source: &Path, target: &Path, dry_run: bool) -> ApplyAction
     }
     // Catch anything at the backup path — files, dirs, even dangling
     // symlinks (which `Path::exists` would miss). `rename(2)` would atomically
-    // replace it; we refuse instead.
+    // replace it; we refuse instead. Classified as a Conflict, not an Error:
+    // same root cause as any other blocked target (something is in the way),
+    // regardless of the --force flag.
     if backup.symlink_metadata().is_ok() {
-        return ApplyAction::Error(format!(
-            "backup already exists: {} (move it aside and re-run)",
-            backup.display()
-        ));
+        return ApplyAction::Conflict(backup);
     }
     if let Err(e) = std::fs::rename(target, &backup) {
         return ApplyAction::Error(format!(
