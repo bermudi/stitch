@@ -558,14 +558,14 @@ files = ["lua/init.lua"]
 
 #[test]
 fn add_rejects_traversal_in_files() {
-    // `add --file ../escape` must fail before the store dir is created, so no
+    // `add --files ../escape` must fail before the store dir is created, so no
     // orphaned directory is left behind and nothing escapes the target.
     let repo = Repo::new();
     let target = repo.path().join("home");
     let target_str = target.to_string_lossy().into_owned();
 
     repo.cmd()
-        .args(["add", "shells", &target_str, "--file", "../escape"])
+        .args(["add", "shells", &target_str, "--files", "../escape"])
         .assert()
         .failure()
         .stderr(contains("invalid file entry"));
