@@ -42,6 +42,10 @@ pub enum Commands {
         /// Only diff these stores (repeatable)
         #[arg(short, long = "only")]
         only: Vec<String>,
+
+        /// Preview .bak backup behavior (what `apply --force` would do)
+        #[arg(long)]
+        force: bool,
     },
 
     /// List all configured stores

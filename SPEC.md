@@ -64,7 +64,7 @@ Reconcile all stores. Creates missing symlinks, replaces broken ones, reports co
 |---|---|---|
 | `--only` | `-o` | Apply only named stores (repeatable) |
 | `--dry-run` | | Preview without changes |
-| `--force` | | Auto-create `.bak` backups for conflicts *(planned — currently a no-op)* |
+| `--force` | | Back up real-file/dir conflicts to `{target}.bak`, then link |
 
 ### `stitch status [name]`
 
@@ -72,7 +72,12 @@ Show symlink state for one or all stores. States: `linked`, `missing`, `conflict
 
 ### `stitch diff`
 
-Preview what `stitch apply` would do. Reports `ok`, `create`, `conflict`, `replace` per target.
+Preview what `stitch apply` would do. Reports `ok`, `create`, `conflict`, `replace`, `backed up` per target.
+
+| Flag | Short | Description |
+|---|---|---|
+| `--only` | `-o` | Diff only named stores (repeatable) |
+| `--force` | | Preview `.bak` backup behavior (what `apply --force` would do) |
 
 ### `stitch list`
 
@@ -172,12 +177,21 @@ If ignored content exists, whole-directory mode is promoted to file mode.
 
 ## Conflict handling
 
-Before linking, if a real file/dir exists at the target (not a stitch-managed symlink):
+Before linking, if a real file/dir exists at the target (not a stitch-managed
+symlink):
 1. Stop.
-2. Offer to move it into the repo (store `adopt` behavior).
+2. Offer to move it into the repo (store `adopt` behavior) — the interactive
+   path.
 3. Then symlink back.
 
-Nothing overwritten silently. `--force` auto-creates `.bak` backups.
+`apply --force` is the scripted path: it renames the conflicting target to
+`{target}.bak` and links in place, leaving a recoverable copy alongside.
+(`adopt` moves the file *into* the repo to manage it; `--force` leaves the
+backup in the target dir.)
+
+Nothing overwritten silently. Foreign symlinks (stow/chezmoi/Nix/Home-Manager)
+are always conflicts — even under `--force`. If `{target}.bak` already exists,
+`--force` fails rather than destroy a prior backup.
 
 ## Architecture
 

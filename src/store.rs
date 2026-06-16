@@ -9,10 +9,26 @@ use std::path::{Path, PathBuf};
 pub enum ApplyAction {
     Created(PathBuf),
     Replaced(PathBuf),
+    /// The conflicting real file/dir was renamed to `{target}.bak` and the
+    /// link created (`apply --force`). `target` is now symlinked; `backup`
+    /// holds the original content.
+    BackedUp {
+        target: PathBuf,
+        backup: PathBuf,
+    },
     Conflict(PathBuf),
     SkippedPlatform,
     AlreadyLinked,
     Error(String),
+}
+
+/// Flags controlling how `apply` reconciles each link.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyOpts {
+    pub dry_run: bool,
+    /// Rename real-file/dir conflicts to `{target}.bak` and link instead of
+    /// stopping. Foreign symlinks remain hard conflicts regardless.
+    pub force: bool,
 }
 
 #[derive(Debug)]
@@ -26,12 +42,12 @@ pub fn apply_all(
     repo_root: &Path,
     config: &Config,
     platform: &Platform,
-    dry_run: bool,
+    opts: ApplyOpts,
 ) -> Vec<ApplyResult> {
     let sorted: BTreeMap<_, _> = config.stores.iter().collect();
     sorted
         .into_iter()
-        .map(|(name, store)| apply_store(repo_root, name, store, platform, dry_run))
+        .map(|(name, store)| apply_store(repo_root, name, store, platform, opts))
         .collect()
 }
 
@@ -41,7 +57,7 @@ pub fn apply_store(
     name: &str,
     store: &Store,
     platform: &Platform,
-    dry_run: bool,
+    opts: ApplyOpts,
 ) -> ApplyResult {
     if !platform.matches_when(&store.when) {
         return ApplyResult {
@@ -76,7 +92,7 @@ pub fn apply_store(
                 &target_entry.files,
                 &target_entry.patterns,
                 &target_entry.ignore,
-                dry_run,
+                opts,
             ));
         }
     } else if let Some(ref target_str) = store.target {
@@ -88,7 +104,7 @@ pub fn apply_store(
             &store.files,
             &store.patterns,
             &store.ignore,
-            dry_run,
+            opts,
         ));
     } else {
         actions.push(ApplyAction::Error("no target configured".into()));
@@ -107,7 +123,7 @@ fn apply_target(
     files: &[String],
     patterns: &[String],
     ignore: &[String],
-    dry_run: bool,
+    opts: ApplyOpts,
 ) -> Vec<ApplyAction> {
     let mode = if files.is_empty() && patterns.is_empty() {
         StoreMode::WholeDir
@@ -116,12 +132,7 @@ fn apply_target(
     };
     match mode {
         StoreMode::WholeDir => {
-            vec![apply_single_link(
-                store_dir,
-                target_path,
-                repo_root,
-                dry_run,
-            )]
+            vec![apply_single_link(store_dir, target_path, repo_root, opts)]
         }
         StoreMode::File => {
             let resolved = resolve_files(store_dir, files, patterns, ignore);
@@ -129,20 +140,25 @@ fn apply_target(
             for file_name in &resolved {
                 let source = store_dir.join(file_name);
                 let target = target_path.join(file_name);
-                actions.push(apply_single_link(&source, &target, repo_root, dry_run));
+                actions.push(apply_single_link(&source, &target, repo_root, opts));
             }
             actions
         }
     }
 }
 
-fn apply_single_link(source: &Path, target: &Path, repo_root: &Path, dry_run: bool) -> ApplyAction {
+fn apply_single_link(
+    source: &Path,
+    target: &Path,
+    repo_root: &Path,
+    opts: ApplyOpts,
+) -> ApplyAction {
     let status = linker::check_link(target, source);
 
     match status {
         LinkStatus::Linked => ApplyAction::AlreadyLinked,
         LinkStatus::Missing => {
-            if dry_run {
+            if opts.dry_run {
                 ApplyAction::Created(target.to_path_buf())
             } else {
                 match linker::create_link(target, source) {
@@ -151,16 +167,27 @@ fn apply_single_link(source: &Path, target: &Path, repo_root: &Path, dry_run: bo
                 }
             }
         }
-        LinkStatus::Conflict(p) => ApplyAction::Conflict(p),
+        // A real file or directory occupies the target. Without --force this
+        // is a hard conflict; with --force the target is renamed to `.bak`
+        // and the link takes its place. (Foreign symlinks never reach here —
+        // they surface as `Broken` below and stay conflicts even under force.)
+        LinkStatus::Conflict(_) => {
+            if !opts.force {
+                ApplyAction::Conflict(target.to_path_buf())
+            } else {
+                force_backup_link(source, target, opts.dry_run)
+            }
+        }
         LinkStatus::Broken(_) => {
             // A symlink that isn't ours. Relink only if it points into this
             // repo (stale stitch state — the store moved or a file was
             // renamed); a foreign symlink (stow/chezmoi/Nix/Home-Manager, or
-            // a dangling user link) is a conflict, never silently clobbered.
+            // a dangling user link) is a conflict, never silently clobbered —
+            // even under --force.
             if !linker::points_into_repo(target, repo_root) {
                 return ApplyAction::Conflict(target.to_path_buf());
             }
-            if dry_run {
+            if opts.dry_run {
                 return ApplyAction::Replaced(target.to_path_buf());
             }
             if let Err(e) = std::fs::remove_file(target) {
@@ -172,6 +199,64 @@ fn apply_single_link(source: &Path, target: &Path, repo_root: &Path, dry_run: bo
             }
         }
     }
+}
+
+/// Resolve a real-file/dir conflict (`apply --force`) by renaming the target
+/// to `{target}.bak` and creating the symlink.
+///
+/// Fails — leaving the original target in place — if a backup already exists
+/// (never silently destroy a prior backup) or the link step fails after the
+/// rename (the backup is restored so the user loses nothing).
+fn force_backup_link(source: &Path, target: &Path, dry_run: bool) -> ApplyAction {
+    let backup = backup_path(target);
+    if dry_run {
+        return ApplyAction::BackedUp {
+            target: target.to_path_buf(),
+            backup,
+        };
+    }
+    // Catch anything at the backup path — files, dirs, even dangling
+    // symlinks (which `Path::exists` would miss). `rename(2)` would atomically
+    // replace it; we refuse instead.
+    if backup.symlink_metadata().is_ok() {
+        return ApplyAction::Error(format!(
+            "backup already exists: {} (move it aside and re-run)",
+            backup.display()
+        ));
+    }
+    if let Err(e) = std::fs::rename(target, &backup) {
+        return ApplyAction::Error(format!(
+            "failed to back up {} → {}: {}",
+            target.display(),
+            backup.display(),
+            e
+        ));
+    }
+    if let Err(e) = linker::create_link(target, source) {
+        // Restore the original so the user is left with their file, not a
+        // missing target. Best-effort: a (near-impossible) restore failure
+        // is ignored rather than masking the original link error.
+        let _ = std::fs::rename(&backup, target);
+        return ApplyAction::Error(format!(
+            "failed to link after backing up {}: {e}",
+            target.display()
+        ));
+    }
+    ApplyAction::BackedUp {
+        target: target.to_path_buf(),
+        backup,
+    }
+}
+
+/// Backup path for a target: `{target}.bak`.
+///
+/// Appends rather than `Path::with_extension("bak")` — dotfiles like `.bashrc`
+/// have no extension in `Path` semantics, so `with_extension` would yield just
+/// `.bak`, dropping the name. Uses `OsString` to stay correct on non-UTF8 paths.
+fn backup_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    name.push(".bak");
+    name.into()
 }
 
 #[derive(Debug)]
