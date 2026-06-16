@@ -267,7 +267,8 @@ fn cmd_adopt(
     let source = expand_home(path);
     if source.is_symlink() {
         return Err(format!(
-            "{} is already a symlink — use `stitch import` instead",
+            "{} is already a symlink — adopt expects a real file or directory \
+             (remove the symlink first if you want stitch to manage it)",
             source.display()
         )
         .into());

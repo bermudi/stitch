@@ -89,8 +89,8 @@ were already honest.)
 Missing vs SPEC: `import`, `modify`, hook execution (per-store + global), full ignore
 behavior, global ignores (`.git`/`.stitch`/`.DS_Store`), whole-dir→file-mode promotion
 when ignored content exists, a distinct `diff` report
-(`ok`/`create`/`conflict`/`replace`). `undo` exists but isn't in the SPEC command list.
-Gist snapshot behavior isn't represented in the SPEC's `adopt` contract.
+(`ok`/`create`/`conflict`/`replace`). Gist snapshot behavior isn't represented in
+the SPEC's `adopt` contract.
 
 Additional, verified against source: the `add` flags are `--file`/`-f` and
 `--target-flag`/`-t` in code but documented as `--files`/`--target` (`cli.rs`). The
