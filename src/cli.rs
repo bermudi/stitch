@@ -70,18 +70,20 @@ pub enum Commands {
         /// Store name
         name: String,
 
-        /// Target path (or use --target)
+        /// Target path (or pass positionally)
+        #[arg(group = "target_input")]
         target: Option<String>,
 
-        #[arg(short, long)]
+        /// Target path (or pass positionally)
+        #[arg(short, long = "target", group = "target_input", value_name = "TARGET")]
         target_flag: Option<String>,
 
         /// Files to link individually (repeatable)
-        #[arg(short, long = "file")]
+        #[arg(short, long = "files", value_name = "FILE")]
         files: Vec<String>,
 
         /// Glob patterns (repeatable)
-        #[arg(short, long)]
+        #[arg(short, long = "patterns", value_name = "PATTERN")]
         patterns: Vec<String>,
     },
 
