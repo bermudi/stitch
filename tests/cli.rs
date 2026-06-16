@@ -214,13 +214,13 @@ target = "{target_str}"
     ));
 
     repo.cmd().arg("apply").assert().success();
-    // Second run should report each link as already-present (the `✓` glyph)
+    // Second run should report each link as already-present (the `ok` label)
     // and still succeed.
     repo.cmd()
         .arg("apply")
         .assert()
         .success()
-        .stdout(contains("✓"));
+        .stdout(contains("ok"));
 }
 
 #[test]

@@ -115,19 +115,19 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
             match action {
                 store::ApplyAction::Created(p) => {
                     created += 1;
-                    println!("→ {}", p.display());
+                    println!("create: {}", p.display());
                 }
                 store::ApplyAction::Replaced(p) => {
                     replaced += 1;
-                    println!("↻ {}", p.display());
+                    println!("replace: {}", p.display());
                 }
                 store::ApplyAction::BackedUp { target, backup } => {
                     backed_up += 1;
-                    println!("◆ {} (backed up → {})", target.display(), backup.display());
+                    println!("backed up: {} → {}", target.display(), backup.display());
                 }
                 store::ApplyAction::Conflict(p) => {
                     conflicts += 1;
-                    println!("✗ conflict: {}", p.display());
+                    println!("conflict: {}", p.display());
                 }
                 store::ApplyAction::SkippedPlatform => {
                     skipped += 1;
@@ -135,7 +135,7 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
                 }
                 store::ApplyAction::AlreadyLinked => {
                     already += 1;
-                    println!("✓");
+                    println!("ok");
                 }
                 store::ApplyAction::Error(e) => {
                     errors += 1;
