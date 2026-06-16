@@ -32,11 +32,14 @@ rollback + collision pre-checks (P0#4); `add`/`adopt` exit codes made honest (P0
 foreign symlinks treated as conflicts, not clobbers (P0#3); path fragments validated
 at config load — absolute and `..`-containing `files`/`patterns` entries are rejected
 (P1#6); `apply --force` implemented as `{target}.bak` backup for real-file/dir
-conflicts, foreign symlinks still hard conflicts, fails loudly if `.bak` exists (P1#5).
-All P0 blockers and the resolved P1 items are clear; every red line below is now upheld
-by the code. **Still open:** P1#8 SPEC/impl reconciliation, and the P2 items
-(recursive glob P2#9, atomic config writes P2#10, unknown-store-name errors P2#11)
-in the review doc.
+conflicts, foreign symlinks still hard conflicts, fails loudly if `.bak` exists (P1#5);
+SPEC/impl reconciliation (P1#8) — `add` flags aligned to SPEC (`--files`/`--target`),
+global ignores + whole-dir→file-mode promotion implemented (`.git` no longer
+symlinked into `$HOME`), per-store + global hooks implemented (were silently ignored),
+dangling `stitch import` reference removed, review-doc `undo` contradiction fixed.
+All P0 blockers and all P1 items are clear; every red line below is now upheld
+by the code. **Still open:** the P2 items (recursive glob P2#9, atomic config writes
+P2#10, unknown-store-name errors P2#11) in the review doc.
 
 ## Constraints & red lines
 `stitch` mutates `$HOME`. The core safety contract: **never surprise the user with data
@@ -55,10 +58,12 @@ Note: as of 2026-06-15 every red-line violation flagged in the review is resolve
 gist-upload, adopt-collision, dishonest-exit-code, foreign-symlink-clobbering, and
 path-fragment-validation (P1#6) are all fixed. `apply --force` (P1#5) is now
 implemented as a local `.bak` backup (never external upload, foreign symlinks stay
-conflicts). The remaining open items (P1#8 SPEC reconciliation, the P2s) are
-feature/spec gaps, not red-line breaches. When touching `adopt`, the linker, `apply`,
-or config parsing, keep the code in line with these red lines — don't reintroduce a
-violation.
+conflicts). P1#8 (SPEC reconciliation) is resolved: hooks, global ignores, and flag
+naming now match the SPEC; deferred items (`modify`, `import`, distinct `diff`
+format) are explicitly marked future on the v0.2 roadmap. The remaining open items
+(the P2s) are feature/spec gaps, not red-line breaches. When touching `adopt`, the
+linker, `apply`, or config parsing, keep the code in line with these red lines — don't
+reintroduce a violation.
 
 ## Quality bar
 Target: zero warnings. For a change to count as "done", `cargo fmt` and `cargo clippy`

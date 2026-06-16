@@ -206,6 +206,7 @@ src/
   store.rs      Store model, apply/remove logic
   linker.rs     Symlink create/remove/verify
   platform.rs   OS, arch, distro, hostname detection
+  hooks.rs      Per-store + global hook execution
 ```
 
 `conflict.rs`, `adopt.rs`, `doctor.rs`, `template.rs`, `secrets.rs` appear in the roadmap
