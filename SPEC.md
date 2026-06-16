@@ -156,12 +156,13 @@ Secrets stored encrypted in `.stitch/secrets.enc`. Rendered files go to `~/.loca
 ## Hooks (v0.2)
 
 Per-store `pre` and `post` shell commands. `pre` failure aborts the store. `post` failure warns.
+Hooks are run via `sh -c` with the user's privileges (like git hooks). They are skipped under `--dry-run`/`diff`.
 
-Global hooks in `.stitch/hooks/`:
+Global hooks in `.stitch/hooks/` (must be executable — `chmod +x`):
 - `pre-apply` / `post-apply` — run before/after all stores
 - `pre-remove` / `post-remove` — run before/after removals
 
-Hooks receive env vars: `STITCH_ROOT`, `STITCH_STORE`, `STITCH_TARGET`, `STITCH_ACTION`, plus platform vars.
+Hooks receive env vars: `STITCH_ROOT`, `STITCH_STORE`, `STITCH_TARGET`, `STITCH_ACTION`, plus platform vars (`STITCH_OS`, `STITCH_ARCH`, `STITCH_DISTRO`, `STITCH_HOSTNAME`, `STITCH_SHELL`).
 
 ## Ignore patterns (v0.2)
 
@@ -227,7 +228,7 @@ inline in `main.rs` / `store.rs`.
 - [ ] `modify`
 - [x] `diff` (dry run)
 - [ ] `import` (scan existing symlinks)
-- [ ] Hooks (execution — parsed, not yet run)
+- [x] Hooks (per-store pre/post + global hooks, env vars)
 - [x] Ignore patterns (per-store + global ignores active; whole-dir promotion)
 - [x] Multi-target stores
 

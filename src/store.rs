@@ -1,4 +1,5 @@
 use crate::config::{self, Config, Store};
+use crate::hooks::{self, HookEnv};
 use crate::linker::{self, LinkStatus};
 use crate::platform::Platform;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -79,6 +80,26 @@ pub fn apply_store(
 
     let mut actions = Vec::new();
 
+    // Per-store pre-hook: aborts the store on failure (SPEC). Skipped under
+    // dry-run — running a shell command is a side effect, not a preview.
+    if !opts.dry_run
+        && let Some(pre) = &store.hooks.pre
+    {
+        let env = HookEnv {
+            root: repo_root,
+            store: Some(name),
+            target: store.target.as_deref(),
+            action: "apply",
+        };
+        if let Err(msg) = hooks::run_store_hook(pre, &env, platform) {
+            actions.push(ApplyAction::Error(format!("pre-hook: {msg}")));
+            return ApplyResult {
+                store_name: name.to_string(),
+                actions,
+            };
+        }
+    }
+
     if store.is_multi_target() {
         for target_entry in &store.targets {
             if !platform.matches_when(&target_entry.when) {
@@ -108,6 +129,22 @@ pub fn apply_store(
         ));
     } else {
         actions.push(ApplyAction::Error("no target configured".into()));
+    }
+
+    // Per-store post-hook: warns on failure — the store is already applied,
+    // so post-hook failure does not abort (SPEC). Skipped under dry-run.
+    if !opts.dry_run
+        && let Some(post) = &store.hooks.post
+    {
+        let env = HookEnv {
+            root: repo_root,
+            store: Some(name),
+            target: store.target.as_deref(),
+            action: "apply",
+        };
+        if let Err(msg) = hooks::run_store_hook(post, &env, platform) {
+            eprintln!("warning: store '{name}' post-hook: {msg}");
+        }
     }
 
     ApplyResult {

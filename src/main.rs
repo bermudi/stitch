@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod hooks;
 mod linker;
 mod platform;
 mod store;
@@ -86,6 +87,18 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
         println!("Dry run — no changes will be made.\n");
     }
 
+    // Global pre-apply hook (skipped under dry-run — hooks have side effects).
+    if !opts.dry_run {
+        let env = hooks::HookEnv {
+            root: &root,
+            store: None,
+            target: None,
+            action: "apply",
+        };
+        hooks::run_global_hook(&root, "pre-apply", &env, &platform)
+            .map_err(|e| format!("pre-apply hook: {e}"))?;
+    }
+
     let results = store::apply_all(&root, &filtered_config, &platform, opts);
 
     let mut created = 0;
@@ -136,6 +149,20 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
         "\nSummary: {} ok, {} created, {} replaced, {} backed up, {} conflicts, {} errors, {} skipped",
         already, created, replaced, backed_up, conflicts, errors, skipped
     );
+
+    // Global post-apply hook (skipped under dry-run). Warns on failure — the
+    // apply already happened, so post-hook failure does not abort.
+    if !opts.dry_run {
+        let env = hooks::HookEnv {
+            root: &root,
+            store: None,
+            target: None,
+            action: "apply",
+        };
+        if let Err(e) = hooks::run_global_hook(&root, "post-apply", &env, &platform) {
+            eprintln!("warning: post-apply hook: {e}");
+        }
+    }
 
     if errors > 0 || conflicts > 0 {
         Err(format!("{} errors, {} conflicts", errors, conflicts).into())
@@ -530,18 +557,34 @@ fn cmd_add(
 fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
     let mut config = Config::load(&root)?;
-
-    // Get status before removing from config.
     let platform = Platform::detect();
-    let statuses = store::status_all(&root, &config, &platform);
 
-    // Now remove the config entry.
-    config
+    // Check existence (borrow) before removing, so the config stays intact for
+    // status_all and the hook env.
+    let target = config
         .stores
-        .remove(name)
-        .ok_or_else(|| format!("store '{}' not found in config", name))?;
+        .get(name)
+        .ok_or_else(|| format!("store '{}' not found in config", name))?
+        .target
+        .as_deref()
+        .map(str::to_owned);
 
-    // Remove symlinks for this store.
+    // Global pre-remove hook.
+    {
+        let env = hooks::HookEnv {
+            root: &root,
+            store: Some(name),
+            target: target.as_deref(),
+            action: "remove",
+        };
+        hooks::run_global_hook(&root, "pre-remove", &env, &platform)
+            .map_err(|e| format!("pre-remove hook: {e}"))?;
+    }
+
+    // Compute link statuses from the still-complete config, then remove the entry.
+    let statuses = store::status_all(&root, &config, &platform);
+    config.stores.remove(name);
+
     let linked: Vec<_> = statuses
         .iter()
         .filter(|e| e.store_name == *name && !e.skipped_platform)
@@ -553,6 +596,20 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     config.save(&root)?;
+
+    // Global post-remove hook.
+    {
+        let env = hooks::HookEnv {
+            root: &root,
+            store: Some(name),
+            target: target.as_deref(),
+            action: "remove",
+        };
+        if let Err(e) = hooks::run_global_hook(&root, "post-remove", &env, &platform) {
+            eprintln!("warning: post-remove hook: {e}");
+        }
+    }
+
     println!("Removed store '{}' (directory left untouched)", name);
     Ok(())
 }

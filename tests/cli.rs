@@ -1420,3 +1420,191 @@ target = "{target_str}"
     assert!(target.is_symlink());
     assert!(target.join("init.lua").exists());
 }
+
+// --- Hooks (P1#8 C) ---
+
+/// Helper: chmod +x a path (for global hook scripts).
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+/// Per-store pre-hook runs before the store is applied.
+#[test]
+fn per_store_pre_hook_runs() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    let marker = repo.path().join("pre-ran");
+    repo.write_config(&format!(
+        r#"
+[stores.s]
+target = "{target_str}"
+hooks = {{ pre = "touch {}" }}
+"#,
+        marker.display()
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(marker.exists(), "pre-hook should have run");
+    assert!(target.is_symlink(), "store should still be applied");
+}
+
+/// Per-store pre-hook failure aborts the store: no link created, non-zero exit.
+#[test]
+fn per_store_pre_hook_failure_aborts_store() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.s]
+target = "{target_str}"
+hooks = {{ pre = "exit 1" }}
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("pre-hook"));
+
+    assert!(
+        !target.exists(),
+        "store must not be linked when pre-hook fails"
+    );
+}
+
+/// Per-store post-hook runs after the store is applied.
+#[test]
+fn per_store_post_hook_runs() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    let marker = repo.path().join("post-ran");
+    repo.write_config(&format!(
+        r#"
+[stores.s]
+target = "{target_str}"
+hooks = {{ post = "touch {}" }}
+"#,
+        marker.display()
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(marker.exists(), "post-hook should have run");
+    assert!(target.is_symlink());
+}
+
+/// Dry-run skips all hooks — no side effects.
+#[test]
+fn dry_run_skips_hooks() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    let marker = repo.path().join("ran");
+    repo.write_config(&format!(
+        r#"
+[stores.s]
+target = "{target_str}"
+hooks = {{ pre = "touch {}", post = "touch {}" }}
+"#,
+        marker.display(),
+        marker.display()
+    ));
+
+    repo.cmd().arg("diff").assert().success();
+
+    assert!(!marker.exists(), "hooks must not run under dry-run (diff)");
+    assert!(!target.is_symlink(), "dry-run must not link");
+}
+
+/// Global pre-apply hook runs before any store is applied.
+#[test]
+fn global_pre_apply_hook_runs() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let marker = repo.path().join("global-pre-ran");
+    fs::write(
+        hooks_dir.join("pre-apply"),
+        format!("#!/bin/sh\ntouch {}\n", marker.display()),
+    )
+    .unwrap();
+    make_executable(&hooks_dir.join("pre-apply"));
+
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.s]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(marker.exists(), "global pre-apply hook should have run");
+}
+
+/// Global pre-apply hook failure aborts the entire apply.
+#[test]
+fn global_pre_apply_failure_aborts() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(hooks_dir.join("pre-apply"), "#!/bin/sh\nexit 1\n").unwrap();
+    make_executable(&hooks_dir.join("pre-apply"));
+
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.s]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("pre-apply hook"));
+    assert!(!target.exists(), "apply must abort when pre-apply fails");
+}
+
+/// Hooks receive STITCH_* env vars, including STITCH_STORE.
+#[test]
+fn hook_receives_env_vars() {
+    let repo = Repo::new();
+    repo.make_store("mystore", &["f"]);
+    let target = repo.path().join("home").join("mystore");
+    let target_str = target.to_string_lossy().into_owned();
+    let outfile = repo.path().join("env.txt");
+    repo.write_config(&format!(
+        r#"
+[stores.mystore]
+target = "{target_str}"
+hooks = {{ pre = "env | grep ^STITCH > {}" }}
+"#,
+        outfile.display()
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let captured = fs::read_to_string(&outfile).unwrap();
+    assert!(captured.contains("STITCH_STORE=mystore"), "got: {captured}");
+    assert!(captured.contains("STITCH_ACTION=apply"), "got: {captured}");
+    assert!(captured.contains("STITCH_TARGET="), "got: {captured}");
+    assert!(captured.contains("STITCH_ROOT="), "got: {captured}");
+}
