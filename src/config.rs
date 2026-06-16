@@ -59,21 +59,7 @@ pub struct Hooks {
     pub post: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreMode {
-    WholeDir,
-    File,
-}
-
 impl Store {
-    pub fn mode(&self) -> StoreMode {
-        if self.files.is_empty() && self.patterns.is_empty() {
-            StoreMode::WholeDir
-        } else {
-            StoreMode::File
-        }
-    }
-
     pub fn is_multi_target(&self) -> bool {
         !self.targets.is_empty()
     }
@@ -294,31 +280,6 @@ mod tests {
         assert_eq!(config.stores.len(), parsed.stores.len());
         assert_eq!(parsed.stores["shells"].files, vec![".bashrc", ".zshrc"]);
         assert_eq!(parsed.stores["shells"].when.os.as_deref(), Some("linux"));
-    }
-
-    #[test]
-    fn test_store_mode() {
-        let whole = Store {
-            target: Some("~/.config/nvim".into()),
-            files: vec![],
-            patterns: vec![],
-            ignore: vec![],
-            when: WhenClause::default(),
-            hooks: Hooks::default(),
-            targets: vec![],
-        };
-        assert_eq!(whole.mode(), StoreMode::WholeDir);
-
-        let file_mode = Store {
-            target: Some("~".into()),
-            files: vec![".bashrc".into()],
-            patterns: vec![],
-            ignore: vec![],
-            when: WhenClause::default(),
-            hooks: Hooks::default(),
-            targets: vec![],
-        };
-        assert_eq!(file_mode.mode(), StoreMode::File);
     }
 
     // --- path-fragment validation (P1#6) ---

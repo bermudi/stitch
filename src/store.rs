@@ -1,7 +1,7 @@
-use crate::config::{self, Config, Store, StoreMode};
+use crate::config::{self, Config, Store};
 use crate::linker::{self, LinkStatus};
 use crate::platform::Platform;
-use globset::{GlobBuilder, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -125,19 +125,11 @@ fn apply_target(
     ignore: &[String],
     opts: ApplyOpts,
 ) -> Vec<ApplyAction> {
-    let mode = if files.is_empty() && patterns.is_empty() {
-        StoreMode::WholeDir
-    } else {
-        StoreMode::File
-    };
-    match mode {
-        StoreMode::WholeDir => {
-            vec![apply_single_link(store_dir, target_path, repo_root, opts)]
-        }
-        StoreMode::File => {
-            let resolved = resolve_files(store_dir, files, patterns, ignore);
+    match resolve_targets(store_dir, files, patterns, ignore) {
+        LinkTargets::WholeDir => vec![apply_single_link(store_dir, target_path, repo_root, opts)],
+        LinkTargets::Files(names) => {
             let mut actions = Vec::new();
-            for file_name in &resolved {
+            for file_name in &names {
                 let source = store_dir.join(file_name);
                 let target = target_path.join(file_name);
                 actions.push(apply_single_link(&source, &target, repo_root, opts));
@@ -291,15 +283,9 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                     continue;
                 }
                 let target_path = config::expand_home(&target_entry.target);
-                let mode = if target_entry.files.is_empty() && target_entry.patterns.is_empty() {
-                    StoreMode::WholeDir
-                } else {
-                    StoreMode::File
-                };
                 entries.extend(collect_statuses(
                     &store_dir,
                     &target_path,
-                    mode,
                     &target_entry.files,
                     &target_entry.patterns,
                     &target_entry.ignore,
@@ -311,7 +297,6 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
             entries.extend(collect_statuses(
                 &store_dir,
                 &target_path,
-                store.mode(),
                 &store.files,
                 &store.patterns,
                 &store.ignore,
@@ -326,15 +311,14 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
 fn collect_statuses(
     store_dir: &Path,
     target_path: &Path,
-    mode: StoreMode,
     files: &[String],
     patterns: &[String],
     ignore: &[String],
     name: &str,
 ) -> Vec<StatusEntry> {
     let mut entries = Vec::new();
-    match mode {
-        StoreMode::WholeDir => {
+    match resolve_targets(store_dir, files, patterns, ignore) {
+        LinkTargets::WholeDir => {
             entries.push(StatusEntry {
                 store_name: name.to_string(),
                 source: store_dir.to_path_buf(),
@@ -343,9 +327,8 @@ fn collect_statuses(
                 skipped_platform: false,
             });
         }
-        StoreMode::File => {
-            let resolved = resolve_files(store_dir, files, patterns, ignore);
-            for file_name in &resolved {
+        LinkTargets::Files(names) => {
+            for file_name in &names {
                 let source = store_dir.join(file_name);
                 let target = target_path.join(file_name);
                 entries.push(StatusEntry {
@@ -450,11 +433,108 @@ pub fn doctor(repo_root: &Path, config: &Config, platform: &Platform) -> DoctorR
     }
 }
 
+/// Glob patterns always active for every store, regardless of config. Protects
+/// against symlinking repo metadata (`.git`, `.stitch`, `.gitignore`,
+/// `.DS_Store`) into a target. Per SPEC "Ignore patterns (v0.2)".
+const GLOBAL_IGNORES: &[&str] = &[
+    ".stitch",
+    ".stitch/**",
+    ".git",
+    ".git/**",
+    ".gitignore",
+    ".DS_Store",
+];
+
+/// What a single store/target should link: one whole-directory symlink, or a
+/// list of individual entries (file mode, or a whole-dir store promoted to
+/// file mode because it contains ignored content).
+enum LinkTargets {
+    WholeDir,
+    Files(Vec<String>),
+}
+
+/// Merge global ignores (always active) with a store's own `ignore` patterns.
+fn merge_ignores(store_ignore: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = GLOBAL_IGNORES.iter().map(|s| (*s).to_string()).collect();
+    merged.extend(store_ignore.iter().cloned());
+    merged
+}
+
+/// Build a [`GlobSet`] from patterns. Invalid patterns are warned about on
+/// stderr and skipped — one bad pattern does not disable the rest. Returns
+/// `None` if `patterns` is empty or every pattern failed to compile.
+fn build_globset(patterns: &[String]) -> Option<GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = GlobSetBuilder::new();
+    let mut added = 0;
+    for pat in patterns {
+        match GlobBuilder::new(pat).literal_separator(false).build() {
+            Ok(glob) => {
+                builder.add(glob);
+                added += 1;
+            }
+            Err(e) => eprintln!("warning: invalid glob pattern '{}': {}", pat, e),
+        }
+    }
+    if added == 0 {
+        return None;
+    }
+    builder.build().ok()
+}
+
+/// Sorted, deduped top-level entry names in `store_dir` (non-recursive).
+fn top_level_entries(store_dir: &Path) -> Vec<String> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(store_dir) {
+        for entry in entries.flatten() {
+            if let Some(n) = entry.file_name().to_str() {
+                names.insert(n.to_string());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Resolve what to link for one store/target.
+///
+/// In whole-directory mode, if any top-level entry is ignored (global or
+/// per-store), the store is promoted to file mode so that ignored content —
+/// e.g. a `.git/` checked into the store — is never symlinked wholesale into
+/// the target. File mode always applies the merged (global + per-store) ignore.
+fn resolve_targets(
+    store_dir: &Path,
+    files: &[String],
+    patterns: &[String],
+    store_ignore: &[String],
+) -> LinkTargets {
+    let ignore = merge_ignores(store_ignore);
+    let explicit = !files.is_empty() || !patterns.is_empty();
+    if !explicit {
+        let entries = top_level_entries(store_dir);
+        if let Some(globset) = build_globset(&ignore)
+            && entries.iter().any(|n| globset.is_match(n))
+        {
+            return LinkTargets::Files(
+                entries
+                    .into_iter()
+                    .filter(|n| !globset.is_match(n))
+                    .collect(),
+            );
+        }
+        LinkTargets::WholeDir
+    } else {
+        LinkTargets::Files(resolve_files(store_dir, files, patterns, &ignore))
+    }
+}
+
 /// Resolve the complete file list for a file-mode store.
 ///
-/// Combines explicit `files` with glob `patterns` matched against the store directory,
-/// then removes anything matched by `ignore` patterns. Returns deduplicated, sorted paths
-/// relative to `store_dir`.
+/// Combines explicit `files` with glob `patterns` matched against the store
+/// directory, then removes anything matched by `ignore` patterns (the caller
+/// passes the merged global + per-store set). Returns deduplicated, sorted
+/// paths relative to `store_dir`.
 fn resolve_files(
     store_dir: &Path,
     files: &[String],
@@ -468,55 +548,22 @@ fn resolve_files(
         seen.insert(f.clone());
     }
 
-    // Build the include globset from patterns.
-    if !patterns.is_empty() {
-        let mut builder = GlobSetBuilder::new();
-        let mut valid = true;
-        for pat in patterns {
-            match GlobBuilder::new(pat).literal_separator(false).build() {
-                Ok(glob) => {
-                    builder.add(glob);
-                }
-                Err(e) => {
-                    eprintln!("warning: invalid glob pattern '{}': {}", pat, e);
-                    valid = false;
-                }
-            }
-        }
-
-        if valid && let Ok(globset) = builder.build() {
-            // Walk the store directory and match against patterns.
-            if let Ok(entries) = std::fs::read_dir(store_dir) {
-                for entry in entries.flatten() {
-                    let file_name = entry.file_name();
-                    let name_str = file_name.to_string_lossy();
-                    if globset.is_match(name_str.as_ref()) {
-                        seen.insert(name_str.into_owned());
-                    }
-                }
+    // Include glob pattern matches.
+    if let Some(globset) = build_globset(patterns)
+        && let Ok(entries) = std::fs::read_dir(store_dir)
+    {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if globset.is_match(name_str.as_ref()) {
+                seen.insert(name_str.into_owned());
             }
         }
     }
 
-    // Build the ignore globset and filter.
-    if !ignore.is_empty() {
-        let mut builder = GlobSetBuilder::new();
-        let mut valid = true;
-        for pat in ignore {
-            match GlobBuilder::new(pat).literal_separator(false).build() {
-                Ok(glob) => {
-                    builder.add(glob);
-                }
-                Err(e) => {
-                    eprintln!("warning: invalid ignore pattern '{}': {}", pat, e);
-                    valid = false;
-                }
-            }
-        }
-
-        if valid && let Ok(globset) = builder.build() {
-            seen.retain(|name| !globset.is_match(name.as_str()));
-        }
+    // Exclude ignored patterns.
+    if let Some(globset) = build_globset(ignore) {
+        seen.retain(|name| !globset.is_match(name.as_str()));
     }
 
     seen.into_iter().collect()
