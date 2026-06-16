@@ -228,7 +228,7 @@ inline in `main.rs` / `store.rs`.
 - [x] `diff` (dry run)
 - [ ] `import` (scan existing symlinks)
 - [ ] Hooks (execution — parsed, not yet run)
-- [~] Ignore patterns (per-store only; global ignores not active)
+- [x] Ignore patterns (per-store + global ignores active; whole-dir promotion)
 - [x] Multi-target stores
 
 ### v0.3 — Templates & secrets

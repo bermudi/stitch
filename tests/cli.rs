@@ -1320,3 +1320,103 @@ target = "{target_str}"
         .failure()
         .stdout(contains("both target"));
 }
+
+// --- Global ignores + whole-dir promotion (P1#8 D/E) ---
+
+/// Whole-directory mode with ignored content present is promoted to file mode,
+/// so repo metadata like `.git` is never symlinked wholesale into the target.
+/// This is the core footgun global ignores exist to prevent.
+#[test]
+fn whole_dir_promoted_when_git_present() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("vim", &["vimrc"]);
+    // Simulate a .git checked into the store (the footgun).
+    fs::create_dir(store_dir.join(".git")).unwrap();
+    fs::write(
+        store_dir.join(".git").join("config"),
+        "[core]
+",
+    )
+    .unwrap();
+
+    let target = repo.path().join("home").join(".vim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.vim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    // Promoted to file mode: vimrc is linked individually...
+    assert!(target.join("vimrc").is_symlink());
+    // ...and .git is NOT present at the target (the whole point).
+    assert!(
+        !target.join(".git").exists(),
+        ".git must not be symlinked into the target"
+    );
+    // The target itself is now a real directory (file mode), not a symlink.
+    assert!(target.is_dir());
+    assert!(!target.is_symlink());
+}
+
+/// Global ignores also apply in file mode: a `files`/`patterns` store cannot
+/// opt `.gitignore` or `.git` into a target even by naming them explicitly
+/// is unnecessary — they're filtered by default. But an explicitly-listed
+/// file that happens to match a global ignore is still linked (explicit wins).
+/// Here we verify the common case: patterns don't pull in global-ignored names.
+#[test]
+fn file_mode_patterns_skip_global_ignored() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("shells", &[]);
+    fs::write(store_dir.join(".bashrc"), "...").unwrap();
+    fs::write(store_dir.join(".gitignore"), "*").unwrap();
+    fs::write(store_dir.join(".DS_Store"), "x").unwrap();
+
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.shells]
+target = "{target_str}"
+patterns = ["*"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.join(".bashrc").is_symlink());
+    assert!(
+        !target.join(".gitignore").exists(),
+        ".gitignore must be globally ignored"
+    );
+    assert!(
+        !target.join(".DS_Store").exists(),
+        ".DS_Store must be globally ignored"
+    );
+}
+
+/// A clean whole-dir store (no ignored content) stays in whole-dir mode —
+/// promotion only triggers when there's something to exclude.
+#[test]
+fn whole_dir_stays_when_no_ignored_content() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    // Unchanged: single symlink to the whole dir.
+    assert!(target.is_symlink());
+    assert!(target.join("init.lua").exists());
+}
