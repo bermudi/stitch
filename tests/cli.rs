@@ -443,7 +443,7 @@ target = "{target_str}"
         .args(["apply", "--force"])
         .assert()
         .failure()
-        .stdout(contains("already exists"));
+        .stdout(contains("conflict"));
 
     // Nothing moved: target is still the real file, .bak unchanged.
     assert_eq!(fs::read_to_string(&target).unwrap(), "current");
