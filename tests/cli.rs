@@ -351,6 +351,139 @@ target = "{target_str}"
     );
 }
 
+// ---------------------------------------------------------------------------
+// apply --force (.bak backups)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_force_backs_up_real_file_and_links() {
+    // A real file at the target + --force: the file is renamed to
+    // {target}.bak, the symlink takes its place, and the original content is
+    // preserved.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "I am a real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .assert()
+        .success()
+        .stdout(contains("backed up"));
+
+    // Original content is now at {target}.bak.
+    let backup = format!("{}.bak", target.display());
+    assert!(Path::new(&backup).is_file());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), "I am a real file");
+    // The target is now a symlink into the store.
+    assert!(target.is_symlink());
+}
+
+#[test]
+fn apply_force_backs_up_real_directory() {
+    // A real directory at the target (the common case — e.g. a pre-existing
+    // ~/.config/nvim) is backed up the same way under --force.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("old.txt"), "legacy").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .assert()
+        .success()
+        .stdout(contains("backed up"));
+
+    let backup = format!("{}.bak", target.display());
+    assert!(Path::new(&backup).is_dir());
+    assert_eq!(
+        fs::read_to_string(Path::new(&backup).join("old.txt")).unwrap(),
+        "legacy"
+    );
+    assert!(target.is_symlink());
+}
+
+#[test]
+fn apply_force_fails_when_bak_already_exists() {
+    // If {target}.bak already exists, --force must fail rather than destroy
+    // the prior backup. The original target and the existing .bak are both
+    // left untouched.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let backup = format!("{}.bak", target.display());
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "current").unwrap();
+    fs::write(&backup, "previous backup").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .assert()
+        .failure()
+        .stdout(contains("already exists"));
+
+    // Nothing moved: target is still the real file, .bak unchanged.
+    assert_eq!(fs::read_to_string(&target).unwrap(), "current");
+    assert!(!target.is_symlink());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
+}
+
+#[test]
+fn apply_force_does_not_clobber_foreign_symlink() {
+    // --force resolves real-file/dir conflicts only. A foreign symlink
+    // (another tool's managed link) stays a hard conflict even under --force.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("nvim");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("init.lua"), "not ours").unwrap();
+    std::os::unix::fs::symlink(&foreign, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    // Untouched.
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), foreign);
+    assert!(!Path::new(&format!("{}.bak", target.display())).exists());
+}
+
 #[test]
 fn apply_rejects_traversal_in_files() {
     // A `../` file entry would symlink outside the target dir. Config load
@@ -649,6 +782,35 @@ target = "{target_str}"
 
     // Nothing should actually have been created.
     assert!(!target.exists());
+}
+
+#[test]
+fn diff_force_reports_backup_without_changing() {
+    // diff --force previews the .bak backup without touching the filesystem.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .args(["diff", "--force"])
+        .assert()
+        .success()
+        .stdout(contains("backed up"));
+
+    // Dry run: nothing moved.
+    assert!(target.is_file());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "real file");
+    assert!(!target.is_symlink());
+    assert!(!Path::new(&format!("{}.bak", target.display())).exists());
 }
 
 // ---------------------------------------------------------------------------

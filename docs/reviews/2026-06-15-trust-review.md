@@ -55,10 +55,20 @@ Removed with the gist code. `cargo test` is now local-only.
 
 ## P1 — must fix before trust
 
-### 5. `apply --force` parsed but unused
-- `src/main.rs` accepts `force`, passes `_force`, ignores it. SPEC says `--force`
-  auto-creates `.bak` backups for conflicts. A no-op safety flag misleads scripted users.
-- **Fix:** implement backups, or remove the flag/claim. Effort: S–M.
+### 5. ~~`apply --force` parsed but unused~~ ✅ RESOLVED
+- `--force` now backs up real-file/dir conflicts to `{target}.bak` and links
+  in place (`force_backup_link` in `src/store.rs`). Threaded through the apply
+  chain via an `ApplyOpts { dry_run, force }` struct (avoids `too_many_arguments`
+  on `apply_target`). A new `ApplyAction::BackedUp { target, backup }` variant
+  is counted in the summary. Foreign symlinks remain hard conflicts even under
+  `--force` (P0#3 guarantee untouched — they surface as `Broken`, never
+  `Conflict`). `diff --force` previews the backup. If `{target}.bak` already
+  exists, `--force` fails loudly (`symlink_metadata` catches dangling
+  symlinks too, since `rename(2)` would atomically replace them). On a
+  link-step failure after the rename, the backup is restored. Covered by
+  `apply_force_backs_up_real_file_and_links`,
+  `apply_force_backs_up_real_directory`, `apply_force_fails_when_bak_already_exists`,
+  `apply_force_does_not_clobber_foreign_symlink`, `diff_force_reports_backup_without_changing`.
 
 ### 6. ~~Path traversal unguarded in file mode~~ ✅ RESOLVED
 - `Config::load` now calls `Config::validate`, which rejects any `files`/`patterns`
@@ -124,7 +134,7 @@ usage and Unix-only tests are correct for scope, not a defect.
 
 ## Test gaps (high-value)
 
-1. `apply --force` actually creates `.bak` and preserves conflict content.
+1. ✅ `apply --force` actually creates `.bak` and preserves conflict content. *(covered: `apply_force_backs_up_real_file_and_links`, `apply_force_backs_up_real_directory`, `apply_force_fails_when_bak_already_exists`, `apply_force_does_not_clobber_foreign_symlink`, `diff_force_reports_backup_without_changing`)*
 2. ✅ Existing symlink → another manager is treated as conflict, not replaced. *(covered: `apply_conflicts_on_foreign_symlink`)*
 3. ✅ Broken/dangling symlink outside the repo is not blindly clobbered. *(covered: `apply_conflicts_on_dangling_foreign_symlink`; repo-owned self-heal covered by `apply_replaces_repo_owned_broken_symlink`)*
 4. ✅ `adopt` rejects store/config collisions; does not overwrite existing repo files; fails

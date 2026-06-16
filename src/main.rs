@@ -23,9 +23,9 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
             only,
             dry_run,
             force,
-        } => cmd_apply(&only, dry_run, force),
+        } => cmd_apply(&only, store::ApplyOpts { dry_run, force }),
         cli::Commands::Status { name } => cmd_status(&name),
-        cli::Commands::Diff { only } => cmd_diff(&only),
+        cli::Commands::Diff { only, force } => cmd_diff(&only, force),
         cli::Commands::List => cmd_list(),
         cli::Commands::Adopt {
             path,
@@ -72,11 +72,7 @@ fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_apply(
-    only: &[String],
-    dry_run: bool,
-    _force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
     let config = Config::load(&root)?;
     let platform = Platform::detect();
@@ -86,14 +82,15 @@ fn cmd_apply(
         filtered_config.stores.retain(|name, _| only.contains(name));
     }
 
-    if dry_run {
+    if opts.dry_run {
         println!("Dry run — no changes will be made.\n");
     }
 
-    let results = store::apply_all(&root, &filtered_config, &platform, dry_run);
+    let results = store::apply_all(&root, &filtered_config, &platform, opts);
 
     let mut created = 0;
     let mut replaced = 0;
+    let mut backed_up = 0;
     let mut conflicts = 0;
     let mut errors = 0;
     let mut skipped = 0;
@@ -110,6 +107,10 @@ fn cmd_apply(
                 store::ApplyAction::Replaced(p) => {
                     replaced += 1;
                     println!("↻ {}", p.display());
+                }
+                store::ApplyAction::BackedUp { target, backup } => {
+                    backed_up += 1;
+                    println!("◆ {} (backed up → {})", target.display(), backup.display());
                 }
                 store::ApplyAction::Conflict(p) => {
                     conflicts += 1;
@@ -132,8 +133,8 @@ fn cmd_apply(
     }
 
     println!(
-        "\nSummary: {} ok, {} created, {} replaced, {} conflicts, {} errors, {} skipped",
-        already, created, replaced, conflicts, errors, skipped
+        "\nSummary: {} ok, {} created, {} replaced, {} backed up, {} conflicts, {} errors, {} skipped",
+        already, created, replaced, backed_up, conflicts, errors, skipped
     );
 
     if errors > 0 || conflicts > 0 {
@@ -200,8 +201,14 @@ fn cmd_status(name: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_diff(only: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    cmd_apply(only, true, false)
+fn cmd_diff(only: &[String], force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    cmd_apply(
+        only,
+        store::ApplyOpts {
+            dry_run: true,
+            force,
+        },
+    )
 }
 
 fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
@@ -337,7 +344,16 @@ fn cmd_adopt(
     // If this fails, roll back the move so the user's file is back where it
     // was. config was never touched.
     let platform = Platform::detect();
-    let results = store::apply_store(&root, &store_name, &new_store, &platform, false);
+    let results = store::apply_store(
+        &root,
+        &store_name,
+        &new_store,
+        &platform,
+        store::ApplyOpts {
+            dry_run: false,
+            force: false,
+        },
+    );
     if results.actions.iter().any(|a| {
         matches!(
             a,
@@ -459,7 +475,16 @@ fn cmd_add(
     // apply created plus removing the empty store dir, not adopt's rename-back.
     let results = target.is_some().then(|| {
         let platform = Platform::detect();
-        store::apply_store(&root, name, &new_store, &platform, false)
+        store::apply_store(
+            &root,
+            name,
+            &new_store,
+            &platform,
+            store::ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+        )
     });
 
     if let Some(results) = results.as_ref() {
