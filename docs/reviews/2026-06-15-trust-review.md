@@ -159,12 +159,12 @@ usage and Unix-only tests are correct for scope, not a defect.
 
 ---
 
-## Recommended fix order
+## Recommended fix order (all completed as of 2026-06-15)
 
-1. Disable Gist snapshots by default (local backups or explicit opt-in).
-2. Harden linker semantics: foreign symlink = conflict; only replace repo-owned broken links.
-3. Honest exit codes from `add` / `adopt` / `apply` / `diff`.
-4. Implement or remove `--force`.
-5. Collision + path-traversal validation in `adopt` / `add` / file mode.
-6. Mock snapshotting in tests.
-7. Close or explicitly trim the SPEC gaps.
+1. ~~Disable Gist snapshots by default~~ ✅ (`387488f`)
+2. ~~Harden linker semantics~~ ✅ (`de07218`)
+3. ~~Honest exit codes~~ ✅ (`387488f`, `7a3eeb1`)
+4. ~~Implement or remove `--force`~~ ✅ (`b28bed8`)
+5. ~~Collision + path-traversal validation~~ ✅ (`387488f`, `a941c1a`)
+6. ~~Mock snapshotting in tests~~ ✅ (moot — snapshot code deleted)
+7. ~~Close or explicitly trim SPEC gaps~~ ✅ (`fac97d2`, `105acd3`, `a781530`, `118d834`, `5cd715a`, `2196237`)
