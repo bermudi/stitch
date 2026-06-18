@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.1 — 2026-06-18
+
+### Features
+
+- **`stitch prune` (alias `gc`)** — find symlinks pointing into the repo that
+  no store references, and remove them. Closes the last v0.3 checkbox
+  (orphaned-link detection). Non-destructive by default: lists only; `--yes`
+  removes, `--dry-run` is an explicit alias for the default. Removal routes
+  through the `points_into_repo`-guarded `remove_link`, so foreign symlinks are
+  never touched and a link repointed between scan and unlink is skipped.
+- **`src/scan.rs`** — shared filesystem scanner. By default walks `~`
+  *shallowly* (top-level dotfiles only — `~/.bashrc`, `~/.gitconfig`, …) so a
+  bare `prune` never descends into `~/.cache`, `node_modules`, or other slow
+  `$HOME` trees, plus `~/.config` and `~/.local/share` at full depth; an
+  explicit `--scan-dir` is always full depth. Scan dirs are a parameter, not
+  hardwired to `$HOME`, so the scanner is testable. Platform-gated: a store
+  skipped on this host doesn't own its target, so a stray link there counts as
+  an orphan. Foundation for the planned `import` command.
+
+### Trust & safety
+
+- **Honest exit codes.** `prune --yes` returns non-zero if any link could not
+  be removed (a permissions error, or a link repointed between scan and unlink).
+  A scripted `stitch prune --yes && …` won't sail past failures.
+
+### Design note
+
+`doctor` deliberately stays a fast, repo-local health check — the home-dir scan
+lives in `prune` only. Scanning `$HOME` on every `doctor` run would be slow and
+surprising, and would force every `doctor` test to override `$HOME`. This is an
+intentional deviation from the original v0.3 plan (which sketched orphan-link
+detection as a `doctor` check); see `docs/plans/v0.3-config-state-split.md`.
+
+### Testing
+
+150 tests (58 unit + 92 CLI), all passing. New coverage: 9 scanner unit tests
+(repo-pointing, foreign, missing-scan-dir, repo-pruning, covered-vs-orphan,
+platform-skipped target, max-depth cap, dangling repo-pointing link,
+file-mode target coverage) + 8 `prune` CLI tests (default lists, `--yes`
+removes only the orphan, `--dry-run`, `--yes --dry-run` still lists, foreign
+ignored, no-orphans, `gc` alias, non-zero exit on removal failure). `cargo fmt`
+and `cargo clippy -D warnings` clean.
+
 ## 0.3.0 — 2026-06-18
 
 ### BREAKING — config/state split

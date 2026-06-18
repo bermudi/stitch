@@ -41,12 +41,13 @@ movement, data exposure, or silent replacement.** New code must uphold:
   opt-in flag is set.
 - **Foreign symlinks are conflicts, not replacements.** A symlink not pointing into this
   repo is never silently clobbered.
-- **Exit codes are honest.** `add`/`adopt`/`apply`/`diff` return non-zero on real errors
-  and conflicts.
+- **Exit codes are honest.** `add`/`adopt`/`apply`/`diff`/`prune` return non-zero on real errors
+  and conflicts (including partial removal failure in `prune --yes`).
 - **Validate path fragments.** Reject absolute and `..`-containing file entries; nothing
   escapes the store/target dirs.
 - **No destructive overwrite of existing repo content.** Collisions are rejected.
 - **Authored config is read-only to the tool.** After `init`, stitch never rewrites `stitch.toml`. Mutations touch `.stitch/state.toml` only — never silently destroy the user's comments or formatting. (v0.3 split, shipped.)
+- **`prune` is list-only by default.** It walks `$HOME` for repo-pointing symlinks no store references; removal requires explicit `--yes`. Removal routes through the `points_into_repo`-guarded `remove_link`, so foreign symlinks are never touched and a link repointed between scan and unlink is skipped. (v0.3.1, shipped.)
 
 Note: as of 2026-06-15 every red-line violation flagged in the review is resolved.
 When touching `adopt`, the linker, `apply`, or config parsing, keep the code in line

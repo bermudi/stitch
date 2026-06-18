@@ -176,13 +176,47 @@ One-shot conversion of a v0.2 `.stitch/config.toml` repo to the two-file layout.
 |---|---|
 | `--dry-run` | Preview the planned `stitch.toml` + `state.toml` without writing |
 
-### `stitch import` *(planned — not yet implemented)*
+### `stitch prune` (alias: `gc`)
 
-Scan for existing symlinks pointing into the repo and import them into config.
+Find symlinks pointing into this repo that no store references (orphans left
+behind by a renamed/removed store), and optionally remove them. Non-destructive
+by default: it lists and removes nothing unless `--yes` is given.
+
+A shared scanner walks the scan dirs, classifies each symlink via the same
+`points_into_repo` guard the rest of the tool uses, and reports links whose
+location is not covered by any merged store's target set (platform-gated — a
+store skipped on this host does not own its target here, so a stray link there
+is an orphan). Foreign symlinks (stow/chezmoi/Nix/Home-Manager) are never
+listed or removed. Only the symlink is ever removed; repo content is untouched.
+
+Removal routes through the `points_into_repo`-guarded `remove_link`, so a link
+that was repointed between the scan and the unlink is skipped rather than
+clobbered.
 
 | Flag | Description |
 |---|---|
-| `--scan-dir` | Directories to scan (repeatable). Default: `~`, `~/.config`, `~/.local/share` |
+| `--scan-dir` | Directories to scan, full depth (repeatable). Default: `~` (top-level dotfiles only), `~/.config`, `~/.local/share` |
+| `--dry-run` | Preview only (also the default behavior) |
+| `--yes` | Remove the orphaned links (default is list-only) |
+
+By default `~` is walked shallowly — direct children only — so a bare `prune`
+catches top-level dotfile links (`~/.bashrc`, `~/.gitconfig`, …) without
+descending into slow `$HOME` trees (`~/.cache`, `node_modules`, …).
+`~/.config` and `~/.local/share` are walked at full depth. An explicit
+`--scan-dir` is always full depth, so `--scan-dir ~` forces a complete sweep.
+
+The scanner lives in `src/scan.rs` and is shared with the planned `import`
+command, which will register existing repo-pointing symlinks in config instead
+of removing them.
+
+### `stitch import` *(planned — not yet implemented)*
+
+Scan for existing symlinks pointing into the repo and import them into config.
+Shares the `src/scan.rs` scanner with `prune`.
+
+| Flag | Description |
+|---|---|
+| `--scan-dir` | Directories to scan, full depth (repeatable). Default: `~` (top-level dotfiles only), `~/.config`, `~/.local/share` |
 | `--dry-run` | Preview |
 
 ## Platform support
@@ -274,6 +308,7 @@ src/
   linker.rs     Symlink create/remove/verify, ownership checks
   platform.rs   OS, arch, distro, hostname, shell detection
   hooks.rs      Per-store + global hook execution
+  scan.rs       Filesystem scan for repo-pointing symlinks (prune + future import)
 ```
 
 `config.rs` loads `stitch.toml` + `.stitch/state.toml`, merges per store by
@@ -305,7 +340,8 @@ comments on every `add`/`adopt`/`remove` reserialize.
 - [x] `stitch migrate` — one-shot split of v0.2 `.stitch/config.toml`
 - [x] `doctor`: orphaned-behavior detection (authored store with no state entry)
 - [x] Deterministic `state.toml` ordering (sorted maps + files/patterns)
-- [ ] orphaned-link detection + `prune`/`gc` *(deferred to a follow-up cut)*
+- [x] orphaned-link detection + `prune`/`gc` — shared `src/scan.rs` scanner;
+  `doctor` stays repo-local (the home-dir scan lives in `prune` only)
 
 ### v0.4 — Templates & secrets (planned)
 - [ ] `modify` command

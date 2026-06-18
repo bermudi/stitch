@@ -105,4 +105,21 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Remove symlinks pointing into this repo that no store references
+    #[command(alias = "gc")]
+    Prune {
+        /// Directories to scan for orphaned links (repeatable, full depth).
+        /// Default: ~ (top-level dotfiles only), ~/.config, ~/.local/share.
+        #[arg(long = "scan-dir", value_name = "DIR")]
+        scan_dirs: Vec<String>,
+
+        /// Preview only — list what would be removed (also the default behavior)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove the orphaned links (default is list-only)
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
 }
