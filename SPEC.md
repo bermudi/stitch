@@ -6,13 +6,32 @@ Symlinks point from the target (`~/.bashrc`, `~/.config/nvim`) back to the repo.
 
 ## Config
 
-`.stitch/config.toml` at the repo root. Declared explicitly — directory layout is freeform.
+Desired state is split across two files by authorship. Load-bearing rule: **human-authored content is never rewritten by the tool.** v0.2 mixed authored and generated fields in one file, so every `add`/`adopt`/`remove` reserialized the whole thing via `to_string_pretty` and silently destroyed comments and hand-formatting. The split ends that.
+
+### `stitch.toml` — repo root, visible, **authored**
+
+You write and edit this. Like `Cargo.toml` — signal, not noise. stitch writes it exactly once, at `init`; thereafter it is read-only from the tool's side.
 
 ```toml
 [vars]
 editor = "nvim"
 email = "you@example.com"
 
+[stores.shells.when]
+os = "linux"
+
+[stores.git]
+hooks = { post = "git config --global core.editor nvim" }
+
+[stores.nvim]
+ignore = ["*.bak", "scratch/"]
+```
+
+### `.stitch/state.toml` — hidden, **generated**
+
+stitch writes this. It records the concrete link inventory — what to link, where. `add`/`adopt`/`remove` are the only writers. You may hand-edit it (plain TOML), but the tool is authorized to reserialize it on the next mutation, so do not rely on comments or formatting here.
+
+```toml
 [stores.nvim]
 target = "~/.config/nvim"
 
@@ -20,25 +39,59 @@ target = "~/.config/nvim"
 target = "~"
 files = [".bashrc", ".zshrc"]
 
-[stores.shells.when]
-os = "linux"
-
 [stores.git]
 target = "~/.config/git"
-hooks = { post = "git config --global core.editor nvim" }
 ```
 
-Multi-target (one store, multiple destinations):
+### Field ownership
 
+| Field | Lives in | Kind |
+|---|---|---|
+| `vars` | `stitch.toml` | user variables |
+| `when` | `stitch.toml` | behavior — platform filter |
+| `hooks` | `stitch.toml` | behavior — side effects |
+| `ignore` | `stitch.toml` | behavior — resolution rule |
+| `target` | `state.toml` | inventory — where to link |
+| `files` | `state.toml` | inventory — what to link |
+| `patterns` | `state.toml` | inventory — what to link |
+
+### Load-time merge
+
+A store is the union of its `stitch.toml` behavior and its `state.toml` inventory, merged by store name. A store present in only one file is legal:
+- **`state.toml` only** — store with default behavior (`when` always, no hooks).
+- **`stitch.toml` only** — behavior for a store with no links yet. `doctor` warns (dead behavior).
+
+### Multi-target stores
+
+A store can fan out to multiple destinations. Each target entry has a **name** — the join key pairing inventory (`state.toml`) with behavior (`stitch.toml`). The name is required because two targets can share a path (the same `~/.config/helix` on different hostnames), so the path cannot be the key.
+
+`stitch.toml` (authored):
 ```toml
-[[stores.helix.targets]]
-target = "~/.config/helix"
+[stores.helix.targets.laptop]
 when = { hostname = "laptop" }
 
-[[stores.helix.targets]]
-target = "~/.config/helix"
+[stores.helix.targets.server]
 when = { hostname = "server" }
 ```
+
+`.stitch/state.toml` (generated):
+```toml
+[stores.helix.targets.laptop]
+target = "~/.config/helix"
+
+[stores.helix.targets.server]
+target = "~/.config/helix"
+```
+
+`add`/`adopt` generate a name when none is given (from `when.hostname`, else `target-<n>`). Renaming in one file without the other orphans the entry; `doctor` warns.
+
+### Migration
+
+`stitch migrate` splits a v0.2 `.stitch/config.toml` in place: authored fields (`vars`, `when`, `hooks`, `ignore`) → `stitch.toml`, inventory fields (`target`, `files`, `patterns`) → `.stitch/state.toml`, then preserves the original as `.stitch/config.toml.bak` (the recovery path). One-shot, deterministic; `--dry-run` previews the planned files.
+
+Migration is **comment-lossy by design**: v0.2 comments decorate a single-file layout that no longer exists, so there is no faithful place to carry them into the split files. The conversion prints a note to that effect; the `.bak` preserves the original so the user can re-add any comments they want to keep.
+
+Multi-target array entries get deterministic names during migration (hostname-first if present, else `target-<n>`, with a `-N` suffix on collision) — the cross-file join key.
 
 ## Core concepts
 
@@ -48,13 +101,14 @@ when = { hostname = "server" }
 - **File mode** — `files` and/or `patterns` → individual files are symlinked into the target dir.
 - **when** — platform filter. All specified fields must match. Omit = always applies.
 - **Hooks** — `pre` and `post` shell commands per store.
-- **Config is truth** — `stitch apply` reconciles the filesystem to match. The entire update loop.
+- **Authored vs generated** — `stitch.toml` is human-authored and never rewritten by the tool (after `init`); `.stitch/state.toml` is generated and tool-owned. The split exists so mutations to inventory never clobber your comments and formatting.
+- **Desired state is truth** — `stitch apply` reconciles the filesystem to match the merged config. The entire update loop.
 
 ## Commands
 
 ### `stitch init`
 
-Create `.stitch/config.toml` in the current directory.
+Create `stitch.toml` (empty, with a header documenting it is authored/read-only to the tool) and `.stitch/state.toml` (empty, generated) in the current directory. Refuses if either exists, or if a v0.2 `.stitch/config.toml` is present (pointing at `migrate` instead).
 
 ### `stitch apply`
 
@@ -85,7 +139,7 @@ Print all configured stores and their targets.
 
 ### `stitch adopt <path>`
 
-Move an existing file or directory into the repo, create a config entry, symlink back.
+Move an existing file or directory into the repo, record the link in `.stitch/state.toml`, symlink back. Writes inventory only — `stitch.toml` is untouched.
 
 | Flag | Short | Description |
 |---|---|---|
@@ -94,7 +148,7 @@ Move an existing file or directory into the repo, create a config entry, symlink
 
 ### `stitch add <name> [target]`
 
-Create a store directory and config entry. Links immediately if target provided.
+Create a store directory, record it in `.stitch/state.toml`, and link immediately if a target is provided. Writes `state.toml` only.
 
 | Flag | Short | Description |
 |---|---|---|
@@ -104,15 +158,23 @@ Create a store directory and config entry. Links immediately if target provided.
 
 ### `stitch remove <name>`
 
-Remove store symlinks and config entry. Store directory left untouched.
+Remove store symlinks and the store's `state.toml` entry. `stitch.toml` behavior is left in place (the tool never rewrites authored config) — `doctor` flags the orphaned behavior; remove it via `stitch edit`. Store directory left untouched.
 
 ### `stitch edit`
 
-Open `.stitch/config.toml` in `$EDITOR`.
+Open `stitch.toml` in `$EDITOR`.
 
 ### `stitch doctor`
 
-Health check: missing store dirs, broken symlinks, conflicting targets, empty stores.
+Health check: missing store dirs, broken symlinks, conflicting targets, empty stores, orphaned behavior (store in `stitch.toml` with no `state.toml` entry), orphaned links (symlinks into the repo referenced by no store).
+
+### `stitch migrate`
+
+One-shot conversion of a v0.2 `.stitch/config.toml` repo to the two-file layout. Splits authored fields (`vars`, `when`, `hooks`, `ignore`) into `stitch.toml` and inventory fields (`target`, `files`, `patterns`) into `.stitch/state.toml`, then preserves the original as `.stitch/config.toml.bak`. Deterministic; see [Migration](#migration). Comment-lossy by design.
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Preview the planned `stitch.toml` + `state.toml` without writing |
 
 ### `stitch import` *(planned — not yet implemented)*
 
@@ -139,9 +201,9 @@ All fields optional. All specified must match.
 | `hostname` | Machine hostname |
 | `shell` | `zsh`, `bash`, `fish`, `nu` |
 
-## Templates & secrets (v0.3 — planned, not yet implemented)
+## Templates & secrets (v0.4 — planned, not yet implemented)
 
-*This feature is on the v0.3 roadmap and does not exist yet. The design below is
+*This feature is on the v0.4 roadmap and does not exist yet. The design below is
 the intended contract.*
 
 Files containing `{{ ... }}` references will be rendered through a template engine
@@ -170,11 +232,12 @@ Global hooks in `.stitch/hooks/` (must be executable — `chmod +x`):
 
 Hooks receive env vars: `STITCH_ROOT`, `STITCH_STORE`, `STITCH_TARGET`, `STITCH_ACTION`, plus platform vars (`STITCH_OS`, `STITCH_ARCH`, `STITCH_DISTRO`, `STITCH_HOSTNAME`, `STITCH_SHELL`).
 
-## Ignore patterns (v0.2)
+## Ignore patterns
+
+Authored — lives in `stitch.toml` (a resolution rule, not inventory):
 
 ```toml
 [stores.nvim]
-target = "~/.config/nvim"
 ignore = ["*.bak", "scratch/"]
 ```
 
@@ -206,12 +269,17 @@ are always conflicts — even under `--force`. If `{target}.bak` already exists,
 src/
   main.rs       CLI entry point (clap) + command handlers
   cli.rs        Command definitions
-  config.rs     Serde types, TOML parsing, validation
+  config.rs     Serde types, TOML parsing, authored/generated split, load-time merge
   store.rs      Store model, apply/remove logic, file resolution
   linker.rs     Symlink create/remove/verify, ownership checks
   platform.rs   OS, arch, distro, hostname, shell detection
   hooks.rs      Per-store + global hook execution
 ```
+
+`config.rs` loads `stitch.toml` + `.stitch/state.toml`, merges per store by
+name, and validates the merged result (fragment validation, target
+uniqueness). Mutating commands write only `state.toml`; `stitch.toml` is
+read-only to the tool after `init`.
 
 ## Roadmap
 
@@ -225,7 +293,21 @@ src/
 - [x] Conflict detection + `--force` backup semantics
 - [x] Atomic config writes, path traversal validation, honest exit codes
 
-### v0.3 — Templates & secrets (planned)
+### v0.3 — Config/state split (shipped 2026-06-18, **breaking**)
+Separate human-authored config from tool-generated desired state. See
+[Config](#config). Motivated by the v0.2 single-file model silently destroying
+comments on every `add`/`adopt`/`remove` reserialize.
+
+- [x] `stitch.toml` (authored, root) vs `.stitch/state.toml` (generated)
+- [x] Load-time merge by store name; field-ownership table enforced
+- [x] Named multi-target entries (name is the cross-file join key)
+- [x] `add`/`adopt`/`remove` write `state.toml` only; `stitch.toml` read-only after `init`
+- [x] `stitch migrate` — one-shot split of v0.2 `.stitch/config.toml`
+- [x] `doctor`: orphaned-behavior detection (authored store with no state entry)
+- [x] Deterministic `state.toml` ordering (sorted maps + files/patterns)
+- [ ] orphaned-link detection + `prune`/`gc` *(deferred to a follow-up cut)*
+
+### v0.4 — Templates & secrets (planned)
 - [ ] `modify` command
 - [ ] `import` (scan existing symlinks)
 - [ ] Go-style text/template engine
@@ -233,7 +315,7 @@ src/
 - [ ] Encrypted secrets (`age` or XChaCha20-Poly1305)
 - [ ] Template staging dir
 
-### v0.4 — TUI (planned)
+### v0.5 — TUI (planned)
 - [ ] Interactive dashboard (ratatui)
 - [ ] Command palette
 - [ ] Activity log
@@ -244,5 +326,6 @@ src/
 - **Symlinks, not copies** — edits hit the repo directly. No drift possible.
 - **Explicit config** — no inferring targets from directory layout. You declare it.
 - **Absolute symlinks** — resolved to absolute source paths so cwd doesn't matter.
-- **Config is truth** — `apply` reconciles to match. Change config, re-apply. That's the loop.
+- **Authored vs generated, never mixed** — `stitch.toml` is yours and hand-editable; `.stitch/state.toml` is the tool's. The tool never rewrites the authored file after `init`, so comments and formatting survive every mutation. v0.2's single-file model violated this and ate comments on every `add`/`adopt`/`remove`.
+- **Desired state is truth** — `apply` reconciles the filesystem to match the merged config. Change config, re-apply. That's the loop.
 - **Non-destructive by default** — conflicts stop, not clobber. `--force` for scripted use.
