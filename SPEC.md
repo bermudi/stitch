@@ -202,50 +202,38 @@ are always conflicts — even under `--force`. If `{target}.bak` already exists,
 
 ## Architecture
 
-Current source modules:
-
 ```
 src/
-  main.rs       CLI entry point (clap) + command handlers (apply, add, adopt, remove, status, diff, list, doctor, edit)
+  main.rs       CLI entry point (clap) + command handlers
   cli.rs        Command definitions
-  config.rs     Serde types, TOML parsing
-  store.rs      Store model, apply/remove logic
-  linker.rs     Symlink create/remove/verify
-  platform.rs   OS, arch, distro, hostname detection
+  config.rs     Serde types, TOML parsing, validation
+  store.rs      Store model, apply/remove logic, file resolution
+  linker.rs     Symlink create/remove/verify, ownership checks
+  platform.rs   OS, arch, distro, hostname, shell detection
   hooks.rs      Per-store + global hook execution
 ```
 
-`conflict.rs`, `adopt.rs`, `doctor.rs`, `template.rs`, `secrets.rs` appear in the roadmap
-(v0.2–v0.3) and are not yet implemented as separate modules — that logic currently lives
-inline in `main.rs` / `store.rs`.
-
 ## Roadmap
 
-### v0.1 — Core
-- [x] Config parsing (TOML + serde)
-- [x] `init`, `apply`, `status`, `list`, `doctor`
-- [x] Whole-directory and file mode
-- [x] Platform conditionals
-- [x] Conflict detection
-- [x] Absolute symlinks
-- [x] Root discovery (walk up to `.stitch/`)
+### ✅ v0.2 — shipped (2026-06-17)
+- [x] Config parsing, `init`, `apply`, `status`, `list`, `doctor`
+- [x] `adopt`, `add`, `remove`, `edit`, `diff`
+- [x] Whole-directory and file mode with recursive glob
+- [x] Platform conditionals, multi-target stores
+- [x] Hooks (per-store pre/post + global `.stitch/hooks/` executables)
+- [x] Ignore patterns (per-store + global, with directory exclusion)
+- [x] Conflict detection + `--force` backup semantics
+- [x] Atomic config writes, path traversal validation, honest exit codes
 
-### v0.2 — Management
-- [x] `adopt`, `add`, `remove`, `edit`
-- [ ] `modify`
-- [x] `diff` (dry run)
+### v0.3 — Templates & secrets (planned)
+- [ ] `modify` command
 - [ ] `import` (scan existing symlinks)
-- [x] Hooks (per-store pre/post + global hooks, env vars)
-- [x] Ignore patterns (per-store + global ignores active; whole-dir promotion)
-- [x] Multi-target stores
-
-### v0.3 — Templates & secrets
 - [ ] Go-style text/template engine
 - [ ] `{{ env }}`, `{{ .Vars }}`, `{{ .Hostname }}` etc.
 - [ ] Encrypted secrets (`age` or XChaCha20-Poly1305)
 - [ ] Template staging dir
 
-### v0.4 — TUI
+### v0.4 — TUI (planned)
 - [ ] Interactive dashboard (ratatui)
 - [ ] Command palette
 - [ ] Activity log
