@@ -16,6 +16,8 @@ A store is a top-level repo dir symlinked to an explicit target — whole-direct
 filter by platform/hostname/shell. Defining choice: symlinks point target→repo, so edits
 always land in the repo directly — no source/target drift, no re-add step.
 
+**Config/state split (v0.3, shipped, breaking):** human-authored config (`stitch.toml`, repo root) is separated from tool-generated desired state (`.stitch/state.toml`). The tool never rewrites the authored file after `init`; `add`/`adopt`/`remove` write `state.toml` only. Motivation: v0.2's single-file `.stitch/config.toml` was reserialized (`to_string_pretty`) on every mutation, silently destroying comments. Load merges the two by store name. Multi-target `targets` is a name-keyed `BTreeMap` — **the name is the map key**, not a field on `TargetEntry` (a redundant field would desync). See SPEC.md §Config.
+
 ## Platform
 **Linux only.** Built on POSIX symlinks; does not compile on Windows. macOS is not
 officially supported or tested. `when.os` mirrors `std::env::consts::OS`.
@@ -44,6 +46,7 @@ movement, data exposure, or silent replacement.** New code must uphold:
 - **Validate path fragments.** Reject absolute and `..`-containing file entries; nothing
   escapes the store/target dirs.
 - **No destructive overwrite of existing repo content.** Collisions are rejected.
+- **Authored config is read-only to the tool.** After `init`, stitch never rewrites `stitch.toml`. Mutations touch `.stitch/state.toml` only — never silently destroy the user's comments or formatting. (v0.3 split, shipped.)
 
 Note: as of 2026-06-15 every red-line violation flagged in the review is resolved.
 When touching `adopt`, the linker, `apply`, or config parsing, keep the code in line

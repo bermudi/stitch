@@ -1,4 +1,4 @@
-use crate::config::{self, Config, Store};
+use crate::config::{self, Config, Loaded, Store};
 use crate::hooks::{self, HookEnv};
 use crate::linker::{self, LinkStatus};
 use crate::platform::Platform;
@@ -101,7 +101,7 @@ pub fn apply_store(
     }
 
     if store.is_multi_target() {
-        for target_entry in &store.targets {
+        for target_entry in store.targets.values() {
             if !platform.matches_when(&target_entry.when) {
                 continue;
             }
@@ -315,7 +315,7 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
 
         let store_dir = repo_root.join(name);
         if store.is_multi_target() {
-            for target_entry in &store.targets {
+            for target_entry in store.targets.values() {
                 if !platform.matches_when(&target_entry.when) {
                     continue;
                 }
@@ -389,10 +389,16 @@ pub struct DoctorResult {
 }
 
 /// Run health checks.
-pub fn doctor(repo_root: &Path, config: &Config, platform: &Platform) -> DoctorResult {
+///
+/// Takes [`Loaded`] (both halves) rather than just the merged [`Config`] so it
+/// can detect orphaned behavior: a store present in `stitch.toml` (authored)
+/// but missing from `state.toml` (generated) — e.g. left behind deliberately
+/// by `remove`, which never rewrites the authored file.
+pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut info = Vec::new();
+    let config = &loaded.config;
 
     if config.stores.is_empty() {
         warnings.push("no stores configured".into());
@@ -404,6 +410,17 @@ pub fn doctor(repo_root: &Path, config: &Config, platform: &Platform) -> DoctorR
     }
 
     info.push(format!("{} stores configured", config.stores.len()));
+
+    // Orphaned behavior: a store declared in stitch.toml with no state.toml
+    // inventory. load-OK (it contributes no link), but worth surfacing so the
+    // user can prune the authored entry if it's stale.
+    for name in loaded.authored.stores.keys() {
+        if !loaded.generated.stores.contains_key(name) {
+            warnings.push(format!(
+                "store '{name}': behavior configured but no links (orphaned after remove?)"
+            ));
+        }
+    }
 
     let mut seen_targets: BTreeMap<PathBuf, String> = BTreeMap::new();
 

@@ -98,4 +98,11 @@ pub enum Commands {
 
     /// Run health checks
     Doctor,
+
+    /// Split a v0.2 .stitch/config.toml into stitch.toml + .stitch/state.toml
+    Migrate {
+        /// Preview the planned files without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }

@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.3.0 — 2026-06-18
+
+### BREAKING — config/state split
+
+Human-authored config and tool-generated desired state are now separate files.
+**v0.2 repos must run `stitch migrate` once.**
+
+- **`stitch.toml`** (repo root, authored) — `vars`, `when`, `hooks`, `ignore`.
+  Written once by `init`; thereafter the tool **never rewrites it**. Your
+  comments and formatting survive every mutation.
+- **`.stitch/state.toml`** (hidden, generated) — `target`, `files`, `patterns`.
+  The only file `add`/`adopt`/`remove` touch. May be hand-edited, but the tool
+  reserializes it on the next mutation (sorted, with a tool-owned header).
+
+**Motivation:** v0.2 kept everything in one `.stitch/config.toml` and
+reserialized it via `to_string_pretty` on every mutation, silently destroying
+comments and hand-formatting. The split ends that — the motivating bug is not
+fixable inside the single-file model.
+
+**Migration:** `stitch migrate` splits a v0.2 `.stitch/config.toml` in place,
+writing `stitch.toml` + `.stitch/state.toml` and preserving the original as
+`.stitch/config.toml.bak`. Migration is **comment-lossy by design** (a
+structural one-shot conversion): v0.2 comments decorate a single-file layout
+that no longer exists, so there is no faithful place to carry them. The `.bak`
+is the recovery path; the conversion prints a note so the loss is not a
+surprise.
+
+### Features
+
+- `stitch migrate` — one-shot, deterministic v0.2 → v0.3 split. `--dry-run`
+  previews the planned files without writing.
+- Multi-target entries are now **name-keyed** (the cross-file join key), so two
+  targets can share a path (e.g. the same `~/.config/helix` on different
+  hostnames). `list` prints `name → target` for multi-target stores.
+- `doctor` flags **orphaned behavior**: a store declared in `stitch.toml` with
+  no `state.toml` entry (e.g. deliberately left behind by `remove`, which never
+  rewrites the authored file).
+- `state.toml` ordering is **deterministic** (sorted maps + sorted
+  `files`/`patterns`) for stable git diffs across invocations.
+
+### Trust & safety
+
+- **Authored config is read-only to the tool.** After `init`, stitch never
+  rewrites `stitch.toml` — mutations touch `.stitch/state.toml` only.
+- **v0.2 repos are rejected with an actionable error** pointing at `migrate`,
+  not silently read in a dual-format mode.
+
+### Testing
+
+132 tests (49 unit + 83 CLI), all passing. New regression coverage:
+comment-preservation across mutations, v0.2 rejection, stale-config warning,
+authored-only-target load-and-skip, `state.toml` ordering stability, and a
+migrate golden-file roundtrip. `cargo fmt` and `cargo clippy -D warnings` clean.
+
 ## 0.2.0 — 2026-06-17
 
 First trust-worthy release. All P0/P1/P2 issues from the 2026-06 trust review

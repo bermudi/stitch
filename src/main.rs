@@ -6,7 +6,7 @@ mod platform;
 mod store;
 
 use clap::Parser;
-use config::{Config, expand_home, find_root};
+use config::{Config, Loaded, expand_home, find_root};
 use platform::Platform;
 
 fn main() {
@@ -48,6 +48,15 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli::Commands::Remove { name } => cmd_remove(&name),
         cli::Commands::Edit => cmd_edit(),
         cli::Commands::Doctor => cmd_doctor(),
+        cli::Commands::Migrate { dry_run } => cmd_migrate(dry_run),
+    }
+}
+
+/// Print non-fatal load-time warnings (e.g. a stale v0.2 file alongside the new
+/// format) to stderr. Each command calls this once after `Config::load`.
+fn print_warnings(loaded: &Loaded) {
+    for w in &loaded.warnings {
+        eprintln!("warning: {w}");
     }
 }
 
@@ -84,24 +93,43 @@ fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
     let stitch_dir = cwd.join(".stitch");
     std::fs::create_dir_all(&stitch_dir)?;
 
-    let config_path = stitch_dir.join("config.toml");
-    if config_path.exists() {
-        return Err(format!("config already exists at {}", config_path.display()).into());
+    let authored_path = cwd.join("stitch.toml");
+    if authored_path.exists() {
+        return Err(format!("config already exists at {}", authored_path.display()).into());
+    }
+    // Refuse if a v0.2 repo is present — the user should `migrate`, not re-init.
+    let legacy_path = stitch_dir.join("config.toml");
+    if legacy_path.exists() {
+        return Err(format!(
+            "v0.2 config found at {} — run `stitch migrate` instead of init",
+            legacy_path.display()
+        )
+        .into());
     }
 
-    let config = Config::empty();
-    config.save(&cwd)?;
-    println!("Initialized stitch config at {}", config_path.display());
+    // Authored half: written exactly once, with a header explaining it is the
+    // user's to edit. The tool never rewrites this file after init. Reuses the
+    // same fsync+rename atomicity as state writes.
+    let authored_content = format!("{}{}", config::AUTHORED_TEMPLATE, "\n[vars]\n");
+    config::atomic_write(&authored_path, &authored_content)?;
+
+    // Generated half: empty state. Reserialized by the tool on every mutation.
+    config::GeneratedState::default().save(&cwd)?;
+
+    println!("Initialized stitch config:");
+    println!("  {}", authored_path.display());
+    println!("  {}", stitch_dir.join("state.toml").display());
     Ok(())
 }
 
 fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let config = Config::load(&root)?;
-    check_unknown_names(only.iter().map(|s| s.as_str()), &config)?;
+    let loaded = Config::load(&root)?;
+    print_warnings(&loaded);
+    check_unknown_names(only.iter().map(|s| s.as_str()), &loaded.config)?;
     let platform = Platform::detect();
 
-    let mut filtered_config = config.clone();
+    let mut filtered_config = loaded.config.clone();
     if !only.is_empty() {
         filtered_config.stores.retain(|name, _| only.contains(name));
     }
@@ -196,13 +224,14 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
 
 fn cmd_status(name: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let config = Config::load(&root)?;
+    let loaded = Config::load(&root)?;
+    print_warnings(&loaded);
     if let Some(name) = name {
-        check_unknown_names(std::iter::once(name.as_str()), &config)?;
+        check_unknown_names(std::iter::once(name.as_str()), &loaded.config)?;
     }
     let platform = Platform::detect();
 
-    let entries = store::status_all(&root, &config, &platform);
+    let entries = store::status_all(&root, &loaded.config, &platform);
 
     for entry in &entries {
         if let Some(filter) = name
@@ -266,16 +295,14 @@ fn cmd_diff(only: &[String], force: bool) -> Result<(), Box<dyn std::error::Erro
 
 fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let config = Config::load(&root)?;
+    let loaded = Config::load(&root)?;
+    print_warnings(&loaded);
 
-    let mut sorted: Vec<_> = config.stores.iter().collect();
-    sorted.sort_by_key(|(name, _)| name.to_string());
-
-    for (name, store) in &sorted {
+    for (name, store) in &loaded.config.stores {
         if store.is_multi_target() {
             println!("  {} ({} targets)", name, store.targets.len());
-            for target_entry in &store.targets {
-                println!("      {}", target_entry.target);
+            for (tname, target_entry) in &store.targets {
+                println!("      {} → {}", tname, target_entry.target);
             }
         } else if let Some(ref target) = store.target {
             println!("  {:20} → {}", name, target);
@@ -315,7 +342,8 @@ fn cmd_adopt(
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let mut config = Config::load(&root)?;
+    let mut loaded = Config::load(&root)?;
+    print_warnings(&loaded);
 
     let source = expand_home(path);
     if source.is_symlink() {
@@ -363,27 +391,30 @@ fn cmd_adopt(
     }
 
     // --- Pre-checks: reject any collision BEFORE mutating anything. ---
-    if config.stores.contains_key(&store_name) {
+    if loaded.config.stores.contains_key(&store_name) {
         return Err(format!("store '{}' already exists in config", store_name).into());
     }
     if store_dir.exists() {
         return Err(format!("destination already exists: {}", store_dir.display()).into());
     }
 
-    // Build the store record in memory. Persisted only after both move and
-    // link succeed, so adopt is all-or-nothing.
+    // Build two literals: (1) a Store for the pre-commit preview (apply_store
+    // takes &Store and the store doesn't exist in the merged view yet — it's
+    // being created, so authored side is empty/default), and (2) a
+    // GeneratedStore for persistence. They mirror the same inventory.
+    let files = if is_dir {
+        vec![]
+    } else {
+        vec![raw_name.clone()]
+    };
     let new_store = config::Store {
         target: Some(target_str.clone()),
-        files: if is_dir {
-            vec![]
-        } else {
-            vec![raw_name.clone()]
-        },
+        files: files.clone(),
         patterns: vec![],
         ignore: vec![],
         when: config::WhenClause::default(),
         hooks: config::Hooks::default(),
-        targets: vec![],
+        targets: std::collections::BTreeMap::new(),
     };
 
     // --- Move: relocate the file/dir into the repo. ---
@@ -396,7 +427,7 @@ fn cmd_adopt(
 
     // --- Link: create the return symlink using the in-memory store. ---
     // If this fails, roll back the move so the user's file is back where it
-    // was. config was never touched.
+    // was. State was never touched.
     let platform = Platform::detect();
     let results = store::apply_store(
         &root,
@@ -436,10 +467,18 @@ fn cmd_adopt(
         .into());
     }
 
-    // --- Record: persist the config. ---
-    // If save fails, roll back the link and the move to stay all-or-nothing.
-    config.stores.insert(store_name.clone(), new_store);
-    if let Err(e) = config.save(&root) {
+    // --- Record: persist state.toml (generated half only). stitch.toml is
+    // never rewritten by the tool after init, so comments/formatting survive. ---
+    loaded.generated.stores.insert(
+        store_name.clone(),
+        config::GeneratedStore {
+            target: Some(target_str.clone()),
+            files,
+            patterns: vec![],
+            targets: std::collections::BTreeMap::new(),
+        },
+    );
+    if let Err(e) = loaded.generated.save(&root) {
         for action in &results.actions {
             if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
                 let _ = linker::remove_link(p, &root);
@@ -447,7 +486,7 @@ fn cmd_adopt(
         }
         rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|re| {
             format!(
-                "config save failed ({e}) and rollback also failed: {} is stranded in {} ({re})",
+                "state save failed ({e}) and rollback also failed: {} is stranded in {} ({re})",
                 source.display(),
                 store_dir.display(),
             )
@@ -498,9 +537,10 @@ fn cmd_add(
     patterns: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let mut config = Config::load(&root)?;
+    let mut loaded = Config::load(&root)?;
+    print_warnings(&loaded);
 
-    if config.stores.contains_key(name) {
+    if loaded.config.stores.contains_key(name) {
         return Err(format!("store '{}' already exists", name).into());
     }
 
@@ -520,6 +560,9 @@ fn cmd_add(
 
     std::fs::create_dir_all(&store_dir)?;
 
+    // Two literals: a Store for the pre-commit preview (default behavior — a
+    // new store has no authored half yet) and the inventory recorded as a
+    // GeneratedStore for persistence.
     let new_store = config::Store {
         target: target.map(|t| t.to_string()),
         files: files.to_vec(),
@@ -527,10 +570,10 @@ fn cmd_add(
         ignore: vec![],
         when: config::WhenClause::default(),
         hooks: config::Hooks::default(),
-        targets: vec![],
+        targets: std::collections::BTreeMap::new(),
     };
 
-    // Apply first against the in-memory store, BEFORE persisting config — so a
+    // Apply first against the in-memory store, BEFORE persisting state — so a
     // failed add leaves no trace. A store with a target must link cleanly or
     // the add aborts; a store with no target has nothing to link and persists
     // directly. add moves no user data, so the unwind is unlinking anything
@@ -575,11 +618,20 @@ fn cmd_add(
         return Err("apply reported conflicts or errors".into());
     }
 
-    // Persist config. If save fails after apply already created links, undo
-    // them and the empty store dir so no half-applied store is left without a
-    // config entry — same all-or-nothing contract as adopt.
-    config.stores.insert(name.to_string(), new_store);
-    if let Err(e) = config.save(&root) {
+    // Persist state.toml (generated half only). If save fails after apply
+    // already created links, undo them and the empty store dir so no
+    // half-applied store is left without a state entry — same all-or-nothing
+    // contract as adopt. stitch.toml is never touched.
+    loaded.generated.stores.insert(
+        name.to_string(),
+        config::GeneratedStore {
+            target: target.map(|t| t.to_string()),
+            files: files.to_vec(),
+            patterns: patterns.to_vec(),
+            targets: std::collections::BTreeMap::new(),
+        },
+    );
+    if let Err(e) = loaded.generated.save(&root) {
         discard_uncommitted_add(results.as_ref(), &store_dir, &root);
         return Err(e.into());
     }
@@ -590,12 +642,14 @@ fn cmd_add(
 
 fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let mut config = Config::load(&root)?;
+    let mut loaded = Config::load(&root)?;
+    print_warnings(&loaded);
     let platform = Platform::detect();
 
     // Check existence (borrow) before removing, so the config stays intact for
     // status_all and the hook env.
-    let target = config
+    let target = loaded
+        .config
         .stores
         .get(name)
         .ok_or_else(|| format!("store '{}' not found in config", name))?
@@ -615,9 +669,12 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("pre-remove hook: {e}"))?;
     }
 
-    // Compute link statuses from the still-complete config, then remove the entry.
-    let statuses = store::status_all(&root, &config, &platform);
-    config.stores.remove(name);
+    // Compute link statuses from the still-complete merged view, then drop the
+    // entry from the generated half. stitch.toml behavior is deliberately left
+    // in place (the tool never rewrites authored config); `doctor` flags the
+    // orphaned behavior if the user wants to clean it up via `stitch edit`.
+    let statuses = store::status_all(&root, &loaded.config, &platform);
+    loaded.generated.stores.remove(name);
 
     let linked: Vec<_> = statuses
         .iter()
@@ -629,7 +686,7 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         println!("  removed {}", entry.target.display());
     }
 
-    config.save(&root)?;
+    loaded.generated.save(&root)?;
 
     // Global post-remove hook.
     {
@@ -650,11 +707,18 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_edit() -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let config_path = root.join(".stitch").join("config.toml");
+    let authored_path = root.join("stitch.toml");
+    if !authored_path.exists() {
+        return Err(format!(
+            "{} does not exist — run `stitch init` first",
+            authored_path.display()
+        )
+        .into());
+    }
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let status = std::process::Command::new(editor)
-        .arg(&config_path)
+        .arg(&authored_path)
         .status()?;
 
     if !status.success() {
@@ -665,12 +729,13 @@ fn cmd_edit() -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
-    let config = Config::load(&root)?;
+    let loaded = Config::load(&root)?;
+    print_warnings(&loaded);
     let platform = Platform::detect();
 
     println!("Checking stitch health...\n");
 
-    let result = store::doctor(&root, &config, &platform);
+    let result = store::doctor(&root, &loaded, &platform);
 
     for msg in &result.info {
         println!("  [info]  {msg}");
@@ -700,4 +765,106 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Ok(())
     }
+}
+
+fn cmd_migrate(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let root = resolve_root()?;
+    let legacy_path = root.join(".stitch").join("config.toml");
+    let authored_path = root.join("stitch.toml");
+    let state_path = root.join(".stitch").join("state.toml");
+
+    if !legacy_path.exists() {
+        if authored_path.exists() {
+            return Err("already migrated: stitch.toml exists".into());
+        }
+        return Err(format!("nothing to migrate: {} not found", legacy_path.display()).into());
+    }
+    // Refuse to overwrite an existing stitch.toml — a half-finished migrate
+    // should not clobber the user's authored file.
+    if authored_path.exists() {
+        return Err(format!(
+            "{} already exists — refusing to overwrite; remove it if you want to re-migrate",
+            authored_path.display()
+        )
+        .into());
+    }
+    // Refuse if the .bak backup target already exists — we'd have nowhere to
+    // preserve the original. Checked up front (before parse, before any write)
+    // so a .bak collision fails before touching anything, matching the
+    // fail-before-mutate invariant the other writers uphold.
+    let backup_path = legacy_path.with_extension("toml.bak");
+    if backup_path.exists() {
+        return Err(format!(
+            "{} already exists — move it aside first (it's where the original \
+             .stitch/config.toml would be backed up during migration)",
+            backup_path.display()
+        )
+        .into());
+    }
+
+    // Parse the v0.2 file into the frozen LegacyConfig shape (not the
+    // post-split types, which no longer carry the v0.2 layout).
+    let contents = std::fs::read_to_string(&legacy_path)?;
+    let legacy: config::LegacyConfig = toml::from_str(&contents)
+        .map_err(|e| format!("could not parse {}: {e}", legacy_path.display()))?;
+
+    let (authored, generated) = config::split_legacy(&legacy);
+
+    // Render both halves once: authored (with the read-only header prepended)
+    // and generated (sorted + header-stamped). The state string is reused for
+    // both the dry-run preview and the real write — no double-serialize, and a
+    // serialization error aborts before any file is touched.
+    let authored_str = format!(
+        "{}{}",
+        config::AUTHORED_TEMPLATE,
+        toml::to_string_pretty(&authored)?
+    );
+    let state_str = generated.render_for_display()?;
+
+    if dry_run {
+        println!("Dry run — no changes will be made.\n");
+        println!(
+            "note: comments in {} are not carried into stitch.toml; the \
+             original is preserved as {}.bak on write",
+            legacy_path.display(),
+            legacy_path.display()
+        );
+        println!(
+            "\n--- would write {} ---\n{}",
+            authored_path.display(),
+            authored_str
+        );
+        println!(
+            "--- would write {} ---\n{}",
+            state_path.display(),
+            state_str
+        );
+        return Ok(());
+    }
+
+    // Write both new files first; only after both succeed do we move the legacy
+    // file aside. A crash during writes leaves the original intact. The .bak
+    // target was pre-checked above, so this rename can't clobber.
+    config::atomic_write(&authored_path, &authored_str)?;
+    config::atomic_write(&state_path, &state_str)?;
+
+    // Preserve the original as a .bak rather than delete — the user's comments
+    // and formatting are the recovery path (migrate is comment-lossy by design).
+    std::fs::rename(&legacy_path, &backup_path)?;
+
+    println!("Migrated v0.2 config:");
+    println!("  wrote {}", authored_path.display());
+    println!("  wrote {}", state_path.display());
+    println!(
+        "  backed up {} → {}",
+        legacy_path.display(),
+        backup_path.display()
+    );
+    eprintln!(
+        "note: comments in the old config were not carried into stitch.toml \
+         (structural conversion drops them). The original is preserved at {}. \
+         Re-add any comments you want to keep.",
+        backup_path.display()
+    );
+    Ok(())
 }

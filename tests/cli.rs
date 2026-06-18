@@ -1,8 +1,9 @@
 //! End-to-end tests for the `stitch` CLI binary.
 //!
 //! These tests build and exercise the binary via `assert_cmd`. Each test gets
-//! a fresh tempdir that acts as the repo root, and writes a `.stitch/config.toml`
-//! directly (bypassing the `init` command) to keep the test bodies focused.
+//! a fresh tempdir that acts as the repo root, and writes the two-file v0.3
+//! layout (`stitch.toml` authored + `.stitch/state.toml` generated) directly
+//! (bypassing `init`) to keep the test bodies focused.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -11,9 +12,10 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use predicates::str::contains;
 
-/// A scratch repo: a tempdir with `.stitch/` initialized and a configured
-/// `Config` written to `.stitch/config.toml`. Tests can further mutate the
-/// filesystem (e.g. create store directories, source files) as needed.
+/// A scratch repo: a tempdir with `.stitch/` initialized and the two-file
+/// config layout written (`stitch.toml` + `.stitch/state.toml`). Tests can
+/// further mutate the filesystem (e.g. create store directories, source files)
+/// as needed.
 struct Repo {
     dir: tempfile::TempDir,
 }
@@ -23,8 +25,10 @@ impl Repo {
         let dir = tempfile::tempdir().expect("tempdir");
         let stitch = dir.path().join(".stitch");
         fs::create_dir_all(&stitch).expect("mkdir .stitch");
-        let empty = "vars = {}\n\n[stores]\n";
-        fs::write(stitch.join("config.toml"), empty).expect("write config");
+        // Authored half: empty.
+        fs::write(dir.path().join("stitch.toml"), "").expect("write stitch.toml");
+        // Generated half: empty (the header is optional on read; keep it minimal).
+        fs::write(stitch.join("state.toml"), "").expect("write state.toml");
         Self { dir }
     }
 
@@ -32,9 +36,23 @@ impl Repo {
         self.dir.path()
     }
 
-    /// Write a complete config.toml from a TOML string.
-    fn write_config(&self, toml: &str) {
-        fs::write(self.dir.path().join(".stitch").join("config.toml"), toml).expect("write config");
+    /// Write the generated half (`.stitch/state.toml`) from a TOML string.
+    /// Used by tests that only set inventory — the authored half stays empty.
+    fn write_state(&self, toml: &str) {
+        fs::write(self.dir.path().join(".stitch").join("state.toml"), toml)
+            .expect("write state.toml");
+    }
+
+    /// Write the authored half (`stitch.toml`) from a TOML string.
+    fn write_authored(&self, toml: &str) {
+        fs::write(self.dir.path().join("stitch.toml"), toml).expect("write stitch.toml");
+    }
+
+    /// Write a complete store split across both files: `state` is the inventory
+    /// half, `authored` is the behavior half. Both default to empty.
+    fn write_split(&self, state: &str, authored: &str) {
+        self.write_state(state);
+        self.write_authored(authored);
     }
 
     /// Convenience: create a directory with some files inside the repo.
@@ -56,9 +74,9 @@ impl Repo {
 }
 
 /// If running as root, file mode bits don't constrain writes, so tests that
-/// rely on making config.toml read-only can't trigger the failure path
-/// they're meant to exercise. Returns true to indicate the caller should
-/// skip (loudly) rather than pass spuriously.
+/// rely on making state.toml read-only can't trigger the failure path they're
+/// meant to exercise. Returns true to indicate the caller should skip (loudly)
+/// rather than pass spuriously.
 fn is_root() -> bool {
     std::process::Command::new("id")
         .arg("-u")
@@ -84,8 +102,21 @@ fn init_creates_config_in_empty_dir() {
         .success()
         .stdout(contains("Initialized stitch config"));
 
-    let config_path = dir.path().join(".stitch").join("config.toml");
-    assert!(config_path.exists());
+    // Post-split: stitch.toml + .stitch/state.toml are created; the v0.2
+    // .stitch/config.toml is not.
+    let authored = dir.path().join("stitch.toml");
+    let state = dir.path().join(".stitch").join("state.toml");
+    let legacy = dir.path().join(".stitch").join("config.toml");
+    assert!(authored.exists(), "stitch.toml must be created");
+    assert!(state.exists(), "state.toml must be created");
+    assert!(!legacy.exists(), ".stitch/config.toml must not be created");
+
+    // The authored header documents that the tool never rewrites it.
+    let authored_text = fs::read_to_string(&authored).unwrap();
+    assert!(
+        authored_text.contains("the tool never rewrites this"),
+        "stitch.toml should carry the read-only header"
+    );
 }
 
 #[test]
@@ -96,6 +127,26 @@ fn init_fails_when_config_already_exists() {
         .assert()
         .failure()
         .stderr(contains("config already exists"));
+}
+
+#[test]
+fn init_fails_on_v02_repo() {
+    // A v0.2-only repo: init must point at `migrate`, not silently re-init.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "vars = {}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(contains("stitch migrate"));
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +187,7 @@ fn apply_whole_dir_creates_symlink() {
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -162,7 +213,7 @@ fn apply_file_mode_links_individual_files() {
     repo.make_store("shells", &[".bashrc", ".zshrc", ".profile"]);
     let target = repo.path().join("home");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.shells]
 target = "{target_str}"
@@ -184,7 +235,7 @@ fn apply_dry_run_makes_no_changes() {
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -206,7 +257,7 @@ fn apply_already_linked_reports_no_change() {
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -232,7 +283,7 @@ fn apply_reports_conflict_for_real_file_at_target() {
     // Plant a real file at the target location.
     fs::write(&target, "I am a real file").unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -263,7 +314,7 @@ fn apply_replaces_repo_owned_broken_symlink() {
     let stale = repo.path().join("nvim").join("does-not-exist");
     std::os::unix::fs::symlink(&stale, &target).unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -298,7 +349,7 @@ fn apply_conflicts_on_foreign_symlink() {
     fs::write(foreign.join("init.lua"), "not ours").unwrap();
     std::os::unix::fs::symlink(&foreign, &target).unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -330,7 +381,7 @@ fn apply_conflicts_on_dangling_foreign_symlink() {
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/nonexistent/path/that/does/not/exist", &target).unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -366,7 +417,7 @@ fn apply_force_backs_up_real_file_and_links() {
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, "I am a real file").unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -397,7 +448,7 @@ fn apply_force_backs_up_real_directory() {
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("old.txt"), "legacy").unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -432,7 +483,7 @@ fn apply_force_fails_when_bak_already_exists() {
     fs::write(&target, "current").unwrap();
     fs::write(&backup, "previous backup").unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -465,7 +516,7 @@ fn apply_force_does_not_clobber_foreign_symlink() {
     fs::write(foreign.join("init.lua"), "not ours").unwrap();
     std::os::unix::fs::symlink(&foreign, &target).unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -492,7 +543,7 @@ fn apply_rejects_traversal_in_files() {
     repo.make_store("shells", &[".bashrc"]);
     let target = repo.path().join("home");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.shells]
 target = "{target_str}"
@@ -517,7 +568,7 @@ fn apply_rejects_absolute_in_files() {
     repo.make_store("shells", &[".bashrc"]);
     let target = repo.path().join("home");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.shells]
 target = "{target_str}"
@@ -543,7 +594,7 @@ fn apply_allows_nested_file_entries() {
     fs::write(store_dir.join("lua").join("init.lua"), "...").unwrap();
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -582,7 +633,7 @@ fn apply_only_filter_restricts_to_named_stores() {
     repo.make_store("shells", &[".bashrc"]);
     let nvim_target = repo.path().join("home").join(".config").join("nvim");
     let shells_target = repo.path().join("home");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -610,7 +661,7 @@ fn apply_missing_store_dir_reports_error() {
     let repo = Repo::new();
     // Config references a store but the directory does not exist.
     let target = repo.path().join("home").join(".config").join("nvim");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -631,7 +682,7 @@ fn apply_store_with_no_target_reports_error() {
     let repo = Repo::new();
     // Empty store, no target configured.
     repo.make_store("nvim", &["init.lua"]);
-    repo.write_config(
+    repo.write_state(
         r#"
 [stores.nvim]
 "#,
@@ -649,7 +700,7 @@ fn apply_only_unknown_store_errors() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -669,7 +720,7 @@ fn apply_only_partial_unknown_errors_and_aborts() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -702,7 +753,7 @@ fn status_reports_linked_and_missing() {
 
     let nvim_target = repo.path().join("home").join(".config").join("nvim");
     let shells_target = repo.path().join("home");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -738,7 +789,7 @@ fn status_reports_conflict() {
     let target = repo.path().join("home").join(".config").join("nvim");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, "real file").unwrap();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -760,7 +811,7 @@ fn status_reports_broken_link() {
     let target = repo.path().join("home").join(".config").join("nvim");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/nonexistent", &target).unwrap();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -783,7 +834,7 @@ fn status_name_filter_shows_only_matching_store() {
 
     let nvim_target = repo.path().join("home").join(".config").join("nvim");
     let shells_target = repo.path().join("home");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -808,7 +859,7 @@ fn status_unknown_store_errors() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -833,7 +884,7 @@ fn diff_is_dry_run_apply() {
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -859,7 +910,7 @@ fn diff_force_reports_backup_without_changing() {
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(&target, "real file").unwrap();
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -884,7 +935,7 @@ fn diff_only_unknown_store_errors() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -907,7 +958,7 @@ target = "{}"
 fn list_shows_single_target_stores() {
     let repo = Repo::new();
     let target = repo.path().join("home").join(".config").join("nvim");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -925,33 +976,48 @@ target = "{}"
 
 #[test]
 fn list_shows_multi_target_stores_with_count() {
+    // Multi-target: name-keyed map split across the two files. The target
+    // names appear in `list` output so two targets sharing a path are
+    // distinguishable.
     let repo = Repo::new();
     let t1 = repo.path().join("home1");
     let t2 = repo.path().join("home2");
-    repo.write_config(&format!(
+    // Authored half: per-target behavior keyed by name.
+    repo.write_authored(
         r#"
-[stores.shells]
-targets = [
-    {{ target = "{}" }},
-    {{ target = "{}" }},
-]
+[stores.shells.targets.laptop]
+when = { hostname = "laptop" }
+
+[stores.shells.targets.server]
+when = { hostname = "server" }
 "#,
-        t1.to_string_lossy(),
-        t2.to_string_lossy(),
+    );
+    // Generated half: per-target inventory keyed by the same names.
+    repo.write_state(&format!(
+        r#"
+[stores.shells.targets.laptop]
+target = "{t1}"
+
+[stores.shells.targets.server]
+target = "{t2}"
+"#,
+        t1 = t1.to_string_lossy(),
+        t2 = t2.to_string_lossy(),
     ));
 
-    repo.cmd()
-        .arg("list")
-        .assert()
-        .success()
-        .stdout(contains("shells"))
-        .stdout(contains("2 targets"));
+    let output = repo.cmd().arg("list").assert().success();
+    let stdout = std::str::from_utf8(&output.get_output().stdout).unwrap();
+    assert!(stdout.contains("shells"), "got: {stdout}");
+    assert!(stdout.contains("2 targets"), "got: {stdout}");
+    // Names appear alongside targets.
+    assert!(stdout.contains("laptop"), "got: {stdout}");
+    assert!(stdout.contains("server"), "got: {stdout}");
 }
 
 #[test]
 fn list_marks_stores_without_target() {
     let repo = Repo::new();
-    repo.write_config(
+    repo.write_state(
         r#"
 [stores.blank]
 "#,
@@ -1055,10 +1121,10 @@ fn adopt_missing_path_errors() {
 
 #[test]
 fn adopt_rejects_store_name_already_in_config() {
-    // Pre-existing config entry for "bashrc" must block adoption of .bashrc,
+    // Pre-existing state entry for "bashrc" must block adoption of .bashrc,
     // which would derive the same store name. Nothing should be moved.
     let repo = Repo::new();
-    repo.write_config("vars = {}\n\n[stores.bashrc]\ntarget = \"~/.bashrc\"\n");
+    repo.write_state("[stores.bashrc]\ntarget = \"~/.bashrc\"\n");
 
     let src = repo.path().join("external").join(".bashrc");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
@@ -1102,7 +1168,7 @@ fn adopt_rejects_when_store_dir_already_exists() {
 
 #[test]
 fn adopt_rolls_back_file_when_record_fails() {
-    // Force the config-save step to fail (after move + link succeed) by making
+    // Force the state-save step to fail (after move + link succeed) by making
     // the .stitch/ directory unwritable. adopt must roll back: file restored
     // to its original path, the store dir removed, no partial state left.
     // Skipped under root: root ignores file mode bits, so the failure path
@@ -1180,9 +1246,9 @@ fn add_creates_store_without_immediate_link() {
 
     // Store directory should be created.
     assert!(repo.path().join("shells").is_dir());
-    // Config should have the entry.
-    let config_text = fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
-    assert!(config_text.contains("shells"));
+    // State should have the entry.
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state_text.contains("shells"));
 }
 
 #[test]
@@ -1256,7 +1322,7 @@ fn add_rejects_existing_symlink_at_store_path() {
 #[test]
 fn add_target_conflict_leaves_no_config_or_store_dir() {
     // A pre-existing real file at the target forces apply into Conflict. The
-    // add must abort atomically: config never records the store, the empty
+    // add must abort atomically: state never records the store, the empty
     // store dir is removed, and the pre-existing target file is untouched.
     let repo = Repo::new();
     let target = repo.path().join("home").join(".config").join("nvim");
@@ -1270,9 +1336,9 @@ fn add_target_conflict_leaves_no_config_or_store_dir() {
         .failure()
         .stderr(contains("conflicts or errors"));
 
-    // No config entry, no orphaned store dir.
-    let config_text = fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
-    assert!(!config_text.contains("nvim"));
+    // No state entry, no orphaned store dir.
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(!state_text.contains("nvim"));
     assert!(
         !repo.path().join("nvim").exists(),
         "store dir must be removed on conflict"
@@ -1284,9 +1350,9 @@ fn add_target_conflict_leaves_no_config_or_store_dir() {
 
 #[test]
 fn add_rolls_back_when_config_save_fails() {
-    // apply succeeds (link created) but config.save fails: adopt-style
+    // apply succeeds (link created) but state.save fails: adopt-style
     // all-or-nothing must undo the link and the empty store dir so no
-    // half-applied store is left without a config entry.
+    // half-applied store is left without a state entry.
     // Skipped under root: root ignores file mode bits, so the failure path
     // can't be triggered and the test would give false confidence.
     if is_root() {
@@ -1298,7 +1364,7 @@ fn add_rolls_back_when_config_save_fails() {
     let target_str = target.to_string_lossy().into_owned();
 
     let stitch_dir = repo.path().join(".stitch");
-    let cfg = stitch_dir.join("config.toml");
+    let state = stitch_dir.join("state.toml");
     let mut perms = fs::metadata(&stitch_dir).unwrap().permissions();
     perms.set_mode(0o555);
     fs::set_permissions(&stitch_dir, perms).unwrap();
@@ -1308,14 +1374,14 @@ fn add_rolls_back_when_config_save_fails() {
         .assert()
         .failure();
 
-    // Link undone, store dir removed, config has no entry.
+    // Link undone, store dir removed, state has no entry.
     assert!(!target.is_symlink(), "symlink must be removed on rollback");
     assert!(
         !repo.path().join("nvim").exists(),
         "store dir must be removed on rollback"
     );
-    let config_text = fs::read_to_string(&cfg).unwrap();
-    assert!(!config_text.contains("nvim"));
+    let state_text = fs::read_to_string(&state).unwrap();
+    assert!(!state_text.contains("nvim"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,11 +1407,11 @@ fn remove_drops_store_and_unlinks() {
         .success()
         .stdout(contains("Removed store 'nvim'"));
 
-    // Config entry gone, symlink gone, repo directory left untouched.
+    // State entry gone, symlink gone, repo directory left untouched.
     assert!(!target.exists());
     assert!(repo.path().join("nvim").is_dir());
-    let config_text = fs::read_to_string(repo.path().join(".stitch").join("config.toml")).unwrap();
-    assert!(!config_text.contains("nvim"));
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(!state_text.contains("nvim"));
 }
 
 #[test]
@@ -1368,7 +1434,7 @@ fn doctor_passes_on_healthy_repo() {
     repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -1387,7 +1453,7 @@ target = "{target_str}"
 fn doctor_flags_missing_store_dir_as_error() {
     let repo = Repo::new();
     let target = repo.path().join("home").join(".config").join("nvim");
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{}"
@@ -1408,7 +1474,7 @@ fn doctor_warns_on_empty_store() {
     let repo = Repo::new();
     // Create an empty store dir, no target means no apply is needed.
     fs::create_dir_all(repo.path().join("nvim")).unwrap();
-    repo.write_config(
+    repo.write_state(
         r#"
 [stores.nvim]
 "#,
@@ -1429,7 +1495,7 @@ fn doctor_warns_on_duplicate_targets() {
     let target_str = target.to_string_lossy().into_owned();
     repo.make_store("a", &[]);
     repo.make_store("b", &[]);
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.a]
 target = "{target_str}"
@@ -1444,6 +1510,32 @@ target = "{target_str}"
         .assert()
         .failure()
         .stdout(contains("both target"));
+}
+
+// ---------------------------------------------------------------------------
+// doctor: orphaned-behavior detection (v0.3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_flags_orphaned_behavior_store() {
+    // A store present in stitch.toml (authored) but not state.toml (generated)
+    // — e.g. left behind by `remove`, which never rewrites the authored file.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_authored(
+        r#"
+[stores.nvim]
+ignore = ["*.bak"]
+"#,
+    );
+    // No state.toml entry for nvim.
+
+    let output = repo.cmd().arg("doctor").assert().success();
+    let stdout = std::str::from_utf8(&output.get_output().stdout).unwrap();
+    assert!(
+        stdout.contains("orphaned") && stdout.contains("nvim"),
+        "expected orphaned-behavior warning for nvim, got: {stdout}"
+    );
 }
 
 // --- Global ignores + whole-dir promotion (P1#8 D/E) ---
@@ -1466,7 +1558,7 @@ fn whole_dir_promoted_when_git_present() {
 
     let target = repo.path().join("home").join(".vim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.vim]
 target = "{target_str}"
@@ -1502,7 +1594,7 @@ fn file_mode_patterns_skip_global_ignored() {
 
     let target = repo.path().join("home");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.shells]
 target = "{target_str}"
@@ -1526,7 +1618,7 @@ patterns = ["*"]
 #[test]
 fn file_mode_patterns_match_recursively() {
     let repo = Repo::new();
-    let store_dir = repo.path().join("configs");
+    let store_dir = repo.make_store("configs", &[]);
     fs::create_dir_all(store_dir.join("sub")).unwrap();
     fs::write(store_dir.join("top.conf"), "top").unwrap();
     fs::write(store_dir.join("sub").join("nested.conf"), "nested").unwrap();
@@ -1534,7 +1626,7 @@ fn file_mode_patterns_match_recursively() {
 
     let target = repo.path().join("home");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.configs]
 target = "{target_str}"
@@ -1563,7 +1655,7 @@ fn whole_dir_stays_when_no_ignored_content() {
 
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
 target = "{target_str}"
@@ -1587,7 +1679,8 @@ fn make_executable(path: &Path) {
     fs::set_permissions(path, perms).unwrap();
 }
 
-/// Per-store pre-hook runs before the store is applied.
+/// Per-store pre-hook runs before the store is applied. Hooks are authored
+/// behavior, so this test configures them in stitch.toml, not state.toml.
 #[test]
 fn per_store_pre_hook_runs() {
     let repo = Repo::new();
@@ -1595,14 +1688,21 @@ fn per_store_pre_hook_runs() {
     let target = repo.path().join("home").join("s");
     let target_str = target.to_string_lossy().into_owned();
     let marker = repo.path().join("pre-ran");
-    repo.write_config(&format!(
-        r#"
+    repo.write_split(
+        &format!(
+            r#"
 [stores.s]
 target = "{target_str}"
+"#,
+        ),
+        &format!(
+            r#"
+[stores.s]
 hooks = {{ pre = "touch {}" }}
 "#,
-        marker.display()
-    ));
+            marker.display()
+        ),
+    );
 
     repo.cmd().arg("apply").assert().success();
 
@@ -1617,13 +1717,18 @@ fn per_store_pre_hook_failure_aborts_store() {
     repo.make_store("s", &["f"]);
     let target = repo.path().join("home").join("s");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
-        r#"
+    repo.write_split(
+        &format!(
+            r#"
 [stores.s]
 target = "{target_str}"
-hooks = {{ pre = "exit 1" }}
-"#
-    ));
+"#,
+        ),
+        r#"
+[stores.s]
+hooks = { pre = "exit 1" }
+"#,
+    );
 
     repo.cmd()
         .arg("apply")
@@ -1645,14 +1750,21 @@ fn per_store_post_hook_runs() {
     let target = repo.path().join("home").join("s");
     let target_str = target.to_string_lossy().into_owned();
     let marker = repo.path().join("post-ran");
-    repo.write_config(&format!(
-        r#"
+    repo.write_split(
+        &format!(
+            r#"
 [stores.s]
 target = "{target_str}"
+"#,
+        ),
+        &format!(
+            r#"
+[stores.s]
 hooks = {{ post = "touch {}" }}
 "#,
-        marker.display()
-    ));
+            marker.display()
+        ),
+    );
 
     repo.cmd().arg("apply").assert().success();
 
@@ -1668,15 +1780,22 @@ fn dry_run_skips_hooks() {
     let target = repo.path().join("home").join("s");
     let target_str = target.to_string_lossy().into_owned();
     let marker = repo.path().join("ran");
-    repo.write_config(&format!(
-        r#"
+    repo.write_split(
+        &format!(
+            r#"
 [stores.s]
 target = "{target_str}"
+"#,
+        ),
+        &format!(
+            r#"
+[stores.s]
 hooks = {{ pre = "touch {}", post = "touch {}" }}
 "#,
-        marker.display(),
-        marker.display()
-    ));
+            marker.display(),
+            marker.display()
+        ),
+    );
 
     repo.cmd().arg("diff").assert().success();
 
@@ -1701,7 +1820,7 @@ fn global_pre_apply_hook_runs() {
 
     let target = repo.path().join("home").join("s");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.s]
 target = "{target_str}"
@@ -1724,7 +1843,7 @@ fn global_pre_apply_failure_aborts() {
 
     let target = repo.path().join("home").join("s");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_config(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.s]
 target = "{target_str}"
@@ -1747,14 +1866,21 @@ fn hook_receives_env_vars() {
     let target = repo.path().join("home").join("mystore");
     let target_str = target.to_string_lossy().into_owned();
     let outfile = repo.path().join("env.txt");
-    repo.write_config(&format!(
-        r#"
+    repo.write_split(
+        &format!(
+            r#"
 [stores.mystore]
 target = "{target_str}"
+"#,
+        ),
+        &format!(
+            r#"
+[stores.mystore]
 hooks = {{ pre = "env | grep ^STITCH > {}" }}
 "#,
-        outfile.display()
-    ));
+            outfile.display()
+        ),
+    );
 
     repo.cmd().arg("apply").assert().success();
 
@@ -1763,4 +1889,346 @@ hooks = {{ pre = "env | grep ^STITCH > {}" }}
     assert!(captured.contains("STITCH_ACTION=apply"), "got: {captured}");
     assert!(captured.contains("STITCH_TARGET="), "got: {captured}");
     assert!(captured.contains("STITCH_ROOT="), "got: {captured}");
+}
+
+// ===========================================================================
+// v0.3 split: new regression tests (items 1, 2, 4, 5, 6)
+// ===========================================================================
+
+/// Comment-preservation regression (item 2): add/adopt/remove mutate only
+/// state.toml; stitch.toml is byte-stable across mutations, so the user's
+/// comments and formatting survive. This is the motivating bug of the split.
+#[test]
+fn stitch_toml_is_byte_stable_across_add_adopt_remove() {
+    let repo = Repo::new();
+    // Author stitch.toml with a comment the v0.2 reserializer would destroy.
+    repo.write_authored(
+        "# my dotfiles — do not let the tool rewrite this\n[vars]\neditor = \"nvim\"\n",
+    );
+    let before = fs::read_to_string(repo.path().join("stitch.toml")).unwrap();
+
+    // add (with a target so a link is created), then remove.
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.cmd()
+        .args(["add", "nvim", &target_str])
+        .assert()
+        .success();
+    repo.cmd().args(["remove", "nvim"]).assert().success();
+
+    // stitch.toml is byte-identical: comment and formatting preserved.
+    let after = fs::read_to_string(repo.path().join("stitch.toml")).unwrap();
+    assert_eq!(
+        before, after,
+        "stitch.toml must be byte-stable across mutations"
+    );
+}
+
+/// v0.2-only repos get an actionable error pointing at migrate (item 5): every
+/// read command errors, not just apply.
+#[test]
+fn v02_repo_errors_on_apply_with_migrate_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "vars = {}\n\n[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("stitch migrate"));
+}
+
+#[test]
+fn v02_repo_errors_on_list_with_migrate_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "vars = {}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(contains("stitch migrate"));
+}
+
+/// Stale-config warning (item 5): both files present → new format wins, and a
+/// warning is printed to stderr.
+#[test]
+fn both_files_present_uses_new_format_and_warns() {
+    let repo = Repo::new();
+    repo.write_state("[stores.nvim]\ntarget = \"~/.config/nvim\"\n");
+    // Stale v0.2 file alongside.
+    fs::write(repo.path().join(".stitch").join("config.toml"), "# stale\n").unwrap();
+
+    repo.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(contains("stale v0.2"));
+}
+
+/// Authored-only target (item 1 merge): load-OK + skip. The target contributes
+/// no link, a warning is emitted, and unrelated stores still apply.
+#[test]
+fn authored_only_target_loads_ok_and_skips() {
+    let repo = Repo::new();
+    repo.make_store("helix", &["settings.toml"]);
+    let target = repo.path().join("home").join(".config").join("helix");
+    let target_str = target.to_string_lossy().into_owned();
+    // Generated half: store-level target so the store still applies.
+    repo.write_state(&format!(
+        r#"
+[stores.helix]
+target = "{target_str}"
+"#,
+    ));
+    // Authored half: declares a per-target entry "laptop" with behavior, but
+    // state.toml has no matching generated entry → orphaned-authored target.
+    repo.write_authored(
+        r#"
+[stores.helix.targets.laptop]
+when = { hostname = "laptop" }
+"#,
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stderr(contains("orphaned"));
+    // The store-level link is created despite the orphaned authored-only target.
+    assert!(target.is_symlink());
+}
+
+/// state.toml ordering stability (item 6): adding stores in different orders
+/// produces a byte-identical state.toml (BTreeMap keys + sorted files).
+#[test]
+fn state_toml_ordering_is_stable_across_operation_order() {
+    // Snapshot after adding A then B.
+    let repo_a = Repo::new();
+    repo_a.cmd().args(["add", "zebra"]).assert().success();
+    repo_a.cmd().args(["add", "alpha"]).assert().success();
+    let snap_a = fs::read_to_string(repo_a.path().join(".stitch").join("state.toml")).unwrap();
+
+    // Snapshot after adding B then A.
+    let repo_b = Repo::new();
+    repo_b.cmd().args(["add", "alpha"]).assert().success();
+    repo_b.cmd().args(["add", "zebra"]).assert().success();
+    let snap_b = fs::read_to_string(repo_b.path().join(".stitch").join("state.toml")).unwrap();
+
+    assert_eq!(snap_a, snap_b, "state.toml must be order-stable");
+    // And keys appear sorted.
+    let za = snap_a.find("[stores.zebra]");
+    let aa = snap_a.find("[stores.alpha]");
+    assert!(aa < za, "alpha should sort before zebra");
+}
+
+/// files are emitted sorted in state.toml (item 6). `add` without a target
+/// persists the inventory without linking, so the files need not exist on disk
+/// — this test checks the serialization order, not the apply path.
+#[test]
+fn state_toml_emits_files_sorted() {
+    let repo = Repo::new();
+    repo.cmd()
+        .args(["add", "s", "--files", "c", "--files", "a", "--files", "b"])
+        .assert()
+        .success();
+
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    // files emitted sorted as a, b, c — not insertion order (c, a, b). The toml
+    // crate pretty-prints multi-element arrays across lines, so assert on the
+    // relative positions of the entries rather than an exact inline string.
+    let a = state_text.find("\"a\"").unwrap();
+    let b = state_text.find("\"b\"").unwrap();
+    let c = state_text.find("\"c\"").unwrap();
+    assert!(
+        a < b && b < c,
+        "files must be sorted a<b<c, got: {state_text}"
+    );
+}
+
+// ===========================================================================
+// migrate (item 4)
+// ===========================================================================
+
+/// `stitch migrate` converts a v0.2 repo deterministically: authored half →
+/// stitch.toml, inventory half → state.toml, original preserved as .bak.
+/// migrate is comment-lossy by design (structural conversion); the note is
+/// printed so the user can re-add comments.
+#[test]
+fn migrate_splits_v02_repo_and_backs_up_original() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    // A representative v0.2 config: flat target, behavior, and a comment that
+    // anchors the comment-lossy assertion.
+    let original = "\
+# my dotfiles — this comment must NOT survive into stitch.toml
+vars = { editor = \"nvim\" }
+
+[stores.nvim]
+target = \"~/.config/nvim\"
+
+[stores.shells]
+target = \"~\"
+files = [\".bashrc\"]
+ignore = [\"*.bak\"]
+when = { os = \"linux\" }
+";
+    fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .success()
+        .stderr(contains("comments"));
+
+    // stitch.toml + state.toml now exist.
+    let authored = fs::read_to_string(dir.path().join("stitch.toml")).unwrap();
+    let state = fs::read_to_string(dir.path().join(".stitch").join("state.toml")).unwrap();
+
+    // Authored half carries vars + behavior (ignore, when), NOT inventory.
+    assert!(authored.contains("editor = \"nvim\""));
+    assert!(authored.contains("[stores.shells]"));
+    assert!(authored.contains("ignore"));
+    assert!(authored.contains("when"));
+    // migrate is comment-lossy: the v0.2 comment must not appear.
+    assert!(!authored.contains("my dotfiles"));
+
+    // Generated half carries inventory (target, files), NOT behavior.
+    assert!(state.contains("[stores.nvim]"));
+    assert!(state.contains("~/.config/nvim"));
+    assert!(state.contains("[stores.shells]"));
+    assert!(state.contains(".bashrc"));
+    // The generated file starts with the tool-owned header.
+    assert!(state.starts_with("# Generated by stitch"));
+
+    // Original preserved as .bak (comments intact — the recovery path).
+    let backup = fs::read_to_string(dir.path().join(".stitch").join("config.toml.bak")).unwrap();
+    assert!(backup.contains("my dotfiles"));
+    // The old config.toml is gone (renamed to .bak).
+    assert!(!dir.path().join(".stitch").join("config.toml").exists());
+
+    // The migrated repo now works with the new commands.
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("nvim"));
+}
+
+/// `stitch migrate --dry-run` previews without writing.
+#[test]
+fn migrate_dry_run_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("stitch.toml"));
+
+    // Nothing written.
+    assert!(!dir.path().join("stitch.toml").exists());
+    assert!(dir.path().join(".stitch").join("config.toml").exists());
+    assert!(!dir.path().join(".stitch").join("config.toml.bak").exists());
+}
+
+/// migrate refuses to overwrite an existing stitch.toml.
+#[test]
+fn migrate_refuses_when_stitch_toml_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "vars = {}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("stitch.toml"), "").unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("refusing to overwrite"));
+}
+
+/// migrate fails *before* writing anything when the .bak backup target already
+/// exists — the fail-before-mutate invariant the other writers uphold. A
+/// pre-existing .bak must not leave the repo half-migrated with the original
+/// stranded.
+#[test]
+fn migrate_fails_before_writing_when_bak_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+    // Plant a prior backup that would collide.
+    fs::write(dir.path().join(".stitch").join("config.toml.bak"), "old").unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("config.toml.bak already exists"));
+
+    // Nothing was written: no stitch.toml, no state.toml, original intact.
+    assert!(
+        !dir.path().join("stitch.toml").exists(),
+        "must not write stitch.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("state.toml").exists(),
+        "must not write state.toml"
+    );
+    assert!(
+        dir.path().join(".stitch").join("config.toml").exists(),
+        "original intact"
+    );
+}
+
+/// migrate with nothing to migrate reports so.
+#[test]
+fn migrate_nothing_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("nothing to migrate"));
 }
