@@ -2232,3 +2232,198 @@ fn migrate_nothing_to_do() {
         .failure()
         .stderr(contains("nothing to migrate"));
 }
+
+// ---------------------------------------------------------------------------
+// prune
+// ---------------------------------------------------------------------------
+
+/// Set up a repo with one store (`nvim`) linked at a covered target, plus a
+/// second repo-pointing symlink at an uncovered path. Returns (repo, covered,
+/// orphan) so tests can assert on each. A dedicated tempdir stands in for the
+/// home dir and is passed via `--scan-dir` (no $HOME override needed).
+fn prune_fixture() -> (Repo, PathBuf, PathBuf, tempfile::TempDir) {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+
+    let home = tempfile::tempdir().unwrap();
+    let covered = home.path().join(".config").join("nvim");
+    let orphan = home.path().join(".config").join("old-nvim");
+    fs::create_dir_all(covered.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store_dir, &covered).unwrap();
+    std::os::unix::fs::symlink(&store_dir, &orphan).unwrap();
+
+    let covered_str = covered.to_string_lossy().into_owned();
+    repo.write_state(&format!("[stores.nvim]\ntarget = \"{covered_str}\"\n"));
+
+    (repo, covered, orphan, home)
+}
+
+/// prune with no flags lists orphans without removing anything (the non-
+/// destructive default — the core red line).
+#[test]
+fn prune_default_lists_without_removing() {
+    let (repo, _covered, orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("Found 1 orphaned link(s):"))
+        .stdout(contains(orphan.to_string_lossy().as_ref()))
+        .stdout(contains("stitch prune --yes"));
+
+    // The orphan symlink is still on disk — default removed nothing.
+    assert!(orphan.is_symlink(), "orphan link must survive a bare prune");
+}
+
+/// prune --yes removes only the orphan link; the covered link (referenced by a
+/// store) is untouched, and the repo store directory is never touched.
+#[test]
+fn prune_yes_removes_only_orphan() {
+    let (repo, covered, orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--yes")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("Removed 1 link(s)."))
+        .stdout(contains(format!("removed {}", orphan.display())));
+
+    assert!(!orphan.exists(), "orphan link removed");
+    assert!(covered.is_symlink(), "covered link untouched");
+    assert!(
+        repo.path().join("nvim").exists(),
+        "repo store dir untouched"
+    );
+}
+
+/// prune --dry-run is an explicit alias for the safe default: lists, does not
+/// remove, even though `--yes` is what gates removal (no --yes here anyway).
+/// Pairs with prune_yes_dry_run_still_lists below for the --yes --dry-run case.
+#[test]
+fn prune_dry_run_lists_without_removing() {
+    let (repo, _covered, orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--dry-run")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("Found 1 orphaned link(s):"));
+
+    assert!(orphan.is_symlink(), "dry run removed nothing");
+}
+
+/// --yes --dry-run still removes nothing: dry-run outranks --yes, so the
+/// explicit-preview flag can never accidentally mutate $HOME.
+#[test]
+fn prune_yes_dry_run_still_lists() {
+    let (repo, _covered, orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--yes")
+        .arg("--dry-run")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("Found 1 orphaned link(s):"));
+
+    assert!(orphan.is_symlink(), "--yes --dry-run removed nothing");
+}
+
+/// A foreign symlink (pointing outside the repo) is never listed and never
+/// removed — consistent with the points_into_repo guard used elsewhere.
+#[test]
+fn prune_ignores_foreign_symlink() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+
+    let home = tempfile::tempdir().unwrap();
+    let foreign_target = tempfile::tempdir().unwrap();
+    let foreign_link = home.path().join("stranger");
+    std::os::unix::fs::symlink(foreign_target.path(), &foreign_link).unwrap();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--yes")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("No orphaned links found."));
+
+    assert!(foreign_link.is_symlink(), "foreign link untouched");
+}
+
+/// No orphans → friendly message, success.
+#[test]
+fn prune_no_orphans() {
+    let (repo, _covered, orphan, home) = prune_fixture();
+    // Pre-emptively remove the orphan so only the covered link remains.
+    fs::remove_file(&orphan).unwrap();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("No orphaned links found."));
+}
+
+/// `gc` is an alias for `prune`.
+#[test]
+fn prune_gc_alias_works() {
+    let (repo, _covered, orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("gc")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("Found 1 orphaned link(s):"))
+        .stdout(contains(orphan.to_string_lossy().as_ref()));
+
+    assert!(orphan.is_symlink(), "alias honors the list-only default");
+}
+
+/// `prune --yes` exits non-zero when a removal fails — the honest-exit-code red
+/// line. We force `remove_file` to fail by making the orphan's parent dir
+/// non-writable (r-x), which still lets the scan read and traverse it. Skipped
+/// when running as root: root bypasses file modes, so removal would succeed and
+/// the failure path wouldn't trigger.
+#[test]
+fn prune_yes_exits_nonzero_on_removal_failure() {
+    if is_root() {
+        eprintln!("skipping: running as root, file modes won't block removal");
+        return;
+    }
+    let (repo, _covered, orphan, home) = prune_fixture();
+    let parent = orphan.parent().expect("orphan has a parent");
+    // r-x: readdir/traverse still work, but unlink needs write on the parent.
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o555)).unwrap();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--yes")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .failure()
+        .stderr(contains("could not remove"))
+        .stderr(contains("see warnings above"));
+
+    // Restore before the tempdir drops so it can clean up cleanly.
+    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+    assert!(orphan.is_symlink(), "orphan survived the failed removal");
+}

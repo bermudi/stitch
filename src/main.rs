@@ -3,6 +3,7 @@ mod config;
 mod hooks;
 mod linker;
 mod platform;
+mod scan;
 mod store;
 
 use clap::Parser;
@@ -49,6 +50,11 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli::Commands::Edit => cmd_edit(),
         cli::Commands::Doctor => cmd_doctor(),
         cli::Commands::Migrate { dry_run } => cmd_migrate(dry_run),
+        cli::Commands::Prune {
+            scan_dirs,
+            dry_run,
+            yes,
+        } => cmd_prune(&scan_dirs, dry_run, yes),
     }
 }
 
@@ -866,5 +872,87 @@ fn cmd_migrate(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
          Re-add any comments you want to keep.",
         backup_path.display()
     );
+    Ok(())
+}
+
+fn cmd_prune(
+    scan_dirs: &[String],
+    dry_run: bool,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = resolve_root()?;
+    let loaded = Config::load(&root)?;
+    print_warnings(&loaded);
+    let platform = Platform::detect();
+
+    // Scan dirs are a parameter (never hardwired to home_dir) so the scanner is
+    // testable without overriding $HOME, and so a user can scope a prune. No
+    // args → the defaults: `~` shallow (top-level dotfiles only), `~/.config`
+    // and `~/.local/share` full depth. An explicit `--scan-dir` is always full
+    // depth, so `--scan-dir ~` is the escape hatch for a complete home sweep.
+    let roots: Vec<scan::ScanRoot> = if scan_dirs.is_empty() {
+        scan::default_scan_dirs()
+    } else {
+        scan_dirs
+            .iter()
+            .map(|s| scan::ScanRoot::from(expand_home(s)))
+            .collect()
+    };
+
+    let found = scan::scan_for_repo_links(&root, &roots);
+    let orphans = scan::orphan_links(&root, &found, &loaded.config, &platform);
+
+    if orphans.is_empty() {
+        println!("No orphaned links found.");
+        return Ok(());
+    }
+
+    println!("Found {} orphaned link(s):", orphans.len());
+    for fl in &orphans {
+        println!("  {} → {}", fl.link.display(), fl.resolves_to.display());
+    }
+
+    // Removal requires an explicit opt-in: the default lists only. --dry-run is
+    // an explicit alias for the same safe default, so `--yes --dry-run` still
+    // removes nothing (explicit over implicit). Removal routes through
+    // remove_link, which re-checks points_into_repo — a foreign symlink is
+    // never clobbered even if classification raced between scan and unlink.
+    if !yes || dry_run {
+        println!("\n  (to remove these, run: stitch prune --yes)");
+        return Ok(());
+    }
+
+    let mut removed = 0;
+    let mut failed = 0;
+    for fl in &orphans {
+        match linker::remove_link(&fl.link, &root) {
+            Ok(true) => {
+                removed += 1;
+                println!("  removed {}", fl.link.display());
+            }
+            Ok(false) => {
+                // No longer repo-pointing between scan and unlink (e.g. user
+                // repointed it). Skip rather than touch a now-foreign link.
+                failed += 1;
+                eprintln!(
+                    "  warning: {} no longer points into repo — skipped",
+                    fl.link.display()
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("  warning: could not remove {}: {e}", fl.link.display());
+            }
+        }
+    }
+
+    println!("\nRemoved {removed} link(s).");
+    if failed > 0 {
+        // Red line: honest exit codes. A scripted `stitch prune --yes && …`
+        // must not sail past links that couldn't be removed — mirror the
+        // non-zero exit cmd_apply returns on conflicts/errors.
+        eprintln!("{failed} link(s) could not be removed — see warnings above.");
+        return Err("prune could not remove some links — see warnings above".into());
+    }
     Ok(())
 }
