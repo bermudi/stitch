@@ -21,13 +21,16 @@ always land in the repo directly — no source/target drift, no re-add step.
 officially supported or tested. `when.os` mirrors `std::env::consts::OS`.
 
 ## ⚠️ Trust status
-**All P0 and P1 issues from the 2026-06 trust review are resolved.** Each red line below
-is now upheld by the code. Full findings — severity-ranked, with file references, test
-gaps, and a fix order — are in `docs/reviews/2026-06-15-trust-review.md`. Read it
-before touching `adopt`, the linker, or `apply`.
+**All P0, P1, and P2 issues from the 2026-06 trust review are resolved.** Each red
+line below is now upheld by the code. Full findings — severity-ranked, with file
+references, test gaps, and a fix order — are in `docs/reviews/2026-06-15-trust-review.md`.
+Read it before touching `adopt`, the linker, or `apply`.
 
-The remaining open items are the P2s (recursive glob, atomic config writes,
-unknown-store-name errors) — feature/spec gaps, not red-line breaches.
+Oracle #2 re-review (2026-06-17) confirmed all blockers resolved and would
+personally use stitch for real dotfiles. Four hardening items were also
+resolved in the same pass; see `docs/plans/p2-and-hardening.md`.
+
+No known trust blockers remain.
 
 ## Constraints & red lines
 `stitch` mutates `$HOME`. The core safety contract: **never surprise the user with data

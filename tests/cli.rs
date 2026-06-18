@@ -644,6 +644,52 @@ fn apply_store_with_no_target_reports_error() {
         .stdout(contains("no target configured"));
 }
 
+#[test]
+fn apply_only_unknown_store_errors() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .args(["apply", "--only", "nonexistent"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown store"));
+}
+
+#[test]
+fn apply_only_partial_unknown_errors_and_aborts() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    // Even though "nvim" is a real store, the unknown "typo" should
+    // abort the whole apply — partial application on typos is confusing.
+    repo.cmd()
+        .args(["apply", "--only", "nvim", "--only", "typo"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown store"))
+        .stderr(contains("typo"));
+
+    // nvim was NOT applied — we abort on any unknown.
+    assert!(!target.is_symlink());
+}
+
 // ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
@@ -757,6 +803,26 @@ files = [".bashrc"]
     assert!(!stdout.contains("shells"));
 }
 
+#[test]
+fn status_unknown_store_errors() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .args(["status", "nonexistent"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown store"));
+}
+
 // ---------------------------------------------------------------------------
 // diff
 // ---------------------------------------------------------------------------
@@ -811,6 +877,26 @@ target = "{target_str}"
     assert_eq!(fs::read_to_string(&target).unwrap(), "real file");
     assert!(!target.is_symlink());
     assert!(!Path::new(&format!("{}.bak", target.display())).exists());
+}
+
+#[test]
+fn diff_only_unknown_store_errors() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_config(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .args(["diff", "--only", "nonexistent"])
+        .assert()
+        .failure()
+        .stderr(contains("unknown store"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,8 +1103,8 @@ fn adopt_rejects_when_store_dir_already_exists() {
 #[test]
 fn adopt_rolls_back_file_when_record_fails() {
     // Force the config-save step to fail (after move + link succeed) by making
-    // config.toml unwritable. adopt must roll back: file restored to its
-    // original path, the store dir removed, no partial state left.
+    // the .stitch/ directory unwritable. adopt must roll back: file restored
+    // to its original path, the store dir removed, no partial state left.
     // Skipped under root: root ignores file mode bits, so the failure path
     // can't be triggered and the test would give false confidence.
     if is_root() {
@@ -1030,10 +1116,10 @@ fn adopt_rolls_back_file_when_record_fails() {
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "data").unwrap();
 
-    let cfg = repo.path().join(".stitch").join("config.toml");
-    let mut perms = fs::metadata(&cfg).unwrap().permissions();
-    perms.set_mode(0o444);
-    fs::set_permissions(&cfg, perms).unwrap();
+    let stitch_dir = repo.path().join(".stitch");
+    let mut perms = fs::metadata(&stitch_dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&stitch_dir, perms).unwrap();
 
     repo.cmd()
         .args(["adopt", src.to_str().unwrap()])
@@ -1061,10 +1147,10 @@ fn adopt_rolls_back_dir_when_record_fails() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.conf"), "a").unwrap();
 
-    let cfg = repo.path().join(".stitch").join("config.toml");
-    let mut perms = fs::metadata(&cfg).unwrap().permissions();
-    perms.set_mode(0o444);
-    fs::set_permissions(&cfg, perms).unwrap();
+    let stitch_dir = repo.path().join(".stitch");
+    let mut perms = fs::metadata(&stitch_dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&stitch_dir, perms).unwrap();
 
     repo.cmd()
         .args(["adopt", src.to_str().unwrap()])
@@ -1129,6 +1215,45 @@ fn add_duplicate_store_errors() {
 }
 
 #[test]
+fn add_rejects_existing_store_directory() {
+    let repo = Repo::new();
+    // Create a directory that collides with the store name.
+    fs::create_dir_all(repo.path().join("shells")).unwrap();
+
+    repo.cmd()
+        .args(["add", "shells"])
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+}
+
+#[test]
+fn add_rejects_existing_file_at_store_path() {
+    let repo = Repo::new();
+    // A regular file at the store path should also be rejected.
+    fs::write(repo.path().join("shells"), "not a dir").unwrap();
+
+    repo.cmd()
+        .args(["add", "shells"])
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+}
+
+#[test]
+fn add_rejects_existing_symlink_at_store_path() {
+    let repo = Repo::new();
+    // A symlink at the store path should also be rejected.
+    std::os::unix::fs::symlink("/tmp", repo.path().join("shells")).unwrap();
+
+    repo.cmd()
+        .args(["add", "shells"])
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+}
+
+#[test]
 fn add_target_conflict_leaves_no_config_or_store_dir() {
     // A pre-existing real file at the target forces apply into Conflict. The
     // add must abort atomically: config never records the store, the empty
@@ -1172,10 +1297,11 @@ fn add_rolls_back_when_config_save_fails() {
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
 
-    let cfg = repo.path().join(".stitch").join("config.toml");
-    let mut perms = fs::metadata(&cfg).unwrap().permissions();
-    perms.set_mode(0o444);
-    fs::set_permissions(&cfg, perms).unwrap();
+    let stitch_dir = repo.path().join(".stitch");
+    let cfg = stitch_dir.join("config.toml");
+    let mut perms = fs::metadata(&stitch_dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&stitch_dir, perms).unwrap();
 
     repo.cmd()
         .args(["add", "nvim", &target_str])
@@ -1199,11 +1325,10 @@ fn add_rolls_back_when_config_save_fails() {
 #[test]
 fn remove_drops_store_and_unlinks() {
     let repo = Repo::new();
-    repo.make_store("nvim", &["init.lua"]);
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
 
-    // Add with a target so the link is created.
+    // Add with a target so the link is created (add creates the store dir).
     repo.cmd()
         .args(["add", "nvim", &target_str])
         .assert()
@@ -1396,6 +1521,37 @@ patterns = ["*"]
         !target.join(".DS_Store").exists(),
         ".DS_Store must be globally ignored"
     );
+}
+
+#[test]
+fn file_mode_patterns_match_recursively() {
+    let repo = Repo::new();
+    let store_dir = repo.path().join("configs");
+    fs::create_dir_all(store_dir.join("sub")).unwrap();
+    fs::write(store_dir.join("top.conf"), "top").unwrap();
+    fs::write(store_dir.join("sub").join("nested.conf"), "nested").unwrap();
+    fs::write(store_dir.join("sub").join("skip.txt"), "skip").unwrap();
+
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_config(&format!(
+        r#"
+[stores.configs]
+target = "{target_str}"
+files = []
+patterns = ["*.conf"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    // `*.conf` matches at all depths (leaf-name match).
+    assert!(target.join("top.conf").is_symlink());
+    assert!(target.join("sub").join("nested.conf").is_symlink());
+    // Pattern does not match .txt files.
+    assert!(!target.join("sub").join("skip.txt").exists());
+    // Subdirectory structure is replicated.
+    assert!(target.join("sub").is_dir());
 }
 
 /// A clean whole-dir store (no ignored content) stays in whole-dir mode —

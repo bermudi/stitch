@@ -568,10 +568,14 @@ fn resolve_targets(
 
 /// Resolve the complete file list for a file-mode store.
 ///
-/// Combines explicit `files` with glob `patterns` matched against the store
-/// directory, then removes anything matched by `ignore` patterns (the caller
-/// passes the merged global + per-store set). Returns deduplicated, sorted
-/// paths relative to `store_dir`.
+/// Combines explicit `files` with glob `patterns` matched recursively against
+/// the store directory via `walkdir`, then removes anything matched by
+/// `ignore` patterns (the caller passes the merged global + per-store set).
+/// Returns deduplicated, sorted paths relative to `store_dir`.
+///
+/// Globs are matched against both the file name and the full relative path,
+/// so a bare `*.conf` matches at any depth while `subdir/*.conf` scopes the
+/// match. Ignore patterns ending in `/` exclude entire subdirectory trees.
 fn resolve_files(
     store_dir: &Path,
     files: &[String],
@@ -580,27 +584,50 @@ fn resolve_files(
 ) -> Vec<String> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    // Explicit files always included.
+    // Explicit files always included (validated elsewhere — safe fragments).
     for f in files {
         seen.insert(f.clone());
     }
 
-    // Include glob pattern matches.
-    if let Some(globset) = build_globset(patterns)
-        && let Ok(entries) = std::fs::read_dir(store_dir)
-    {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-            if globset.is_match(name_str.as_ref()) {
-                seen.insert(name_str.into_owned());
-            }
-        }
-    }
+    // Walk the store directory recursively.
+    let include_glob = build_globset(patterns);
+    let ignore_glob = build_globset(ignore);
+    let ignore_dirs: Vec<&str> = ignore
+        .iter()
+        .filter(|p| p.ends_with('/'))
+        .map(|s| s.as_str())
+        .collect();
 
-    // Exclude ignored patterns.
-    if let Some(globset) = build_globset(ignore) {
-        seen.retain(|name| !globset.is_match(name.as_str()));
+    for entry in walkdir::WalkDir::new(store_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(store_dir) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy();
+        let file_name = entry.file_name().to_string_lossy();
+
+        // Check ignore patterns first — if ignored, skip entirely.
+        let ignored = ignore_glob
+            .as_ref()
+            .is_some_and(|g| g.is_match(rel_str.as_ref()) || g.is_match(file_name.as_ref()))
+            || ignore_dirs.iter().any(|d| rel_str.starts_with(d));
+        if ignored {
+            continue;
+        }
+
+        // Include if the pattern matches file name or relative path.
+        if include_glob
+            .as_ref()
+            .is_some_and(|g| g.is_match(rel_str.as_ref()) || g.is_match(file_name.as_ref()))
+        {
+            seen.insert(rel_str.into_owned());
+        }
     }
 
     seen.into_iter().collect()
@@ -695,5 +722,87 @@ mod tests {
             &["*.local.conf".into()],
         );
         assert_eq!(resolved, vec!["app.conf", "app.prod.conf"]);
+    }
+
+    #[test]
+    fn test_resolve_files_recursive_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(store_dir.join("sub")).unwrap();
+
+        std::fs::write(store_dir.join("top.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("sub").join("nested.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("sub").join("other.txt"), "...").unwrap();
+
+        // `*.conf` matches at any depth (leaf name match).
+        let resolved = resolve_files(&store_dir, &[], &["*.conf".into()], &[]);
+        assert_eq!(resolved, vec!["sub/nested.conf", "top.conf"]);
+    }
+
+    #[test]
+    fn test_resolve_files_recursive_scoped_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(store_dir.join("sub")).unwrap();
+
+        std::fs::write(store_dir.join("top.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("sub").join("nested.conf"), "...").unwrap();
+
+        // `sub/*.conf` scopes to the subdirectory.
+        let resolved = resolve_files(&store_dir, &[], &["sub/*.conf".into()], &[]);
+        assert_eq!(resolved, vec!["sub/nested.conf"]);
+    }
+
+    #[test]
+    fn test_resolve_files_ignore_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(store_dir.join("scratch")).unwrap();
+
+        std::fs::write(store_dir.join("keep.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("scratch").join("junk.conf"), "...").unwrap();
+        std::fs::create_dir_all(store_dir.join("scratch").join("deep")).unwrap();
+        std::fs::write(
+            store_dir.join("scratch").join("deep").join("also.conf"),
+            "...",
+        )
+        .unwrap();
+
+        // `scratch/` ignores the entire subdirectory tree.
+        let resolved = resolve_files(&store_dir, &[], &["*.conf".into()], &["scratch/".into()]);
+        assert_eq!(resolved, vec!["keep.conf"]);
+    }
+
+    #[test]
+    fn test_resolve_files_ignore_recursive_wildcard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(store_dir.join("sub")).unwrap();
+
+        std::fs::write(store_dir.join("top.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("top.bak"), "...").unwrap();
+        std::fs::write(store_dir.join("sub").join("nested.bak"), "...").unwrap();
+        std::fs::write(store_dir.join("sub").join("nested.conf"), "...").unwrap();
+
+        // `*.bak` matches at any depth.
+        let resolved = resolve_files(
+            &store_dir,
+            &[],
+            &["*.conf".into(), "*.bak".into()],
+            &["*.bak".into()],
+        );
+        assert_eq!(resolved, vec!["sub/nested.conf", "top.conf"]);
+    }
+
+    #[test]
+    fn test_resolve_files_empty_dirs_yield_no_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(store_dir.join("empty")).unwrap();
+        std::fs::write(store_dir.join("real.conf"), "...").unwrap();
+
+        // Empty directories produce no matches, no errors.
+        let resolved = resolve_files(&store_dir, &[], &["*.conf".into()], &[]);
+        assert_eq!(resolved, vec!["real.conf"]);
     }
 }

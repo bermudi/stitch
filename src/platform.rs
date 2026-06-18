@@ -10,6 +10,11 @@ pub struct Platform {
 }
 
 impl Platform {
+    /// Detect the current platform.
+    ///
+    /// Note: `os` uses `std::env::consts::OS`, which returns `"macos"` on
+    /// macOS, **not** `"darwin"`. A `when.os = "darwin"` config entry will
+    /// never match. Use `"macos"` if macOS support is ever claimed.
     pub fn detect() -> Self {
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
