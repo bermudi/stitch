@@ -111,20 +111,20 @@ explicitly marked future on the v0.2 roadmap. Commits `fac97d2` (A/H), `105acd3`
 
 ## P2 — important, not existential
 
-### 9. Glob resolution is non-recursive
-- `resolve_files()` uses `read_dir(store_dir)` — top-level only. Clashes with ignore
-  examples like `scratch/` and `.git/**`.
-- **Fix:** `walkdir` + match on paths relative to `store_dir`. Effort: S–M.
+### 9. ~~Glob resolution is non-recursive~~ ✅ RESOLVED (2026-06-17)
+- `resolve_files()` now uses `walkdir` for recursive traversal. Globs match against
+  both the file name and the full relative path, so `*.conf` works at any depth.
+  Ignore patterns ending in `/` exclude entire subdirectory trees.
 
-### 10. Config writes are non-atomic
-- `Config::save()` → `toml::to_string_pretty`: reorders stores (`HashMap`), strips
-  comments, corruption risk if interrupted.
-- **Fix:** atomic temp-file + rename now (S); comment-preserving edits later (L).
+### 10. ~~Config writes are non-atomic~~ ✅ RESOLVED (2026-06-17)
+- `Config::save()` now writes to a temp file in `.stitch/` then `rename(2)`s into
+  place — atomic on Linux for same-filesystem paths. The original file is never
+  truncated or partially written. Comment preservation is deferred (L).
 
-### 11. Unknown store names are silent no-ops
-- `status <name>` / `apply --only <name>` don't error on unknown names — a typo does
-  nothing.
-- **Fix:** hard error. Effort: S.
+### 11. ~~Unknown store names are silent no-ops~~ ✅ RESOLVED (2026-06-17)
+- `apply --only`, `status <name>`, and `diff --only` now error on unknown store
+  names with a message listing them. A partial set (one known + one unknown) aborts
+  the whole command.
 
 ### 12. (Was Windows portability in the original review — now resolved by scope.)
 Project is scoped Linux-only (see root `AGENTS.md` / `SPEC.md`). The `std::os::unix::fs::symlink`
@@ -168,3 +168,89 @@ usage and Unix-only tests are correct for scope, not a defect.
 5. ~~Collision + path-traversal validation~~ ✅ (`387488f`, `a941c1a`)
 6. ~~Mock snapshotting in tests~~ ✅ (moot — snapshot code deleted)
 7. ~~Close or explicitly trim SPEC gaps~~ ✅ (`fac97d2`, `105acd3`, `a781530`, `118d834`, `5cd715a`, `2196237`)
+
+---
+
+## Oracle #2 re-review — 2026-06-17
+
+Source: same thread (`T-019ecb9c-abb9-7067-9581-4083dcff2431`), message #29.
+Re-review of the resolved P0/P1 items against current source.
+
+**Verdict: all prior P0/P1 trust blockers are resolved. Would personally use for
+real Linux dotfiles now**, with normal caveats (run `stitch diff` first, keep the
+repo in git, don't `apply` untrusted repos because hooks are arbitrary shell).
+
+Validation: `cargo build`, `cargo fmt --check`, `cargo test` (27 unit + 62 CLI =
+89 tests), `cargo clippy --all-targets --all-features -- -D warnings` — all pass.
+
+### Blocker re-review (all resolved)
+
+1. **No external uploads — ✅.** Gist/snapshot machinery deleted. Hooks are
+   explicit user configuration, not a hidden upload path.
+
+2. **Foreign symlinks are conflicts — ✅.** `apply_single_link` treats mismatched
+   symlinks as `Conflict` unless `points_into_repo` returns true. Foreign symlinks
+   remain conflicts even under `--force`. Covered by tests.
+
+3. **`apply --force` backup semantics — ✅.** Backs up real file/dir conflicts to
+   `{target}.bak`, refuses to overwrite existing `.bak`, restores backup on link
+   failure. Covered by tests.
+
+4. **`adopt` collision safety and rollback — ✅.** Pre-checks config/store-dir
+   collisions before mutation, rolls back move + link on any failure, returns
+   non-zero on errors. Covered by tests.
+
+5. **`add` conflict handling and rollback — ✅.** Rejects duplicate stores, validates
+   fragments before fs mutation, applies in-memory first, rolls back links + empty
+   store dir on apply/config-save failure. Covered by tests.
+
+6. **Honest exit codes — ✅.** `apply`, `adopt`, `add`, `doctor` all return non-zero
+   on real errors/conflicts. Remaining gap: unknown store names are silent no-ops
+   (P2#11).
+
+7. **Path traversal validation — ✅.** `Config::validate` rejects absolute and
+   `..`-containing entries. `cmd_add` validates CLI fragments before store dir
+   creation. Covered by tests.
+
+8. **SPEC/implementation drift — no blocker drift remains.** Conflict handling,
+   hooks, ignores, Linux-only scope, and roadmap state align well enough for a
+   personal-use contract.
+
+### New hardening items surfaced (non-blockers)
+
+These are not trust blockers — the reviewer would still use stitch without them —
+but are worth fixing for defense-in-depth:
+
+#### H1: `points_into_repo` is purely lexical, no `..` normalization
+- In `src/linker.rs`, `points_into_repo` resolves the symlink target and checks
+  `starts_with(repo_root)` without normalizing `.` or `..` components. A crafted
+  symlink target like `/home/user/repo/../.ssh` would be misclassified as
+  repo-owned when it actually points outside.
+- **Fix:** canonicalize when the path exists; lexically normalize `..`/`.` for
+  dangling paths before `starts_with`. Effort: **S**.
+- Tracked in: `docs/plans/p2-and-hardening.md`.
+
+#### H2: `add` does not reject an already-existing unconfigured store directory
+- `cmd_add` checks `config.stores.contains_key(name)` but not whether
+  `root.join(name)` already exists on disk. `create_dir_all` is a no-op on
+  existing directories, so no data loss — but the intent of "add creates a
+  fresh store" isn't fully upheld.
+- **Fix:** pre-check with `symlink_metadata` and reject existing paths.
+  Effort: **S**.
+- Tracked in: `docs/plans/p2-and-hardening.md`.
+
+#### H3: SPEC.md v0.3 templates/secrets reads like current behavior
+- The "Templates & secrets (v0.3)" section uses present tense ("files are
+  rendered", "secrets stored encrypted") before the roadmap clarifies it's
+  unchecked/planned.
+- **Fix:** reword to future/planned tense. Effort: **S**.
+
+#### H4: `when.os` value mismatch (known bug, still present)
+- `std::env::consts::OS` returns `macos` on macOS, not `darwin`. A
+  `when = { os = "darwin" }` store would never match. Out of scope while
+  Linux-only, but flag if macOS support is ever claimed.
+- Also: the unreachable `"windows" => Some("windows".into())` distro branch in
+  `src/platform.rs` is dead code under Linux-only scope.
+- **Fix:** update the `macos`/`darwin` comment, remove dead Windows code, or
+  gate with `cfg`. Effort: **S**.
+- Tracked in: `docs/plans/p2-and-hardening.md`.

@@ -133,15 +133,20 @@ All fields optional. All specified must match.
 
 | Field | Values |
 |---|---|
-| `os` | `linux` |
+| `os` | `linux`, `macos`, `windows` — mirrors `std::env::consts::OS` (note: `macos`, **not** `darwin`) |
 | `arch` | `x86_64`, `aarch64`, ... |
 | `distro` | `ubuntu`, `arch`, `debian`, ... |
 | `hostname` | Machine hostname |
 | `shell` | `zsh`, `bash`, `fish`, `nu` |
 
-## Templates & secrets (v0.3)
+## Templates & secrets (v0.3 — planned, not yet implemented)
 
-Files containing `{{ ... }}` references are rendered through a template engine and symlinked from a staging dir. Files without template expressions are symlinked directly.
+*This feature is on the v0.3 roadmap and does not exist yet. The design below is
+the intended contract.*
+
+Files containing `{{ ... }}` references will be rendered through a template engine
+and symlinked from a staging dir. Files without template expressions will be
+symlinked directly.
 
 | Expression | Description |
 |---|---|
@@ -151,7 +156,8 @@ Files containing `{{ ... }}` references are rendered through a template engine a
 | `{{ .OS }}` | Operating system |
 | `{{ .Vars.key }}` | User-defined variable |
 
-Secrets stored encrypted in `.stitch/secrets.enc`. Rendered files go to `~/.local/state/stitch/<repo-hash>/`.
+Secrets will be stored encrypted in `.stitch/secrets.enc`. Rendered files will go
+to `~/.local/state/stitch/<repo-hash>/`.
 
 ## Hooks (v0.2)
 

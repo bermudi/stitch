@@ -51,6 +51,28 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Validate that every name in `only` exists in the config. Returns an error
+/// listing unknown names so a typo can't silently do nothing.
+fn check_unknown_names(
+    only: impl IntoIterator<Item = impl AsRef<str>>,
+    config: &Config,
+) -> Result<(), String> {
+    let unknown: Vec<_> = only
+        .into_iter()
+        .filter(|n| !config.stores.contains_key(n.as_ref()))
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        let names = unknown
+            .iter()
+            .map(|n| format!("'{}'", n.as_ref()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("unknown store(s): {names}"))
+    }
+}
+
 /// Resolve the repo root from cwd, or error.
 fn resolve_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
@@ -76,6 +98,7 @@ fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
 fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
     let config = Config::load(&root)?;
+    check_unknown_names(only.iter().map(|s| s.as_str()), &config)?;
     let platform = Platform::detect();
 
     let mut filtered_config = config.clone();
@@ -174,6 +197,9 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
 fn cmd_status(name: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
     let config = Config::load(&root)?;
+    if let Some(name) = name {
+        check_unknown_names(std::iter::once(name.as_str()), &config)?;
+    }
     let platform = Platform::detect();
 
     let entries = store::status_all(&root, &config, &platform);
@@ -478,12 +504,20 @@ fn cmd_add(
         return Err(format!("store '{}' already exists", name).into());
     }
 
+    // Reject if the store path already exists on disk — `add` creates fresh
+    // stores; an existing dir (or file, or symlink) at this path is an
+    // ambiguity we shouldn't silently accept. Checked before fragment
+    // validation: no point validating fragments for a store we won't create.
+    let store_dir = root.join(name);
+    if store_dir.symlink_metadata().is_ok() {
+        return Err(format!("store path '{}' already exists", store_dir.display()).into());
+    }
+
     // Validate user-supplied fragments before touching the filesystem: a
     // `--file ../x` would otherwise escape the store/target dirs during the
     // apply below (and leave an orphaned store dir on failure).
     config::validate_fragments(files, patterns, &format!("store '{name}'"))?;
 
-    let store_dir = root.join(name);
     std::fs::create_dir_all(&store_dir)?;
 
     let new_store = config::Store {

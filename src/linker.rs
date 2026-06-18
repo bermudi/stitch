@@ -83,6 +83,10 @@ pub fn create_link(target: &Path, source: &Path) -> Result<(), LinkError> {
 /// (stow/chezmoi/Nix/Home-Manager/hand-managed — must never be silently
 /// clobbered). Relative symlink targets are resolved against the symlink's own
 /// parent directory. Returns `false` for non-symlinks or unreadable links.
+///
+/// Normalizes `..` and `.` components so a crafted symlink target like
+/// `/repo/../foreign` is not misclassified as repo-owned via a purely lexical
+/// `starts_with` check.
 pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
     let Ok(resolved) = std::fs::read_link(target) else {
         return false;
@@ -92,7 +96,43 @@ pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
     } else {
         target.parent().unwrap_or(Path::new(".")).join(&resolved)
     };
-    resolved_abs.starts_with(repo_root)
+
+    // If the path exists, canonicalize to resolve any symlink chains and `..`
+    // components. Fall back to lexical normalization if canonicalize fails
+    // (e.g. permission error) — never use an unnormalized path.
+    let normalized = if resolved_abs.exists() {
+        resolved_abs
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical(&resolved_abs))
+    } else {
+        normalize_lexical(&resolved_abs)
+    };
+    let normalized_root = if repo_root.exists() {
+        repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical(repo_root))
+    } else {
+        normalize_lexical(repo_root)
+    };
+
+    normalized.starts_with(&normalized_root)
+}
+
+/// Lexically normalize a path by collapsing `.` and `..` components without
+/// touching the filesystem. The result may still contain symlinks if the path
+/// does not exist — use `canonicalize` for existing paths.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Remove a symlink at `target` if it points into the given repo root.
@@ -185,5 +225,73 @@ mod tests {
         // Should NOT remove — points to other_repo, not our_repo.
         assert!(!remove_link(&target, &our_repo).unwrap());
         assert!(target.exists());
+    }
+
+    #[test]
+    fn test_normalize_lexical_basic() {
+        assert_eq!(normalize_lexical(Path::new("/a/b")), PathBuf::from("/a/b"));
+        assert_eq!(
+            normalize_lexical(Path::new("/a/./b")),
+            PathBuf::from("/a/b")
+        );
+        assert_eq!(normalize_lexical(Path::new("/a/b/..")), PathBuf::from("/a"));
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        // `..` at root stays at root.
+        assert_eq!(normalize_lexical(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(
+            normalize_lexical(Path::new("/a/../../b")),
+            PathBuf::from("/b")
+        );
+    }
+
+    #[test]
+    fn test_points_into_repo_rejects_dotdot_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let inside = repo.join("config");
+        let outside = tmp.path().join("foreign");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // A symlink whose lexical target escapes the repo via `..` —
+        // e.g. pointing at repo/../foreign. Exists on disk, so canonicalize
+        // resolves it.
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(repo.join("..").join("foreign"), &link).unwrap();
+
+        assert!(!points_into_repo(&link, &repo));
+    }
+
+    #[test]
+    fn test_points_into_repo_accepts_dotdot_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let sub = repo.join("a");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Lexically: repo/a/../a/b  →  repo/a/b (still inside).
+        // Dangling path, so normalize_lexical is used.
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(repo.join("a").join("..").join("a").join("b"), &link).unwrap();
+
+        assert!(points_into_repo(&link, &repo));
+    }
+
+    #[test]
+    fn test_points_into_repo_rejects_dangling_dotdot_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // A dangling symlink whose target escapes via `..`.
+        // repo/../nonexistent — the path does not exist, so normalize_lexical
+        // is used and should detect the escape.
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(repo.join("..").join("nonexistent"), &link).unwrap();
+
+        assert!(!points_into_repo(&link, &repo));
     }
 }

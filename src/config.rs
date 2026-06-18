@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,14 +87,34 @@ impl Config {
         Ok(config)
     }
 
+    /// Write config to `.stitch/config.toml` atomically via temp-file +
+    /// rename. On interruption the original file is left intact. The temp
+    /// file is cleaned up on any error.
     pub fn save(&self, repo_root: &Path) -> Result<(), ConfigError> {
         let config_dir = repo_root.join(".stitch");
         std::fs::create_dir_all(&config_dir)
             .map_err(|e| ConfigError::Write(e, config_dir.clone()))?;
         let config_path = config_dir.join("config.toml");
         let contents = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
-        std::fs::write(&config_path, contents).map_err(|e| ConfigError::Write(e, config_path))?;
-        Ok(())
+
+        // Write to a temp file in the same directory then rename — on Linux
+        // rename(2) is atomic for same-filesystem paths, so the original
+        // file is never truncated or partially written. The PID suffix
+        // avoids collisions if two stitch processes somehow run concurrently.
+        let tmp_path = config_dir.join(format!(".config.toml.{}.tmp", std::process::id()));
+        let result = (|| {
+            let mut f = std::fs::File::create(&tmp_path)
+                .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
+            f.write_all(contents.as_bytes())
+                .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
+            f.sync_all()
+                .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
+            std::fs::rename(&tmp_path, &config_path).map_err(|e| ConfigError::Write(e, config_path))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
     }
 
     /// Validate that no `files`/`patterns` fragment can escape its store or target dir.
