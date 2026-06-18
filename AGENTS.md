@@ -21,25 +21,13 @@ always land in the repo directly — no source/target drift, no re-add step.
 officially supported or tested. `when.os` mirrors `std::env::consts::OS`.
 
 ## ⚠️ Trust status
-**Not yet safe for real dotfiles.** A candid review flagged data-exposure,
-non-destructive, and exit-code problems that disqualify it from real `$HOME` use until
-fixed. Full findings — severity-ranked, with file references, test gaps, and a fix
-order — are in `docs/reviews/2026-06-15-trust-review.md`. Read it before touching
-`adopt`, the linker, or `apply`.
+**All P0 and P1 issues from the 2026-06 trust review are resolved.** Each red line below
+is now upheld by the code. Full findings — severity-ranked, with file references, test
+gaps, and a fix order — are in `docs/reviews/2026-06-15-trust-review.md`. Read it
+before touching `adopt`, the linker, or `apply`.
 
-**Resolved (2026-06-15):** gist uploads deleted (P0#1/#2); `adopt` made atomic with
-rollback + collision pre-checks (P0#4); `add`/`adopt` exit codes made honest (P0#7);
-foreign symlinks treated as conflicts, not clobbers (P0#3); path fragments validated
-at config load — absolute and `..`-containing `files`/`patterns` entries are rejected
-(P1#6); `apply --force` implemented as `{target}.bak` backup for real-file/dir
-conflicts, foreign symlinks still hard conflicts, fails loudly if `.bak` exists (P1#5);
-SPEC/impl reconciliation (P1#8) — `add` flags aligned to SPEC (`--files`/`--target`),
-global ignores + whole-dir→file-mode promotion implemented (`.git` no longer
-symlinked into `$HOME`), per-store + global hooks implemented (were silently ignored),
-dangling `stitch import` reference removed, review-doc `undo` contradiction fixed.
-All P0 blockers and all P1 items are clear; every red line below is now upheld
-by the code. **Still open:** the P2 items (recursive glob P2#9, atomic config writes
-P2#10, unknown-store-name errors P2#11) in the review doc.
+The remaining open items are the P2s (recursive glob, atomic config writes,
+unknown-store-name errors) — feature/spec gaps, not red-line breaches.
 
 ## Constraints & red lines
 `stitch` mutates `$HOME`. The core safety contract: **never surprise the user with data
@@ -54,22 +42,13 @@ movement, data exposure, or silent replacement.** New code must uphold:
   escapes the store/target dirs.
 - **No destructive overwrite of existing repo content.** Collisions are rejected.
 
-Note: as of 2026-06-15 every red-line violation flagged in the review is resolved —
-gist-upload, adopt-collision, dishonest-exit-code, foreign-symlink-clobbering, and
-path-fragment-validation (P1#6) are all fixed. `apply --force` (P1#5) is now
-implemented as a local `.bak` backup (never external upload, foreign symlinks stay
-conflicts). P1#8 (SPEC reconciliation) is resolved: hooks, global ignores, and flag
-naming now match the SPEC; deferred items (`modify`, `import`, distinct `diff`
-format) are explicitly marked future on the v0.2 roadmap. The remaining open items
-(the P2s) are feature/spec gaps, not red-line breaches. When touching `adopt`, the
-linker, `apply`, or config parsing, keep the code in line with these red lines — don't
-reintroduce a violation.
+Note: as of 2026-06-15 every red-line violation flagged in the review is resolved.
+When touching `adopt`, the linker, `apply`, or config parsing, keep the code in line
+with these red lines — don't reintroduce a violation.
 
 ## Quality bar
-Target: zero warnings. For a change to count as "done", `cargo fmt` and `cargo clippy`
-(`-D warnings`) must be clean — this tool mutates `$HOME`. (As of the review, both fail
-on existing code; clearing that debt is itself an open task, not a reason to skip the
-bar on new code.)
+Zero warnings. `cargo fmt` and `cargo clippy` (`-D warnings`) must be clean for a
+change to count as "done" — this tool mutates `$HOME`.
 
 ## Workflow
 ```sh
