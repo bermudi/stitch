@@ -51,40 +51,27 @@ pub enum Commands {
     /// List all configured stores
     List,
 
-    /// Move an existing file/dir into the repo and symlink back
-    Adopt {
-        /// Path to adopt
+    /// Add a path to stitch: move existing content into the repo and link back,
+    /// or create an empty store if the path doesn't exist yet
+    Add {
+        /// Target path to manage (e.g. ~/.config/nvim)
         path: String,
 
-        /// Override the derived store name
+        /// Override the derived store name (default: basename, leading dot stripped)
         #[arg(short, long)]
         name: Option<String>,
+
+        /// Files to link individually (repeatable; only when creating a new store)
+        #[arg(short, long = "files", value_name = "FILE")]
+        files: Vec<String>,
+
+        /// Glob patterns (repeatable; only when creating a new store)
+        #[arg(short, long = "patterns", value_name = "PATTERN")]
+        patterns: Vec<String>,
 
         /// Preview without making changes
         #[arg(long)]
         dry_run: bool,
-    },
-
-    /// Create a new store entry
-    Add {
-        /// Store name
-        name: String,
-
-        /// Target path (or pass positionally)
-        #[arg(group = "target_input")]
-        target: Option<String>,
-
-        /// Target path (or pass positionally)
-        #[arg(short, long = "target", group = "target_input", value_name = "TARGET")]
-        target_flag: Option<String>,
-
-        /// Files to link individually (repeatable)
-        #[arg(short, long = "files", value_name = "FILE")]
-        files: Vec<String>,
-
-        /// Glob patterns (repeatable)
-        #[arg(short, long = "patterns", value_name = "PATTERN")]
-        patterns: Vec<String>,
     },
 
     /// Remove a store and its symlinks

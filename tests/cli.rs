@@ -612,11 +612,18 @@ fn add_rejects_traversal_in_files() {
     // `add --files ../escape` must fail before the store dir is created, so no
     // orphaned directory is left behind and nothing escapes the target.
     let repo = Repo::new();
-    let target = repo.path().join("home");
+    let target = repo.path().join("home").join(".config").join("shells");
     let target_str = target.to_string_lossy().into_owned();
 
     repo.cmd()
-        .args(["add", "shells", &target_str, "--files", "../escape"])
+        .args([
+            "add",
+            &target_str,
+            "--name",
+            "shells",
+            "--files",
+            "../escape",
+        ])
         .assert()
         .failure()
         .stderr(contains("invalid file entry"));
@@ -1031,21 +1038,21 @@ fn list_marks_stores_without_target() {
 }
 
 // ---------------------------------------------------------------------------
-// adopt
+// add (adopt existing path)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn adopt_dry_run_makes_no_changes() {
+fn add_dry_run_adopt_existing_makes_no_changes() {
     let repo = Repo::new();
     let src = repo.path().join("external").join(".myrc");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "data").unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap(), "--dry-run"])
+        .args(["add", src.to_str().unwrap(), "--dry-run"])
         .assert()
         .success()
-        .stdout(contains("Would adopt"));
+        .stdout(contains("Would add (adopt existing)"));
 
     // Nothing was moved.
     assert!(src.exists());
@@ -1053,17 +1060,17 @@ fn adopt_dry_run_makes_no_changes() {
 }
 
 #[test]
-fn adopt_file_moves_and_links_back() {
+fn add_adopt_file_moves_and_links_back() {
     let repo = Repo::new();
     let src = repo.path().join("external").join(".myrc");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "data").unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap()])
+        .args(["add", src.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(contains("Adopted"));
+        .stdout(contains("Added store"));
 
     // The file should now live at <repo>/myrc/.myrc (File mode layout).
     let in_repo = repo.path().join("myrc").join(".myrc");
@@ -1077,17 +1084,17 @@ fn adopt_file_moves_and_links_back() {
 }
 
 #[test]
-fn adopt_dir_moves_and_links_back() {
+fn add_adopt_dir_moves_and_links_back() {
     let repo = Repo::new();
     let src = repo.path().join("external").join("myconfig");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.conf"), "a").unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap()])
+        .args(["add", src.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(contains("Adopted"));
+        .stdout(contains("Added store"));
 
     // The directory should now be inside the repo.
     assert!(repo.path().join("myconfig").is_dir());
@@ -1096,32 +1103,22 @@ fn adopt_dir_moves_and_links_back() {
 }
 
 #[test]
-fn adopt_rejects_existing_symlink() {
+fn add_rejects_existing_symlink_at_target() {
     let repo = Repo::new();
     let src = repo.path().join("external").join("myrc");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/elsewhere", &src).unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap()])
+        .args(["add", src.to_str().unwrap()])
         .assert()
         .failure()
         .stderr(contains("already a symlink"));
 }
 
 #[test]
-fn adopt_missing_path_errors() {
-    let repo = Repo::new();
-    repo.cmd()
-        .args(["adopt", "/nonexistent/path/abc"])
-        .assert()
-        .failure()
-        .stderr(contains("path does not exist"));
-}
-
-#[test]
-fn adopt_rejects_store_name_already_in_config() {
-    // Pre-existing state entry for "bashrc" must block adoption of .bashrc,
+fn add_rejects_store_name_already_in_config() {
+    // Pre-existing state entry for "bashrc" must block adding .bashrc,
     // which would derive the same store name. Nothing should be moved.
     let repo = Repo::new();
     repo.write_state("[stores.bashrc]\ntarget = \"~/.bashrc\"\n");
@@ -1131,10 +1128,10 @@ fn adopt_rejects_store_name_already_in_config() {
     fs::write(&src, "data").unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap()])
+        .args(["add", src.to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(contains("already exists in config"));
+        .stderr(contains("already exists"));
 
     // File untouched.
     assert!(src.exists());
@@ -1142,7 +1139,7 @@ fn adopt_rejects_store_name_already_in_config() {
 }
 
 #[test]
-fn adopt_rejects_when_store_dir_already_exists() {
+fn add_rejects_when_store_dir_already_exists() {
     // A directory for the derived store name already sits in the repo.
     let repo = Repo::new();
     repo.make_store("myrc", &["stale"]); // creates <repo>/myrc/
@@ -1152,10 +1149,10 @@ fn adopt_rejects_when_store_dir_already_exists() {
     fs::write(&src, "data").unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap()])
+        .args(["add", src.to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(contains("destination already exists"));
+        .stderr(contains("already exists"));
 
     // File untouched; the existing store dir not overwritten.
     assert!(src.exists());
@@ -1167,14 +1164,14 @@ fn adopt_rejects_when_store_dir_already_exists() {
 }
 
 #[test]
-fn adopt_rolls_back_file_when_record_fails() {
+fn add_rolls_back_adopt_file_when_record_fails() {
     // Force the state-save step to fail (after move + link succeed) by making
-    // the .stitch/ directory unwritable. adopt must roll back: file restored
+    // the .stitch/ directory unwritable. add must roll back: file restored
     // to its original path, the store dir removed, no partial state left.
     // Skipped under root: root ignores file mode bits, so the failure path
     // can't be triggered and the test would give false confidence.
     if is_root() {
-        eprintln!("note: adopt_rolls_back_file_when_record_fails skipped under root");
+        eprintln!("note: add_rolls_back_adopt_file_when_record_fails skipped under root");
         return;
     }
     let repo = Repo::new();
@@ -1188,7 +1185,7 @@ fn adopt_rolls_back_file_when_record_fails() {
     fs::set_permissions(&stitch_dir, perms).unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap()])
+        .args(["add", src.to_str().unwrap()])
         .assert()
         .failure();
 
@@ -1201,11 +1198,11 @@ fn adopt_rolls_back_file_when_record_fails() {
 }
 
 #[test]
-fn adopt_rolls_back_dir_when_record_fails() {
+fn add_rolls_back_adopt_dir_when_record_fails() {
     // Symmetric to the file-mode rollback test, but exercising the dir branch
     // of rollback_adopt_move (rename(store_dir, source) directly).
     if is_root() {
-        eprintln!("note: adopt_rolls_back_dir_when_record_fails skipped under root");
+        eprintln!("note: add_rolls_back_adopt_dir_when_record_fails skipped under root");
         return;
     }
     let repo = Repo::new();
@@ -1219,7 +1216,7 @@ fn adopt_rolls_back_dir_when_record_fails() {
     fs::set_permissions(&stitch_dir, perms).unwrap();
 
     repo.cmd()
-        .args(["adopt", src.to_str().unwrap()])
+        .args(["add", src.to_str().unwrap()])
         .assert()
         .failure();
 
@@ -1232,14 +1229,17 @@ fn adopt_rolls_back_dir_when_record_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// add
+// add (create empty store)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn add_creates_store_without_immediate_link() {
+fn add_creates_empty_store_and_links() {
     let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("shells");
+    let target_str = target.to_string_lossy().into_owned();
+
     repo.cmd()
-        .args(["add", "shells"])
+        .args(["add", &target_str])
         .assert()
         .success()
         .stdout(contains("Added store 'shells'"));
@@ -1249,32 +1249,40 @@ fn add_creates_store_without_immediate_link() {
     // State should have the entry.
     let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
     assert!(state_text.contains("shells"));
+    // Target symlinked to the empty store.
+    assert!(target.is_symlink());
 }
 
 #[test]
-fn add_with_target_links_immediately() {
+fn add_creates_store_with_explicit_name() {
     let repo = Repo::new();
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
 
     repo.cmd()
-        .args(["add", "nvim", &target_str])
+        .args(["add", &target_str, "--name", "editor"])
         .assert()
         .success()
-        .stdout(contains("linked"));
+        .stdout(contains("Added store 'editor'"));
 
-    // Store was created, target symlinked.
-    assert!(repo.path().join("nvim").is_dir());
+    assert!(repo.path().join("editor").is_dir());
     assert!(target.is_symlink());
 }
 
 #[test]
 fn add_duplicate_store_errors() {
+    // Two different paths that derive the same store name: the second must
+    // fail because the store name already exists in config.
     let repo = Repo::new();
-    repo.cmd().args(["add", "shells"]).assert().success();
+    let target1 = repo.path().join("home").join(".config").join("shells");
+    let target2 = repo.path().join("home").join(".local").join("shells");
+    let t1 = target1.to_string_lossy().into_owned();
+    let t2 = target2.to_string_lossy().into_owned();
+
+    repo.cmd().args(["add", &t1]).assert().success();
 
     repo.cmd()
-        .args(["add", "shells"])
+        .args(["add", &t2])
         .assert()
         .failure()
         .stderr(contains("already exists"));
@@ -1283,11 +1291,13 @@ fn add_duplicate_store_errors() {
 #[test]
 fn add_rejects_existing_store_directory() {
     let repo = Repo::new();
-    // Create a directory that collides with the store name.
+    // Create a directory that collides with the derived store name.
     fs::create_dir_all(repo.path().join("shells")).unwrap();
+    let target = repo.path().join("home").join(".config").join("shells");
+    let target_str = target.to_string_lossy().into_owned();
 
     repo.cmd()
-        .args(["add", "shells"])
+        .args(["add", &target_str])
         .assert()
         .failure()
         .stderr(contains("already exists"));
@@ -1298,9 +1308,11 @@ fn add_rejects_existing_file_at_store_path() {
     let repo = Repo::new();
     // A regular file at the store path should also be rejected.
     fs::write(repo.path().join("shells"), "not a dir").unwrap();
+    let target = repo.path().join("home").join(".config").join("shells");
+    let target_str = target.to_string_lossy().into_owned();
 
     repo.cmd()
-        .args(["add", "shells"])
+        .args(["add", &target_str])
         .assert()
         .failure()
         .stderr(contains("already exists"));
@@ -1311,41 +1323,14 @@ fn add_rejects_existing_symlink_at_store_path() {
     let repo = Repo::new();
     // A symlink at the store path should also be rejected.
     std::os::unix::fs::symlink("/tmp", repo.path().join("shells")).unwrap();
-
-    repo.cmd()
-        .args(["add", "shells"])
-        .assert()
-        .failure()
-        .stderr(contains("already exists"));
-}
-
-#[test]
-fn add_target_conflict_leaves_no_config_or_store_dir() {
-    // A pre-existing real file at the target forces apply into Conflict. The
-    // add must abort atomically: state never records the store, the empty
-    // store dir is removed, and the pre-existing target file is untouched.
-    let repo = Repo::new();
-    let target = repo.path().join("home").join(".config").join("nvim");
-    fs::create_dir_all(target.parent().unwrap()).unwrap();
-    fs::write(&target, "existing").unwrap();
+    let target = repo.path().join("home").join(".config").join("shells");
     let target_str = target.to_string_lossy().into_owned();
 
     repo.cmd()
-        .args(["add", "nvim", &target_str])
+        .args(["add", &target_str])
         .assert()
         .failure()
-        .stderr(contains("conflicts or errors"));
-
-    // No state entry, no orphaned store dir.
-    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
-    assert!(!state_text.contains("nvim"));
-    assert!(
-        !repo.path().join("nvim").exists(),
-        "store dir must be removed on conflict"
-    );
-    // The conflicting target file is left exactly as it was.
-    assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
-    assert!(!target.is_symlink());
+        .stderr(contains("already exists"));
 }
 
 #[test]
@@ -1369,10 +1354,7 @@ fn add_rolls_back_when_config_save_fails() {
     perms.set_mode(0o555);
     fs::set_permissions(&stitch_dir, perms).unwrap();
 
-    repo.cmd()
-        .args(["add", "nvim", &target_str])
-        .assert()
-        .failure();
+    repo.cmd().args(["add", &target_str]).assert().failure();
 
     // Link undone, store dir removed, state has no entry.
     assert!(!target.is_symlink(), "symlink must be removed on rollback");
@@ -1382,6 +1364,64 @@ fn add_rolls_back_when_config_save_fails() {
     );
     let state_text = fs::read_to_string(&state).unwrap();
     assert!(!state_text.contains("nvim"));
+}
+
+#[test]
+fn add_create_empty_dry_run_makes_no_changes() {
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+
+    repo.cmd()
+        .args(["add", &target_str, "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("Would add (create empty store)"));
+
+    // Nothing created on disk.
+    assert!(!repo.path().join("nvim").exists());
+    assert!(!target.exists());
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(!state_text.contains("nvim"));
+}
+
+#[test]
+fn add_rejects_files_on_existing_path() {
+    // --files on an existing path is a user error: the moved content determines
+    // the store layout, so --files would be silently ignored. Must error rather
+    // than surprise.
+    let repo = Repo::new();
+    let src = repo.path().join("external").join(".myrc");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(&src, "data").unwrap();
+
+    repo.cmd()
+        .args(["add", src.to_str().unwrap(), "--files", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("only apply when creating a new empty store"));
+
+    // File untouched, no store created.
+    assert!(src.exists());
+    assert_eq!(fs::read_to_string(&src).unwrap(), "data");
+    assert!(!repo.path().join("myrc").exists());
+}
+
+#[test]
+fn add_rejects_patterns_on_existing_path() {
+    let repo = Repo::new();
+    let src = repo.path().join("external").join("myconfig");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.conf"), "a").unwrap();
+
+    repo.cmd()
+        .args(["add", src.to_str().unwrap(), "--patterns", "*"])
+        .assert()
+        .failure()
+        .stderr(contains("only apply when creating a new empty store"));
+
+    assert!(src.exists());
+    assert!(!repo.path().join("myconfig").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,10 +1435,7 @@ fn remove_drops_store_and_unlinks() {
     let target_str = target.to_string_lossy().into_owned();
 
     // Add with a target so the link is created (add creates the store dir).
-    repo.cmd()
-        .args(["add", "nvim", &target_str])
-        .assert()
-        .success();
+    repo.cmd().args(["add", &target_str]).assert().success();
     assert!(target.is_symlink());
 
     repo.cmd()
@@ -1895,11 +1932,11 @@ hooks = {{ pre = "env | grep ^STITCH > {}" }}
 // v0.3 split: new regression tests (items 1, 2, 4, 5, 6)
 // ===========================================================================
 
-/// Comment-preservation regression (item 2): add/adopt/remove mutate only
+/// Comment-preservation regression (item 2): add/remove mutate only
 /// state.toml; stitch.toml is byte-stable across mutations, so the user's
 /// comments and formatting survive. This is the motivating bug of the split.
 #[test]
-fn stitch_toml_is_byte_stable_across_add_adopt_remove() {
+fn stitch_toml_is_byte_stable_across_add_remove() {
     let repo = Repo::new();
     // Author stitch.toml with a comment the v0.2 reserializer would destroy.
     repo.write_authored(
@@ -1910,10 +1947,7 @@ fn stitch_toml_is_byte_stable_across_add_adopt_remove() {
     // add (with a target so a link is created), then remove.
     let target = repo.path().join("home").join(".config").join("nvim");
     let target_str = target.to_string_lossy().into_owned();
-    repo.cmd()
-        .args(["add", "nvim", &target_str])
-        .assert()
-        .success();
+    repo.cmd().args(["add", &target_str]).assert().success();
     repo.cmd().args(["remove", "nvim"]).assert().success();
 
     // stitch.toml is byte-identical: comment and formatting preserved.
@@ -2017,16 +2051,18 @@ when = { hostname = "laptop" }
 /// produces a byte-identical state.toml (BTreeMap keys + sorted files).
 #[test]
 fn state_toml_ordering_is_stable_across_operation_order() {
+    // Use relative target paths so state.toml content is independent of the
+    // tempdir path — only the store names and targets matter for ordering.
     // Snapshot after adding A then B.
     let repo_a = Repo::new();
-    repo_a.cmd().args(["add", "zebra"]).assert().success();
-    repo_a.cmd().args(["add", "alpha"]).assert().success();
+    repo_a.cmd().args(["add", "home/zebra"]).assert().success();
+    repo_a.cmd().args(["add", "home/alpha"]).assert().success();
     let snap_a = fs::read_to_string(repo_a.path().join(".stitch").join("state.toml")).unwrap();
 
     // Snapshot after adding B then A.
     let repo_b = Repo::new();
-    repo_b.cmd().args(["add", "alpha"]).assert().success();
-    repo_b.cmd().args(["add", "zebra"]).assert().success();
+    repo_b.cmd().args(["add", "home/alpha"]).assert().success();
+    repo_b.cmd().args(["add", "home/zebra"]).assert().success();
     let snap_b = fs::read_to_string(repo_b.path().join(".stitch").join("state.toml")).unwrap();
 
     assert_eq!(snap_a, snap_b, "state.toml must be order-stable");
@@ -2036,16 +2072,18 @@ fn state_toml_ordering_is_stable_across_operation_order() {
     assert!(aa < za, "alpha should sort before zebra");
 }
 
-/// files are emitted sorted in state.toml (item 6). `add` without a target
-/// persists the inventory without linking, so the files need not exist on disk
-/// — this test checks the serialization order, not the apply path.
+/// files are emitted sorted in state.toml (item 6). Pre-seed state with
+/// unsorted files, then trigger a re-save by adding another store — the save
+/// re-serializes all stores with sorted files.
 #[test]
 fn state_toml_emits_files_sorted() {
     let repo = Repo::new();
-    repo.cmd()
-        .args(["add", "s", "--files", "c", "--files", "a", "--files", "b"])
-        .assert()
-        .success();
+    repo.make_store("s", &["c", "a", "b"]);
+    repo.write_state("[stores.s]\ntarget = \"home/s\"\nfiles = [\"c\", \"a\", \"b\"]\n");
+
+    // Adding a different store triggers a state.toml rewrite, which
+    // re-serializes all stores with sorted files.
+    repo.cmd().args(["add", "home/other"]).assert().success();
 
     let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
     // files emitted sorted as a, b, c — not insertion order (c, a, b). The toml
