@@ -16,7 +16,7 @@ A store is a top-level repo dir symlinked to an explicit target — whole-direct
 filter by platform/hostname/shell. Defining choice: symlinks point target→repo, so edits
 always land in the repo directly — no source/target drift, no re-add step.
 
-**Config/state split (v0.3, shipped, breaking):** human-authored config (`stitch.toml`, repo root) is separated from tool-generated desired state (`.stitch/state.toml`). The tool never rewrites the authored file after `init`; `add`/`adopt`/`remove` write `state.toml` only. Motivation: v0.2's single-file `.stitch/config.toml` was reserialized (`to_string_pretty`) on every mutation, silently destroying comments. Load merges the two by store name. Multi-target `targets` is a name-keyed `BTreeMap` — **the name is the map key**, not a field on `TargetEntry` (a redundant field would desync). See SPEC.md §Config.
+**Config/state split (v0.3, shipped, breaking):** human-authored config (`stitch.toml`, repo root) is separated from tool-generated desired state (`.stitch/state.toml`). The tool never rewrites the authored file after `init`; `add`/`remove` write `state.toml` only. Motivation: v0.2's single-file `.stitch/config.toml` was reserialized (`to_string_pretty`) on every mutation, silently destroying comments. Load merges the two by store name. Multi-target `targets` is a name-keyed `BTreeMap` — **the name is the map key**, not a field on `TargetEntry` (a redundant field would desync). See SPEC.md §Config.
 
 ## Platform
 **Linux only.** Built on POSIX symlinks; does not compile on Windows. macOS is not
@@ -26,7 +26,7 @@ officially supported or tested. `when.os` mirrors `std::env::consts::OS`.
 **All P0, P1, and P2 issues from the 2026-06 trust review are resolved.** Each red
 line below is now upheld by the code. Full findings — severity-ranked, with file
 references, test gaps, and a fix order — are in `docs/reviews/2026-06-15-trust-review.md`.
-Read it before touching `adopt`, the linker, or `apply`.
+Read it before touching `add`, the linker, or `apply`.
 
 Oracle #2 re-review (2026-06-17) confirmed all blockers resolved and would
 personally use stitch for real dotfiles. Four hardening items were also
@@ -41,7 +41,7 @@ movement, data exposure, or silent replacement.** New code must uphold:
   opt-in flag is set.
 - **Foreign symlinks are conflicts, not replacements.** A symlink not pointing into this
   repo is never silently clobbered.
-- **Exit codes are honest.** `add`/`adopt`/`apply`/`diff`/`prune` return non-zero on real errors
+- **Exit codes are honest.** `add`/`apply`/`diff`/`prune` return non-zero on real errors
   and conflicts (including partial removal failure in `prune --yes`).
 - **Validate path fragments.** Reject absolute and `..`-containing file entries; nothing
   escapes the store/target dirs.
@@ -50,7 +50,7 @@ movement, data exposure, or silent replacement.** New code must uphold:
 - **`prune` is list-only by default.** It walks `$HOME` for repo-pointing symlinks no store references; removal requires explicit `--yes`. Removal routes through the `points_into_repo`-guarded `remove_link`, so foreign symlinks are never touched and a link repointed between scan and unlink is skipped. (v0.3.1, shipped.)
 
 Note: as of 2026-06-15 every red-line violation flagged in the review is resolved.
-When touching `adopt`, the linker, `apply`, or config parsing, keep the code in line
+When touching `add`, the linker, `apply`, or config parsing, keep the code in line
 with these red lines — don't reintroduce a violation.
 
 ## Quality bar
@@ -64,3 +64,16 @@ cargo test          # unit + CLI integration tests
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+## Releases
+A release is a commit titled `Release vX.Y.Z` that bumps `version` in `Cargo.toml`.
+**Every release commit must also be tagged** with an annotated tag of the same name
+(`vX.Y.Z`); a version bump without a tag is incomplete. The tag is created on the
+release commit itself, not on a later follow-up.
+
+```sh
+# after the Release vX.Y.Z commit lands on main:
+git tag -a vX.Y.Z <release-commit> -m "vX.Y.Z: <one-line summary>"
+```
+
+Existing tags: `v0.2.0` (d35496a), `v0.3.0` (76fc01f), `v0.3.1` (6d10de3).
