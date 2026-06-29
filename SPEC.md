@@ -104,6 +104,25 @@ Multi-target array entries get deterministic names during migration (hostname-fi
 - **Authored vs generated** — `stitch.toml` is human-authored and never rewritten by the tool (after `init`); `.stitch/state.toml` is generated and tool-owned. The split exists so mutations to inventory never clobber your comments and formatting.
 - **Desired state is truth** — `stitch apply` reconciles the filesystem to match the merged config. The entire update loop.
 
+## Repo discovery
+
+Every command except `init` resolves the repo root by, in order:
+
+1. **`--repo <path>`** global flag (highest precedence),
+2. **`STITCH_REPO`** env var,
+3. an upward walk from cwd looking for a `.stitch/` directory (the default).
+
+An override (flag or env) must point at a directory that actually contains
+`.stitch/`; a typo is rejected rather than silently operating on the wrong
+directory. `init` is cwd-anchored and ignores both — it creates a new repo in
+the current directory, so honoring an override would be surprising.
+
+Set `STITCH_REPO` once in your shell rc to run `stitch` from anywhere:
+
+```sh
+export STITCH_REPO=~/dots
+```
+
 ## Commands
 
 ### `stitch init`

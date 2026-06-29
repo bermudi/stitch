@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 /// A scratch repo: a tempdir with `.stitch/` initialized and the two-file
@@ -69,6 +70,7 @@ impl Repo {
         let mut c = Command::cargo_bin("stitch").expect("stitch binary");
         c.current_dir(self.dir.path());
         c.env_remove("EDITOR"); // avoid any inherited editor
+        c.env_remove("STITCH_REPO"); // tests drive --repo explicitly when needed
         c
     }
 }
@@ -159,6 +161,7 @@ fn apply_outside_repo_errors() {
     Command::cargo_bin("stitch")
         .unwrap()
         .current_dir(dir.path())
+        .env_remove("STITCH_REPO")
         .arg("apply")
         .assert()
         .failure()
@@ -171,10 +174,214 @@ fn list_outside_repo_errors() {
     Command::cargo_bin("stitch")
         .unwrap()
         .current_dir(dir.path())
+        .env_remove("STITCH_REPO")
         .arg("list")
         .assert()
         .failure()
         .stderr(contains("not inside a stitch repo"));
+}
+
+// ---------------------------------------------------------------------------
+// --repo flag / STITCH_REPO env — run from outside the repo
+// ---------------------------------------------------------------------------
+
+/// Run `stitch --repo <path> list` from an unrelated cwd and confirm it
+/// operates on the referenced repo.
+#[test]
+fn repo_flag_works_from_outside() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    // Run from a completely different tempdir.
+    let elsewhere = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .env_remove("STITCH_REPO")
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("nvim"));
+}
+
+/// `STITCH_REPO` env var alone is enough to operate from outside the repo.
+#[test]
+fn stitch_repo_env_works_from_outside() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .env("STITCH_REPO", repo.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("bashrc"));
+}
+
+/// `--repo` takes precedence over `STITCH_REPO` when both are set.
+#[test]
+fn repo_flag_overrides_env() {
+    let repo = Repo::new();
+    repo.make_store("real", &["f"]);
+    repo.write_state(
+        r#"
+[stores.real]
+target = "~/.config/real"
+"#,
+    );
+
+    // A second repo that would produce different output.
+    let decoy = Repo::new();
+    decoy.make_store("decoy", &["f"]);
+    decoy.write_state(
+        r#"
+[stores.decoy]
+target = "~/.config/decoy"
+"#,
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .env("STITCH_REPO", decoy.path())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("real"))
+        .stdout(contains("decoy").not());
+}
+
+/// `--repo` pointing at a directory without `.stitch/` is rejected — a typo
+/// can't silently operate on the wrong directory.
+#[test]
+fn repo_flag_rejects_non_repo_path() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("STITCH_REPO")
+        .arg("--repo")
+        .arg(dir.path())
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(contains("does not point at a stitch repo"));
+}
+
+/// `STITCH_REPO` pointing at a non-repo is rejected with a clear message.
+#[test]
+fn stitch_repo_env_rejects_non_repo_path() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .env("STITCH_REPO", dir.path())
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(contains("does not point at a stitch repo"));
+}
+
+/// `init` is cwd-anchored and ignores `--repo` — it creates the repo in the
+/// current directory, not at the --repo path.
+#[test]
+fn init_ignores_repo_flag() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let bogus = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .env_remove("STITCH_REPO")
+        .arg("--repo")
+        .arg(bogus.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(contains("Initialized stitch config"));
+
+    // Created in `elsewhere` (cwd), not in `bogus` (--repo).
+    assert!(elsewhere.path().join(".stitch").is_dir());
+    assert!(!bogus.path().join(".stitch").is_dir());
+}
+
+/// `--repo` accepts a relative path, resolved against cwd.
+#[test]
+fn repo_flag_accepts_relative_path() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    // Run from a sibling tempdir, referencing the repo by a relative path.
+    // We can't easily construct a relative path between two tempdirs, so run
+    // from the repo's parent and use the basename.
+    let parent = repo.path().parent().unwrap();
+    let basename = repo.path().file_name().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(parent)
+        .env_remove("STITCH_REPO")
+        .arg("--repo")
+        .arg(basename)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("nvim"));
+}
+
+/// `STITCH_REPO` expands `~` to the user's home directory.
+#[test]
+fn stitch_repo_env_expands_tilde() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    // Set HOME to the repo's parent so `~/basename` resolves to the repo.
+    let parent = repo.path().parent().unwrap();
+    let basename = repo.path().file_name().unwrap();
+    let tilde_path = format!("~/{}", basename.to_string_lossy());
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .env("HOME", parent)
+        .env("STITCH_REPO", &tilde_path)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("bashrc"));
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,11 @@ use clap::{Parser, Subcommand};
     about = "A dotfile manager that symlinks your configs into place"
 )]
 pub struct Cli {
+    /// Path to the stitch repo to operate on. Overrides the STITCH_REPO env
+    /// var and the upward cwd walk. Ignored by `init` (which is cwd-anchored).
+    #[arg(long, global = true, value_name = "PATH")]
+    pub repo: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
