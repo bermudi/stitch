@@ -666,7 +666,7 @@ pub fn find_root(start: &Path) -> Option<PathBuf> {
 
 /// Expand `~` at the start of a path.
 pub fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
+    let raw = if let Some(rest) = path.strip_prefix("~/") {
         dirs::home_dir()
             .expect("could not determine home directory")
             .join(rest)
@@ -674,7 +674,17 @@ pub fn expand_home(path: &str) -> PathBuf {
         dirs::home_dir().expect("could not determine home directory")
     } else {
         PathBuf::from(path)
+    };
+    // Strip trailing slashes: symlink(2) fails with ENOENT when the linkpath
+    // has a trailing slash (the kernel treats it as "must resolve to a
+    // directory", but the path doesn't exist yet when we're creating a link).
+    // User input like `stitch add ~/.config/alacritty/` would otherwise fail
+    // at the link step with a confusing rollback error.
+    let mut s = raw.to_string_lossy().into_owned();
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
     }
+    PathBuf::from(s)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -712,6 +722,17 @@ mod tests {
             expand_home("/absolute/path"),
             PathBuf::from("/absolute/path")
         );
+        // Trailing slashes are stripped — symlink(2) fails on a linkpath
+        // with a trailing slash, so `stitch add ~/.config/foo/` must not
+        // carry the slash through to the linker.
+        assert_eq!(expand_home("~/foo/"), home.join("foo"));
+        assert_eq!(expand_home("~/foo///"), home.join("foo"));
+        assert_eq!(
+            expand_home("/absolute/path/"),
+            PathBuf::from("/absolute/path")
+        );
+        // Root stays root — the `len() > 1` guard prevents stripping "/" to "".
+        assert_eq!(expand_home("/"), PathBuf::from("/"));
     }
 
     #[test]

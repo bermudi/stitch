@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-06-28
+
+### Fixes
+
+- **`stitch add` with a trailing slash now works.** `stitch add ~/.config/alacritty/`
+  used to fail at the link step with a confusing rollback error. Root cause:
+  `symlink(2)` rejects a linkpath with a trailing slash (the kernel treats it as
+  "must resolve to an existing directory", but the path doesn't exist yet when
+  we're creating the symlink). `expand_home` now strips trailing slashes from
+  its result, fixing the issue for every caller (`add`, `apply`, `scan`,
+  config load). Root (`/`) is preserved.
+
 ## 0.4.0 — 2026-06-28
 
 ### BREAKING — `adopt` merged into `add`
