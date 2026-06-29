@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Run `stitch` from outside the repo.** A global `--repo <path>` flag and
+  `STITCH_REPO` env var let you operate on a repo without `cd`-ing into it.
+  Precedence: `--repo` > `STITCH_REPO` > upward cwd walk (unchanged default).
+  An override must point at a directory containing `.stitch/` — a typo is
+  rejected, not silently applied to the wrong directory. `init` is cwd-anchored
+  and ignores both (it creates a new repo in the current directory).
+
 ## 0.4.1 — 2026-06-28
 
 ### Fixes

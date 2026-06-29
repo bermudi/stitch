@@ -19,32 +19,65 @@ fn main() {
 }
 
 fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // `init` is cwd-anchored: it creates a new repo in the current directory,
+    // so it must not honor --repo/STITCH_REPO. Every other command resolves
+    // the repo once here (flag > env > cwd walk) and receives `&root`.
     match cli.command {
         cli::Commands::Init => cmd_init(),
         cli::Commands::Apply {
             only,
             dry_run,
             force,
-        } => cmd_apply(&only, store::ApplyOpts { dry_run, force }),
-        cli::Commands::Status { name } => cmd_status(&name),
-        cli::Commands::Diff { only, force } => cmd_diff(&only, force),
-        cli::Commands::List => cmd_list(),
+        } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_apply(&root, &only, store::ApplyOpts { dry_run, force })
+        }
+        cli::Commands::Status { name } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_status(&root, &name)
+        }
+        cli::Commands::Diff { only, force } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_diff(&root, &only, force)
+        }
+        cli::Commands::List => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_list(&root)
+        }
         cli::Commands::Add {
             path,
             name,
             files,
             patterns,
             dry_run,
-        } => cmd_add(&path, &name, &files, &patterns, dry_run),
-        cli::Commands::Remove { name } => cmd_remove(&name),
-        cli::Commands::Edit => cmd_edit(),
-        cli::Commands::Doctor => cmd_doctor(),
-        cli::Commands::Migrate { dry_run } => cmd_migrate(dry_run),
+        } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_add(&root, &path, &name, &files, &patterns, dry_run)
+        }
+        cli::Commands::Remove { name } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_remove(&root, &name)
+        }
+        cli::Commands::Edit => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_edit(&root)
+        }
+        cli::Commands::Doctor => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_doctor(&root)
+        }
+        cli::Commands::Migrate { dry_run } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_migrate(&root, dry_run)
+        }
         cli::Commands::Prune {
             scan_dirs,
             dry_run,
             yes,
-        } => cmd_prune(&scan_dirs, dry_run, yes),
+        } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_prune(&root, &scan_dirs, dry_run, yes)
+        }
     }
 }
 
@@ -78,10 +111,45 @@ fn check_unknown_names(
     }
 }
 
-/// Resolve the repo root from cwd, or error.
-fn resolve_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+/// Resolve the repo root.
+///
+/// Precedence: an explicit `--repo` override > the `STITCH_REPO` env var > an
+/// upward walk from cwd looking for `.stitch/`. `init` is cwd-anchored and
+/// does not call this. An override (flag or env) must point at a directory
+/// that actually contains `.stitch/` — we don't trust a bare path, so a typo
+/// can't silently operate on the wrong directory.
+fn resolve_root(
+    override_path: Option<&str>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    if let Some(p) = override_path {
+        return resolve_override(p, "--repo");
+    }
+    if let Ok(p) = std::env::var("STITCH_REPO")
+        && !p.is_empty()
+    {
+        return resolve_override(&p, "STITCH_REPO");
+    }
     let cwd = std::env::current_dir()?;
     find_root(&cwd).ok_or_else(|| "not inside a stitch repo (no .stitch/ found)".into())
+}
+
+/// Validate an explicit repo override (from `--repo` or `STITCH_REPO`):
+/// expand `~`, require a `.stitch/` dir so a typo can't silently operate on
+/// the wrong directory, and canonicalize when possible. `label` prefixes the
+/// error so the user knows which override was bad.
+fn resolve_override(
+    path: &str,
+    label: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let root = expand_home(path);
+    if !root.join(".stitch").is_dir() {
+        return Err(format!(
+            "{label} {} does not point at a stitch repo (no .stitch/ found)",
+            root.display()
+        )
+        .into());
+    }
+    Ok(root.canonicalize().unwrap_or(root))
 }
 
 fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
@@ -118,9 +186,12 @@ fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let loaded = Config::load(&root)?;
+fn cmd_apply(
+    root: &std::path::Path,
+    only: &[String],
+    opts: store::ApplyOpts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let loaded = Config::load(root)?;
     print_warnings(&loaded);
     check_unknown_names(only.iter().map(|s| s.as_str()), &loaded.config)?;
     let platform = Platform::detect();
@@ -137,16 +208,16 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
     // Global pre-apply hook (skipped under dry-run — hooks have side effects).
     if !opts.dry_run {
         let env = hooks::HookEnv {
-            root: &root,
+            root,
             store: None,
             target: None,
             action: "apply",
         };
-        hooks::run_global_hook(&root, "pre-apply", &env, &platform)
+        hooks::run_global_hook(root, "pre-apply", &env, &platform)
             .map_err(|e| format!("pre-apply hook: {e}"))?;
     }
 
-    let results = store::apply_all(&root, &filtered_config, &platform, opts);
+    let results = store::apply_all(root, &filtered_config, &platform, opts);
 
     let mut created = 0;
     let mut replaced = 0;
@@ -201,12 +272,12 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
     // apply already happened, so post-hook failure does not abort.
     if !opts.dry_run {
         let env = hooks::HookEnv {
-            root: &root,
+            root,
             store: None,
             target: None,
             action: "apply",
         };
-        if let Err(e) = hooks::run_global_hook(&root, "post-apply", &env, &platform) {
+        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform) {
             eprintln!("warning: post-apply hook: {e}");
         }
     }
@@ -218,16 +289,18 @@ fn cmd_apply(only: &[String], opts: store::ApplyOpts) -> Result<(), Box<dyn std:
     }
 }
 
-fn cmd_status(name: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let loaded = Config::load(&root)?;
+fn cmd_status(
+    root: &std::path::Path,
+    name: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let loaded = Config::load(root)?;
     print_warnings(&loaded);
     if let Some(name) = name {
         check_unknown_names(std::iter::once(name.as_str()), &loaded.config)?;
     }
     let platform = Platform::detect();
 
-    let entries = store::status_all(&root, &loaded.config, &platform);
+    let entries = store::status_all(root, &loaded.config, &platform);
 
     for entry in &entries {
         if let Some(filter) = name
@@ -279,8 +352,13 @@ fn cmd_status(name: &Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_diff(only: &[String], force: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_diff(
+    root: &std::path::Path,
+    only: &[String],
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     cmd_apply(
+        root,
         only,
         store::ApplyOpts {
             dry_run: true,
@@ -289,9 +367,8 @@ fn cmd_diff(only: &[String], force: bool) -> Result<(), Box<dyn std::error::Erro
     )
 }
 
-fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let loaded = Config::load(&root)?;
+fn cmd_list(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let loaded = Config::load(root)?;
     print_warnings(&loaded);
 
     for (name, store) in &loaded.config.stores {
@@ -354,14 +431,14 @@ fn discard_uncommitted_add(
 }
 
 fn cmd_add(
+    root: &std::path::Path,
     path: &str,
     name: &Option<String>,
     files: &[String],
     patterns: &[String],
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let mut loaded = Config::load(&root)?;
+    let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
 
     let source = expand_home(path);
@@ -488,7 +565,7 @@ fn cmd_add(
         // it was. State was never touched.
         let platform = Platform::detect();
         let results = store::apply_store(
-            &root,
+            root,
             &store_name,
             &new_store,
             &platform,
@@ -505,7 +582,7 @@ fn cmd_add(
         }) {
             for action in &results.actions {
                 if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
-                    let _ = linker::remove_link(p, &root);
+                    let _ = linker::remove_link(p, root);
                 }
             }
             rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|e| {
@@ -535,10 +612,10 @@ fn cmd_add(
                 targets: std::collections::BTreeMap::new(),
             },
         );
-        if let Err(e) = loaded.generated.save(&root) {
+        if let Err(e) = loaded.generated.save(root) {
             for action in &results.actions {
                 if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
-                    let _ = linker::remove_link(p, &root);
+                    let _ = linker::remove_link(p, root);
                 }
             }
             rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|re| {
@@ -581,7 +658,7 @@ fn cmd_add(
 
         let platform = Platform::detect();
         let results = store::apply_store(
-            &root,
+            root,
             &store_name,
             &new_store,
             &platform,
@@ -609,7 +686,7 @@ fn cmd_add(
         });
 
         if failed {
-            discard_uncommitted_add(Some(&results), &store_dir, &root);
+            discard_uncommitted_add(Some(&results), &store_dir, root);
             return Err("apply reported conflicts or errors".into());
         }
 
@@ -625,8 +702,8 @@ fn cmd_add(
                 targets: std::collections::BTreeMap::new(),
             },
         );
-        if let Err(e) = loaded.generated.save(&root) {
-            discard_uncommitted_add(Some(&results), &store_dir, &root);
+        if let Err(e) = loaded.generated.save(root) {
+            discard_uncommitted_add(Some(&results), &store_dir, root);
             return Err(e.into());
         }
 
@@ -636,9 +713,8 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let mut loaded = Config::load(&root)?;
+fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
 
@@ -656,12 +732,12 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Global pre-remove hook.
     {
         let env = hooks::HookEnv {
-            root: &root,
+            root,
             store: Some(name),
             target: target.as_deref(),
             action: "remove",
         };
-        hooks::run_global_hook(&root, "pre-remove", &env, &platform)
+        hooks::run_global_hook(root, "pre-remove", &env, &platform)
             .map_err(|e| format!("pre-remove hook: {e}"))?;
     }
 
@@ -669,7 +745,7 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // entry from the generated half. stitch.toml behavior is deliberately left
     // in place (the tool never rewrites authored config); `doctor` flags the
     // orphaned behavior if the user wants to clean it up via `stitch edit`.
-    let statuses = store::status_all(&root, &loaded.config, &platform);
+    let statuses = store::status_all(root, &loaded.config, &platform);
     loaded.generated.stores.remove(name);
 
     let linked: Vec<_> = statuses
@@ -678,21 +754,21 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
         .filter(|e| e.status == linker::LinkStatus::Linked)
         .collect();
     for entry in &linked {
-        linker::remove_link(&entry.target, &root)?;
+        linker::remove_link(&entry.target, root)?;
         println!("  removed {}", entry.target.display());
     }
 
-    loaded.generated.save(&root)?;
+    loaded.generated.save(root)?;
 
     // Global post-remove hook.
     {
         let env = hooks::HookEnv {
-            root: &root,
+            root,
             store: Some(name),
             target: target.as_deref(),
             action: "remove",
         };
-        if let Err(e) = hooks::run_global_hook(&root, "post-remove", &env, &platform) {
+        if let Err(e) = hooks::run_global_hook(root, "post-remove", &env, &platform) {
             eprintln!("warning: post-remove hook: {e}");
         }
     }
@@ -701,8 +777,7 @@ fn cmd_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_edit() -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
+fn cmd_edit(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let authored_path = root.join("stitch.toml");
     if !authored_path.exists() {
         return Err(format!(
@@ -723,15 +798,14 @@ fn cmd_edit() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let loaded = Config::load(&root)?;
+fn cmd_doctor(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
 
     println!("Checking stitch health...\n");
 
-    let result = store::doctor(&root, &loaded, &platform);
+    let result = store::doctor(root, &loaded, &platform);
 
     for msg in &result.info {
         println!("  [info]  {msg}");
@@ -763,8 +837,7 @@ fn cmd_doctor() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn cmd_migrate(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
+fn cmd_migrate(root: &std::path::Path, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     let legacy_path = root.join(".stitch").join("config.toml");
     let authored_path = root.join("stitch.toml");
     let state_path = root.join(".stitch").join("state.toml");
@@ -866,12 +939,12 @@ fn cmd_migrate(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_prune(
+    root: &std::path::Path,
     scan_dirs: &[String],
     dry_run: bool,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let loaded = Config::load(&root)?;
+    let loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
 
@@ -889,8 +962,8 @@ fn cmd_prune(
             .collect()
     };
 
-    let found = scan::scan_for_repo_links(&root, &roots);
-    let orphans = scan::orphan_links(&root, &found, &loaded.config, &platform);
+    let found = scan::scan_for_repo_links(root, &roots);
+    let orphans = scan::orphan_links(root, &found, &loaded.config, &platform);
 
     if orphans.is_empty() {
         println!("No orphaned links found.");
@@ -915,7 +988,7 @@ fn cmd_prune(
     let mut removed = 0;
     let mut failed = 0;
     for fl in &orphans {
-        match linker::remove_link(&fl.link, &root) {
+        match linker::remove_link(&fl.link, root) {
             Ok(true) => {
                 removed += 1;
                 println!("  removed {}", fl.link.display());
