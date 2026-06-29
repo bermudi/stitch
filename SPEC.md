@@ -6,7 +6,7 @@ Symlinks point from the target (`~/.bashrc`, `~/.config/nvim`) back to the repo.
 
 ## Config
 
-Desired state is split across two files by authorship. Load-bearing rule: **human-authored content is never rewritten by the tool.** v0.2 mixed authored and generated fields in one file, so every `add`/`adopt`/`remove` reserialized the whole thing via `to_string_pretty` and silently destroyed comments and hand-formatting. The split ends that.
+Desired state is split across two files by authorship. Load-bearing rule: **human-authored content is never rewritten by the tool.** v0.2 mixed authored and generated fields in one file, so every `add`/`remove` reserialized the whole thing via `to_string_pretty` and silently destroyed comments and hand-formatting. The split ends that.
 
 ### `stitch.toml` — repo root, visible, **authored**
 
@@ -29,7 +29,7 @@ ignore = ["*.bak", "scratch/"]
 
 ### `.stitch/state.toml` — hidden, **generated**
 
-stitch writes this. It records the concrete link inventory — what to link, where. `add`/`adopt`/`remove` are the only writers. You may hand-edit it (plain TOML), but the tool is authorized to reserialize it on the next mutation, so do not rely on comments or formatting here.
+stitch writes this. It records the concrete link inventory — what to link, where. `add`/`remove` are the only writers. You may hand-edit it (plain TOML), but the tool is authorized to reserialize it on the next mutation, so do not rely on comments or formatting here.
 
 ```toml
 [stores.nvim]
@@ -83,7 +83,7 @@ target = "~/.config/helix"
 target = "~/.config/helix"
 ```
 
-`add`/`adopt` generate a name when none is given (from `when.hostname`, else `target-<n>`). Renaming in one file without the other orphans the entry; `doctor` warns.
+`add` derives a store name from the target path basename (leading `.` stripped) when `--name` is not given. `migrate` names v0.2 multi-target array entries hostname-first, else `target-<n>` with a `-N` suffix on collision. Renaming in one file without the other orphans the entry; `doctor` warns.
 
 ### Migration
 
@@ -137,24 +137,18 @@ Preview what `stitch apply` would do. Reports `ok`, `create`, `conflict`, `repla
 
 Print all configured stores and their targets.
 
-### `stitch adopt <path>`
+### `stitch add <path>`
 
-Move an existing file or directory into the repo, record the link in `.stitch/state.toml`, symlink back. Writes inventory only — `stitch.toml` is untouched.
+Add a path to stitch. If the path exists as a real file or directory, it is moved into the repo and symlinked back (adopt). If it doesn't exist, an empty store directory is created and linked to the path. Either way, the link inventory is recorded in `.stitch/state.toml` only — `stitch.toml` is untouched.
+
+A symlink at the target path is always an error (never silently clobbered). The store name is derived from the path basename with a leading `.` stripped; override with `--name`.
 
 | Flag | Short | Description |
 |---|---|---|
 | `--name` | `-n` | Override derived store name |
+| `--files` | `-f` | Files to link individually (repeatable; create-empty only) |
+| `--patterns` | `-p` | Glob patterns (repeatable; create-empty only) |
 | `--dry-run` | | Preview |
-
-### `stitch add <name> [target]`
-
-Create a store directory, record it in `.stitch/state.toml`, and link immediately if a target is provided. Writes `state.toml` only.
-
-| Flag | Short | Description |
-|---|---|---|
-| `--target` | `-t` | Target path (or pass positionally) |
-| `--files` | `-f` | Files to link individually (repeatable) |
-| `--patterns` | `-p` | Glob patterns (repeatable) |
 
 ### `stitch remove <name>`
 
@@ -284,13 +278,12 @@ If ignored content exists, whole-directory mode is promoted to file mode.
 Before linking, if a real file/dir exists at the target (not a stitch-managed
 symlink):
 1. Stop.
-2. Offer to move it into the repo (store `adopt` behavior) — the interactive
-   path.
-3. Then symlink back.
+2. `stitch add <path>` moves it into the repo and symlinks back — the
+   interactive path.
+3. Or `apply --force` renames the conflicting target to `{target}.bak` and
+   links in place, leaving a recoverable copy alongside.
 
-`apply --force` is the scripted path: it renames the conflicting target to
-`{target}.bak` and links in place, leaving a recoverable copy alongside.
-(`adopt` moves the file *into* the repo to manage it; `--force` leaves the
+(`add` moves the file *into* the repo to manage it; `--force` leaves the
 backup in the target dir.)
 
 Nothing overwritten silently. Foreign symlinks (stow/chezmoi/Nix/Home-Manager)
@@ -320,7 +313,7 @@ read-only to the tool after `init`.
 
 ### ✅ v0.2 — shipped (2026-06-17)
 - [x] Config parsing, `init`, `apply`, `status`, `list`, `doctor`
-- [x] `adopt`, `add`, `remove`, `edit`, `diff`
+- [x] `add`, `remove`, `edit`, `diff`
 - [x] Whole-directory and file mode with recursive glob
 - [x] Platform conditionals, multi-target stores
 - [x] Hooks (per-store pre/post + global `.stitch/hooks/` executables)
@@ -331,12 +324,12 @@ read-only to the tool after `init`.
 ### v0.3 — Config/state split (shipped 2026-06-18, **breaking**)
 Separate human-authored config from tool-generated desired state. See
 [Config](#config). Motivated by the v0.2 single-file model silently destroying
-comments on every `add`/`adopt`/`remove` reserialize.
+comments on every `add`/`remove` reserialize.
 
 - [x] `stitch.toml` (authored, root) vs `.stitch/state.toml` (generated)
 - [x] Load-time merge by store name; field-ownership table enforced
 - [x] Named multi-target entries (name is the cross-file join key)
-- [x] `add`/`adopt`/`remove` write `state.toml` only; `stitch.toml` read-only after `init`
+- [x] `add`/`remove` write `state.toml` only; `stitch.toml` read-only after `init`
 - [x] `stitch migrate` — one-shot split of v0.2 `.stitch/config.toml`
 - [x] `doctor`: orphaned-behavior detection (authored store with no state entry)
 - [x] Deterministic `state.toml` ordering (sorted maps + files/patterns)
@@ -362,6 +355,6 @@ comments on every `add`/`adopt`/`remove` reserialize.
 - **Symlinks, not copies** — edits hit the repo directly. No drift possible.
 - **Explicit config** — no inferring targets from directory layout. You declare it.
 - **Absolute symlinks** — resolved to absolute source paths so cwd doesn't matter.
-- **Authored vs generated, never mixed** — `stitch.toml` is yours and hand-editable; `.stitch/state.toml` is the tool's. The tool never rewrites the authored file after `init`, so comments and formatting survive every mutation. v0.2's single-file model violated this and ate comments on every `add`/`adopt`/`remove`.
+- **Authored vs generated, never mixed** — `stitch.toml` is yours and hand-editable; `.stitch/state.toml` is the tool's. The tool never rewrites the authored file after `init`, so comments and formatting survive every mutation. v0.2's single-file model violated this and ate comments on every `add`/`remove`.
 - **Desired state is truth** — `apply` reconciles the filesystem to match the merged config. Change config, re-apply. That's the loop.
 - **Non-destructive by default** — conflicts stop, not clobber. `--force` for scripted use.

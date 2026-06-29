@@ -32,7 +32,7 @@ Requires Rust 2024 edition.
 mkdir ~/dots && cd ~/dots
 stitch init                                # create stitch.toml + .stitch/state.toml
 $EDITOR stitch.toml                        # add behavior (when, hooks, ignore)
-stitch add nvim ~/.config/nvim             # record a store's link inventory
+stitch add ~/.config/nvim                   # move existing content into the repo and link back (or create empty store if target doesn't exist)
 stitch apply                               # link them into place
 stitch status                              # verify
 ```
@@ -42,7 +42,7 @@ Config is split across two files by authorship:
 - **`stitch.toml`** (repo root) — yours. `vars`, `when`, `hooks`, `ignore`.
   Written once at `init`; the tool never rewrites it, so your comments survive.
 - **`.stitch/state.toml`** (hidden) — the tool's. `target`, `files`,
-  `patterns`. `add`/`adopt`/`remove` are the only writers.
+  `patterns`. `add`/`remove` are the only writers.
 
 ## Example config
 
@@ -83,8 +83,7 @@ target = "~/.config/git"
 | `stitch status [name]` | Show symlink state per store |
 | `stitch diff` | Preview what `apply` would do |
 | `stitch list` | Print all configured stores and targets |
-| `stitch adopt <path>` | Move an existing file/dir into the repo and link back |
-| `stitch add <name> [target]` | Create a store dir and inventory entry |
+| `stitch add <path>` | Move existing content into the repo and link back, or create an empty store if the path doesn't exist |
 | `stitch remove <name>` | Remove symlinks and the inventory entry |
 | `stitch edit` | Open `stitch.toml` in `$EDITOR` |
 | `stitch doctor` | Health check (orphaned behavior, broken links, conflicts) |
@@ -121,7 +120,7 @@ movement, exposure, or silent replacement.**
   never silently replaced, even under `--force`.
 - `apply --force` renames a conflicting real file/dir to `{target}.bak` before
   linking. Refuses if `.bak` already exists.
-- `adopt` moves a file *into* the repo to manage it; `--force` leaves the
+- `add` moves a file *into* the repo to manage it; `--force` leaves the
   backup in the target dir.
 - Path traversal is rejected: absolute and `..`-containing `files`/`patterns`
   entries are rejected at config load.

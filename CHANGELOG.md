@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.0 — Unreleased
+
+### BREAKING — `adopt` merged into `add`
+
+`stitch adopt` is removed. `stitch add` now does both jobs based on whether the
+path exists:
+
+| Old | New |
+|---|---|
+| `stitch adopt <path>` | `stitch add <path>` (path exists → move into repo + link back) |
+| `stitch add <name> [target]` | `stitch add <path>` (path missing → create empty store + link) |
+
+**Why:** the old split had two commands with different signatures, different
+name-derivation rules, and a footgun — `stitch add ~/.shrc` silently created a
+store named `~/.shrc` with no target, a literal `~` directory in the repo, and
+linked nothing. One command with one rule (path is the positional, name derived
+from basename) eliminates the ambiguity.
+
+**Migration:** replace `stitch adopt <path>` with `stitch add <path>`. Replace
+`stitch add <name> <target>` with `stitch add <target> [--name <name>]`. The
+no-target form (`stitch add <name>`) is gone — it created a dead-end store with
+no link; use `stitch add <target>` instead.
+
+**New error:** `--files`/`--patterns` on an existing path now errors (the moved
+content determines the store layout; they were silently ignored before).
+
+### Features
+
+- `stitch add --dry-run` — preview both adopt-existing and create-empty paths.
+
 ## 0.3.1 — 2026-06-18
 
 ### Features
