@@ -29,23 +29,13 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
         cli::Commands::Status { name } => cmd_status(&name),
         cli::Commands::Diff { only, force } => cmd_diff(&only, force),
         cli::Commands::List => cmd_list(),
-        cli::Commands::Adopt {
+        cli::Commands::Add {
             path,
             name,
-            dry_run,
-        } => cmd_adopt(&path, &name, dry_run),
-        cli::Commands::Add {
-            name,
-            target,
-            target_flag,
             files,
             patterns,
-        } => cmd_add(
-            &name,
-            target.as_deref().or(target_flag.as_deref()),
-            &files,
-            &patterns,
-        ),
+            dry_run,
+        } => cmd_add(&path, &name, &files, &patterns, dry_run),
         cli::Commands::Remove { name } => cmd_remove(&name),
         cli::Commands::Edit => cmd_edit(),
         cli::Commands::Doctor => cmd_doctor(),
@@ -342,185 +332,12 @@ fn rollback_adopt_move(
     }
 }
 
-fn cmd_adopt(
-    path: &str,
-    name: &Option<String>,
-    dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let root = resolve_root()?;
-    let mut loaded = Config::load(&root)?;
-    print_warnings(&loaded);
-
-    let source = expand_home(path);
-    if source.is_symlink() {
-        return Err(format!(
-            "{} is already a symlink — adopt expects a real file or directory \
-             (remove the symlink first if you want stitch to manage it)",
-            source.display()
-        )
-        .into());
-    }
-    if !source.exists() {
-        return Err(format!("path does not exist: {}", source.display()).into());
-    }
-
-    // Determine store name: strip leading dot for the directory name in the repo.
-    let raw_name = source
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unnamed".into());
-    let store_name = name
-        .clone()
-        .unwrap_or_else(|| raw_name.trim_start_matches('.').to_string());
-
-    let store_dir = root.join(&store_name);
-    let is_dir = source.is_dir();
-
-    // Determine target path BEFORE moving the file.
-    let target_str = if is_dir {
-        source.to_string_lossy().into_owned()
-    } else {
-        source
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "~".into())
-    };
-
-    if dry_run {
-        println!("Would adopt:");
-        println!("  {} → {}/", source.display(), store_dir.display());
-        println!(
-            "  then symlink back to {}",
-            expand_home(&target_str).display()
-        );
-        return Ok(());
-    }
-
-    // --- Pre-checks: reject any collision BEFORE mutating anything. ---
-    if loaded.config.stores.contains_key(&store_name) {
-        return Err(format!("store '{}' already exists in config", store_name).into());
-    }
-    if store_dir.exists() {
-        return Err(format!("destination already exists: {}", store_dir.display()).into());
-    }
-
-    // Build two literals: (1) a Store for the pre-commit preview (apply_store
-    // takes &Store and the store doesn't exist in the merged view yet — it's
-    // being created, so authored side is empty/default), and (2) a
-    // GeneratedStore for persistence. They mirror the same inventory.
-    let files = if is_dir {
-        vec![]
-    } else {
-        vec![raw_name.clone()]
-    };
-    let new_store = config::Store {
-        target: Some(target_str.clone()),
-        files: files.clone(),
-        patterns: vec![],
-        ignore: vec![],
-        when: config::WhenClause::default(),
-        hooks: config::Hooks::default(),
-        targets: std::collections::BTreeMap::new(),
-    };
-
-    // --- Move: relocate the file/dir into the repo. ---
-    if is_dir {
-        std::fs::rename(&source, &store_dir)?;
-    } else {
-        std::fs::create_dir_all(&store_dir)?;
-        std::fs::rename(&source, store_dir.join(&raw_name))?;
-    }
-
-    // --- Link: create the return symlink using the in-memory store. ---
-    // If this fails, roll back the move so the user's file is back where it
-    // was. State was never touched.
-    let platform = Platform::detect();
-    let results = store::apply_store(
-        &root,
-        &store_name,
-        &new_store,
-        &platform,
-        store::ApplyOpts {
-            dry_run: false,
-            force: false,
-        },
-    );
-    if results.actions.iter().any(|a| {
-        matches!(
-            a,
-            store::ApplyAction::Conflict(_) | store::ApplyAction::Error(_)
-        )
-    }) {
-        // Roll back: remove any link that was created, then move back.
-        for action in &results.actions {
-            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
-                let _ = linker::remove_link(p, &root);
-            }
-        }
-        rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|e| {
-            format!(
-                "ADOPT FAILED and rollback also failed: {} is stranded in {} ({})",
-                source.display(),
-                store_dir.display(),
-                e
-            )
-        })?;
-        return Err(format!(
-            "could not link {} back; rolled back (file restored to {})",
-            store_name,
-            source.display()
-        )
-        .into());
-    }
-
-    // --- Record: persist state.toml (generated half only). stitch.toml is
-    // never rewritten by the tool after init, so comments/formatting survive. ---
-    loaded.generated.stores.insert(
-        store_name.clone(),
-        config::GeneratedStore {
-            target: Some(target_str.clone()),
-            files,
-            patterns: vec![],
-            targets: std::collections::BTreeMap::new(),
-        },
-    );
-    if let Err(e) = loaded.generated.save(&root) {
-        for action in &results.actions {
-            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
-                let _ = linker::remove_link(p, &root);
-            }
-        }
-        rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|re| {
-            format!(
-                "state save failed ({e}) and rollback also failed: {} is stranded in {} ({re})",
-                source.display(),
-                store_dir.display(),
-            )
-        })?;
-        return Err(e.into());
-    }
-
-    println!("Adopted:");
-    for action in &results.actions {
-        match action {
-            store::ApplyAction::Created(p) => {
-                println!("  {} → {}", store_name, p.display())
-            }
-            store::ApplyAction::AlreadyLinked => {
-                println!("  {} → already linked", store_name)
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Undo a partial `add`: remove any links `apply_store` managed to create,
-/// then remove the (empty) store directory. Unlike `rollback_adopt_move`, add
-/// relocates no user data, so there is nothing to rename back — only links we
-/// created and an empty dir we made are torn down. Errors are ignored: this is
-/// best-effort cleanup on an already-failing path, and a leftover empty dir or
-/// stale link is far less harmful than a half-recorded store.
+/// Undo a partial `add` (create-empty path): remove any links `apply_store`
+/// managed to create, then remove the (empty) store directory. Unlike
+/// `rollback_adopt_move`, this path relocates no user data, so there is
+/// nothing to rename back — only links we created and an empty dir we made
+/// are torn down. Errors are ignored: best-effort cleanup on an already-
+/// failing path.
 fn discard_uncommitted_add(
     results: Option<&store::ApplyResult>,
     store_dir: &std::path::Path,
@@ -537,68 +354,243 @@ fn discard_uncommitted_add(
 }
 
 fn cmd_add(
-    name: &str,
-    target: Option<&str>,
+    path: &str,
+    name: &Option<String>,
     files: &[String],
     patterns: &[String],
+    dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let root = resolve_root()?;
     let mut loaded = Config::load(&root)?;
     print_warnings(&loaded);
 
-    if loaded.config.stores.contains_key(name) {
-        return Err(format!("store '{}' already exists", name).into());
+    let source = expand_home(path);
+
+    // A symlink at the target is always an error — we never silently clobber
+    // or repoint a foreign symlink.
+    if source.is_symlink() {
+        return Err(format!(
+            "{} is already a symlink — add expects a real file or directory \
+             (remove the symlink first if you want stitch to manage it)",
+            source.display()
+        )
+        .into());
     }
 
-    // Reject if the store path already exists on disk — `add` creates fresh
-    // stores; an existing dir (or file, or symlink) at this path is an
-    // ambiguity we shouldn't silently accept. Checked before fragment
-    // validation: no point validating fragments for a store we won't create.
-    let store_dir = root.join(name);
+    // Derive store name from basename, leading dot stripped. Override via --name.
+    let raw_name = source
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".into());
+    let store_name = name
+        .clone()
+        .unwrap_or_else(|| raw_name.trim_start_matches('.').to_string());
+    let store_dir = root.join(&store_name);
+
+    // Pre-checks: reject any collision BEFORE mutating anything.
+    if loaded.config.stores.contains_key(&store_name) {
+        return Err(format!("store '{}' already exists", store_name).into());
+    }
     if store_dir.symlink_metadata().is_ok() {
         return Err(format!("store path '{}' already exists", store_dir.display()).into());
     }
 
     // Validate user-supplied fragments before touching the filesystem: a
-    // `--file ../x` would otherwise escape the store/target dirs during the
-    // apply below (and leave an orphaned store dir on failure).
-    config::validate_fragments(files, patterns, &format!("store '{name}'"))?;
+    // `--file ../x` would otherwise escape the store/target dirs during apply
+    // (and leave an orphaned store dir on failure).
+    config::validate_fragments(files, patterns, &format!("store '{store_name}'"))?;
 
-    std::fs::create_dir_all(&store_dir)?;
+    let source_exists = source.exists();
 
-    // Two literals: a Store for the pre-commit preview (default behavior — a
-    // new store has no authored half yet) and the inventory recorded as a
-    // GeneratedStore for persistence.
-    let new_store = config::Store {
-        target: target.map(|t| t.to_string()),
-        files: files.to_vec(),
-        patterns: patterns.to_vec(),
-        ignore: vec![],
-        when: config::WhenClause::default(),
-        hooks: config::Hooks::default(),
-        targets: std::collections::BTreeMap::new(),
-    };
+    // --files/--patterns only apply when creating an empty store (path doesn't
+    // exist). On the adopt path the moved content determines the store layout,
+    // so passing them is a user error — silently ignoring them would repeat the
+    // "stitch says done, did nothing useful" footgun this command was created to
+    // fix.
+    if source_exists && (!files.is_empty() || !patterns.is_empty()) {
+        return Err(format!(
+            "{} exists — --files/--patterns only apply when creating a new empty store \
+             (the existing content is moved into the repo as-is)",
+            source.display()
+        )
+        .into());
+    }
 
-    // Apply first against the in-memory store, BEFORE persisting state — so a
-    // failed add leaves no trace. A store with a target must link cleanly or
-    // the add aborts; a store with no target has nothing to link and persists
-    // directly. add moves no user data, so the unwind is unlinking anything
-    // apply created plus removing the empty store dir, not adopt's rename-back.
-    let results = target.is_some().then(|| {
+    if dry_run {
+        if source_exists {
+            let is_dir = source.is_dir();
+            let target_str = if is_dir {
+                source.to_string_lossy().into_owned()
+            } else {
+                source
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "~".into())
+            };
+            println!("Would add (adopt existing):");
+            println!("  {} → {}/", source.display(), store_dir.display());
+            println!(
+                "  then symlink back to {}",
+                expand_home(&target_str).display()
+            );
+        } else {
+            println!("Would add (create empty store):");
+            println!(
+                "  {} → {} (empty store, linked to {})",
+                store_name,
+                store_dir.display(),
+                source.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if source_exists {
+        // --- Adopt path: move existing content into the repo, link back. ---
+        // --files/--patterns are not used here; the moved content determines
+        // the store layout (whole-dir for dirs, single-file for files).
+        let is_dir = source.is_dir();
+        let target_str = if is_dir {
+            source.to_string_lossy().into_owned()
+        } else {
+            source
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "~".into())
+        };
+
+        let adopt_files = if is_dir {
+            vec![]
+        } else {
+            vec![raw_name.clone()]
+        };
+
+        let new_store = config::Store {
+            target: Some(target_str.clone()),
+            files: adopt_files.clone(),
+            patterns: vec![],
+            ignore: vec![],
+            when: config::WhenClause::default(),
+            hooks: config::Hooks::default(),
+            targets: std::collections::BTreeMap::new(),
+        };
+
+        // Move: relocate the file/dir into the repo.
+        if is_dir {
+            std::fs::rename(&source, &store_dir)?;
+        } else {
+            std::fs::create_dir_all(&store_dir)?;
+            std::fs::rename(&source, store_dir.join(&raw_name))?;
+        }
+
+        // Link: create the return symlink using the in-memory store.
+        // If this fails, roll back the move so the user's file is back where
+        // it was. State was never touched.
         let platform = Platform::detect();
-        store::apply_store(
+        let results = store::apply_store(
             &root,
-            name,
+            &store_name,
             &new_store,
             &platform,
             store::ApplyOpts {
                 dry_run: false,
                 force: false,
             },
-        )
-    });
+        );
+        if results.actions.iter().any(|a| {
+            matches!(
+                a,
+                store::ApplyAction::Conflict(_) | store::ApplyAction::Error(_)
+            )
+        }) {
+            for action in &results.actions {
+                if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+                    let _ = linker::remove_link(p, &root);
+                }
+            }
+            rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|e| {
+                format!(
+                    "ADD FAILED and rollback also failed: {} is stranded in {} ({})",
+                    source.display(),
+                    store_dir.display(),
+                    e
+                )
+            })?;
+            return Err(format!(
+                "could not link {} back; rolled back (file restored to {})",
+                store_name,
+                source.display()
+            )
+            .into());
+        }
 
-    if let Some(results) = results.as_ref() {
+        // Record: persist state.toml (generated half only). stitch.toml is
+        // never rewritten by the tool after init, so comments/formatting survive.
+        loaded.generated.stores.insert(
+            store_name.clone(),
+            config::GeneratedStore {
+                target: Some(target_str.clone()),
+                files: adopt_files,
+                patterns: vec![],
+                targets: std::collections::BTreeMap::new(),
+            },
+        );
+        if let Err(e) = loaded.generated.save(&root) {
+            for action in &results.actions {
+                if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+                    let _ = linker::remove_link(p, &root);
+                }
+            }
+            rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|re| {
+                format!(
+                    "state save failed ({e}) and rollback also failed: {} is stranded in {} ({re})",
+                    source.display(),
+                    store_dir.display(),
+                )
+            })?;
+            return Err(e.into());
+        }
+
+        println!(
+            "Added store '{}' (adopted from {})",
+            store_name,
+            source.display()
+        );
+        for action in &results.actions {
+            match action {
+                store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
+                store::ApplyAction::AlreadyLinked => println!("  already linked"),
+                _ => {}
+            }
+        }
+    } else {
+        // --- Create-empty path: fresh store, link to target. ---
+        let target_str = path.to_string();
+
+        let new_store = config::Store {
+            target: Some(target_str.clone()),
+            files: files.to_vec(),
+            patterns: patterns.to_vec(),
+            ignore: vec![],
+            when: config::WhenClause::default(),
+            hooks: config::Hooks::default(),
+            targets: std::collections::BTreeMap::new(),
+        };
+
+        std::fs::create_dir_all(&store_dir)?;
+
+        let platform = Platform::detect();
+        let results = store::apply_store(
+            &root,
+            &store_name,
+            &new_store,
+            &platform,
+            store::ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+        );
+
         for action in &results.actions {
             match action {
                 store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
@@ -608,41 +600,39 @@ fn cmd_add(
                 _ => {}
             }
         }
-    }
 
-    let failed = results.as_ref().is_some_and(|r| {
-        r.actions.iter().any(|a| {
+        let failed = results.actions.iter().any(|a| {
             matches!(
                 a,
                 store::ApplyAction::Conflict(_) | store::ApplyAction::Error(_)
             )
-        })
-    });
+        });
 
-    if failed {
-        discard_uncommitted_add(results.as_ref(), &store_dir, &root);
-        return Err("apply reported conflicts or errors".into());
+        if failed {
+            discard_uncommitted_add(Some(&results), &store_dir, &root);
+            return Err("apply reported conflicts or errors".into());
+        }
+
+        // Persist state.toml (generated half only). If save fails after apply
+        // already created links, undo them and the empty store dir so no
+        // half-applied store is left without a state entry.
+        loaded.generated.stores.insert(
+            store_name.clone(),
+            config::GeneratedStore {
+                target: Some(target_str.clone()),
+                files: files.to_vec(),
+                patterns: patterns.to_vec(),
+                targets: std::collections::BTreeMap::new(),
+            },
+        );
+        if let Err(e) = loaded.generated.save(&root) {
+            discard_uncommitted_add(Some(&results), &store_dir, &root);
+            return Err(e.into());
+        }
+
+        println!("Added store '{}'", store_name);
     }
 
-    // Persist state.toml (generated half only). If save fails after apply
-    // already created links, undo them and the empty store dir so no
-    // half-applied store is left without a state entry — same all-or-nothing
-    // contract as adopt. stitch.toml is never touched.
-    loaded.generated.stores.insert(
-        name.to_string(),
-        config::GeneratedStore {
-            target: target.map(|t| t.to_string()),
-            files: files.to_vec(),
-            patterns: patterns.to_vec(),
-            targets: std::collections::BTreeMap::new(),
-        },
-    );
-    if let Err(e) = loaded.generated.save(&root) {
-        discard_uncommitted_add(results.as_ref(), &store_dir, &root);
-        return Err(e.into());
-    }
-
-    println!("Added store '{}'", name);
     Ok(())
 }
 

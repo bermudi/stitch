@@ -5,7 +5,7 @@
 //! mutations to the link inventory never clobber the user's comments and
 //! formatting. Authored content lives in `stitch.toml` (repo root); generated
 //! content lives in `.stitch/state.toml`. After `init`, the tool never rewrites
-//! the authored file — every mutation (`add`/`adopt`/`remove`) writes
+//! the authored file — every mutation (`add`/`remove`) writes
 //! `state.toml` only.
 
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ pub struct AuthoredTarget {
 // Generated — from .stitch/state.toml. Tool-owned.
 // ===========================================================================
 
-/// Tool-generated desired state: the concrete link inventory. `add`/`adopt`/
+/// Tool-generated desired state: the concrete link inventory. `add`/
 /// `remove` are the only writers; `init`/`migrate` seed it. Serialized
 /// deterministically (BTreeMap key order + sorted `files`/`patterns`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
