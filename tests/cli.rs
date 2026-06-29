@@ -1103,6 +1103,28 @@ fn add_adopt_dir_moves_and_links_back() {
 }
 
 #[test]
+fn add_adopt_dir_with_trailing_slash() {
+    // Regression: `stitch add ~/.config/alacritty/` (trailing slash) used to
+    // fail at the link step because symlink(2) rejects a linkpath with a
+    // trailing slash. expand_home now strips trailing slashes.
+    let repo = Repo::new();
+    let src = repo.path().join("external").join("myconfig");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.conf"), "a").unwrap();
+
+    // Pass the path with a trailing slash.
+    let src_str = format!("{}/", src.to_str().unwrap());
+    repo.cmd()
+        .args(["add", &src_str])
+        .assert()
+        .success()
+        .stdout(contains("Added store"));
+
+    assert!(repo.path().join("myconfig").is_dir());
+    assert!(src.is_symlink());
+}
+
+#[test]
 fn add_rejects_existing_symlink_at_target() {
     let repo = Repo::new();
     let src = repo.path().join("external").join("myrc");
