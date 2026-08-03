@@ -76,4 +76,5 @@ release commit itself, not on a later follow-up.
 git tag -a vX.Y.Z <release-commit> -m "vX.Y.Z: <one-line summary>"
 ```
 
-Existing tags: `v0.2.0` (d35496a), `v0.3.0` (76fc01f), `v0.3.1` (6d10de3).
+Existing tags: `v0.2.0` (d35496a), `v0.3.0` (76fc01f), `v0.3.1` (6d10de3),
+`v0.4.0`, `v0.4.1`, `v0.5.0`.

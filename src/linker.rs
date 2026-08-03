@@ -50,17 +50,14 @@ pub fn check_link(target: &Path, source: &Path) -> LinkStatus {
     }
 }
 
-/// Create a symlink at `target` pointing to `source`.
-/// Parent directories are created as needed.
+/// Create a symlink at an absent `target` pointing to `source`.
+/// Parent directories are created as needed. Never removes an existing target:
+/// callers classify known stale links before calling this, and an unexpected
+/// link appearing in the gap must remain a conflict rather than be clobbered.
 pub fn create_link(target: &Path, source: &Path) -> Result<(), LinkError> {
     // Ensure the source exists.
     if !source.exists() {
         return Err(LinkError::SourceMissing(source.to_path_buf()));
-    }
-
-    // Remove existing symlink/file if it's already a symlink.
-    if target.is_symlink() {
-        std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
     }
 
     // Create parent directory for the target.
@@ -77,24 +74,21 @@ pub fn create_link(target: &Path, source: &Path) -> Result<(), LinkError> {
     Ok(())
 }
 
-/// Whether the symlink at `target` points into `repo_root`.
+/// Whether the symlink at `target` resolves beneath `root`.
 ///
-/// Distinguishes stitch-owned links (safe to replace/remove) from foreign ones
-/// (stow/chezmoi/Nix/Home-Manager/hand-managed — must never be silently
-/// clobbered). Relative symlink targets are resolved against the symlink's own
-/// parent directory. Returns `false` for non-symlinks or unreadable links.
-///
-/// Normalizes `..` and `.` components so a crafted symlink target like
-/// `/repo/../foreign` is not misclassified as repo-owned via a purely lexical
-/// `starts_with` check.
-pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
+/// Relative symlink targets are resolved against the symlink's own parent
+/// directory. Returns `false` for non-symlinks or unreadable links. Existing
+/// paths are canonicalized to resolve symlink chains; dangling paths are
+/// compared after lexical normalization so ownership checks remain useful for
+/// stale links whose source was removed.
+pub fn points_into(target: &Path, root: &Path) -> bool {
     let Ok(resolved) = std::fs::read_link(target) else {
         return false;
     };
     let resolved_abs = if resolved.is_absolute() {
-        resolved.clone()
+        resolved
     } else {
-        target.parent().unwrap_or(Path::new(".")).join(&resolved)
+        target.parent().unwrap_or(Path::new(".")).join(resolved)
     };
 
     // If the path exists, canonicalize to resolve any symlink chains and `..`
@@ -107,15 +101,23 @@ pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
     } else {
         normalize_lexical(&resolved_abs)
     };
-    let normalized_root = if repo_root.exists() {
-        repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| normalize_lexical(repo_root))
+    let normalized_root = if root.exists() {
+        root.canonicalize()
+            .unwrap_or_else(|_| normalize_lexical(root))
     } else {
-        normalize_lexical(repo_root)
+        normalize_lexical(root)
     };
 
     normalized.starts_with(&normalized_root)
+}
+
+/// Whether the symlink at `target` points into `repo_root`.
+///
+/// Distinguishes stitch-owned links (safe to replace/remove) from foreign ones
+/// (stow/chezmoi/Nix/Home-Manager/hand-managed — must never be silently
+/// clobbered). This is the repo-scoped form of [`points_into`].
+pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
+    points_into(target, repo_root)
 }
 
 /// Lexically normalize a path by collapsing `.` and `..` components without
@@ -139,6 +141,23 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 /// Returns true if something was removed.
 pub fn remove_link(target: &Path, repo_root: &Path) -> Result<bool, LinkError> {
     if !points_into_repo(target, repo_root) {
+        return Ok(false);
+    }
+    std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
+    Ok(true)
+}
+
+/// Remove `target` only when it still points exactly at `expected_source` in
+/// this repo. Used for whole-directory → file-mode promotion: a link repointed
+/// to another store between inspection and removal must remain untouched.
+pub fn remove_link_to(
+    target: &Path,
+    expected_source: &Path,
+    repo_root: &Path,
+) -> Result<bool, LinkError> {
+    if check_link(target, expected_source) != LinkStatus::Linked
+        || !points_into_repo(target, repo_root)
+    {
         return Ok(false);
     }
     std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
@@ -191,6 +210,36 @@ mod tests {
         // Remove the link.
         assert!(remove_link(&target_file, tmp.path()).unwrap());
         assert_eq!(check_link(&target_file, &source_file), LinkStatus::Missing);
+    }
+
+    #[test]
+    fn test_create_link_does_not_replace_existing_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_a = tmp.path().join("a");
+        let source_b = tmp.path().join("b");
+        std::fs::write(&source_a, "a").unwrap();
+        std::fs::write(&source_b, "b").unwrap();
+        let target = tmp.path().join("link");
+        create_link(&target, &source_a).unwrap();
+
+        assert!(create_link(&target, &source_b).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a");
+    }
+
+    #[test]
+    fn test_remove_link_to_requires_expected_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_a = tmp.path().join("a");
+        let source_b = tmp.path().join("b");
+        std::fs::write(&source_a, "a").unwrap();
+        std::fs::write(&source_b, "b").unwrap();
+        let target = tmp.path().join("link");
+        create_link(&target, &source_a).unwrap();
+
+        assert!(!remove_link_to(&target, &source_b, tmp.path()).unwrap());
+        assert!(target.is_symlink(), "wrong expected source must not unlink");
+        assert!(remove_link_to(&target, &source_a, tmp.path()).unwrap());
+        assert!(target.symlink_metadata().is_err());
     }
 
     #[test]

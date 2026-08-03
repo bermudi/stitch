@@ -2,6 +2,7 @@ use crate::config::{self, Config, Loaded, Store};
 use crate::hooks::{self, HookEnv};
 use crate::linker::{self, LinkStatus};
 use crate::platform::Platform;
+use crate::render;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,13 @@ pub enum ApplyAction {
     Conflict(PathBuf),
     SkippedPlatform,
     AlreadyLinked,
+    /// Templated entry: staged content was (or would be) refreshed; the link
+    /// already pointed at the staging path. Surfaced so `diff`/`apply` can
+    /// answer "would apply change anything?" for content, not only link state.
+    ContentChanged(PathBuf),
+    /// A stale stitch-owned file-mode link was removed (or would be removed in
+    /// a dry run) because its source is no longer in the resolved entry set.
+    Removed(PathBuf),
     Error(String),
 }
 
@@ -48,8 +56,49 @@ pub fn apply_all(
     let sorted: BTreeMap<_, _> = config.stores.iter().collect();
     sorted
         .into_iter()
-        .map(|(name, store)| apply_store(repo_root, name, store, platform, opts))
+        .map(|(name, store)| apply_store(repo_root, name, store, platform, &config.vars, opts))
         .collect()
+}
+
+/// Whether an apply on this platform could render an on-disk template source.
+/// Used to make the `.gitignore` trust boundary conditional for upgraded repos:
+/// plain stores need no migration, but rendering refuses to create output until
+/// staging is ignored.
+pub fn has_active_template_sources(repo_root: &Path, config: &Config, platform: &Platform) -> bool {
+    config.stores.iter().any(|(name, store)| {
+        if !platform.matches_when(&store.when) {
+            return false;
+        }
+        let store_dir = repo_root.join(name);
+        if store.is_multi_target() {
+            store.targets.values().any(|target| {
+                platform.matches_when(&target.when)
+                    && target_has_template_source(
+                        &store_dir,
+                        &target.files,
+                        &target.patterns,
+                        &target.ignore,
+                    )
+            })
+        } else {
+            target_has_template_source(&store_dir, &store.files, &store.patterns, &store.ignore)
+        }
+    })
+}
+
+fn target_has_template_source(
+    store_dir: &Path,
+    files: &[String],
+    patterns: &[String],
+    ignore: &[String],
+) -> bool {
+    let LinkTargets::Files(names) = resolve_target_names(store_dir, files, patterns, ignore) else {
+        return false;
+    };
+    names.into_iter().any(|source_name| {
+        let entry = render::resolve_entry(&source_name);
+        entry.is_template && store_dir.join(entry.source_rel).is_file()
+    })
 }
 
 /// Apply a single store.
@@ -58,6 +107,7 @@ pub fn apply_store(
     name: &str,
     store: &Store,
     platform: &Platform,
+    vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
 ) -> ApplyResult {
     if !platform.matches_when(&store.when) {
@@ -100,35 +150,114 @@ pub fn apply_store(
         }
     }
 
+    // Reconciliation is derived from desired sources, not successful entry
+    // application. A render/resolution failure and a target skipped by `when`
+    // must preserve a live staged render and its owned link; otherwise a
+    // harmless config mistake turns a working link dangling.
+    let mut keep_links: BTreeSet<String> = BTreeSet::new();
+    // File-mode cleanup is target-specific. A store can have multiple targets,
+    // and two target entries may even share a target path, so union their
+    // configured link names before scanning that path.
+    let mut target_keep_links: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+
+    let empty_link_rels = BTreeSet::new();
     if store.is_multi_target() {
+        // Build every desired keep-set before applying any target. An active
+        // whole-dir target must see a skipped file-mode sibling that shares its
+        // path; otherwise it could erase that sibling before its turn.
+        for target_entry in store.targets.values() {
+            collect_reconciliation_keeps(
+                &store_dir,
+                &config::expand_home(&target_entry.target),
+                &target_entry.files,
+                &target_entry.patterns,
+                &target_entry.ignore,
+                &mut keep_links,
+                &mut target_keep_links,
+            );
+        }
         for target_entry in store.targets.values() {
             if !platform.matches_when(&target_entry.when) {
                 continue;
             }
             let target_path = config::expand_home(&target_entry.target);
+            let target_link_rels = target_keep_links
+                .get(&target_path)
+                .unwrap_or(&empty_link_rels);
             actions.extend(apply_target(
+                name,
                 &store_dir,
                 &target_path,
                 repo_root,
                 &target_entry.files,
                 &target_entry.patterns,
                 &target_entry.ignore,
+                target_link_rels,
+                platform,
+                vars,
                 opts,
             ));
         }
     } else if let Some(ref target_str) = store.target {
         let target_path = config::expand_home(target_str);
+        collect_reconciliation_keeps(
+            &store_dir,
+            &target_path,
+            &store.files,
+            &store.patterns,
+            &store.ignore,
+            &mut keep_links,
+            &mut target_keep_links,
+        );
+        let target_link_rels = target_keep_links
+            .get(&target_path)
+            .unwrap_or(&empty_link_rels);
         actions.extend(apply_target(
+            name,
             &store_dir,
             &target_path,
             repo_root,
             &store.files,
             &store.patterns,
             &store.ignore,
+            target_link_rels,
+            platform,
+            vars,
             opts,
         ));
     } else {
         actions.push(ApplyAction::Error("no target configured".into()));
+    }
+
+    // Reconcile file-mode links before staging: a deleted source must not leave
+    // a target symlink pointing at a render that is about to disappear. The
+    // helper is dry-run aware so `diff` previews removals without mutating.
+    let mut link_reconciliation_failed = false;
+    for (target_path, link_rels) in target_keep_links {
+        match render::reconcile_store_links(
+            &target_path,
+            repo_root,
+            &store_dir,
+            name,
+            &link_rels,
+            opts.dry_run,
+        ) {
+            Ok(removed) => actions.extend(removed.into_iter().map(ApplyAction::Removed)),
+            Err(e) => {
+                link_reconciliation_failed = true;
+                actions.push(ApplyAction::Error(e));
+            }
+        }
+    }
+
+    // Reap staging only after target cleanup fully succeeds. An I/O failure
+    // while unlinking a stale target must leave its render readable rather
+    // than converting the failure into a dangling link.
+    if !opts.dry_run
+        && !link_reconciliation_failed
+        && let Err(e) = render::reconcile_store_staging(repo_root, name, &keep_links)
+    {
+        actions.push(ApplyAction::Error(e));
     }
 
     // Per-store post-hook: warns on failure — the store is already applied,
@@ -153,25 +282,370 @@ pub fn apply_store(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // thin dispatcher over resolve + per-entry apply
 fn apply_target(
+    store_name: &str,
     store_dir: &Path,
     target_path: &Path,
     repo_root: &Path,
     files: &[String],
     patterns: &[String],
     ignore: &[String],
+    target_link_rels: &BTreeSet<String>,
+    platform: &Platform,
+    vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
 ) -> Vec<ApplyAction> {
     match resolve_targets(store_dir, files, patterns, ignore) {
-        LinkTargets::WholeDir => vec![apply_single_link(store_dir, target_path, repo_root, opts)],
-        LinkTargets::Files(names) => {
-            let mut actions = Vec::new();
-            for file_name in &names {
-                let source = store_dir.join(file_name);
-                let target = target_path.join(file_name);
-                actions.push(apply_single_link(&source, &target, repo_root, opts));
+        Err(msg) => vec![ApplyAction::Error(msg)],
+        Ok(LinkTargets::WholeDir) => apply_whole_dir(
+            store_name,
+            store_dir,
+            target_path,
+            repo_root,
+            target_link_rels,
+            opts,
+        ),
+        Ok(LinkTargets::Files(names)) => {
+            let (replaces_whole_dir, mut actions) = match prepare_file_mode_target(
+                store_name,
+                store_dir,
+                target_path,
+                repo_root,
+                &names,
+                platform,
+                vars,
+                opts,
+            ) {
+                Ok(prepared) => prepared,
+                Err(action) => return vec![action],
+            };
+            for source_name in &names {
+                if replaces_whole_dir && opts.dry_run {
+                    actions.push(preview_file_entry_after_root_removal(
+                        target_path,
+                        source_name,
+                    ));
+                } else {
+                    actions.push(apply_file_entry(
+                        store_name,
+                        store_dir,
+                        target_path,
+                        repo_root,
+                        source_name,
+                        platform,
+                        vars,
+                        opts,
+                    ));
+                }
             }
             actions
+        }
+    }
+}
+
+/// Remove a verified whole-directory link before creating file-mode children.
+/// Without this ordering, POSIX follows the root symlink and writes new child
+/// links into the store itself.
+#[allow(clippy::too_many_arguments)]
+fn prepare_file_mode_target(
+    store_name: &str,
+    store_dir: &Path,
+    target_path: &Path,
+    repo_root: &Path,
+    source_names: &[String],
+    platform: &Platform,
+    vars: &BTreeMap<String, String>,
+    opts: ApplyOpts,
+) -> Result<(bool, Vec<ApplyAction>), ApplyAction> {
+    let metadata = match std::fs::symlink_metadata(target_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((false, Vec::new())),
+        Err(e) => {
+            return Err(ApplyAction::Error(format!(
+                "could not inspect {}: {e}",
+                target_path.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok((false, Vec::new()));
+    }
+
+    // Only this store's exact whole-dir link may be promoted. A foreign link,
+    // or a link to another store in the same repo, remains a conflict.
+    if linker::check_link(target_path, store_dir) != LinkStatus::Linked {
+        return Err(ApplyAction::Conflict(target_path.to_path_buf()));
+    }
+    preflight_file_mode_promotion(
+        store_name,
+        store_dir,
+        repo_root,
+        source_names,
+        platform,
+        vars,
+        opts,
+    )?;
+    if opts.dry_run {
+        return Ok((true, vec![ApplyAction::Removed(target_path.to_path_buf())]));
+    }
+
+    match linker::remove_link_to(target_path, store_dir, repo_root) {
+        Ok(true) => Ok((true, vec![ApplyAction::Removed(target_path.to_path_buf())])),
+        // The link was repointed between check and removal. Do not risk
+        // writing through it; report the now-unmanaged root as a conflict.
+        Ok(false) => Err(ApplyAction::Conflict(target_path.to_path_buf())),
+        Err(e) => Err(ApplyAction::Error(format!(
+            "could not remove whole-directory link {}: {e}",
+            target_path.display()
+        ))),
+    }
+}
+
+/// Verify a whole-directory → file-mode promotion before unlinking its live
+/// root. Templates are rendered/staged first; a bad template or missing source
+/// leaves the old directory link intact.
+#[allow(clippy::too_many_arguments)]
+fn preflight_file_mode_promotion(
+    store_name: &str,
+    store_dir: &Path,
+    repo_root: &Path,
+    source_names: &[String],
+    platform: &Platform,
+    vars: &BTreeMap<String, String>,
+    opts: ApplyOpts,
+) -> Result<(), ApplyAction> {
+    let entries: Vec<_> = source_names
+        .iter()
+        .map(|name| render::resolve_entry(name))
+        .collect();
+    for entry in &entries {
+        let source_path = store_dir.join(&entry.source_rel);
+        if !source_path.exists() {
+            return Err(ApplyAction::Error(format!(
+                "source does not exist: {}",
+                source_path.display()
+            )));
+        }
+    }
+    for entry in entries.iter().filter(|entry| entry.is_template) {
+        let source_path = store_dir.join(&entry.source_rel);
+        let result = if opts.dry_run {
+            render::staged_differs(
+                repo_root,
+                store_name,
+                &entry.source_rel,
+                &source_path,
+                platform,
+                vars,
+            )
+            .map(|_| ())
+        } else {
+            render::stage_template(
+                repo_root,
+                store_name,
+                &entry.source_rel,
+                &source_path,
+                platform,
+                vars,
+            )
+            .map(|_| ())
+        };
+        if let Err(e) = result {
+            return Err(ApplyAction::Error(e));
+        }
+    }
+    Ok(())
+}
+
+/// Preview an entry after [`prepare_file_mode_target`] would remove the old
+/// whole-directory root. The promotion preflight already verified its source
+/// and template render, so every child link is known to be absent afterwards.
+fn preview_file_entry_after_root_removal(target_path: &Path, source_name: &str) -> ApplyAction {
+    let entry = render::resolve_entry(source_name);
+    ApplyAction::Created(target_path.join(entry.link_rel))
+}
+
+/// Apply a whole-directory store, including a safe transition back from file mode.
+///
+/// A store with templates is promoted to a real target directory containing
+/// individual links. If its last template disappears, its desired state becomes
+/// a single directory link again. The real target dir is normally a conflict,
+/// but we can prove it came from file mode when it contains stale links owned by
+/// this store. Remove only those links, then replace the directory only when it
+/// is empty. Foreign content keeps the ordinary conflict behavior.
+fn apply_whole_dir(
+    store_name: &str,
+    store_dir: &Path,
+    target_path: &Path,
+    repo_root: &Path,
+    keep_link_rels: &BTreeSet<String>,
+    opts: ApplyOpts,
+) -> Vec<ApplyAction> {
+    // Do not scan a correct directory symlink: `Path::is_dir` follows it, and
+    // treating the root link as a stale child would remove the desired state.
+    if target_path.is_symlink() || !target_path.is_dir() {
+        return vec![apply_single_link(store_dir, target_path, repo_root, opts)];
+    }
+
+    let removed = match render::reconcile_store_links(
+        target_path,
+        repo_root,
+        store_dir,
+        store_name,
+        keep_link_rels,
+        opts.dry_run,
+    ) {
+        Ok(removed) => removed,
+        Err(e) => return vec![ApplyAction::Error(e)],
+    };
+    let had_stale_links = !removed.is_empty();
+    let mut actions: Vec<ApplyAction> = removed.into_iter().map(ApplyAction::Removed).collect();
+
+    // An empty pre-existing directory is still a user-owned conflict. Only
+    // replace it automatically after proving that we removed stale links for
+    // this exact store from it.
+    if !had_stale_links {
+        actions.push(apply_single_link(store_dir, target_path, repo_root, opts));
+        return actions;
+    }
+
+    let empty = if opts.dry_run {
+        target_would_be_empty_after_removals(target_path, &actions)
+    } else {
+        remove_empty_target_dir(target_path)
+    };
+    match empty {
+        Ok(true) => {
+            if opts.dry_run {
+                actions.push(ApplyAction::Replaced(target_path.to_path_buf()));
+            } else {
+                match linker::create_link(target_path, store_dir) {
+                    Ok(()) => actions.push(ApplyAction::Replaced(target_path.to_path_buf())),
+                    Err(e) => actions.push(ApplyAction::Error(e.to_string())),
+                }
+            }
+        }
+        Ok(false) => actions.push(apply_single_link(store_dir, target_path, repo_root, opts)),
+        Err(e) => actions.push(ApplyAction::Error(e)),
+    }
+    actions
+}
+
+/// Whether `target_path` would become an empty directory after the removals
+/// reported by a dry-run stale-link reconciliation.
+fn target_would_be_empty_after_removals(
+    target_path: &Path,
+    actions: &[ApplyAction],
+) -> Result<bool, String> {
+    let removed: BTreeSet<&Path> = actions
+        .iter()
+        .filter_map(|action| match action {
+            ApplyAction::Removed(path) => Some(path.as_path()),
+            _ => None,
+        })
+        .collect();
+
+    for entry in walkdir::WalkDir::new(target_path)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = entry.map_err(|e| {
+            format!(
+                "could not scan target {} while previewing directory replacement: {e}",
+                target_path.display()
+            )
+        })?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        if entry.file_type().is_symlink() && removed.contains(entry.path()) {
+            continue;
+        }
+        // Do not erase even an empty nested directory: it could have been
+        // created by the user after the prior file-mode apply. The target root
+        // itself is replaced only when it becomes directly empty.
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Remove the target root only when it is directly empty. Nested directories
+/// are deliberately retained: without a state database we cannot distinguish a
+/// directory created for a prior file-mode link from an empty one a user made.
+fn remove_empty_target_dir(target_path: &Path) -> Result<bool, String> {
+    match std::fs::remove_dir(target_path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(false),
+        Err(e) => Err(format!(
+            "could not remove empty target directory {}: {e}",
+            target_path.display()
+        )),
+    }
+}
+
+/// Apply one resolved file-mode entry. Templates render to staging first;
+/// non-templates link the store source directly.
+#[allow(clippy::too_many_arguments)] // mirrors apply_target's parameter set
+fn apply_file_entry(
+    store_name: &str,
+    store_dir: &Path,
+    target_path: &Path,
+    repo_root: &Path,
+    source_name: &str,
+    platform: &Platform,
+    vars: &BTreeMap<String, String>,
+    opts: ApplyOpts,
+) -> ApplyAction {
+    let entry = render::resolve_entry(source_name);
+    let source_path = store_dir.join(&entry.source_rel);
+    let target = target_path.join(&entry.link_rel);
+
+    if !entry.is_template {
+        return apply_single_link(&source_path, &target, repo_root, opts);
+    }
+
+    let staged = render::staging_path(repo_root, store_name, &entry.link_rel);
+
+    if opts.dry_run {
+        // Content dimension: fresh in-memory render vs staged. Never write.
+        let content_differs = match render::staged_differs(
+            repo_root,
+            store_name,
+            &entry.source_rel,
+            &source_path,
+            platform,
+            vars,
+        ) {
+            Ok(d) => d,
+            Err(e) => return ApplyAction::Error(e),
+        };
+        let link_action = apply_single_link(&staged, &target, repo_root, opts);
+        if content_differs && matches!(link_action, ApplyAction::AlreadyLinked) {
+            ApplyAction::ContentChanged(target)
+        } else {
+            link_action
+        }
+    } else {
+        // Render-before-link: failure skips the link entirely (no broken link).
+        let (link_source, wrote) = match render::stage_template(
+            repo_root,
+            store_name,
+            &entry.source_rel,
+            &source_path,
+            platform,
+            vars,
+        ) {
+            Ok(render::StageOutcome::Written(p)) => (p, true),
+            Ok(render::StageOutcome::Unchanged(p)) => (p, false),
+            Err(e) => return ApplyAction::Error(e),
+        };
+        let action = apply_single_link(&link_source, &target, repo_root, opts);
+        // Link already correct but staging was refreshed → content changed.
+        if wrote && matches!(action, ApplyAction::AlreadyLinked) {
+            ApplyAction::ContentChanged(target)
+        } else {
+            action
         }
     }
 }
@@ -290,10 +764,15 @@ fn backup_path(target: &Path) -> PathBuf {
 #[derive(Debug)]
 pub struct StatusEntry {
     pub store_name: String,
+    /// Repo source path (the `.tmpl` for templates, plain file otherwise).
+    /// Never the staged render — status compares the *link* against the
+    /// effective source (staging for templates).
     pub source: PathBuf,
     pub target: PathBuf,
     pub status: LinkStatus,
     pub skipped_platform: bool,
+    /// True when this entry is backed by a `.tmpl` (link points at staging).
+    pub is_template: bool,
 }
 
 /// Get status for all stores.
@@ -309,6 +788,7 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                 target: PathBuf::new(),
                 status: LinkStatus::Missing,
                 skipped_platform: true,
+                is_template: false,
             });
             continue;
         }
@@ -321,23 +801,25 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                 }
                 let target_path = config::expand_home(&target_entry.target);
                 entries.extend(collect_statuses(
+                    repo_root,
+                    name,
                     &store_dir,
                     &target_path,
                     &target_entry.files,
                     &target_entry.patterns,
                     &target_entry.ignore,
-                    name,
                 ));
             }
         } else if let Some(ref target_str) = store.target {
             let target_path = config::expand_home(target_str);
             entries.extend(collect_statuses(
+                repo_root,
+                name,
                 &store_dir,
                 &target_path,
                 &store.files,
                 &store.patterns,
                 &store.ignore,
-                name,
             ));
         }
     }
@@ -346,34 +828,48 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
 }
 
 fn collect_statuses(
+    repo_root: &Path,
+    name: &str,
     store_dir: &Path,
     target_path: &Path,
     files: &[String],
     patterns: &[String],
     ignore: &[String],
-    name: &str,
 ) -> Vec<StatusEntry> {
     let mut entries = Vec::new();
     match resolve_targets(store_dir, files, patterns, ignore) {
-        LinkTargets::WholeDir => {
+        Err(_) => {
+            // Collision / resolution error: surface nothing here; apply will
+            // report the Error action. Status stays quiet on bad config.
+        }
+        Ok(LinkTargets::WholeDir) => {
             entries.push(StatusEntry {
                 store_name: name.to_string(),
                 source: store_dir.to_path_buf(),
                 target: target_path.to_path_buf(),
                 status: linker::check_link(target_path, store_dir),
                 skipped_platform: false,
+                is_template: false,
             });
         }
-        LinkTargets::Files(names) => {
-            for file_name in &names {
-                let source = store_dir.join(file_name);
-                let target = target_path.join(file_name);
+        Ok(LinkTargets::Files(names)) => {
+            for source_name in &names {
+                let entry = render::resolve_entry(source_name);
+                let repo_source = store_dir.join(&entry.source_rel);
+                let target = target_path.join(&entry.link_rel);
+                // Link source is staging for templates, repo file otherwise.
+                let link_source = if entry.is_template {
+                    render::staging_path(repo_root, name, &entry.link_rel)
+                } else {
+                    repo_source.clone()
+                };
                 entries.push(StatusEntry {
                     store_name: name.to_string(),
-                    source: source.clone(),
+                    source: repo_source,
                     target: target.clone(),
-                    status: linker::check_link(&target, &source),
+                    status: linker::check_link(&target, &link_source),
                     skipped_platform: false,
+                    is_template: entry.is_template,
                 });
             }
         }
@@ -399,6 +895,35 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
     let mut warnings = Vec::new();
     let mut info = Vec::new();
     let config = &loaded.config;
+
+    // Existing pre-template repos do not need a migration merely because
+    // `init` now creates a render directory. Once a configured template or
+    // staged output exists, though, this is a hard trust boundary.
+    let rendering_in_use = has_active_template_sources(repo_root, config, platform)
+        || render::has_staged_output(repo_root);
+    if rendering_in_use && !render::repo_gitignore_covers_render(repo_root) {
+        errors.push(format!(
+            "repo .gitignore is missing `{}` — add that entry before rendering templates; \
+             staged output must never be committed",
+            render::RENDER_GITIGNORE_ENTRY
+        ));
+    }
+
+    // Permission contract on an existing staging tree.
+    let render_root = render::render_root(repo_root);
+    if render_root.exists() {
+        match render::path_mode(&render_root) {
+            Some(mode) if mode != 0o700 => {
+                errors.push(format!(
+                    "{} has mode {:04o}, expected 0700",
+                    render_root.display(),
+                    mode
+                ));
+            }
+            None => {}
+            Some(_) => {}
+        }
+    }
 
     if config.stores.is_empty() {
         warnings.push("no stores configured".into());
@@ -477,6 +1002,46 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                     resolved.display()
                 ));
             }
+
+            // Staging drift: tool-owned render differs from a fresh render.
+            // Hand-edits (or a vars/env change since last apply) surface here
+            // so the next apply's overwrite is never silent.
+            if entry.is_template {
+                match render::staged_differs(
+                    repo_root,
+                    name,
+                    // source is the repo path; recover the store-relative name.
+                    entry
+                        .source
+                        .strip_prefix(&store_dir)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| {
+                            entry
+                                .source
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        })
+                        .as_str(),
+                    &entry.source,
+                    platform,
+                    &config.vars,
+                ) {
+                    Ok(true) => {
+                        warnings.push(format!(
+                            "store '{}': staged render for {} is stale (run `stitch apply`)",
+                            name,
+                            entry.target.display()
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        // A template that fails to render is an error — same
+                        // class as a broken link.
+                        errors.push(format!("store '{name}': {e}"));
+                    }
+                }
+            }
         }
     }
 
@@ -551,13 +1116,64 @@ fn top_level_entries(store_dir: &Path) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// Resolve what to link for one store/target.
+/// Populate the link and staging keep-sets from actual desired sources.
 ///
-/// In whole-directory mode, if any top-level entry is ignored (global or
-/// per-store), the store is promoted to file mode so that ignored content —
-/// e.g. a `.git/` checked into the store — is never symlinked wholesale into
-/// the target. File mode always applies the merged (global + per-store) ignore.
+/// This intentionally bypasses collision validation: both sides of a
+/// `foo`/`foo.tmpl` collision must keep their currently live output safe while
+/// apply reports the resolution error. It also runs before `when` filtering so
+/// a skipped target cannot make a shared target directory or staged render
+/// look stale.
+fn collect_reconciliation_keeps(
+    store_dir: &Path,
+    target_path: &Path,
+    files: &[String],
+    patterns: &[String],
+    store_ignore: &[String],
+    staging_keep_links: &mut BTreeSet<String>,
+    target_keep_links: &mut BTreeMap<PathBuf, BTreeSet<String>>,
+) {
+    let LinkTargets::Files(names) = resolve_target_names(store_dir, files, patterns, store_ignore)
+    else {
+        return;
+    };
+
+    let target_links = target_keep_links
+        .entry(target_path.to_path_buf())
+        .or_default();
+    for source_name in names {
+        let entry = render::resolve_entry(&source_name);
+        let source_path = store_dir.join(&entry.source_rel);
+        // A vanished configured source is stale by definition and therefore
+        // must not retain its old target link/render. Existing templates stay
+        // live even when their render or resolution subsequently fails.
+        if source_path.exists() {
+            target_links.insert(entry.link_rel.clone());
+            if entry.is_template {
+                staging_keep_links.insert(entry.link_rel);
+            }
+        }
+    }
+}
+
+/// Resolve what to link for one store/target, rejecting source names that
+/// collapse to the same link name (`foo` + `foo.tmpl`).
 fn resolve_targets(
+    store_dir: &Path,
+    files: &[String],
+    patterns: &[String],
+    store_ignore: &[String],
+) -> Result<LinkTargets, String> {
+    let targets = resolve_target_names(store_dir, files, patterns, store_ignore);
+    if let LinkTargets::Files(ref names) = targets {
+        render::check_name_collisions(names)?;
+    }
+    Ok(targets)
+}
+
+/// Resolve the desired mode and source names without collision validation.
+/// Kept separate so reconciliation can conservatively preserve a live template
+/// when normal resolution reports an error.
+fn resolve_target_names(
     store_dir: &Path,
     files: &[String],
     patterns: &[String],
@@ -565,22 +1181,44 @@ fn resolve_targets(
 ) -> LinkTargets {
     let ignore = merge_ignores(store_ignore);
     let explicit = !files.is_empty() || !patterns.is_empty();
-    if !explicit {
+    let names = if !explicit {
+        let has_templates = render::store_has_templates(store_dir);
         let entries = top_level_entries(store_dir);
-        if let Some(globset) = build_globset(&ignore)
-            && entries.iter().any(|n| globset.is_match(n))
-        {
-            return LinkTargets::Files(
+        let ignore_hit = build_globset(&ignore)
+            .map(|g| entries.iter().any(|n| g.is_match(n)))
+            .unwrap_or(false);
+
+        if has_templates || ignore_hit {
+            // Promote: expand to every non-ignored file (full tree), so nested
+            // `.tmpl` files become individual links rather than riding inside a
+            // whole-dir symlink as literal `.tmpl` sources.
+            let all = resolve_files(store_dir, &[], &["**/*".into(), "*".into()], &ignore);
+            // `resolve_files` with patterns only includes matches; `**/*` + `*`
+            // covers files at any depth. Filter out directories implicitly
+            // (resolve_files is file-only).
+            //
+            // For ignore-only promotion (no templates) the historical behavior
+            // listed top-level entries only. Preserve that when there are no
+            // templates so a `.git` in a store still promotes to top-level
+            // file links rather than exploding into a recursive file list.
+            if has_templates {
+                all
+            } else if let Some(globset) = build_globset(&ignore) {
                 entries
                     .into_iter()
                     .filter(|n| !globset.is_match(n))
-                    .collect(),
-            );
+                    .collect()
+            } else {
+                entries
+            }
+        } else {
+            return LinkTargets::WholeDir;
         }
-        LinkTargets::WholeDir
     } else {
-        LinkTargets::Files(resolve_files(store_dir, files, patterns, &ignore))
-    }
+        resolve_files(store_dir, files, patterns, &ignore)
+    };
+
+    LinkTargets::Files(names)
 }
 
 /// Resolve the complete file list for a file-mode store.

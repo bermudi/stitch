@@ -56,12 +56,14 @@ pub struct AuthoredTarget {
 /// `remove` are the only writers; `init`/`migrate` seed it. Serialized
 /// deterministically (BTreeMap key order + sorted `files`/`patterns`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stores: BTreeMap<String, GeneratedStore>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedStore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -74,6 +76,7 @@ pub struct GeneratedStore {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedTarget {
     pub target: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,9 +95,7 @@ pub struct GeneratedTarget {
 #[derive(Debug, Clone)]
 pub struct Config {
     /// User variables from `stitch.toml`, carried through for the merged view.
-    /// Read by tests today and by the v0.4 template engine when it lands; kept
-    /// on the view so `apply`/`status` have one source of truth.
-    #[allow(dead_code)]
+    /// Consumed by the template engine (`{{ vars.key }}`) at apply/diff time.
     pub vars: BTreeMap<String, String>,
     pub stores: BTreeMap<String, Store>,
 }
@@ -772,6 +773,28 @@ mod tests {
         assert_eq!(parsed.vars, authored.vars);
         assert_eq!(parsed.stores["shells"].when.os.as_deref(), Some("linux"));
         assert_eq!(parsed.stores["shells"].ignore, vec!["*.bak"]);
+    }
+
+    #[test]
+    fn test_generated_state_rejects_unknown_root_key() {
+        let err = toml::from_str::<GeneratedState>("unexpected = true\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn test_generated_state_rejects_unknown_store_key() {
+        let err =
+            toml::from_str::<GeneratedState>("[stores.nvim]\nunexpected = true\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn test_generated_state_rejects_unknown_target_key() {
+        let err = toml::from_str::<GeneratedState>(
+            "[stores.nvim.targets.laptop]\ntarget = \"~/.config/nvim\"\nunexpected = true\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `unexpected`"));
     }
 
     #[test]
