@@ -30,6 +30,9 @@ impl Repo {
         fs::write(dir.path().join("stitch.toml"), "").expect("write stitch.toml");
         // Generated half: empty (the header is optional on read; keep it minimal).
         fs::write(stitch.join("state.toml"), "").expect("write state.toml");
+        // Trust foundation: doctor requires `.stitch/render/` in .gitignore.
+        // Real `init` writes this; tests that bypass init need it too.
+        fs::write(dir.path().join(".gitignore"), ".stitch/render/\n").expect("write .gitignore");
         Self { dir }
     }
 
@@ -119,6 +122,17 @@ fn init_creates_config_in_empty_dir() {
         authored_text.contains("the tool never rewrites this"),
         "stitch.toml should carry the read-only header"
     );
+
+    // Trust foundation: .gitignore covers staging; render root is 0700.
+    let gi = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(
+        gi.lines().any(|l| l.trim() == ".stitch/render/"),
+        ".gitignore must contain .stitch/render/"
+    );
+    let render = dir.path().join(".stitch").join("render");
+    assert!(render.is_dir(), ".stitch/render/ must be created");
+    let mode = fs::metadata(&render).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, ".stitch/render must be 0700, got {mode:04o}");
 }
 
 #[test]
@@ -2693,4 +2707,796 @@ fn prune_yes_exits_nonzero_on_removal_failure() {
     // Restore before the tempdir drops so it can clean up cleanly.
     let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
     assert!(orphan.is_symlink(), "orphan survived the failed removal");
+}
+
+// ---------------------------------------------------------------------------
+// templates (v0.6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_allows_plain_repo_without_render_gitignore_entry() {
+    let repo = Repo::new();
+    fs::remove_file(repo.path().join(".gitignore")).unwrap();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("doctor").assert().success();
+}
+
+#[test]
+fn doctor_errors_when_template_repo_lacks_render_gitignore_entry() {
+    let repo = Repo::new();
+    // Wipe the entry that Repo::new seeds.
+    fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+    repo.make_store("nvim", &["init.lua.tmpl"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(contains(".stitch/render/"));
+}
+
+#[test]
+fn template_apply_requires_render_gitignore_before_staging() {
+    let repo = Repo::new();
+    fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig.tmpl"), "name = {{ hostname }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains(".stitch/render/"));
+    assert!(
+        !repo
+            .path()
+            .join(".stitch")
+            .join("render")
+            .join("git")
+            .exists(),
+        "preflight must fail before staging output"
+    );
+}
+
+#[test]
+fn template_apply_renders_and_links_into_staging() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("gitconfig.tmpl"),
+        "user.name = {{ hostname }}\neditor = {{ vars.editor }}\n",
+    )
+    .unwrap();
+    repo.write_authored(
+        r#"
+[vars]
+editor = "nvim"
+"#,
+    );
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    // File-mode: list the source name (with .tmpl).
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    // Staging exists, mode 0600, rendered content.
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("gitconfig");
+    assert!(staged.is_file(), "staged render must exist");
+    let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "staged render must be 0600");
+    let content = fs::read_to_string(&staged).unwrap();
+    assert!(
+        content.contains("editor = nvim"),
+        "vars interpolated: {content}"
+    );
+    assert!(
+        content.contains("user.name = "),
+        "hostname interpolated: {content}"
+    );
+
+    // Target is a symlink into the repo (staging), not the .tmpl source.
+    let link = target.join("gitconfig");
+    assert!(link.is_symlink(), "target must be a symlink");
+    let resolved = fs::read_link(&link).unwrap();
+    assert!(
+        resolved.ends_with(".stitch/render/git/gitconfig")
+            || resolved == staged
+            || resolved.canonicalize().unwrap() == staged.canonicalize().unwrap(),
+        "link must point at staging, got {}",
+        resolved.display()
+    );
+    // points_into_repo invariant: read through the link.
+    assert_eq!(fs::read_to_string(&link).unwrap(), content);
+}
+
+#[test]
+fn adding_template_promotes_existing_whole_directory_link_safely() {
+    let repo = Repo::new();
+    let store = repo.make_store("git", &["config"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink(), "initial mode is a directory link");
+
+    fs::write(store.join("new.tmpl"), "new = {{ os }}\n").unwrap();
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.is_dir());
+    assert!(
+        !target.is_symlink(),
+        "file-mode promotion must replace the root link with a real directory"
+    );
+    assert!(target.join("config").is_symlink());
+    assert!(target.join("new").is_symlink());
+    assert_eq!(
+        fs::read_to_string(target.join("config")).unwrap(),
+        "contents of config"
+    );
+    assert!(
+        store.join("new").symlink_metadata().is_err(),
+        "per-file link must not be written through the old root link into the store"
+    );
+}
+
+#[test]
+fn failed_template_promotion_keeps_existing_whole_directory_link() {
+    let repo = Repo::new();
+    let store = repo.make_store("git", &["config"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    fs::write(store.join("broken.tmpl"), "{{").unwrap();
+    repo.cmd().arg("apply").assert().failure();
+
+    assert!(
+        target.is_symlink(),
+        "a failed render must not remove the working whole-dir link"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("config")).unwrap(),
+        "contents of config"
+    );
+    assert!(
+        store.join("broken").symlink_metadata().is_err(),
+        "promotion must not write a child link through the root symlink"
+    );
+}
+
+#[test]
+fn missing_source_promotion_keeps_existing_whole_directory_link() {
+    let repo = Repo::new();
+    repo.make_store("git", &["config"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["missing"]
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("source does not exist"));
+
+    assert!(
+        target.is_symlink(),
+        "a missing file-mode source must not remove the working whole-dir link"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("config")).unwrap(),
+        "contents of config"
+    );
+}
+
+#[test]
+fn template_whole_dir_promotes_and_strips_suffix() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(store.join("hooks")).unwrap();
+    fs::write(store.join("config"), "plain\n").unwrap();
+    fs::write(
+        store.join("hooks").join("pre-commit.tmpl"),
+        "#!/bin/sh\necho {{ os }}\n",
+    )
+    .unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    // Plain file linked directly.
+    assert!(target.join("config").is_symlink());
+    assert_eq!(
+        fs::read_to_string(target.join("config")).unwrap(),
+        "plain\n"
+    );
+
+    // Nested template rendered; link name has no .tmpl.
+    let hook = target.join("hooks").join("pre-commit");
+    assert!(hook.is_symlink(), "nested template must be linked");
+    assert!(!target.join("hooks").join("pre-commit.tmpl").exists());
+    let body = fs::read_to_string(&hook).unwrap();
+    assert!(
+        body.contains("linux") || body.contains("macos"),
+        "os interpolated: {body}"
+    );
+}
+
+#[test]
+fn template_collision_rejected() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig"), "plain\n").unwrap();
+    fs::write(store.join("gitconfig.tmpl"), "t={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig", "gitconfig.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("name collision"));
+}
+
+#[test]
+fn template_resolution_error_preserves_existing_staging_and_link() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("good.tmpl"), "good = {{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["good.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("good");
+    let link = target.join("good");
+    assert!(staged.is_file());
+    assert!(fs::read_to_string(&link).is_ok());
+
+    // Adding the plain source makes resolution fail, but must not reap the
+    // staging file that the existing target link still needs.
+    fs::write(store.join("good"), "plain\n").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["good", "good.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("name collision"));
+
+    assert!(staged.is_file(), "resolution error must preserve staging");
+    assert!(
+        fs::read_to_string(&link).is_ok(),
+        "resolution error must not leave the live link dangling"
+    );
+}
+
+#[test]
+fn when_skipped_target_preserves_shared_target_link_and_staging() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("a.tmpl"), "a = {{ os }}\n").unwrap();
+    fs::write(store.join("b.tmpl"), "b = {{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy();
+    repo.write_state(&format!(
+        r#"
+[stores.git.targets.active]
+target = "{target_str}"
+files = ["a.tmpl"]
+
+[stores.git.targets.skipped]
+target = "{target_str}"
+files = ["b.tmpl"]
+"#,
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let link = target.join("b");
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("b");
+    assert!(link.is_symlink());
+    assert!(staged.is_file());
+
+    repo.write_authored(
+        r#"
+[stores.git.targets.skipped]
+when = { os = "definitely-not-linux-or-macos" }
+"#,
+    );
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(link.is_symlink(), "skipped target link must not be reaped");
+    assert!(
+        fs::read_to_string(&link).is_ok(),
+        "skipped target link must remain readable"
+    );
+    assert!(
+        staged.is_file(),
+        "skipped target staging must not be reaped"
+    );
+}
+
+#[test]
+fn template_missing_env_fails_entry_not_link() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("gitconfig.tmpl"),
+        r#"x = {{ env("STITCH_TEST_UNSET_ENV_ABC_123") }}
+"#,
+    )
+    .unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("STITCH_TEST_UNSET_ENV_ABC_123"));
+
+    // No broken link, no half-written staging for a failed render.
+    assert!(!target.join("gitconfig").exists());
+}
+
+#[test]
+fn template_diff_shows_content_drift() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig.tmpl"), "v=1\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    // Edit the template without applying.
+    fs::write(store.join("gitconfig.tmpl"), "v=2\n").unwrap();
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .success()
+        .stdout(contains("content:"));
+
+    // After apply, diff is clean.
+    repo.cmd().arg("apply").assert().success();
+    let out = repo.cmd().arg("diff").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(
+        !stdout.contains("content:"),
+        "diff should be empty after apply: {stdout}"
+    );
+}
+
+#[test]
+fn apply_removes_target_link_for_deleted_template() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("keep.tmpl"), "keep={{ os }}\n").unwrap();
+    fs::write(store.join("drop.tmpl"), "drop={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let stale_link = target.join("drop");
+    let stale_render = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("drop");
+    assert!(stale_link.is_symlink());
+    assert!(stale_render.exists());
+
+    fs::remove_file(store.join("drop.tmpl")).unwrap();
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("remove:"));
+
+    assert!(
+        stale_link.symlink_metadata().is_err(),
+        "deleted templates must not leave a dangling target symlink"
+    );
+    assert!(
+        !stale_render.exists(),
+        "deleted templates must not leave a frozen staged render"
+    );
+    assert!(
+        target.join("keep").is_symlink(),
+        "remaining entries survive"
+    );
+}
+
+#[test]
+fn apply_removes_target_link_for_deleted_plain_file_in_promoted_store() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    // The template promotes this otherwise whole-dir store to file mode.
+    fs::write(store.join("keep.tmpl"), "keep={{ os }}\n").unwrap();
+    fs::write(store.join("drop"), "plain\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let stale_link = target.join("drop");
+    assert!(stale_link.is_symlink());
+
+    fs::remove_file(store.join("drop")).unwrap();
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(
+        stale_link.symlink_metadata().is_err(),
+        "file-mode cleanup must include plain entries, not only templates"
+    );
+    assert!(target.join("keep").is_symlink());
+}
+
+#[test]
+fn removing_last_template_restores_whole_directory_link() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("config"), "plain\n").unwrap();
+    fs::write(store.join("config.local.tmpl"), "local={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_dir());
+    assert!(!target.is_symlink(), "template promotion uses file mode");
+
+    fs::remove_file(store.join("config.local.tmpl")).unwrap();
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .success()
+        .stdout(contains("remove:"))
+        .stdout(contains("replace:"));
+    assert!(
+        target.is_dir() && !target.is_symlink(),
+        "diff must not replace the target directory"
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("replace:"));
+    assert!(
+        target.is_symlink(),
+        "after the last template disappears, restore whole-directory mode"
+    );
+    assert_eq!(
+        target.canonicalize().unwrap(),
+        store.canonicalize().unwrap(),
+        "the whole-directory target must point back to the store"
+    );
+    assert!(
+        !repo
+            .path()
+            .join(".stitch")
+            .join("render")
+            .join("git")
+            .exists(),
+        "the final stale render must be removed"
+    );
+}
+
+#[test]
+fn deleted_source_cleanup_preserves_foreign_replacement() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("keep.tmpl"), "keep={{ os }}\n").unwrap();
+    fs::write(store.join("drop.tmpl"), "drop={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    fs::remove_file(store.join("drop.tmpl")).unwrap();
+
+    let replaced = target.join("drop");
+    fs::remove_file(&replaced).unwrap();
+    let foreign = repo.path().join("foreign-file");
+    fs::write(&foreign, "hands off\n").unwrap();
+    std::os::unix::fs::symlink(&foreign, &replaced).unwrap();
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert_eq!(fs::read_link(&replaced).unwrap(), foreign);
+    assert!(
+        !repo
+            .path()
+            .join(".stitch")
+            .join("render")
+            .join("git")
+            .join("drop")
+            .exists(),
+        "staging remains tool-owned even when a target is replaced externally"
+    );
+}
+
+#[test]
+fn diff_previews_deleted_source_cleanup_without_mutating() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("keep.tmpl"), "keep={{ os }}\n").unwrap();
+    fs::write(store.join("drop.tmpl"), "drop={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let stale_link = target.join("drop");
+    let stale_render = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("drop");
+    fs::remove_file(store.join("drop.tmpl")).unwrap();
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .success()
+        .stdout(contains("remove:"));
+
+    assert!(stale_link.is_symlink(), "diff must not unlink targets");
+    assert!(stale_render.exists(), "diff must not delete staged renders");
+}
+
+#[test]
+fn template_remove_cleans_staging() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig.tmpl"), "x={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let staged_dir = repo.path().join(".stitch").join("render").join("git");
+    assert!(staged_dir.exists());
+
+    repo.cmd().args(["remove", "git"]).assert().success();
+    assert!(!staged_dir.exists(), "remove must wipe store staging");
+    assert!(!target.join("gitconfig").exists());
+}
+
+#[test]
+fn template_edit_opens_source_not_staging() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    let tmpl = store.join("gitconfig.tmpl");
+    fs::write(&tmpl, "x={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig.tmpl"]
+"#
+    ));
+    // Works pre-apply: config-based resolution.
+    let marker = repo.path().join("edited");
+    // Fake editor: write the path it was given into a marker file.
+    let editor = repo.path().join("fake-editor.sh");
+    fs::write(
+        &editor,
+        format!("#!/bin/sh\necho \"$1\" > {}\n", marker.to_string_lossy()),
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let entry_path = target.join("gitconfig");
+    let entry_str = entry_path.to_string_lossy().into_owned();
+    repo.cmd()
+        .env("EDITOR", &editor)
+        .args(["edit", &entry_str])
+        .assert()
+        .success();
+
+    let opened = fs::read_to_string(&marker).unwrap();
+    let opened = opened.trim();
+    assert!(
+        opened.ends_with("gitconfig.tmpl"),
+        "edit must open the .tmpl source, got {opened}"
+    );
+    assert!(
+        !opened.contains(".stitch/render"),
+        "edit must never open staging: {opened}"
+    );
+}
+
+#[test]
+fn import_registers_existing_links() {
+    let repo = Repo::new();
+    // Build a store dir with a file, hand-create a symlink into a scan area.
+    let store = repo.make_store("nvim", &["init.lua"]);
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store, &target).unwrap();
+
+    repo.cmd()
+        .arg("import")
+        .arg("--scan-dir")
+        .arg(home.path().join(".config"))
+        .assert()
+        .success()
+        .stdout(contains("import 'nvim'"))
+        .stdout(contains("Imported 1"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("[stores.nvim]"),
+        "state must record nvim: {state}"
+    );
+    assert!(
+        state.contains("target"),
+        "state must have a target: {state}"
+    );
 }

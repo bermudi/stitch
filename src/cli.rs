@@ -85,11 +85,28 @@ pub enum Commands {
         name: String,
     },
 
-    /// Open config in $EDITOR
-    Edit,
+    /// Open stitch.toml (or an entry's repo source) in $EDITOR
+    Edit {
+        /// Store name or target path. Opens the repo source (the `.tmpl` for a
+        /// templated entry, the plain file otherwise) — never the staged render.
+        /// Omit to open `stitch.toml`.
+        entry: Option<String>,
+    },
 
     /// Run health checks
     Doctor,
+
+    /// Scan for existing repo-pointing symlinks and import them into state
+    Import {
+        /// Directories to scan for links (repeatable, full depth).
+        /// Default: ~ (top-level dotfiles only), ~/.config, ~/.local/share.
+        #[arg(long = "scan-dir", value_name = "DIR")]
+        scan_dirs: Vec<String>,
+
+        /// Preview without writing state
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Split a v0.2 .stitch/config.toml into stitch.toml + .stitch/state.toml
     Migrate {

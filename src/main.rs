@@ -3,6 +3,7 @@ mod config;
 mod hooks;
 mod linker;
 mod platform;
+mod render;
 mod scan;
 mod store;
 
@@ -58,9 +59,13 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
             let root = resolve_root(cli.repo.as_deref())?;
             cmd_remove(&root, &name)
         }
-        cli::Commands::Edit => {
+        cli::Commands::Edit { entry } => {
             let root = resolve_root(cli.repo.as_deref())?;
-            cmd_edit(&root)
+            cmd_edit(&root, entry.as_deref())
+        }
+        cli::Commands::Import { scan_dirs, dry_run } => {
+            let root = resolve_root(cli.repo.as_deref())?;
+            cmd_import(&root, &scan_dirs, dry_run)
         }
         cli::Commands::Doctor => {
             let root = resolve_root(cli.repo.as_deref())?;
@@ -180,9 +185,18 @@ fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
     // Generated half: empty state. Reserialized by the tool on every mutation.
     config::GeneratedState::default().save(&cwd)?;
 
+    // Trust foundation (v0.6): staging dir must never enter version control.
+    // Append `.stitch/render/` to .gitignore (create if needed). Idempotent.
+    render::ensure_render_gitignore(&cwd)?;
+
+    // Pre-create the staging root at 0700 so the permission contract holds
+    // before the first templated apply.
+    render::ensure_render_dir(&render::render_root(&cwd))?;
+
     println!("Initialized stitch config:");
     println!("  {}", authored_path.display());
     println!("  {}", stitch_dir.join("state.toml").display());
+    println!("  {}", cwd.join(".gitignore").display());
     Ok(())
 }
 
@@ -205,6 +219,19 @@ fn cmd_apply(
         println!("Dry run — no changes will be made.\n");
     }
 
+    // Upgraded plain repos need no migration, but a real template apply must
+    // not create sensitive staged output before Git is told to ignore it.
+    if !opts.dry_run
+        && store::has_active_template_sources(root, &filtered_config, &platform)
+        && !render::repo_gitignore_covers_render(root)
+    {
+        return Err(format!(
+            "repo .gitignore is missing `{}` — add that entry before applying templates",
+            render::RENDER_GITIGNORE_ENTRY
+        )
+        .into());
+    }
+
     // Global pre-apply hook (skipped under dry-run — hooks have side effects).
     if !opts.dry_run {
         let env = hooks::HookEnv {
@@ -222,6 +249,7 @@ fn cmd_apply(
     let mut created = 0;
     let mut replaced = 0;
     let mut backed_up = 0;
+    let mut removed = 0;
     let mut conflicts = 0;
     let mut errors = 0;
     let mut skipped = 0;
@@ -255,6 +283,16 @@ fn cmd_apply(
                     already += 1;
                     println!("ok");
                 }
+                store::ApplyAction::ContentChanged(p) => {
+                    // Count as a real change so apply/diff are non-empty when
+                    // only template content drifted (link state unchanged).
+                    replaced += 1;
+                    println!("content: {}", p.display());
+                }
+                store::ApplyAction::Removed(p) => {
+                    removed += 1;
+                    println!("remove: {}", p.display());
+                }
                 store::ApplyAction::Error(e) => {
                     errors += 1;
                     println!("error: {e}");
@@ -264,8 +302,8 @@ fn cmd_apply(
     }
 
     println!(
-        "\nSummary: {} ok, {} created, {} replaced, {} backed up, {} conflicts, {} errors, {} skipped",
-        already, created, replaced, backed_up, conflicts, errors, skipped
+        "\nSummary: {} ok, {} created, {} replaced, {} backed up, {} removed, {} conflicts, {} errors, {} skipped",
+        already, created, replaced, backed_up, removed, conflicts, errors, skipped
     );
 
     // Global post-apply hook (skipped under dry-run). Warns on failure — the
@@ -569,6 +607,7 @@ fn cmd_add(
             &store_name,
             &new_store,
             &platform,
+            &loaded.config.vars,
             store::ApplyOpts {
                 dry_run: false,
                 force: false,
@@ -662,6 +701,7 @@ fn cmd_add(
             &store_name,
             &new_store,
             &platform,
+            &loaded.config.vars,
             store::ApplyOpts {
                 dry_run: false,
                 force: false,
@@ -758,6 +798,11 @@ fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), Box<dyn std::err
         println!("  removed {}", entry.target.display());
     }
 
+    // Staging is tool-owned: drop the store's render tree alongside its links.
+    if let Err(e) = render::remove_store_staging(root, name) {
+        eprintln!("warning: {e}");
+    }
+
     loaded.generated.save(root)?;
 
     // Global post-remove hook.
@@ -777,25 +822,218 @@ fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn cmd_edit(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let authored_path = root.join("stitch.toml");
-    if !authored_path.exists() {
-        return Err(format!(
-            "{} does not exist — run `stitch init` first",
-            authored_path.display()
-        )
-        .into());
-    }
+fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = match entry {
+        None => {
+            let authored_path = root.join("stitch.toml");
+            if !authored_path.exists() {
+                return Err(format!(
+                    "{} does not exist — run `stitch init` first",
+                    authored_path.display()
+                )
+                .into());
+            }
+            authored_path
+        }
+        Some(e) => {
+            let loaded = Config::load(root)?;
+            print_warnings(&loaded);
+            render::resolve_edit_source(root, &loaded.config, e)?
+        }
+    };
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    let status = std::process::Command::new(editor)
-        .arg(&authored_path)
-        .status()?;
+    let status = std::process::Command::new(&editor).arg(&path).status()?;
 
     if !status.success() {
         return Err("editor exited with error".into());
     }
     Ok(())
+}
+
+/// Import existing repo-pointing symlinks into `.stitch/state.toml`.
+///
+/// Groups found links by the store directory they resolve into. A link whose
+/// target is exactly a store dir becomes a whole-dir store; links into files
+/// under a store become file-mode entries. Skips links already covered by
+/// config. Never rewrites `stitch.toml`.
+fn cmd_import(
+    root: &std::path::Path,
+    scan_dirs: &[String],
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut loaded = Config::load(root)?;
+    print_warnings(&loaded);
+    let platform = Platform::detect();
+
+    let roots: Vec<scan::ScanRoot> = if scan_dirs.is_empty() {
+        scan::default_scan_dirs()
+    } else {
+        scan_dirs
+            .iter()
+            .map(|s| scan::ScanRoot::from(expand_home(s)))
+            .collect()
+    };
+
+    let found = scan::scan_for_repo_links(root, &roots);
+    // Already-owned links are not re-imported.
+    let owned: std::collections::HashSet<_> = store::status_all(root, &loaded.config, &platform)
+        .into_iter()
+        .filter(|e| !e.skipped_platform)
+        .map(|e| e.target)
+        .collect();
+
+    // store_name → (optional whole-dir target, file entries: (source_rel, target_parent))
+    #[derive(Default)]
+    struct ImportBucket {
+        /// Whole-dir target path string (with ~), if any link points at the store dir.
+        whole_dir_target: Option<String>,
+        /// File-mode: source relative path → target path string for the parent dir.
+        files: std::collections::BTreeMap<String, String>,
+    }
+    let mut buckets: std::collections::BTreeMap<String, ImportBucket> =
+        std::collections::BTreeMap::new();
+
+    let repo_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut skipped_owned = 0;
+
+    for fl in &found {
+        if owned.iter().any(|t| paths_equal(t, &fl.link)) {
+            skipped_owned += 1;
+            continue;
+        }
+        // resolves_to is absolute (canonical when possible). Must live under a
+        // top-level store directory.
+        let Ok(rel) = fl.resolves_to.strip_prefix(&repo_canon) else {
+            continue;
+        };
+        let mut comps = rel.components();
+        let Some(std::path::Component::Normal(store_os)) = comps.next() else {
+            continue;
+        };
+        let store_name = store_os.to_string_lossy().into_owned();
+        // Skip tool-owned / VCS dirs.
+        if store_name == ".stitch" || store_name == ".git" {
+            continue;
+        }
+        let rest: std::path::PathBuf = comps.collect();
+        let target_str = collapse_home(&fl.link);
+
+        let bucket = buckets.entry(store_name).or_default();
+        if rest.as_os_str().is_empty() {
+            // Link points at the store directory itself → whole-dir.
+            bucket.whole_dir_target = Some(target_str);
+        } else {
+            let source_rel = rest.to_string_lossy().into_owned();
+            // Target parent is where the file link lives; for file-mode the
+            // store target is that parent.
+            let parent = fl
+                .link
+                .parent()
+                .map(collapse_home)
+                .unwrap_or_else(|| target_str.clone());
+            bucket.files.insert(source_rel, parent);
+        }
+    }
+
+    if buckets.is_empty() {
+        println!("No importable links found.");
+        if skipped_owned > 0 {
+            println!("  ({skipped_owned} already managed, skipped)");
+        }
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("Dry run — no changes will be made.\n");
+    }
+
+    let mut imported = 0;
+    for (store_name, bucket) in &buckets {
+        // Refuse to clobber an existing store entry.
+        if loaded.generated.stores.contains_key(store_name) {
+            println!("  skip '{store_name}': already in state.toml");
+            continue;
+        }
+
+        let entry = if let Some(ref whole) = bucket.whole_dir_target {
+            // Whole-dir wins if present; file entries under the same store are
+            // noted but not mixed (a store is one mode).
+            if !bucket.files.is_empty() {
+                eprintln!(
+                    "warning: store '{store_name}': found both whole-dir and file links; \
+                     importing as whole-dir, file links ignored"
+                );
+            }
+            println!("  import '{store_name}' → {whole} (whole-dir)");
+            config::GeneratedStore {
+                target: Some(whole.clone()),
+                files: vec![],
+                patterns: vec![],
+                targets: std::collections::BTreeMap::new(),
+            }
+        } else if !bucket.files.is_empty() {
+            // All file links must share the same target parent.
+            let parents: std::collections::BTreeSet<_> = bucket.files.values().cloned().collect();
+            if parents.len() != 1 {
+                eprintln!(
+                    "warning: store '{store_name}': file links point at multiple target \
+                     dirs ({}); skipping",
+                    parents.into_iter().collect::<Vec<_>>().join(", ")
+                );
+                continue;
+            }
+            let target = parents.into_iter().next().unwrap();
+            let files: Vec<String> = bucket.files.keys().cloned().collect();
+            println!(
+                "  import '{store_name}' → {target} (files: {})",
+                files.join(", ")
+            );
+            config::GeneratedStore {
+                target: Some(target),
+                files,
+                patterns: vec![],
+                targets: std::collections::BTreeMap::new(),
+            }
+        } else {
+            continue;
+        };
+
+        if !dry_run {
+            loaded.generated.stores.insert(store_name.clone(), entry);
+        }
+        imported += 1;
+    }
+
+    if !dry_run && imported > 0 {
+        loaded.generated.save(root)?;
+    }
+
+    println!("\nImported {imported} store(s).");
+    if skipped_owned > 0 {
+        println!("  ({skipped_owned} already managed, skipped)");
+    }
+    Ok(())
+}
+
+/// True if two paths refer to the same location (canonical when possible).
+fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
+    let cb = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
+/// Collapse `$HOME` prefix to `~` for state.toml target strings.
+fn collapse_home(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        if rel.as_os_str().is_empty() {
+            return "~".into();
+        }
+        return format!("~/{}", rel.display());
+    }
+    path.display().to_string()
 }
 
 fn cmd_doctor(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {

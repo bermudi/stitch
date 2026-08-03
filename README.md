@@ -77,30 +77,53 @@ target = "~/.config/git"
 
 | Command | Purpose |
 |---|---|
-| `stitch init` | Create `stitch.toml` + `.stitch/state.toml` in the current dir |
+| `stitch init` | Create `stitch.toml` + `.stitch/state.toml` + `.gitignore` entry for staging |
 | `stitch migrate` | Split a v0.2 `.stitch/config.toml` into the two-file layout |
 | `stitch apply` | Reconcile filesystem to match config (the update loop) |
 | `stitch status [name]` | Show symlink state per store |
-| `stitch diff` | Preview what `apply` would do |
+| `stitch diff` | Preview what `apply` would do (incl. template content drift) |
 | `stitch list` | Print all configured stores and targets |
 | `stitch add <path>` | Move existing content into the repo and link back, or create an empty store if the path doesn't exist |
-| `stitch remove <name>` | Remove symlinks and the inventory entry |
-| `stitch edit` | Open `stitch.toml` in `$EDITOR` |
-| `stitch doctor` | Health check (orphaned behavior, broken links, conflicts) |
+| `stitch remove <name>` | Remove symlinks, staging, and the inventory entry |
+| `stitch edit [entry]` | Open `stitch.toml`, or an entry's repo source, in `$EDITOR` |
+| `stitch import` | Scan for existing repo-pointing symlinks and register them in state |
+| `stitch prune` | List (or `--yes` remove) orphaned repo-pointing symlinks |
+| `stitch doctor` | Health check (orphaned behavior, broken links, staging trust) |
 
 `apply`, `diff`, and `add` support `--only <name>` (repeatable), `--dry-run`, and
 `--force` where applicable.
+
+## Templates
+
+Rename a store file to end in `.tmpl` and put Jinja expressions in it:
+
+```
+# git/gitconfig.tmpl
+[user]
+    name = {{ hostname }}
+    email = {{ vars.email }}
+[core]
+    editor = {{ env("EDITOR", "nvim") }}
+```
+
+`apply` renders to `.stitch/render/<store>/...` (mode `0600`, dir `0700`) and
+symlinks the target at the name *without* `.tmpl`. Whole-dir stores that contain
+any `.tmpl` promote to per-file links automatically. Edit the source with
+`stitch edit ~/.gitconfig` — never the staged file. New repos get the required
+`.stitch/render/` `.gitignore` entry from `init`; upgraded repos must add it
+before their first template apply (plain repos need no migration).
 
 ## Concepts
 
 - **Store** — a top-level directory in the repo. One unit of config.
 - **Target** — where the symlink(s) land on disk. Declared explicitly.
 - **Whole-directory mode** — no `files`/`patterns` → the entire store dir is one
-  symlink.
+  symlink (promoted to file mode if any entry is ignored or any `.tmpl` exists).
 - **File mode** — `files` and/or `patterns` → individual files are symlinked into
-  the target dir.
+  the target dir. List template sources by their on-disk name (`gitconfig.tmpl`).
 - **`when`** — platform filter (`os`, `arch`, `distro`, `hostname`, `shell`).
-  All specified fields must match.
+  All specified fields must match. `distro` is the detected Linux distro ID;
+  if unavailable it cannot match and `{{ distro }}` renders as `none` in templates.
 - **Hooks** — per-store `pre`/`post` shell commands, plus global
   `.stitch/hooks/pre-apply` / `post-apply` / `pre-remove` / `post-remove`
   executables.

@@ -127,7 +127,7 @@ export STITCH_REPO=~/dots
 
 ### `stitch init`
 
-Create `stitch.toml` (empty, with a header documenting it is authored/read-only to the tool) and `.stitch/state.toml` (empty, generated) in the current directory. Refuses if either exists, or if a v0.2 `.stitch/config.toml` is present (pointing at `migrate` instead).
+Create `stitch.toml` (empty, with a header documenting it is authored/read-only to the tool) and `.stitch/state.toml` (empty, generated) in the current directory. Also appends `.stitch/render/` to the repo's `.gitignore` (creating the file if needed) and pre-creates `.stitch/render/` at mode `0700`. Refuses if either config file exists, or if a v0.2 `.stitch/config.toml` is present (pointing at `migrate` instead).
 
 ### `stitch apply`
 
@@ -145,7 +145,7 @@ Show symlink state for one or all stores. States: `linked`, `missing`, `conflict
 
 ### `stitch diff`
 
-Preview what `stitch apply` would do. Reports `ok`, `create`, `conflict`, `replace`, `backed up` per target.
+Preview what `stitch apply` would do. Reports `ok`, `create`, `conflict`, `replace`, `backed up` per target. For templated entries, also reports `content` when a fresh in-memory render differs from the staged file (link state may already be correct).
 
 | Flag | Short | Description |
 |---|---|---|
@@ -171,15 +171,15 @@ A symlink at the target path is always an error (never silently clobbered). The 
 
 ### `stitch remove <name>`
 
-Remove store symlinks and the store's `state.toml` entry. `stitch.toml` behavior is left in place (the tool never rewrites authored config) — `doctor` flags the orphaned behavior; remove it via `stitch edit`. Store directory left untouched.
+Remove store symlinks, the store's staged renders under `.stitch/render/<name>/`, and the store's `state.toml` entry. `stitch.toml` behavior is left in place (the tool never rewrites authored config) — `doctor` flags the orphaned behavior; remove it via `stitch edit`. Store directory left untouched.
 
-### `stitch edit`
+### `stitch edit [entry]`
 
-Open `stitch.toml` in `$EDITOR`.
+Open `stitch.toml` in `$EDITOR`. With an argument, opens an entry's **repo source** instead — the `.tmpl` for a templated entry, the plain file otherwise — resolved via the merged config (works pre-apply, since it reads config rather than filesystem links). Never the staged render. The arg is a store name or a home-expanded target path.
 
 ### `stitch doctor`
 
-Health check: missing store dirs, broken symlinks, conflicting targets, empty stores, orphaned behavior (store in `stitch.toml` with no `state.toml` entry), orphaned links (symlinks into the repo referenced by no store).
+Health check: missing store dirs, broken symlinks, conflicting targets, empty stores, orphaned behavior (store in `stitch.toml` with no `state.toml` entry), staging permission drift, template staging content drift (staged ≠ fresh render), template render errors. It errors on a missing `.stitch/render/` gitignore entry only when configured templates are active on this platform or staged output exists; plain pre-template repos need no migration.
 
 ### `stitch migrate`
 
@@ -218,19 +218,21 @@ descending into slow `$HOME` trees (`~/.cache`, `node_modules`, …).
 `~/.config` and `~/.local/share` are walked at full depth. An explicit
 `--scan-dir` is always full depth, so `--scan-dir ~` forces a complete sweep.
 
-The scanner lives in `src/scan.rs` and is shared with the planned `import`
-command, which will register existing repo-pointing symlinks in config instead
-of removing them.
+The scanner lives in `src/scan.rs` and is shared with `import`, which
+registers existing repo-pointing symlinks in state instead of removing them.
 
-### `stitch import` *(planned — not yet implemented)*
+### `stitch import`
 
-Scan for existing symlinks pointing into the repo and import them into config.
-Shares the `src/scan.rs` scanner with `prune`.
+Scan for existing symlinks pointing into the repo and register them in
+`.stitch/state.toml`. Shares the `src/scan.rs` scanner with `prune`. Links
+already covered by config are skipped. Never rewrites `stitch.toml`. A link
+pointing at a store directory becomes a whole-dir store; links into files under
+a store become file-mode entries (all must share one target parent).
 
 | Flag | Description |
 |---|---|
 | `--scan-dir` | Directories to scan, full depth (repeatable). Default: `~` (top-level dotfiles only), `~/.config`, `~/.local/share` |
-| `--dry-run` | Preview |
+| `--dry-run` | Preview without writing state |
 
 ## Platform support
 
@@ -244,29 +246,53 @@ All fields optional. All specified must match.
 |---|---|
 | `os` | `linux`, `macos`, `windows` — mirrors `std::env::consts::OS` (note: `macos`, **not** `darwin`) |
 | `arch` | `x86_64`, `aarch64`, ... |
-| `distro` | `ubuntu`, `arch`, `debian`, ... |
+| `distro` | Detected distro ID (for example `ubuntu`, `arch`, `debian`) |
 | `hostname` | Machine hostname |
 | `shell` | `zsh`, `bash`, `fish`, `nu` |
 
-## Templates & secrets (v0.4 — planned, not yet implemented)
+`distro` detection is exact: on Linux, stitch reads the first `ID=` from
+`/etc/os-release`; if unavailable, it falls back to `DISTRIB_ID=` from
+`/etc/lsb-release` and lowercases that value. On macOS it is `macos`; on other
+platforms, or when neither Linux file supplies an ID, it is absent. A
+`when.distro` clause matches only an exactly equal detected value, so an absent
+distro never matches. In templates, an absent `distro` renders as `none` (the
+minijinja representation of the optional value); use `{{ distro or "unknown" }}`
+when a concrete fallback is needed.
 
-*This feature is on the v0.4 roadmap and does not exist yet. The design below is
-the intended contract.*
+## Templates (v0.6)
 
-Files containing `{{ ... }}` references will be rendered through a template engine
-and symlinked from a staging dir. Files without template expressions will be
-symlinked directly.
+Files ending in `.tmpl` are rendered through minijinja and symlinked from a
+staging dir. Non-`.tmpl` files are symlinked directly. Detection is by suffix
+only — no content sniffing. Secrets (`{{ secret }}`) are v0.7.
 
 | Expression | Description |
 |---|---|
-| `{{ env "VAR" }}` | Environment variable |
-| `{{ secret "name" }}` | Encrypted secret |
-| `{{ .Hostname }}` | Hostname |
-| `{{ .OS }}` | Operating system |
-| `{{ .Vars.key }}` | User-defined variable |
+| `{{ env("VAR") }}` | Environment variable (hard-fails if unset; `env("VAR", "default")` for an opt-in default) |
+| `{{ hostname }}` | Hostname |
+| `{{ os }}` | Operating system |
+| `{{ arch }}` | CPU architecture |
+| `{{ distro }}` | Distro ID; renders `none` when unavailable |
+| `{{ shell }}` | Login shell basename |
+| `{{ vars.key }}` | User-defined variable (`[vars]` in `stitch.toml`) |
+| `{{ secret("name") }}` | Encrypted secret (v0.7 — same render context) |
 
-Secrets will be stored encrypted in `.stitch/secrets.enc`. Rendered files will go
-to `~/.local/state/stitch/<repo-hash>/`.
+Rendered files go to `.stitch/render/<store>/...` — **inside the repo**, so the
+symlink still satisfies `points_into_repo` and the existing `prune`/`remove`
+machinery works unchanged. (An earlier draft put staging at
+`~/.local/state/stitch/<repo-hash>/`; that location is *outside* the repo and
+would make every templated symlink look foreign to `remove_link`/`prune`, which
+both key off "symlink resolves into `repo_root`".) Secrets, when added in v0.7,
+live encrypted in `.stitch/secrets.enc`.
+
+Contract (rationale in `docs/plans/v0.6-templates.md`):
+
+- **Detection is by `.tmpl` suffix, at any depth** — deterministic from the directory entry alone, no content sniffing. A whole-dir store containing a `.tmpl` anywhere is promoted to file-mode resolution: one directory symlink becomes N per-file symlinks. Invisible for `~/.config/git`, observable for watched dirs (`conf.d`, systemd units, file watchers) — a documented behavioral consequence, not a surprise.
+- **State records source names.** `state.toml` lists `gitconfig.tmpl`; apply/status/remove/diff strip the suffix through one shared resolution path (`resolve_entry`). A store file name is never used directly as a link target. A store containing both `foo` and `foo.tmpl` is rejected at resolution time.
+- **Staging is locked down from day one.** `.stitch/render/` is `0700`, rendered files `0600`. All rendering (apply and diff) happens in memory — no tempfile ever holds rendered plaintext under a default umask. Threat model: multi-user machines, shared CI runners, `env()` pulling tokens in v0.6, and encrypted secrets in v0.7 all read through these files. `init` appends `.stitch/render/` to the repo's `.gitignore`; an upgraded repo must add the entry manually before its first template apply. `apply` refuses to render without it, and `doctor` errors when templates or staged output make the entry relevant.
+- **Failure model is per-entry.** A template error (parse failure, missing `env` key) fails that entry and skips its link — never created, never broken. Render is atomic and happens before linking, so staging is never half-written. `apply` continues with other entries and stores, exiting non-zero at the end if anything failed (same aggregation as conflicts).
+- **`diff` gains a content dimension for templated entries only**: a fresh in-memory render compared against the staged file — "would `apply` change anything?" Non-templated entries remain link-state-only.
+- **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed. Hand-edits inside `.stitch/render/` are unsupported and overwritten on the next `apply`; `doctor` flags drift (staged ≠ fresh render) so this is never silent. Writes are hash-gated: unchanged content preserves mtime.
+- **Authoring is by hand.** Write `gitconfig.tmpl` in the store and `apply` — whole-dir stores pick it up via promotion; file-mode stores list the source name in `files`. There is no `add --template` in v0.6.
 
 ## Hooks (v0.2)
 
@@ -355,15 +381,28 @@ comments on every `add`/`remove` reserialize.
 - [x] orphaned-link detection + `prune`/`gc` — shared `src/scan.rs` scanner;
   `doctor` stays repo-local (the home-dir scan lives in `prune` only)
 
-### v0.4 — Templates & secrets (planned)
-- [ ] `modify` command
-- [ ] `import` (scan existing symlinks)
-- [ ] Go-style text/template engine
-- [ ] `{{ env }}`, `{{ .Vars }}`, `{{ .Hostname }}` etc.
-- [ ] Encrypted secrets (`age` or XChaCha20-Poly1305)
-- [ ] Template staging dir
+### v0.4 / v0.5 — incremental releases (shipped 2026-06-28)
+These version numbers shipped for incremental features, not the milestone work
+below; planned milestones are renumbered to avoid collision.
+- [x] v0.4.0 — `adopt` merged into `add` (breaking)
+- [x] v0.4.1 — trailing-slash fix in `expand_home`
+- [x] v0.5.0 — `--repo` flag + `STITCH_REPO` env var
 
-### v0.5 — TUI (planned)
+### ✅ v0.6 — Templates (shipped)
+- [x] Trust foundation: `.gitignore` enforcement in `init`/`doctor`,
+      `.stitch/render` permissions (`0700`/`0600`), threat-model docs
+- [x] Template engine (minijinja) + render→staging→symlink flow
+- [x] `{{ env("VAR") }}`, `{{ vars.key }}`, `{{ hostname }}`, `{{ os }}`, ...
+- [x] Staging dir under `.stitch/render/` (inside the repo — invariant-preserving)
+- [x] `diff` content dimension for templated entries + staging reconciliation
+- [x] `stitch edit <entry>` (open `.tmpl` source in `$EDITOR`)
+- [x] `import` — scan existing repo-pointing symlinks into state
+
+### v0.7 — Encrypted secrets (planned, split out — separate trust surface)
+- [ ] `age` or XChaCha20-Poly1305; `.stitch/secrets.enc`
+- [ ] Key management + threat model (red lines: no external upload, no data exposure)
+
+### v0.8 — TUI (planned)
 - [ ] Interactive dashboard (ratatui)
 - [ ] Command palette
 - [ ] Activity log
@@ -371,7 +410,7 @@ comments on every `add`/`remove` reserialize.
 ## Design decisions
 
 - **TOML over YAML** — no quoting gotchas for `~` paths, Rust-idiomatic, unambiguous.
-- **Symlinks, not copies** — edits hit the repo directly. No drift possible.
+- **Symlinks, not copies** — edits hit the repo directly. No drift possible — *except* templated files (v0.6), which are generated from `.tmpl` sources into `.stitch/render/`; you edit the template, not the rendered output. The rendered symlink still points into the repo, so the ownership/prune invariant holds.
 - **Explicit config** — no inferring targets from directory layout. You declare it.
 - **Absolute symlinks** — resolved to absolute source paths so cwd doesn't matter.
 - **Authored vs generated, never mixed** — `stitch.toml` is yours and hand-editable; `.stitch/state.toml` is the tool's. The tool never rewrites the authored file after `init`, so comments and formatting survive every mutation. v0.2's single-file model violated this and ate comments on every `add`/`remove`.

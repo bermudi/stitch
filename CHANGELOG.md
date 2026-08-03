@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.0 — 2026-08-03
+
+### Features
+
+- **Templates.** Files ending in `.tmpl` are rendered with minijinja and
+  symlinked from `.stitch/render/<store>/...` (inside the repo, so
+  `points_into_repo` / `remove` / `prune` keep working). Context:
+  `{{ hostname }}`, `{{ os }}`, `{{ arch }}`, `{{ distro }}`, `{{ shell }}`,
+  `{{ vars.key }}`, `{{ env("VAR") }}` (hard-fail) / `{{ env("VAR", "default") }}`.
+  Whole-dir stores containing any `.tmpl` promote to per-file links. State
+  records source names; `resolve_entry` strips the suffix for the link target.
+- **Trust foundation for staging.** `init` appends `.stitch/render/` to
+  `.gitignore` and creates the staging root at `0700`; renders are `0600`.
+  `doctor` errors if the gitignore entry is missing. Rendering is in-memory
+  only (no tempfile under a default umask).
+- **`diff` content dimension** for templated entries: fresh render vs staged.
+  Staging is hash-gated (preserves mtime) and reconciled on `apply`/`remove`.
+  `apply` also removes stale stitch-owned file-mode links when a source is
+  deleted or renamed; foreign symlinks remain untouched.
+- **`stitch edit <entry>`** opens a store or target's repo source (the `.tmpl`
+  when present) — never the staged render. Config-based; works pre-apply.
+- **`stitch import`** scans for existing repo-pointing symlinks and registers
+  them in `state.toml` (shares `scan.rs` with `prune`).
+
 ## 0.5.0 — 2026-06-28
 
 ### Features
