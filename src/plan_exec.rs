@@ -12,9 +12,10 @@ use crate::linker::{self, LinkError};
 use crate::plan::{LinkRequires, Plan, PlanOp, TargetState, path_to_string};
 use crate::platform::Platform;
 use crate::render;
+use crate::store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 pub const PLAN_SCHEMA: u32 = 1;
@@ -36,6 +37,11 @@ pub struct PlanFile {
     pub config_sha256: String,
     pub platform: PlatformFingerprint,
     pub ops: Vec<PlanFileOp>,
+    /// Selected store names (the `stitch plan --only` scope, or all stores).
+    /// Used to schedule per-store hooks even when a selected store has no
+    /// filesystem ops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stores: Vec<String>,
     pub conflicts: Vec<PlanConflict>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<PlanError>,
@@ -126,6 +132,11 @@ pub enum PlanFileOp {
         source: Option<String>,
         requires: PlanFileRequires,
     },
+
+    RemoveStaged {
+        store: String,
+        rel: String,
+    },
 }
 
 impl PlanFileOp {
@@ -142,6 +153,7 @@ impl PlanFileOp {
                     find_store_for_target(repo_root, config, Path::new(target))
                 }
             }
+            PlanFileOp::RemoveStaged { store, .. } => Some(store.clone()),
         }
     }
 }
@@ -171,6 +183,8 @@ pub struct PlanExecReport {
     pub ops_remaining: VecDeque<String>,
     pub conflicts: Vec<PlanConflict>,
     pub staged: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// An aborted execution: the prefix that ran and the error that stopped it.
@@ -249,6 +263,7 @@ pub fn build_plan_file(
         config_sha256,
         platform: platform_fp,
         ops,
+        stores: plan.stores.iter().map(|s| s.store_name.clone()).collect(),
         conflicts,
         errors,
     })
@@ -277,11 +292,16 @@ fn convert_store_ops(
 ) -> Result<(Vec<PlanFileOp>, Vec<PlanFileOp>), StitchError> {
     let mut renders = Vec::new();
     let mut links = Vec::new();
+    let mut keep_staged: BTreeSet<String> = BTreeSet::new();
+    let store_config = loaded.config.stores.get(store_name);
 
     for op in ops {
         let maybe_render =
             stage_render_for_op(repo_root, loaded, store_name, store_dir, op, platform)?;
         if let Some(render) = maybe_render {
+            if let PlanFileOp::StageRender { source_rel, .. } = &render {
+                keep_staged.insert(render::resolve_entry(source_rel).link_rel.clone());
+            }
             renders.push(render);
         }
 
@@ -337,14 +357,66 @@ fn convert_store_ops(
                 // For templates these became `StageRender`; for plain files
                 // they are no-ops in the executable plan.
             }
-            PlanOp::StageRender { .. }
-            | PlanOp::SkippedPlatform
-            | PlanOp::Conflict { .. }
-            | PlanOp::Error { .. } => {}
+            PlanOp::Conflict { target, .. } => {
+                // A conflicted but still-configured template keeps its staged
+                // render, matching `reconcile_store_staging` in a normal apply.
+                if let Some(source) = store::resolve_link_source(
+                    repo_root,
+                    store_dir,
+                    store_config,
+                    store_name,
+                    &PathBuf::from(target),
+                ) {
+                    maybe_keep_staged(repo_root, store_name, &source, &mut keep_staged);
+                }
+            }
+            PlanOp::StageRender { .. } | PlanOp::SkippedPlatform | PlanOp::Error { .. } => {}
+        }
+    }
+
+    // Emit staged-render cleanup for any stale renders in this store.
+    let staged_dir = render::store_render_dir(repo_root, store_name);
+    if staged_dir.exists() {
+        for entry in walkdir::WalkDir::new(&staged_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = match entry.path().strip_prefix(&staged_dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let rel_str = rel.to_string_lossy().into_owned();
+            if !keep_staged.contains(&rel_str) {
+                links.push(PlanFileOp::RemoveStaged {
+                    store: store_name.into(),
+                    rel: rel_str,
+                });
+            }
         }
     }
 
     Ok((renders, links))
+}
+
+/// If `source` is a staged path for `store_name`, add its link_rel to `keep`.
+fn maybe_keep_staged(
+    repo_root: &Path,
+    store_name: &str,
+    source: &str,
+    keep: &mut BTreeSet<String>,
+) {
+    let staged_dir = render::store_render_dir(repo_root, store_name);
+    let source_path = Path::new(source);
+    if !source_path.starts_with(&staged_dir) {
+        return;
+    }
+    if let Ok(rel) = source_path.strip_prefix(&staged_dir) {
+        keep.insert(rel.to_string_lossy().into_owned());
+    }
 }
 
 /// If `op` represents a template that must be rendered, produce a `StageRender`
@@ -489,6 +561,301 @@ fn base_report(plan: &PlanFile) -> PlanExecReport {
         ops_remaining: plan.ops.iter().map(op_description).collect(),
         conflicts: plan.conflicts.clone(),
         staged: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preflight state simulation
+// ---------------------------------------------------------------------------
+
+/// Tracks the predicted filesystem state across a plan's ops so that later
+/// ops are preflighted against the *simulated* result of earlier ones.
+struct PreflightState<'a> {
+    repo_root: &'a Path,
+    config: &'a Config,
+    platform: &'a Platform,
+    overrides: BTreeMap<PathBuf, TargetState>,
+}
+
+#[derive(Debug, Clone)]
+struct RenderPin {
+    source_rel: String,
+    staged: String,
+}
+
+impl<'a> PreflightState<'a> {
+    fn new(repo_root: &'a Path, config: &'a Config, platform: &'a Platform) -> Self {
+        Self {
+            repo_root,
+            config,
+            platform,
+            overrides: BTreeMap::new(),
+        }
+    }
+
+    fn actual_target_state(&self, path: &Path) -> TargetState {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(path) {
+                Ok(resolved) => TargetState::SymlinkTo(path_to_string(&resolved)),
+                Err(_) => TargetState::SymlinkIntoRepo,
+            },
+            Ok(_) => TargetState::RealEntry,
+            Err(_) => TargetState::Absent,
+        }
+    }
+
+    fn get_effective_state(&self, path: &Path) -> TargetState {
+        if let Some(state) = self.overrides.get(path) {
+            return state.clone();
+        }
+        for ancestor in path.ancestors().skip(1) {
+            if self.overrides.contains_key(ancestor) {
+                // Any path inside an overridden directory is determined by that
+                // ancestor: removed dirs are absent, created dirs have no children
+                // until an op creates them, and symlinks cannot have children.
+                return TargetState::Absent;
+            }
+        }
+        self.actual_target_state(path)
+    }
+
+    fn parent_is_writable_dir(&self, path: &Path) -> Result<(), String> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        match self.get_effective_state(parent) {
+            TargetState::Absent => Ok(()),
+            TargetState::RealEntry => {
+                // If the plan created this parent, it will be a real directory.
+                if self
+                    .overrides
+                    .get(parent)
+                    .is_some_and(|s| matches!(s, TargetState::RealEntry))
+                    || parent.is_dir()
+                {
+                    Ok(())
+                } else {
+                    Err(format!("parent {} is not a directory", parent.display()))
+                }
+            }
+            TargetState::SymlinkTo(_) | TargetState::SymlinkIntoRepo => {
+                Err(format!("parent {} is a symlink", parent.display()))
+            }
+        }
+    }
+
+    fn state_matches(
+        &self,
+        path: &Path,
+        expected: &TargetState,
+        actual: &TargetState,
+    ) -> Result<(), String> {
+        match (expected, actual) {
+            (TargetState::Absent, TargetState::Absent)
+            | (TargetState::RealEntry, TargetState::RealEntry) => Ok(()),
+            (TargetState::SymlinkTo(exp), TargetState::SymlinkTo(act)) => {
+                if act == exp {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{} points to {act} (expected {exp})",
+                        path.display()
+                    ))
+                }
+            }
+            (TargetState::SymlinkTo(_), TargetState::SymlinkIntoRepo) => Err(format!(
+                "{} is a repo-owned symlink but its target cannot be read",
+                path.display()
+            )),
+            (TargetState::SymlinkIntoRepo, TargetState::SymlinkIntoRepo) => Ok(()),
+            (TargetState::SymlinkIntoRepo, TargetState::SymlinkTo(_)) => {
+                if linker::points_into_repo(path, self.repo_root) {
+                    Ok(())
+                } else {
+                    Err(format!("{} does not point into repo", path.display()))
+                }
+            }
+            _ => Err(format!(
+                "{} state {:?} does not match expected {:?}",
+                path.display(),
+                target_state_id(actual),
+                target_state_id(expected)
+            )),
+        }
+    }
+
+    fn check_source_exists_for_preflight(&self, source: &str) -> Result<(), String> {
+        let source_path = Path::new(source);
+        let is_staged = source_path.starts_with(render::render_root(self.repo_root));
+        if !is_staged && !source_path.exists() {
+            return Err(format!("source does not exist: {source}"));
+        }
+        Ok(())
+    }
+
+    fn set_ancestors_to_real(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.set_ancestors_to_real(parent);
+            if self.get_effective_state(parent) == TargetState::Absent {
+                self.overrides
+                    .insert(parent.to_path_buf(), TargetState::RealEntry);
+            }
+        }
+    }
+
+    fn apply_op(&mut self, loaded: &Loaded, op: &PlanFileOp) -> Result<(), String> {
+        match op {
+            PlanFileOp::StageRender {
+                store,
+                source_rel,
+                staged,
+                sha256,
+            } => {
+                let source_path = self.repo_root.join(store).join(source_rel);
+                let expected_staged = render::staging_path(
+                    self.repo_root,
+                    store,
+                    &render::resolve_entry(source_rel).link_rel,
+                );
+                if path_to_string(&expected_staged) != *staged {
+                    return Err(format!(
+                        "staged path mismatch: expected {}",
+                        expected_staged.display()
+                    ));
+                }
+                let content = render::render_file(
+                    &source_path,
+                    source_rel,
+                    self.platform,
+                    &loaded.config.vars,
+                )
+                .map_err(|e| format!("render failed: {e}"))?;
+                if sha256_hex(&content) != *sha256 {
+                    return Err("render hash mismatch".into());
+                }
+                Ok(())
+            }
+            PlanFileOp::CreateLink {
+                target,
+                source,
+                requires,
+            } => {
+                self.apply_link_op(Path::new(target), source, requires, false)?;
+                self.set_ancestors_to_real(Path::new(target));
+                self.overrides.insert(
+                    Path::new(target).to_path_buf(),
+                    TargetState::SymlinkTo(source.clone()),
+                );
+                Ok(())
+            }
+            PlanFileOp::ReplaceLink {
+                target,
+                source,
+                requires,
+            } => {
+                self.apply_link_op(Path::new(target), source, requires, false)?;
+                self.overrides.insert(
+                    Path::new(target).to_path_buf(),
+                    TargetState::SymlinkTo(source.clone()),
+                );
+                Ok(())
+            }
+            PlanFileOp::BackupAndLink {
+                target,
+                source,
+                backup,
+                requires,
+            } => {
+                self.apply_link_op(Path::new(target), source, requires, true)?;
+                let backup_state = if let Some(backup_req) = &requires.backup {
+                    target_state_from(backup_req, &requires.backup_value)
+                        .map_err(|e| format!("invalid backup requires: {e}"))?
+                } else {
+                    TargetState::Absent
+                };
+                self.state_matches(
+                    Path::new(backup),
+                    &backup_state,
+                    &self.get_effective_state(Path::new(backup)),
+                )?;
+                self.overrides.insert(
+                    Path::new(target).to_path_buf(),
+                    TargetState::SymlinkTo(source.clone()),
+                );
+                self.overrides
+                    .insert(Path::new(backup).to_path_buf(), TargetState::RealEntry);
+                Ok(())
+            }
+            PlanFileOp::RemoveLink {
+                target,
+                source,
+                requires,
+            } => {
+                let target_path = Path::new(target);
+                let target_state = target_state_from(&requires.target, &requires.value)
+                    .map_err(|e| format!("invalid requires: {e}"))?;
+                self.parent_is_writable_dir(target_path)?;
+                self.state_matches(
+                    target_path,
+                    &target_state,
+                    &self.get_effective_state(target_path),
+                )?;
+
+                // For wildcard removals, require the link to point into the
+                // specific store's source or staging tree (not just the repo).
+                if source.is_none() {
+                    let store = find_store_for_target(self.repo_root, self.config, target_path)
+                        .ok_or_else(|| {
+                            format!("target {target} is not under any configured store target")
+                        })?;
+                    let store_dir = self.repo_root.join(&store);
+                    let staged_dir = render::store_render_dir(self.repo_root, &store);
+                    if !linker::points_into(target_path, &store_dir)
+                        && !linker::points_into(target_path, &staged_dir)
+                    {
+                        return Err(format!(
+                            "target {target} does not point into store '{store}'"
+                        ));
+                    }
+                }
+
+                self.overrides
+                    .insert(target_path.to_path_buf(), TargetState::Absent);
+                Ok(())
+            }
+            PlanFileOp::RemoveStaged { store, rel } => {
+                let staged_dir = render::store_render_dir(self.repo_root, store);
+                let staged_path = staged_dir.join(rel);
+                if !staged_path.starts_with(&staged_dir) {
+                    return Err("staged path escapes render tree".into());
+                }
+                // A stale render may already be gone; missing is not a failure.
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_link_op(
+        &mut self,
+        target_path: &Path,
+        source: &str,
+        requires: &PlanFileRequires,
+        has_backup: bool,
+    ) -> Result<(), String> {
+        self.parent_is_writable_dir(target_path)?;
+        self.check_source_exists_for_preflight(source)?;
+        let target_state = target_state_from(&requires.target, &requires.value)
+            .map_err(|e| format!("invalid requires: {e}"))?;
+        self.state_matches(
+            target_path,
+            &target_state,
+            &self.get_effective_state(target_path),
+        )?;
+        if has_backup && !matches!(target_state, TargetState::RealEntry) {
+            return Err("backup_and_link requires target=real_entry".into());
+        }
+        Ok(())
     }
 }
 
@@ -536,8 +903,9 @@ pub fn execute_plan(
     // Untrusted-input validation: every op must be justified by the pinned
     // config. This is the security boundary for hand-edited plan files.
     let validation_context = ValidationContext::new(repo_root, &loaded.config);
+    let mut rendered: BTreeMap<(String, String), RenderPin> = BTreeMap::new();
     for (idx, op) in plan.ops.iter().enumerate() {
-        validate_op(&validation_context, idx, op).map_err(|e| {
+        validate_op(&validation_context, idx, op, &mut rendered).map_err(|e| {
             PlanExecError::new(
                 base_report(plan),
                 StitchError::plan_stale(format!("plan validation failed: {e}")),
@@ -545,9 +913,10 @@ pub fn execute_plan(
         })?;
     }
 
-    // Preflight all ops before mutating anything.
+    // Preflight all ops against a simulated filesystem state before mutating.
+    let mut state = PreflightState::new(repo_root, &loaded.config, &platform);
     for (idx, op) in plan.ops.iter().enumerate() {
-        preflight_op(repo_root, loaded, &platform, op).map_err(|e| {
+        state.apply_op(loaded, op).map_err(|e| {
             PlanExecError::new(
                 base_report(plan),
                 StitchError::plan_stale(format!("preflight failed for op {idx}: {e}")),
@@ -575,9 +944,8 @@ pub fn execute_plan(
 
     let mut report = base_report(plan);
 
-    let mut last_store: Option<String> = None;
-    let mut completed_stores: BTreeSet<String> = BTreeSet::new();
-
+    // Group ops by store, preserving the plan's own ordering.
+    let mut ops_by_store: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, op) in plan.ops.iter().enumerate() {
         let op_store = op.op_store(repo_root, &loaded.config).ok_or_else(|| {
             PlanExecError::new(
@@ -585,50 +953,66 @@ pub fn execute_plan(
                 StitchError::plan_stale(format!("op {idx}: cannot derive store for execution")),
             )
         })?;
-
-        // Per-store pre-hook: run before the first op of a new store.
-        if last_store.as_ref() != Some(&op_store) {
-            if let Some(prev) = last_store.take() {
-                run_store_post_hook(repo_root, &prev, &loaded.config, &platform)
-                    .map_err(|e| PlanExecError::new(report.clone(), e))?;
-                completed_stores.insert(prev);
-            }
-            if !completed_stores.contains(&op_store) {
-                run_store_pre_hook(repo_root, &op_store, &loaded.config, &platform)
-                    .map_err(|e| PlanExecError::new(report.clone(), e))?;
-            }
-            last_store = Some(op_store.clone());
-        }
-
-        // Re-check the precondition immediately before acting.
-        preflight_op(repo_root, loaded, &platform, op).map_err(|e| {
-            PlanExecError::new(
-                report.clone(),
-                StitchError::plan_stale(format!(
-                    "op {idx} ({}) precondition changed: {e}",
-                    op_description(op)
-                )),
-            )
-        })?;
-
-        match execute_op(repo_root, loaded, &platform, op, idx, &mut report) {
-            Ok(()) => {
-                report.ops_executed.push(op_description(op));
-                report.ops_remaining.pop_front();
-            }
-            Err(e) => {
-                return Err(PlanExecError::new(
-                    report,
-                    StitchError::plan_stale(format!("op {idx} ({}): {e}", op_description(op))),
-                ));
-            }
-        }
+        ops_by_store.entry(op_store).or_default().push(idx);
     }
 
-    if let Some(store) = last_store {
-        run_store_post_hook(repo_root, &store, &loaded.config, &platform)
+    let selected_stores: Vec<String> = if plan.stores.is_empty() {
+        loaded.config.stores.keys().cloned().collect()
+    } else {
+        plan.stores.clone()
+    };
+
+    for store_name in &selected_stores {
+        let Some(store) = loaded.config.stores.get(store_name) else {
+            return Err(PlanExecError::new(
+                report.clone(),
+                StitchError::plan_stale(format!("selected store '{store_name}' not in config")),
+            ));
+        };
+        if !platform.matches_when(&store.when) {
+            continue;
+        }
+
+        run_store_pre_hook(repo_root, store_name, &loaded.config, &platform)
             .map_err(|e| PlanExecError::new(report.clone(), e))?;
-        completed_stores.insert(store);
+
+        if let Some(indices) = ops_by_store.get(store_name) {
+            for &idx in indices {
+                let op = &plan.ops[idx];
+
+                // Re-check the precondition immediately before acting.
+                preflight_op(repo_root, loaded, &platform, op).map_err(|e| {
+                    PlanExecError::new(
+                        report.clone(),
+                        StitchError::plan_stale(format!(
+                            "op {idx} ({}) precondition changed: {e}",
+                            op_description(op)
+                        )),
+                    )
+                })?;
+
+                match execute_op(repo_root, loaded, &platform, op, idx, &mut report) {
+                    Ok(()) => {
+                        report.ops_executed.push(op_description(op));
+                        report.ops_remaining.pop_front();
+                    }
+                    Err(e) => {
+                        return Err(PlanExecError::new(
+                            report,
+                            StitchError::plan_stale(format!(
+                                "op {idx} ({}): {e}",
+                                op_description(op)
+                            )),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(warning) = run_store_post_hook(repo_root, store_name, &loaded.config, &platform)
+        {
+            report.warnings.push(warning);
+        }
     }
 
     // Global post-apply hook (warn on failure, never clobber the apply result).
@@ -639,7 +1023,7 @@ pub fn execute_plan(
         action: "apply",
     };
     if let Err(e) = hooks::run_global_hook(repo_root, "post-apply", &env, &platform) {
-        eprintln!("warning: post-apply hook: {e}");
+        report.warnings.push(format!("post-apply hook: {e}"));
     }
 
     if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
@@ -675,10 +1059,8 @@ fn run_store_post_hook(
     store_name: &str,
     config: &Config,
     platform: &Platform,
-) -> Result<(), StitchError> {
-    let Some(store) = config.stores.get(store_name) else {
-        return Ok(());
-    };
+) -> Option<String> {
+    let store = config.stores.get(store_name)?;
     if let Some(post) = &store.hooks.post {
         let env = HookEnv {
             root: repo_root,
@@ -687,10 +1069,10 @@ fn run_store_post_hook(
             action: "apply",
         };
         if let Err(e) = hooks::run_store_hook(post, &env, platform) {
-            eprintln!("warning: store '{store_name}' post-hook: {e}");
+            return Some(format!("store '{store_name}' post-hook: {e}"));
         }
     }
-    Ok(())
+    None
 }
 
 pub fn plan_exec_error(plan: &PlanFile) -> StitchError {
@@ -733,6 +1115,7 @@ pub fn op_description(op: &PlanFileOp) -> String {
         PlanFileOp::ReplaceLink { target, .. } => format!("replace_link {target}"),
         PlanFileOp::BackupAndLink { target, .. } => format!("backup_and_link {target}"),
         PlanFileOp::RemoveLink { target, .. } => format!("remove_link {target}"),
+        PlanFileOp::RemoveStaged { store, rel } => format!("remove_staged {store}/{rel}"),
     }
 }
 
@@ -937,6 +1320,23 @@ fn preflight_op(
             // If a `source` is recorded, the link must still point at it or into
             // the repo — both checked above when relevant.
             let _ = source;
+            Ok(())
+        }
+        PlanFileOp::RemoveStaged { store, rel } => {
+            if !loaded.config.stores.contains_key(store) {
+                return Err(format!("unknown store '{store}'"));
+            }
+            let rel_path = Path::new(rel);
+            if rel_path.is_absolute() || has_parent_dir(rel_path) || !is_safe_fragment(rel) {
+                return Err(format!("invalid staged rel '{rel}'"));
+            }
+            let staged_dir = render::store_render_dir(repo_root, store);
+            let staged_path = staged_dir.join(rel);
+            if !staged_path.starts_with(&staged_dir) {
+                return Err("staged path escapes render tree".into());
+            }
+            // Stale renders may already have been cleaned up by hand; a missing
+            // file is not a preflight failure.
             Ok(())
         }
     }
@@ -1149,6 +1549,35 @@ fn execute_op(
             }
             Ok(())
         }
+        PlanFileOp::RemoveStaged { store, rel } => {
+            let staged_dir = render::store_render_dir(repo_root, store);
+            let staged_path = staged_dir.join(rel);
+            if !staged_path.starts_with(&staged_dir) {
+                return Err("staged path escapes render tree".into());
+            }
+            if staged_path.is_file()
+                && let Err(e) = std::fs::remove_file(&staged_path)
+            {
+                return Err(format!("could not remove {}: {e}", staged_path.display()));
+            }
+            // Prune empty parent directories up to (but not including) the
+            // store render directory.
+            let mut parent = staged_path.parent();
+            while let Some(p) = parent {
+                if p == staged_dir || !p.starts_with(&staged_dir) {
+                    break;
+                }
+                if is_dir_empty(p) {
+                    if let Err(e) = std::fs::remove_dir(p) {
+                        return Err(format!("could not remove {}: {e}", p.display()));
+                    }
+                    parent = p.parent();
+                } else {
+                    break;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1201,13 +1630,18 @@ fn is_under_any_target(config: &Config, store: &str, target: &Path) -> bool {
     })
 }
 
-fn validate_op(ctx: &ValidationContext, idx: usize, op: &PlanFileOp) -> Result<(), String> {
+fn validate_op(
+    ctx: &ValidationContext,
+    idx: usize,
+    op: &PlanFileOp,
+    rendered: &mut BTreeMap<(String, String), RenderPin>,
+) -> Result<(), String> {
     match op {
         PlanFileOp::StageRender {
             store,
             source_rel,
             staged,
-            ..
+            sha256: _,
         } => {
             if !ctx.config.stores.contains_key(store) {
                 return Err(format!("op {idx}: unknown store '{store}'"));
@@ -1239,11 +1673,19 @@ fn validate_op(ctx: &ValidationContext, idx: usize, op: &PlanFileOp) -> Result<(
                     expected_staged.display()
                 ));
             }
+            let link_rel = render::resolve_entry(source_rel).link_rel;
+            rendered.insert(
+                (store.clone(), link_rel),
+                RenderPin {
+                    source_rel: source_rel.clone(),
+                    staged: staged.clone(),
+                },
+            );
             Ok(())
         }
         PlanFileOp::CreateLink { target, source, .. }
         | PlanFileOp::ReplaceLink { target, source, .. } => {
-            validate_link_op(ctx, idx, target, source)?;
+            validate_link_op(ctx, idx, target, source, rendered)?;
             Ok(())
         }
         PlanFileOp::BackupAndLink {
@@ -1252,31 +1694,26 @@ fn validate_op(ctx: &ValidationContext, idx: usize, op: &PlanFileOp) -> Result<(
             backup,
             ..
         } => {
-            validate_link_op(ctx, idx, target, source)?;
+            validate_link_op(ctx, idx, target, source, rendered)?;
             validate_backup_path(idx, target, backup)?;
             Ok(())
         }
         PlanFileOp::RemoveLink { target, source, .. } => {
-            if has_parent_dir(Path::new(target)) {
-                return Err(format!("op {idx}: target '{target}' contains '..'"));
-            }
-            let store = if let Some(src) = source {
-                if has_parent_dir(Path::new(src)) {
-                    return Err(format!("op {idx}: source '{src}' contains '..'"));
-                }
-                source_store(src, ctx.repo_root)
-                    .ok_or_else(|| format!("op {idx}: cannot derive store from source '{src}'"))?
-            } else {
-                find_store_for_target(ctx.repo_root, ctx.config, Path::new(target)).ok_or_else(
-                    || {
-                        format!(
-                            "op {idx}: target {target} is not under any configured store target"
-                        )
-                    },
-                )?
-            };
-            if !ctx.config.stores.contains_key(&store) {
+            validate_remove_link_op(ctx, idx, target, source.as_deref())?;
+            Ok(())
+        }
+        PlanFileOp::RemoveStaged { store, rel } => {
+            if !ctx.config.stores.contains_key(store) {
                 return Err(format!("op {idx}: unknown store '{store}'"));
+            }
+            let rel_path = Path::new(rel);
+            if rel_path.is_absolute() || has_parent_dir(rel_path) || !is_safe_fragment(rel) {
+                return Err(format!("op {idx}: invalid staged rel '{rel}'"));
+            }
+            let staged_dir = render::store_render_dir(ctx.repo_root, store);
+            let staged_path = staged_dir.join(rel);
+            if !staged_path.starts_with(&staged_dir) {
+                return Err(format!("op {idx}: staged path escapes render tree"));
             }
             Ok(())
         }
@@ -1288,6 +1725,7 @@ fn validate_link_op(
     idx: usize,
     target: &str,
     source: &str,
+    rendered: &BTreeMap<(String, String), RenderPin>,
 ) -> Result<(), String> {
     let source_path = Path::new(source);
     if has_parent_dir(source_path) {
@@ -1308,22 +1746,40 @@ fn validate_link_op(
         ));
     }
 
-    // For staged sources, derive the link name and ensure the template exists.
+    // For staged sources, derive the link name and ensure the template exists
+    // and is pinned by a preceding StageRender op.
     if let Some(staged_store) = staged_store(source_path) {
         if staged_store != source_store {
             return Err(format!(
                 "op {idx}: staged path store '{staged_store}' does not match source store"
             ));
         }
+        let staged_dir = render::store_render_dir(ctx.repo_root, &source_store);
         let rel = source_path
-            .strip_prefix(render::store_render_dir(ctx.repo_root, &source_store))
+            .strip_prefix(&staged_dir)
             .map_err(|_| format!("op {idx}: staged path is not under render dir"))?;
         let link_rel = rel.to_string_lossy().into_owned();
-        let source_rel = link_rel + render::TMPL_SUFFIX;
+        let resolved = render::resolve_entry(&(link_rel.clone() + render::TMPL_SUFFIX));
+        let source_rel = resolved.source_rel;
         let tmpl = ctx.repo_root.join(&source_store).join(&source_rel);
         if !tmpl.is_file() {
             return Err(format!(
                 "op {idx}: template source does not exist: {source_rel}"
+            ));
+        }
+        let pin = rendered
+            .get(&(source_store.clone(), link_rel.clone()))
+            .ok_or_else(|| {
+                format!("op {idx}: no pinned stage_render for staged source '{source}'")
+            })?;
+        if pin.staged != *source {
+            return Err(format!(
+                "op {idx}: staged source '{source}' does not match pinned stage_render"
+            ));
+        }
+        if pin.source_rel != source_rel {
+            return Err(format!(
+                "op {idx}: staged source template mismatch: expected {source_rel}"
             ));
         }
     } else {
@@ -1332,14 +1788,28 @@ fn validate_link_op(
             .strip_prefix(ctx.repo_root.join(&source_store))
             .map_err(|_| format!("op {idx}: source is not under store '{source_store}'"))?;
         let rel_str = rel.to_string_lossy().into_owned();
-        if !is_safe_fragment(&rel_str) {
-            return Err(format!("op {idx}: invalid source fragment '{rel_str}'"));
-        }
-        if rel_str.ends_with(render::TMPL_SUFFIX) {
-            return Err(format!("op {idx}: template source must use staged path"));
-        }
-        if !ctx.repo_root.join(&source_store).join(&rel_str).is_file() {
-            return Err(format!("op {idx}: source file does not exist: {rel_str}"));
+        if rel_str.is_empty() {
+            // Whole-directory link: the source must be the store directory itself
+            // and the target must be a configured whole-dir target.
+            let store_dir = ctx.repo_root.join(&source_store);
+            if source_path != store_dir {
+                return Err(format!(
+                    "op {idx}: whole-dir source must be the store directory"
+                ));
+            }
+            if !source_path.is_dir() {
+                return Err(format!("op {idx}: store directory does not exist"));
+            }
+        } else {
+            if !is_safe_fragment(&rel_str) {
+                return Err(format!("op {idx}: invalid source fragment '{rel_str}'"));
+            }
+            if rel_str.ends_with(render::TMPL_SUFFIX) {
+                return Err(format!("op {idx}: template source must use staged path"));
+            }
+            if !ctx.repo_root.join(&source_store).join(&rel_str).is_file() {
+                return Err(format!("op {idx}: source file does not exist: {rel_str}"));
+            }
         }
     }
 
@@ -1352,6 +1822,106 @@ fn validate_link_op(
         return Err(format!(
             "op {idx}: target {target} is not under a configured target for store '{source_store}'"
         ));
+    }
+
+    // Authorize the exact target/source relationship against resolved config.
+    let store = ctx.config.stores.get(&source_store).unwrap();
+    let store_dir = ctx.repo_root.join(&source_store);
+    let expected = store::resolve_link_source(
+        ctx.repo_root,
+        &store_dir,
+        Some(store),
+        &source_store,
+        target_path,
+    )
+    .ok_or_else(|| {
+        format!("op {idx}: target {target} does not resolve to a configured source in store '{source_store}'")
+    })?;
+    if expected != *source {
+        return Err(format!(
+            "op {idx}: source '{source}' is not the expected source for target {target} (expected {expected})"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_remove_link_op(
+    ctx: &ValidationContext,
+    idx: usize,
+    target: &str,
+    source: Option<&str>,
+) -> Result<(), String> {
+    let target_path = Path::new(target);
+    if has_parent_dir(target_path) {
+        return Err(format!("op {idx}: target '{target}' contains '..'"));
+    }
+
+    let store = if let Some(src) = source {
+        let src_path = Path::new(src);
+        if has_parent_dir(src_path) {
+            return Err(format!("op {idx}: source '{src}' contains '..'"));
+        }
+        source_store(src, ctx.repo_root)
+            .ok_or_else(|| format!("op {idx}: cannot derive store from source '{src}'"))?
+    } else {
+        find_store_for_target(ctx.repo_root, ctx.config, target_path).ok_or_else(|| {
+            format!("op {idx}: target {target} is not under any configured store target")
+        })?
+    };
+
+    if !ctx.config.stores.contains_key(&store) {
+        return Err(format!("op {idx}: unknown store '{store}'"));
+    }
+    if !is_under_any_target(ctx.config, &store, target_path) {
+        return Err(format!(
+            "op {idx}: target {target} is not under a configured target for store '{store}'"
+        ));
+    }
+
+    let store_dir = ctx.repo_root.join(&store);
+    let staged_dir = render::store_render_dir(ctx.repo_root, &store);
+
+    if let Some(src) = source {
+        let src_path = Path::new(src);
+        if !src_path.starts_with(ctx.repo_root) {
+            return Err(format!("op {idx}: source {src} is not under the repo"));
+        }
+
+        // The source must be the exact source that the config resolves to for
+        // this target. This guards hand-edited plans that swap a stale link's
+        // source for an arbitrary repo path.
+        let store_config = ctx.config.stores.get(&store).unwrap();
+        let expected = store::resolve_link_source(
+            ctx.repo_root,
+            &store_dir,
+            Some(store_config),
+            &store,
+            target_path,
+        )
+        .ok_or_else(|| {
+            format!(
+                "op {idx}: target {target} does not resolve to a configured source in store '{store}'"
+            )
+        })?;
+        if expected != *src {
+            return Err(format!(
+                "op {idx}: source '{src}' does not match expected source '{expected}'"
+            ));
+        }
+    } else {
+        // Wildcard removal: the actual symlink must resolve into this store's
+        // source or staging tree, not merely any repo-owned link.
+        if !target_path.is_symlink() {
+            return Err(format!("op {idx}: target {target} is not a symlink"));
+        }
+        if !linker::points_into(target_path, &store_dir)
+            && !linker::points_into(target_path, &staged_dir)
+        {
+            return Err(format!(
+                "op {idx}: target {target} does not point into store '{store}'"
+            ));
+        }
     }
 
     Ok(())

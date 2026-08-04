@@ -180,7 +180,7 @@ impl LinkRequires {
 
 /// The expected state of a path when an op is executed. Used as the value of
 /// `requires.target` / `requires.backup`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "target", content = "value", rename_all = "snake_case")]
 pub enum TargetState {
     Absent,

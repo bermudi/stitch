@@ -16,7 +16,61 @@ use config::{Config, ConfigError, Loaded, expand_home, find_root};
 use error::{FailureClass, StitchError};
 use plan_exec::{PlanExecError, PlanFile, PlanFileOp};
 use platform::Platform;
+use serde::Serialize;
 use std::collections::BTreeSet;
+
+#[derive(Serialize)]
+struct AddData {
+    store: String,
+    target: String,
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    patterns: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RemoveData {
+    store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    links: Vec<String>,
+    staging: String,
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+struct ImportedStore {
+    store: String,
+    target: String,
+    mode: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ImportData {
+    dry_run: bool,
+    imported: usize,
+    skipped_owned: usize,
+    stores: Vec<ImportedStore>,
+}
+
+#[derive(Serialize)]
+struct MigrateData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authored_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authored: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+}
 
 fn main() {
     let cli = cli::Cli::parse();
@@ -113,18 +167,22 @@ fn run(cli: cli::Cli) -> Result<(), StitchError> {
             patterns,
             dry_run,
         } => {
-            if json {
-                return Err(StitchError::usage("--json is not supported for add"));
+            if json && !dry_run {
+                return Err(StitchError::usage(
+                    "--json is not supported for add without --dry-run",
+                ));
             }
             let root = resolve_root(repo.as_deref())?;
-            cmd_add(&root, &path, &name, &files, &patterns, dry_run)
+            cmd_add(&root, &path, &name, &files, &patterns, dry_run, json)
         }
-        cli::Commands::Remove { name } => {
-            if json {
-                return Err(StitchError::usage("--json is not supported for remove"));
+        cli::Commands::Remove { name, dry_run } => {
+            if json && !dry_run {
+                return Err(StitchError::usage(
+                    "--json is not supported for remove without --dry-run",
+                ));
             }
             let root = resolve_root(repo.as_deref())?;
-            cmd_remove(&root, &name)
+            cmd_remove(&root, &name, dry_run, json)
         }
         cli::Commands::Edit { entry } => {
             if json {
@@ -134,22 +192,21 @@ fn run(cli: cli::Cli) -> Result<(), StitchError> {
             cmd_edit(&root, entry.as_deref())
         }
         cli::Commands::Import { scan_dirs, dry_run } => {
-            if json {
-                return Err(StitchError::usage("--json is not supported for import"));
-            }
             let root = resolve_root(repo.as_deref())?;
-            cmd_import(&root, &scan_dirs, dry_run)
+            cmd_import(&root, &scan_dirs, dry_run, json)
         }
         cli::Commands::Doctor => {
             let root = resolve_root(repo.as_deref())?;
             cmd_doctor(&root, json)
         }
         cli::Commands::Migrate { dry_run } => {
-            if json {
-                return Err(StitchError::usage("--json is not supported for migrate"));
+            if json && !dry_run {
+                return Err(StitchError::usage(
+                    "--json is not supported for migrate without --dry-run",
+                ));
             }
             let root = resolve_root(repo.as_deref())?;
-            cmd_migrate(&root, dry_run)
+            cmd_migrate(&root, dry_run, json)
         }
         cli::Commands::Prune {
             scan_dirs,
@@ -538,17 +595,24 @@ fn cmd_apply_plan(
     if json {
         match result {
             Ok(report) => {
-                report::write("apply", report, loaded.warnings);
+                let mut warnings = loaded.warnings;
+                warnings.extend(report.warnings.iter().cloned());
+                report::write("apply", report, warnings);
                 Ok(())
             }
             Err(e) => {
-                report::write_data_error("apply", e.report, &e.error, loaded.warnings);
+                let mut warnings = loaded.warnings;
+                warnings.extend(e.report.warnings.iter().cloned());
+                report::write_data_error("apply", e.report, &e.error, warnings);
             }
         }
     } else {
         match result {
             Ok(report) => {
                 for w in &loaded.warnings {
+                    eprintln!("warning: {w}");
+                }
+                for w in &report.warnings {
                     eprintln!("warning: {w}");
                 }
                 if dry_run {
@@ -578,6 +642,9 @@ fn cmd_apply_plan(
                     eprintln!("warning: {w}");
                 }
                 let PlanExecError { report, error } = e;
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
                 eprintln!(
                     "Aborted after {} of {} ops: {}",
                     report.ops_executed.len(),
@@ -881,9 +948,16 @@ fn cmd_add(
     files: &[String],
     patterns: &[String],
     dry_run: bool,
+    json: bool,
 ) -> Result<(), StitchError> {
     let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
+
+    if json && !dry_run {
+        return Err(StitchError::usage(
+            "--json is not supported for add without --dry-run",
+        ));
+    }
 
     let source = expand_home(path);
 
@@ -944,21 +1018,46 @@ fn cmd_add(
     if dry_run {
         if source_exists {
             let is_dir = source.is_dir();
-            let target_str = if is_dir {
-                source.to_string_lossy().into_owned()
+            let (target_str, adopt_files) = if is_dir {
+                (collapse_home(&source), Vec::new())
             } else {
-                source
+                let parent = source
                     .parent()
                     .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "~".into())
+                    .unwrap_or_else(|| "~".into());
+                (collapse_home(&expand_home(&parent)), vec![raw_name.clone()])
             };
+            let data = AddData {
+                store: store_name.clone(),
+                target: target_str,
+                mode: "adopt".into(),
+                source: Some(collapse_home(&source)),
+                files: adopt_files,
+                patterns: Vec::new(),
+            };
+            if json {
+                report::write("add", data, loaded.warnings);
+                return Ok(());
+            }
             println!("Would add (adopt existing):");
             println!("  {} → {}/", source.display(), store_dir.display());
             println!(
                 "  then symlink back to {}",
-                expand_home(&target_str).display()
+                expand_home(&data.target).display()
             );
         } else {
+            let data = AddData {
+                store: store_name.clone(),
+                target: path.to_string(),
+                mode: "create".into(),
+                source: None,
+                files: files.to_vec(),
+                patterns: patterns.to_vec(),
+            };
+            if json {
+                report::write("add", data, loaded.warnings);
+                return Ok(());
+            }
             println!("Would add (create empty store):");
             println!(
                 "  {} → {} (empty store, linked to {})",
@@ -1170,10 +1269,21 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), StitchError> {
+fn cmd_remove(
+    root: &std::path::Path,
+    name: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), StitchError> {
     let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
+
+    if json && !dry_run {
+        return Err(StitchError::usage(
+            "--json is not supported for remove without --dry-run",
+        ));
+    }
 
     // Check existence (borrow) before removing, so the config stays intact for
     // status_all and the hook env.
@@ -1189,6 +1299,44 @@ fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), StitchError> {
         .as_deref()
         .map(str::to_owned);
 
+    let statuses = store::status_all(root, &loaded.config, &platform);
+    let linked: Vec<_> = statuses
+        .iter()
+        .filter(|e| e.store_name == *name && !e.skipped_platform)
+        .filter(|e| e.status == linker::LinkStatus::Linked)
+        .collect();
+    let linked_paths: Vec<String> = linked
+        .iter()
+        .map(|e| e.target.to_string_lossy().into_owned())
+        .collect();
+    let staging = render::store_render_dir(root, name);
+    let staging_str = staging.to_string_lossy().into_owned();
+
+    if dry_run {
+        let data = RemoveData {
+            store: name.into(),
+            target,
+            links: linked_paths,
+            staging: staging_str,
+            dry_run: true,
+        };
+        if json {
+            report::write("remove", data, loaded.warnings);
+        } else {
+            println!("Dry run — no changes will be made.");
+            println!("Would remove store '{name}':");
+            if !data.links.is_empty() {
+                for t in &data.links {
+                    println!("  remove link {t}");
+                }
+            } else {
+                println!("  no links to remove");
+            }
+            println!("  remove staging {}", data.staging);
+        }
+        return Ok(());
+    }
+
     // Global pre-remove hook.
     {
         let env = hooks::HookEnv {
@@ -1201,18 +1349,11 @@ fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), StitchError> {
             .map_err(|e| StitchError::hook("pre-remove", e))?;
     }
 
-    // Compute link statuses from the still-complete merged view, then drop the
-    // entry from the generated half. stitch.toml behavior is deliberately left
-    // in place (the tool never rewrites authored config); `doctor` flags the
+    // Drop the entry from the generated half. stitch.toml behavior is deliberately
+    // left in place (the tool never rewrites authored config); `doctor` flags the
     // orphaned behavior if the user wants to clean it up via `stitch edit`.
-    let statuses = store::status_all(root, &loaded.config, &platform);
     loaded.generated.stores.remove(name);
 
-    let linked: Vec<_> = statuses
-        .iter()
-        .filter(|e| e.store_name == *name && !e.skipped_platform)
-        .filter(|e| e.status == linker::LinkStatus::Linked)
-        .collect();
     for entry in &linked {
         linker::remove_link(&entry.target, root)?;
         println!("  removed {}", entry.target.display());
@@ -1280,9 +1421,12 @@ fn cmd_import(
     root: &std::path::Path,
     scan_dirs: &[String],
     dry_run: bool,
+    json: bool,
 ) -> Result<(), StitchError> {
     let mut loaded = Config::load(root)?;
-    print_warnings(&loaded);
+    if !json {
+        print_warnings(&loaded);
+    }
     let platform = Platform::detect();
 
     let roots: Vec<scan::ScanRoot> = if scan_dirs.is_empty() {
@@ -1355,77 +1499,141 @@ fn cmd_import(
         }
     }
 
-    if buckets.is_empty() {
-        println!("No importable links found.");
-        if skipped_owned > 0 {
-            println!("  ({skipped_owned} already managed, skipped)");
-        }
+    if json && buckets.is_empty() {
+        report::write(
+            "import",
+            ImportData {
+                dry_run,
+                imported: 0,
+                skipped_owned,
+                stores: Vec::new(),
+            },
+            loaded.warnings,
+        );
         return Ok(());
     }
 
-    if dry_run {
-        println!("Dry run — no changes will be made.\n");
+    if !json {
+        if buckets.is_empty() {
+            println!("No importable links found.");
+            if skipped_owned > 0 {
+                println!("  ({skipped_owned} already managed, skipped)");
+            }
+            return Ok(());
+        }
+
+        if dry_run {
+            println!("Dry run — no changes will be made.\n");
+        }
     }
 
     let mut imported = 0;
+    let mut stores: Vec<ImportedStore> = Vec::new();
+    let mut warnings: Vec<String> = loaded.warnings.clone();
     for (store_name, bucket) in &buckets {
         // Refuse to clobber an existing store entry.
         if loaded.generated.stores.contains_key(store_name) {
-            println!("  skip '{store_name}': already in state.toml");
+            if json {
+                warnings.push(format!("store '{store_name}': already in state.toml"));
+            } else {
+                println!("  skip '{store_name}': already in state.toml");
+            }
             continue;
         }
 
-        let entry = if let Some(ref whole) = bucket.whole_dir_target {
+        let imported_store = if let Some(ref whole) = bucket.whole_dir_target {
             // Whole-dir wins if present; file entries under the same store are
             // noted but not mixed (a store is one mode).
             if !bucket.files.is_empty() {
-                eprintln!(
-                    "warning: store '{store_name}': found both whole-dir and file links; \
+                let msg = format!(
+                    "store '{store_name}': found both whole-dir and file links; \
                      importing as whole-dir, file links ignored"
                 );
+                if json {
+                    warnings.push(msg);
+                } else {
+                    eprintln!("warning: {msg}");
+                }
             }
-            println!("  import '{store_name}' → {whole} (whole-dir)");
-            config::GeneratedStore {
-                target: Some(whole.clone()),
-                files: vec![],
-                patterns: vec![],
-                targets: std::collections::BTreeMap::new(),
+            if json {
+                ImportedStore {
+                    store: store_name.clone(),
+                    target: whole.clone(),
+                    mode: "whole-dir".into(),
+                    files: Vec::new(),
+                }
+            } else {
+                println!("  import '{store_name}' → {whole} (whole-dir)");
+                ImportedStore {
+                    store: store_name.clone(),
+                    target: whole.clone(),
+                    mode: "whole-dir".into(),
+                    files: Vec::new(),
+                }
             }
         } else if !bucket.files.is_empty() {
             // All file links must share the same target parent.
             let parents: std::collections::BTreeSet<_> = bucket.files.values().cloned().collect();
             if parents.len() != 1 {
-                eprintln!(
-                    "warning: store '{store_name}': file links point at multiple target \
+                let msg = format!(
+                    "store '{store_name}': file links point at multiple target \
                      dirs ({}); skipping",
                     parents.into_iter().collect::<Vec<_>>().join(", ")
                 );
+                if json {
+                    warnings.push(msg);
+                } else {
+                    eprintln!("warning: {msg}");
+                }
                 continue;
             }
             let target = parents.into_iter().next().unwrap();
             let files: Vec<String> = bucket.files.keys().cloned().collect();
-            println!(
-                "  import '{store_name}' → {target} (files: {})",
-                files.join(", ")
-            );
-            config::GeneratedStore {
-                target: Some(target),
+            if !json {
+                println!(
+                    "  import '{store_name}' → {target} (files: {})",
+                    files.join(", ")
+                );
+            }
+            ImportedStore {
+                store: store_name.clone(),
+                target,
+                mode: "file-mode".into(),
                 files,
-                patterns: vec![],
-                targets: std::collections::BTreeMap::new(),
             }
         } else {
             continue;
         };
 
         if !dry_run {
+            let entry = config::GeneratedStore {
+                target: Some(imported_store.target.clone()),
+                files: imported_store.files.clone(),
+                patterns: vec![],
+                targets: std::collections::BTreeMap::new(),
+            };
             loaded.generated.stores.insert(store_name.clone(), entry);
         }
+        stores.push(imported_store);
         imported += 1;
     }
 
     if !dry_run && imported > 0 {
         loaded.generated.save(root)?;
+    }
+
+    if json {
+        report::write(
+            "import",
+            ImportData {
+                dry_run,
+                imported,
+                skipped_owned,
+                stores,
+            },
+            warnings,
+        );
+        return Ok(());
     }
 
     println!("\nImported {imported} store(s).");
@@ -1515,7 +1723,7 @@ fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     }
 }
 
-fn cmd_migrate(root: &std::path::Path, dry_run: bool) -> Result<(), StitchError> {
+fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), StitchError> {
     let legacy_path = root.join(".stitch").join("config.toml");
     let authored_path = root.join("stitch.toml");
     let state_path = root.join(".stitch").join("state.toml");
@@ -1572,23 +1780,33 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool) -> Result<(), StitchError>
     let state_str = generated.render_for_display()?;
 
     if dry_run {
-        println!("Dry run — no changes will be made.\n");
-        println!(
-            "note: comments in {} are not carried into stitch.toml; the \
-             original is preserved as {}.bak on write",
-            legacy_path.display(),
-            legacy_path.display()
-        );
-        println!(
-            "\n--- would write {} ---\n{}",
-            authored_path.display(),
-            authored_str
-        );
-        println!(
-            "--- would write {} ---\n{}",
-            state_path.display(),
-            state_str
-        );
+        if json {
+            let data = MigrateData {
+                authored_path: Some(authored_path.to_string_lossy().into_owned()),
+                authored: Some(authored_str),
+                state_path: Some(state_path.to_string_lossy().into_owned()),
+                state: Some(state_str),
+            };
+            report::write("migrate", data, Vec::new());
+        } else {
+            println!("Dry run — no changes will be made.\n");
+            println!(
+                "note: comments in {} are not carried into stitch.toml; the \
+                 original is preserved as {}.bak on write",
+                legacy_path.display(),
+                legacy_path.display()
+            );
+            println!(
+                "\n--- would write {} ---\n{}",
+                authored_path.display(),
+                authored_str
+            );
+            println!(
+                "--- would write {} ---\n{}",
+                state_path.display(),
+                state_str
+            );
+        }
         return Ok(());
     }
 

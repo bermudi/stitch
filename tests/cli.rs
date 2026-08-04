@@ -5038,3 +5038,238 @@ files = ["gitconfig.tmpl"]
         "plan exec must fail before staging output"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P1 hardening: plan execution, promotion, staged cleanup, JSON scope
+// ---------------------------------------------------------------------------
+
+/// Whole-directory promotion must produce an executable plan instead of failing
+/// preflight. The store with ignored content is promoted to file mode, links
+/// the desired file, and never links the ignored directory.
+#[test]
+fn plan_promotes_whole_dir_when_ignored_content_present() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("vim", &["vimrc"]);
+    fs::create_dir(store_dir.join(".git")).unwrap();
+    fs::write(store_dir.join(".git").join("config"), "[core]\n").unwrap();
+
+    let target = repo.path().join("home").join(".vim");
+    repo.write_state(&format!(
+        r#"
+[stores.vim]
+target = "{}"
+"#,
+        target.to_string_lossy()
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan should succeed for promoted store"
+    );
+    let plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    let ops = plan["ops"].as_array().unwrap();
+    assert!(
+        ops.iter().any(|o| {
+            o["op"] == "create_link"
+                && o["target"].as_str().unwrap_or("") == target.join("vimrc").to_string_lossy()
+        }),
+        "plan should link the individual file"
+    );
+    assert!(
+        !ops.iter().any(|o| {
+            o["target"]
+                .as_str()
+                .is_some_and(|t| t == target.to_string_lossy())
+        }),
+        "plan must not link the whole directory"
+    );
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, &output.stdout).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert!(target.join("vimrc").is_symlink());
+    assert!(
+        !target.join(".git").exists(),
+        ".git must not be linked into the target"
+    );
+}
+
+/// A hand-edited remove_link whose source belongs to a different store than its
+/// target must be rejected at validation time, even if the paths are both
+/// repo-owned.
+#[test]
+fn apply_plan_rejects_remove_with_source_in_wrong_store() {
+    let repo = Repo::new();
+    repo.make_store("alpha", &["x"]);
+    repo.make_store("beta", &["x"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.alpha]
+target = "{0}/.alpha"
+files = ["x"]
+
+[stores.beta]
+target = "{0}/.beta"
+files = ["x"]
+"#,
+        home.to_string_lossy()
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(home.join(".alpha").join("x").is_symlink());
+    assert!(home.join(".beta").join("x").is_symlink());
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+
+    // Hand-edit the plan: target is beta/x, but source claims repo/alpha/x.
+    plan["ops"] = serde_json::json!([{
+        "op": "remove_link",
+        "target": home.join(".beta").join("x").to_string_lossy(),
+        "source": repo.path().join("alpha").join("x").to_string_lossy(),
+        "requires": { "target": "symlink_to", "value": repo.path().join("alpha").join("x").to_string_lossy() }
+    }]);
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains(
+            "is not under a configured target for store 'alpha'",
+        ));
+}
+
+/// A staged link must be justified by a preceding StageRender op in the same
+/// plan; a hand-edited create_link that points into the render tree without one
+/// is rejected.
+#[test]
+fn apply_plan_rejects_staged_link_without_pinned_stage_render() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    fs::write(store_dir.join("gitconfig.tmpl"), "x\n").unwrap();
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        home.to_string_lossy()
+    ));
+
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("gitconfig")
+        .to_string_lossy()
+        .into_owned();
+
+    // Capture a valid plan, then drop the StageRender op so only the staged
+    // create_link remains. The create_link must be rejected without its pinned
+    // StageRender.
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    plan["ops"] = serde_json::json!([{
+        "op": "create_link",
+        "target": home.join("gitconfig").to_string_lossy(),
+        "source": staged,
+        "requires": { "target": "absent" }
+    }]);
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("no pinned stage_render"));
+}
+
+/// When a template is removed from state, `stitch plan` captures a `remove_staged`
+/// op to clean up the stale render before its link is removed.
+#[test]
+fn plan_captures_stale_render_cleanup() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    fs::write(store_dir.join("gitconfig.tmpl"), "x\n").unwrap();
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        home.to_string_lossy()
+    ));
+
+    // Apply once so a staged render and link exist.
+    repo.cmd().arg("apply").assert().success();
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("gitconfig");
+    assert!(staged.exists());
+    assert!(home.join("gitconfig").is_symlink());
+
+    // Drop the gitconfig from the desired set while leaving the source file in
+    // the store; it is now a stale link/render to be cleaned up. `ignore` lives
+    // in the authored half.
+    repo.write_split(
+        &format!(
+            r#"
+[stores.git]
+target = "{}"
+files = []
+"#,
+            home.to_string_lossy()
+        ),
+        r#"
+[stores.git]
+ignore = ["gitconfig.tmpl"]
+"#,
+    );
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan should succeed: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("???")
+    );
+    let plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    let ops = plan["ops"].as_array().unwrap();
+    assert!(
+        ops.iter()
+            .any(|o| o["op"] == "remove_staged" && o["rel"] == "gitconfig"),
+        "plan must include a remove_staged op for the stale render"
+    );
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, &output.stdout).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert!(!staged.exists(), "staged render must be removed");
+    assert!(!home.join("gitconfig").exists());
+}
