@@ -102,6 +102,10 @@ pub enum Commands {
     Remove {
         /// Store name
         name: String,
+
+        /// Preview without removing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Open stitch.toml (or an entry's repo source) in $EDITOR

@@ -1030,7 +1030,7 @@ fn remove_requires(
     LinkRequires::new(TargetState::SymlinkIntoRepo)
 }
 
-fn resolve_link_source(
+pub(crate) fn resolve_link_source(
     repo_root: &Path,
     store_dir: &Path,
     store: Option<&Store>,
@@ -1482,7 +1482,7 @@ const GLOBAL_IGNORES: &[&str] = &[
 /// What a single store/target should link: one whole-directory symlink, or a
 /// list of individual entries (file mode, or a whole-dir store promoted to
 /// file mode because it contains ignored content).
-enum LinkTargets {
+pub(crate) enum LinkTargets {
     WholeDir,
     Files(Vec<String>),
 }
@@ -1538,7 +1538,7 @@ fn top_level_entries(store_dir: &Path) -> Vec<String> {
 /// apply reports the resolution error. It also runs before `when` filtering so
 /// a skipped target cannot make a shared target directory or staged render
 /// look stale.
-fn collect_reconciliation_keeps(
+pub(crate) fn collect_reconciliation_keeps(
     store_dir: &Path,
     target_path: &Path,
     files: &[String],
@@ -1588,7 +1588,7 @@ fn resolve_targets(
 /// Resolve the desired mode and source names without collision validation.
 /// Kept separate so reconciliation can conservatively preserve a live template
 /// when normal resolution reports an error.
-fn resolve_target_names(
+pub(crate) fn resolve_target_names(
     store_dir: &Path,
     files: &[String],
     patterns: &[String],
