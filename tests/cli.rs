@@ -4997,3 +4997,44 @@ files = [".bashrc"]
 
     assert!(!home.join(".bashrc").exists());
 }
+
+#[test]
+fn apply_plan_requires_render_gitignore_before_staging() {
+    // B3 regression guard: `apply --plan` with a StageRender op must
+    // refuse to stage when .gitignore does not cover .stitch/render/,
+    // matching cmd_apply's v0.6 staging discipline. .gitignore is not
+    // pinned by the config hash, so this is a runtime safety check.
+    let repo = Repo::new();
+    fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+    let store_dir = repo.make_store("git", &[]);
+    fs::write(store_dir.join("gitconfig.tmpl"), "host={{ hostname }}\n").unwrap();
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains(".stitch/render/"));
+    assert!(
+        !repo
+            .path()
+            .join(".stitch")
+            .join("render")
+            .join("git")
+            .exists(),
+        "plan exec must fail before staging output"
+    );
+}

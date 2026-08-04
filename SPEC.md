@@ -125,6 +125,8 @@ export STITCH_REPO=~/dots
 
 ## Commands
 
+Most read/plan commands support a global `--json` flag. See [Agent interface (v0.7)](#agent-interface-v07) for the envelope, per-command shapes, and exit-code table.
+
 ### `stitch init`
 
 Create `stitch.toml` (empty, with a header documenting it is authored/read-only to the tool) and `.stitch/state.toml` (empty, generated) in the current directory. Also appends `.stitch/render/` to the repo's `.gitignore` (creating the file if needed) and pre-creates `.stitch/render/` at mode `0700`. Refuses if either config file exists, or if a v0.2 `.stitch/config.toml` is present (pointing at `migrate` instead).
@@ -138,6 +140,21 @@ Reconcile all stores. Creates missing symlinks, replaces broken ones, reports co
 | `--only` | `-o` | Apply only named stores (repeatable) |
 | `--dry-run` | | Preview without changes |
 | `--force` | | Back up real-file/dir conflicts to `{target}.bak`, then link |
+| `--plan <file>` | | Execute a previously captured plan file verbatim |
+
+### `stitch plan`
+
+Capture the exact operation list `apply` would execute. Text mode prints the raw `stitch/plan` JSON to stdout; `--json` wraps it in the [standard envelope](#json-envelope). Exits non-zero when the captured plan contains conflicts or errors, so `stitch plan && stitch apply --plan p.json` forces a branch.
+
+| Flag | Short | Description |
+|---|---|---|
+| `--only` | `-o` | Plan only named stores (repeatable) |
+| `--force` | | Plan `.bak` backup behavior (what `apply --force` would do) |
+| `--json` | | Emit the plan in the JSON envelope |
+
+### `stitch render <store>/<file>`
+
+Render a `.tmpl` to stdout. Read-only — no staging write, no link touch. `--json` emits `{source, link_name, sha256, content}`.
 
 ### `stitch status [name]`
 
