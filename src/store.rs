@@ -1,5 +1,5 @@
 use crate::config::{self, Config, Loaded, Store};
-use crate::error::StitchError;
+use crate::error::{FailureClass, StitchError};
 use crate::hooks::{self, HookEnv};
 use crate::linker::{self, LinkStatus};
 use crate::plan::{LinkRequires, Plan, PlanOp, PlanStore, TargetState, path_to_string};
@@ -906,8 +906,10 @@ fn action_to_plan_op(
         }
         ApplyAction::AlreadyLinked(target) => {
             let target_str = path_to_string(target);
-            let source = resolve_link_source(repo_root, store_dir, store, store_name, target)
-                .unwrap_or_else(|| target_str.clone());
+            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
+            else {
+                return unresolved_source_op(&target_str);
+            };
             PlanOp::AlreadyLinked {
                 target: target_str,
                 source: source.clone(),
@@ -916,8 +918,10 @@ fn action_to_plan_op(
         }
         ApplyAction::Created(target) => {
             let target_str = path_to_string(target);
-            let source = resolve_link_source(repo_root, store_dir, store, store_name, target)
-                .unwrap_or_else(|| target_str.clone());
+            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
+            else {
+                return unresolved_source_op(&target_str);
+            };
             PlanOp::CreateLink {
                 target: target_str,
                 source,
@@ -929,11 +933,13 @@ fn action_to_plan_op(
             old_resolves_to,
         } => {
             let target_str = path_to_string(target);
-            let source = resolve_link_source(repo_root, store_dir, store, store_name, target)
-                .unwrap_or_else(|| target_str.clone());
+            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
+            else {
+                return unresolved_source_op(&target_str);
+            };
             let requires_target = match old_resolves_to {
                 Some(old) => TargetState::SymlinkTo(path_to_string(old)),
-                None => TargetState::RealFile,
+                None => TargetState::RealEntry,
             };
             PlanOp::ReplaceLink {
                 target: target_str,
@@ -944,8 +950,10 @@ fn action_to_plan_op(
         }
         ApplyAction::ContentChanged(target) => {
             let target_str = path_to_string(target);
-            let source = resolve_link_source(repo_root, store_dir, store, store_name, target)
-                .unwrap_or_else(|| target_str.clone());
+            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
+            else {
+                return unresolved_source_op(&target_str);
+            };
             PlanOp::ContentChanged {
                 target: target_str,
                 source: source.clone(),
@@ -955,15 +963,24 @@ fn action_to_plan_op(
         ApplyAction::BackedUp { target, backup } => {
             let target_str = path_to_string(target);
             let backup_str = path_to_string(backup);
-            let source = resolve_link_source(repo_root, store_dir, store, store_name, target)
-                .unwrap_or_else(|| target_str.clone());
+            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
+            else {
+                return unresolved_source_op(&target_str);
+            };
             PlanOp::BackupAndLink {
                 target: target_str,
                 source,
                 backup: backup_str,
-                requires: LinkRequires::with_backup(TargetState::RealFile, TargetState::Absent),
+                requires: LinkRequires::with_backup(TargetState::RealEntry, TargetState::Absent),
             }
         }
+    }
+}
+
+fn unresolved_source_op(target: &str) -> PlanOp {
+    PlanOp::Error {
+        message: format!("could not resolve source for target {target}"),
+        class: FailureClass::Internal.id().to_string(),
     }
 }
 

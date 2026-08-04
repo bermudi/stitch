@@ -238,7 +238,7 @@ fn conflict_kind(resolves_to: &Option<String>) -> String {
     if resolves_to.is_some() {
         "foreign_symlink".into()
     } else {
-        "real_file".into()
+        "real_entry".into()
     }
 }
 
@@ -413,7 +413,7 @@ impl From<LinkRequires> for PlanFileRequires {
 fn target_state_id(state: &TargetState) -> String {
     match state {
         TargetState::Absent => "absent".into(),
-        TargetState::RealFile => "real_file".into(),
+        TargetState::RealEntry => "real_entry".into(),
         TargetState::SymlinkTo(_) => "symlink_to".into(),
         TargetState::SymlinkIntoRepo => "symlink_into_repo".into(),
     }
@@ -429,7 +429,7 @@ fn target_state_value(state: &TargetState) -> Option<String> {
 fn target_state_from(target: &str, value: &Option<String>) -> Result<TargetState, String> {
     match target {
         "absent" => Ok(TargetState::Absent),
-        "real_file" => Ok(TargetState::RealFile),
+        "real_entry" => Ok(TargetState::RealEntry),
         "symlink_to" => match value {
             Some(v) => Ok(TargetState::SymlinkTo(v.clone())),
             None => Err("symlink_to requires a value".into()),
@@ -763,7 +763,7 @@ fn check_target_state(path: &Path, expected: &TargetState) -> Result<(), String>
                 return Err(format!("{} exists", path.display()));
             }
         }
-        TargetState::RealFile => match std::fs::symlink_metadata(path) {
+        TargetState::RealEntry => match std::fs::symlink_metadata(path) {
             Ok(meta) if !meta.file_type().is_symlink() => {}
             Ok(_) => return Err(format!("{} is a symlink", path.display())),
             Err(_) => return Err(format!("{} does not exist", path.display())),
@@ -864,8 +864,8 @@ fn preflight_op(
         } => {
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
-            if !matches!(target_state, TargetState::RealFile) {
-                return Err("backup_and_link requires target=real_file".into());
+            if !matches!(target_state, TargetState::RealEntry) {
+                return Err("backup_and_link requires target=real_entry".into());
             }
             let backup_state = target_state_from(
                 requires.backup.as_deref().unwrap_or("absent"),
@@ -1002,7 +1002,7 @@ fn execute_op(
                         return Err(format!("{} was repointed", target_path.display()));
                     }
                 }
-                TargetState::RealFile => {
+                TargetState::RealEntry => {
                     // Whole-directory promotion: the real directory was emptied
                     // at capture time. If it is no longer empty, the plan is stale.
                     if target_path.is_dir() {
@@ -1022,7 +1022,7 @@ fn execute_op(
                         return Err(format!("{} is not a real file/dir", target_path.display()));
                     }
                 }
-                _ => return Err("replace_link requires symlink_to or real_file".into()),
+                _ => return Err("replace_link requires symlink_to or real_entry".into()),
             }
 
             linker::create_link(target_path, source_path).map_err(link_error)?;
