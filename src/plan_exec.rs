@@ -5,7 +5,7 @@
 //! for staged renders and the config+platform fingerprint so that `apply --plan`
 //! can refuse to execute anything that shifted between capture and execution.
 
-use crate::config::{self, Config, Loaded, is_safe_fragment};
+use crate::config::{self, Config, Loaded, Store, is_safe_fragment};
 use crate::error::{FailureClass, StitchError};
 use crate::hooks::{self, HookEnv};
 use crate::linker::{self, LinkError};
@@ -14,11 +14,16 @@ use crate::platform::Platform;
 use crate::render;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, VecDeque};
+use std::path::{Component, Path, PathBuf};
 
 pub const PLAN_SCHEMA: u32 = 1;
 pub const PLAN_KIND: &str = "stitch/plan";
+
+/// True if `p` contains any `..` path component.
+fn has_parent_dir(p: &Path) -> bool {
+    p.components().any(|c| c == Component::ParentDir)
+}
 
 /// The on-disk plan file format. Kept intentionally close to the §2 spec so
 /// that hand inspection and external tooling can rely on its shape.
@@ -37,6 +42,7 @@ pub struct PlanFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformFingerprint {
     pub os: String,
     pub arch: String,
@@ -72,6 +78,7 @@ impl PlatformFingerprint {
 /// shape than the M3 `LinkRequires`/`TargetState` enums, so this is a separate
 /// file-oriented representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanFileRequires {
     pub target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,6 +92,7 @@ pub struct PlanFileRequires {
 /// An executable op in the plan file. The `op` tag matches the §2 spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum PlanFileOp {
     StageRender {
         store: String,
@@ -121,20 +129,25 @@ pub enum PlanFileOp {
 }
 
 impl PlanFileOp {
-    pub fn op_store(&self, repo_root: &Path) -> Option<String> {
+    pub fn op_store(&self, repo_root: &Path, config: &Config) -> Option<String> {
         match self {
             PlanFileOp::StageRender { store, .. } => Some(store.clone()),
             PlanFileOp::CreateLink { source, .. }
             | PlanFileOp::ReplaceLink { source, .. }
             | PlanFileOp::BackupAndLink { source, .. } => source_store(source, repo_root),
-            PlanFileOp::RemoveLink { source, .. } => {
-                source.as_ref().and_then(|s| source_store(s, repo_root))
+            PlanFileOp::RemoveLink { target, source, .. } => {
+                if let Some(s) = source {
+                    source_store(s, repo_root)
+                } else {
+                    find_store_for_target(repo_root, config, Path::new(target))
+                }
             }
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanConflict {
     pub target: String,
     pub kind: String,
@@ -143,6 +156,7 @@ pub struct PlanConflict {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanError {
     pub target: Option<String>,
     pub message: String,
@@ -154,7 +168,7 @@ pub struct PlanError {
 pub struct PlanExecReport {
     pub ops_total: usize,
     pub ops_executed: Vec<String>,
-    pub ops_remaining: Vec<String>,
+    pub ops_remaining: VecDeque<String>,
     pub conflicts: Vec<PlanConflict>,
     pub staged: Vec<String>,
 }
@@ -188,7 +202,7 @@ pub fn build_plan_file(
     platform: &Platform,
 ) -> Result<PlanFile, StitchError> {
     let config_sha256 = compute_config_hash(repo_root)?;
-    let platform = PlatformFingerprint::from(platform);
+    let platform_fp = PlatformFingerprint::from(platform);
 
     let mut ops = Vec::new();
     let mut conflicts = Vec::new();
@@ -196,8 +210,14 @@ pub fn build_plan_file(
 
     for store in &plan.stores {
         let store_dir = repo_root.join(&store.store_name);
-        let (renders, mut link_ops) =
-            convert_store_ops(repo_root, loaded, &store.store_name, &store_dir, &store.ops)?;
+        let (renders, mut link_ops) = convert_store_ops(
+            repo_root,
+            loaded,
+            &store.store_name,
+            &store_dir,
+            &store.ops,
+            platform,
+        )?;
         ops.extend(renders);
         ops.append(&mut link_ops);
 
@@ -227,7 +247,7 @@ pub fn build_plan_file(
         kind: PLAN_KIND.into(),
         repo: path_to_string(repo_root),
         config_sha256,
-        platform,
+        platform: platform_fp,
         ops,
         conflicts,
         errors,
@@ -253,12 +273,14 @@ fn convert_store_ops(
     store_name: &str,
     store_dir: &Path,
     ops: &[PlanOp],
+    platform: &Platform,
 ) -> Result<(Vec<PlanFileOp>, Vec<PlanFileOp>), StitchError> {
     let mut renders = Vec::new();
     let mut links = Vec::new();
 
     for op in ops {
-        let maybe_render = stage_render_for_op(repo_root, loaded, store_name, store_dir, op)?;
+        let maybe_render =
+            stage_render_for_op(repo_root, loaded, store_name, store_dir, op, platform)?;
         if let Some(render) = maybe_render {
             renders.push(render);
         }
@@ -333,6 +355,7 @@ fn stage_render_for_op(
     store_name: &str,
     store_dir: &Path,
     op: &PlanOp,
+    platform: &Platform,
 ) -> Result<Option<PlanFileOp>, StitchError> {
     let source = match op {
         PlanOp::CreateLink { source, .. }
@@ -381,13 +404,8 @@ fn stage_render_for_op(
         )));
     }
 
-    let content = render::render_file(
-        &tmpl_source,
-        &source_rel,
-        &Platform::detect(),
-        &loaded.config.vars,
-    )
-    .map_err(|e| StitchError::render(&tmpl_source, e))?;
+    let content = render::render_file(&tmpl_source, &source_rel, platform, &loaded.config.vars)
+        .map_err(|e| StitchError::render(&tmpl_source, e))?;
 
     let staged_path = render::staging_path(repo_root, store_name, &link_rel);
 
@@ -540,10 +558,7 @@ pub fn execute_plan(
     if dry_run {
         let report = base_report(plan);
         if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
-            return Err(PlanExecError::new(
-                report.clone(),
-                plan_exec_error(plan, &report),
-            ));
+            return Err(PlanExecError::new(report.clone(), plan_exec_error(plan)));
         }
         return Ok(report);
     }
@@ -564,7 +579,7 @@ pub fn execute_plan(
     let mut completed_stores: BTreeSet<String> = BTreeSet::new();
 
     for (idx, op) in plan.ops.iter().enumerate() {
-        let op_store = op.op_store(repo_root).ok_or_else(|| {
+        let op_store = op.op_store(repo_root, &loaded.config).ok_or_else(|| {
             PlanExecError::new(
                 report.clone(),
                 StitchError::plan_stale(format!("op {idx}: cannot derive store for execution")),
@@ -574,7 +589,7 @@ pub fn execute_plan(
         // Per-store pre-hook: run before the first op of a new store.
         if last_store.as_ref() != Some(&op_store) {
             if let Some(prev) = last_store.take() {
-                run_store_post_hook(repo_root, &prev, &platform)
+                run_store_post_hook(repo_root, &prev, &loaded.config, &platform)
                     .map_err(|e| PlanExecError::new(report.clone(), e))?;
                 completed_stores.insert(prev);
             }
@@ -596,10 +611,10 @@ pub fn execute_plan(
             )
         })?;
 
-        match execute_op(repo_root, loaded, &platform, op, &mut report) {
+        match execute_op(repo_root, loaded, &platform, op, idx, &mut report) {
             Ok(()) => {
                 report.ops_executed.push(op_description(op));
-                report.ops_remaining.remove(0);
+                report.ops_remaining.pop_front();
             }
             Err(e) => {
                 return Err(PlanExecError::new(
@@ -611,7 +626,7 @@ pub fn execute_plan(
     }
 
     if let Some(store) = last_store {
-        run_store_post_hook(repo_root, &store, &platform)
+        run_store_post_hook(repo_root, &store, &loaded.config, &platform)
             .map_err(|e| PlanExecError::new(report.clone(), e))?;
         completed_stores.insert(store);
     }
@@ -628,10 +643,7 @@ pub fn execute_plan(
     }
 
     if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
-        Err(PlanExecError::new(
-            report.clone(),
-            plan_exec_error(plan, &report),
-        ))
+        Err(PlanExecError::new(report.clone(), plan_exec_error(plan)))
     } else {
         Ok(report)
     }
@@ -661,12 +673,10 @@ fn run_store_pre_hook(
 fn run_store_post_hook(
     repo_root: &Path,
     store_name: &str,
+    config: &Config,
     platform: &Platform,
 ) -> Result<(), StitchError> {
-    // Post-hook requires config lookup; we can load a fresh copy. Plan
-    // execution is rare and the config has already been hash-checked.
-    let loaded = config::Config::load(repo_root)?;
-    let Some(store) = loaded.config.stores.get(store_name) else {
+    let Some(store) = config.stores.get(store_name) else {
         return Ok(());
     };
     if let Some(post) = &store.hooks.post {
@@ -683,7 +693,7 @@ fn run_store_post_hook(
     Ok(())
 }
 
-fn plan_exec_error(plan: &PlanFile, _report: &PlanExecReport) -> StitchError {
+pub fn plan_exec_error(plan: &PlanFile) -> StitchError {
     let mut classes = BTreeSet::new();
     for conflict in &plan.conflicts {
         classes.insert(conflict_class(conflict));
@@ -932,11 +942,93 @@ fn preflight_op(
     }
 }
 
+fn is_dir_empty(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut iter) => iter.next().is_none(),
+        Err(_) => false,
+    }
+}
+
+fn replace_link_real_entry(
+    target_path: &Path,
+    source_path: &Path,
+    idx: usize,
+) -> Result<(), String> {
+    if target_path.is_dir() && !is_dir_empty(target_path) {
+        return Err(format!(
+            "{} is not empty — cannot replace",
+            target_path.display()
+        ));
+    }
+
+    let Some(parent) = target_path.parent() else {
+        return Err(format!("{} has no parent directory", target_path.display()));
+    };
+    let Some(name) = target_path.file_name() else {
+        return Err(format!("{} has no file name", target_path.display()));
+    };
+    let name_str = name.to_string_lossy();
+    let pid = std::process::id();
+    let tmp_link = parent.join(format!(".{name_str}.stitch-link-{idx}-{pid}"));
+    let tmp_orig = parent.join(format!(".{name_str}.stitch-orig-{idx}-{pid}"));
+
+    if tmp_link.symlink_metadata().is_ok() || tmp_orig.symlink_metadata().is_ok() {
+        return Err(format!(
+            "temporary replacement path for {} already exists",
+            target_path.display()
+        ));
+    }
+
+    // Create the new symlink at a temporary path first so the original is not
+    // removed until the link is known to work.
+    if let Err(e) = linker::create_link(&tmp_link, source_path) {
+        return Err(link_error(e));
+    }
+
+    // Move the existing entry aside.
+    if let Err(e) = std::fs::rename(target_path, &tmp_orig) {
+        let _ = std::fs::remove_file(&tmp_link);
+        return Err(format!(
+            "could not move {} aside: {e}",
+            target_path.display()
+        ));
+    }
+
+    // Move the new link into place.
+    if let Err(e) = std::fs::rename(&tmp_link, target_path) {
+        // Roll back on failure.
+        let _ = std::fs::rename(&tmp_orig, target_path);
+        let _ = std::fs::remove_file(&tmp_link);
+        return Err(format!(
+            "could not place symlink at {}: {e}",
+            target_path.display()
+        ));
+    }
+
+    // Remove the original (now at tmp_orig). It was a file or empty directory.
+    if tmp_orig.is_dir() {
+        if let Err(e) = std::fs::remove_dir(&tmp_orig) {
+            return Err(format!(
+                "replaced {} but could not remove original: {e}",
+                target_path.display()
+            ));
+        }
+    } else if let Err(e) = std::fs::remove_file(&tmp_orig) {
+        return Err(format!(
+            "replaced {} but could not remove original: {e}",
+            target_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
 fn execute_op(
     repo_root: &Path,
     loaded: &Loaded,
     platform: &Platform,
     op: &PlanFileOp,
+    idx: usize,
     report: &mut PlanExecReport,
 ) -> Result<(), String> {
     match op {
@@ -1001,31 +1093,14 @@ fn execute_op(
                     {
                         return Err(format!("{} was repointed", target_path.display()));
                     }
+                    linker::create_link(target_path, source_path).map_err(link_error)?;
                 }
                 TargetState::RealEntry => {
-                    // Whole-directory promotion: the real directory was emptied
-                    // at capture time. If it is no longer empty, the plan is stale.
-                    if target_path.is_dir() {
-                        match std::fs::remove_dir(target_path) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                                return Err(format!(
-                                    "{} is not empty — cannot replace",
-                                    target_path.display()
-                                ));
-                            }
-                            Err(e) => return Err(format!("{e}")),
-                        }
-                    } else if target_path.is_file() {
-                        std::fs::remove_file(target_path).map_err(|e| format!("{e}"))?;
-                    } else {
-                        return Err(format!("{} is not a real file/dir", target_path.display()));
-                    }
+                    replace_link_real_entry(target_path, source_path, idx)?;
                 }
                 _ => return Err("replace_link requires symlink_to or real_entry".into()),
             }
 
-            linker::create_link(target_path, source_path).map_err(link_error)?;
             Ok(())
         }
         PlanFileOp::BackupAndLink {
@@ -1038,7 +1113,21 @@ fn execute_op(
             let backup_path = Path::new(backup);
             let source_path = Path::new(source);
 
-            // Preflight already confirmed backup is absent.
+            // Re-check the backup path at exec time (TOCTOU guard).
+            if backup_path.symlink_metadata().is_ok() {
+                return Err(format!(
+                    "backup path {} already exists",
+                    backup_path.display()
+                ));
+            }
+            if backup_path.parent() != target_path.parent() {
+                return Err(format!(
+                    "backup path {} is not under the same directory as target {}",
+                    backup_path.display(),
+                    target_path.display()
+                ));
+            }
+
             std::fs::rename(target_path, backup_path).map_err(|e| format!("{e}"))?;
             if let Err(e) = linker::create_link(target_path, source_path) {
                 // Restore the original on failure.
@@ -1074,28 +1163,42 @@ fn link_error(e: LinkError) -> String {
 struct ValidationContext<'a> {
     repo_root: &'a Path,
     config: &'a Config,
-    targets_by_store: BTreeMap<String, Vec<PathBuf>>,
 }
 
 impl<'a> ValidationContext<'a> {
     fn new(repo_root: &'a Path, config: &'a Config) -> Self {
-        let mut targets_by_store = BTreeMap::new();
-        for (name, store) in &config.stores {
-            let mut paths = Vec::new();
-            if let Some(ref t) = store.target {
-                paths.push(config::expand_home(t));
+        Self { repo_root, config }
+    }
+}
+
+fn target_paths_for_store(store: &Store) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(ref t) = store.target {
+        paths.push(config::expand_home(t));
+    }
+    for te in store.targets.values() {
+        paths.push(config::expand_home(&te.target));
+    }
+    paths
+}
+
+fn find_store_for_target(_repo_root: &Path, config: &Config, target: &Path) -> Option<String> {
+    for (name, store) in &config.stores {
+        for target_path in target_paths_for_store(store) {
+            if target == target_path || target.starts_with(target_path) {
+                return Some(name.clone());
             }
-            for te in store.targets.values() {
-                paths.push(config::expand_home(&te.target));
-            }
-            targets_by_store.insert(name.clone(), paths);
-        }
-        Self {
-            repo_root,
-            config,
-            targets_by_store,
         }
     }
+    None
+}
+
+fn is_under_any_target(config: &Config, store: &str, target: &Path) -> bool {
+    config.stores.get(store).is_some_and(|store| {
+        target_paths_for_store(store)
+            .iter()
+            .any(|p| target == p || target.starts_with(p))
+    })
 }
 
 fn validate_op(ctx: &ValidationContext, idx: usize, op: &PlanFileOp) -> Result<(), String> {
@@ -1109,7 +1212,11 @@ fn validate_op(ctx: &ValidationContext, idx: usize, op: &PlanFileOp) -> Result<(
             if !ctx.config.stores.contains_key(store) {
                 return Err(format!("op {idx}: unknown store '{store}'"));
             }
-            if !is_safe_fragment(source_rel) {
+            let source_rel_path = Path::new(source_rel);
+            if source_rel_path.is_absolute()
+                || has_parent_dir(source_rel_path)
+                || !is_safe_fragment(source_rel)
+            {
                 return Err(format!("op {idx}: invalid source_rel '{source_rel}'"));
             }
             if !source_rel.ends_with(render::TMPL_SUFFIX) {
@@ -1135,22 +1242,38 @@ fn validate_op(ctx: &ValidationContext, idx: usize, op: &PlanFileOp) -> Result<(
             Ok(())
         }
         PlanFileOp::CreateLink { target, source, .. }
-        | PlanFileOp::ReplaceLink { target, source, .. }
-        | PlanFileOp::BackupAndLink { target, source, .. } => {
+        | PlanFileOp::ReplaceLink { target, source, .. } => {
             validate_link_op(ctx, idx, target, source)?;
             Ok(())
         }
+        PlanFileOp::BackupAndLink {
+            target,
+            source,
+            backup,
+            ..
+        } => {
+            validate_link_op(ctx, idx, target, source)?;
+            validate_backup_path(idx, target, backup)?;
+            Ok(())
+        }
         PlanFileOp::RemoveLink { target, source, .. } => {
+            if has_parent_dir(Path::new(target)) {
+                return Err(format!("op {idx}: target '{target}' contains '..'"));
+            }
             let store = if let Some(src) = source {
+                if has_parent_dir(Path::new(src)) {
+                    return Err(format!("op {idx}: source '{src}' contains '..'"));
+                }
                 source_store(src, ctx.repo_root)
                     .ok_or_else(|| format!("op {idx}: cannot derive store from source '{src}'"))?
             } else {
-                find_store_for_target(ctx, Path::new(target)).ok_or_else(|| {
-                    format!(
-                        "op {idx}: target {} is not under any configured store target",
-                        target
-                    )
-                })?
+                find_store_for_target(ctx.repo_root, ctx.config, Path::new(target)).ok_or_else(
+                    || {
+                        format!(
+                            "op {idx}: target {target} is not under any configured store target"
+                        )
+                    },
+                )?
             };
             if !ctx.config.stores.contains_key(&store) {
                 return Err(format!("op {idx}: unknown store '{store}'"));
@@ -1167,6 +1290,9 @@ fn validate_link_op(
     source: &str,
 ) -> Result<(), String> {
     let source_path = Path::new(source);
+    if has_parent_dir(source_path) {
+        return Err(format!("op {idx}: source '{source}' contains '..'"));
+    }
     if !source_path.starts_with(ctx.repo_root) {
         return Err(format!("op {idx}: source {source} is not under the repo"));
     }
@@ -1219,29 +1345,43 @@ fn validate_link_op(
 
     // Target must fall under a configured target path for this store.
     let target_path = Path::new(target);
-    if !is_under_any_target(ctx, &source_store, target_path) {
+    if has_parent_dir(target_path) {
+        return Err(format!("op {idx}: target '{target}' contains '..'"));
+    }
+    if !is_under_any_target(ctx.config, &source_store, target_path) {
         return Err(format!(
-            "op {idx}: target {} is not under a configured target for store '{source_store}'",
-            target
+            "op {idx}: target {target} is not under a configured target for store '{source_store}'"
         ));
     }
 
     Ok(())
 }
 
-fn find_store_for_target(ctx: &ValidationContext, target: &Path) -> Option<String> {
-    for (name, paths) in &ctx.targets_by_store {
-        for target_path in paths {
-            if target == target_path || target.starts_with(target_path) {
-                return Some(name.clone());
-            }
-        }
+fn validate_backup_path(idx: usize, target: &str, backup: &str) -> Result<(), String> {
+    let target_path = Path::new(target);
+    let backup_path = Path::new(backup);
+    if has_parent_dir(backup_path) {
+        return Err(format!("op {idx}: backup path '{backup}' contains '..'"));
     }
-    None
-}
-
-fn is_under_any_target(ctx: &ValidationContext, store: &str, target: &Path) -> bool {
-    ctx.targets_by_store
-        .get(store)
-        .is_some_and(|paths| paths.iter().any(|p| target == p || target.starts_with(p)))
+    if target_path == backup_path {
+        return Err(format!(
+            "op {idx}: backup path '{backup}' must differ from target"
+        ));
+    }
+    let Some(target_parent) = target_path.parent() else {
+        return Err(format!(
+            "op {idx}: target '{target}' has no parent directory"
+        ));
+    };
+    let Some(backup_parent) = backup_path.parent() else {
+        return Err(format!(
+            "op {idx}: backup path '{backup}' has no parent directory"
+        ));
+    };
+    if target_parent != backup_parent {
+        return Err(format!(
+            "op {idx}: backup path '{backup}' is not under the same directory as target '{target}'"
+        ));
+    }
+    Ok(())
 }
