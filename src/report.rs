@@ -23,9 +23,7 @@ pub struct Envelope<T: Serialize> {
     pub command: &'static str,
     pub ok: bool,
     pub warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorDetail>,
 }
 
@@ -34,13 +32,11 @@ pub struct ErrorDetail {
     pub class: String,
     pub code: i32,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
     /// Reserved, machine-readable structured detail for future milestones
     /// (e.g. M3/M4 plan-stale precondition diffs). No command populates it
-    /// today; it is `None` and skipped on serialization. Kept in the struct so
+    /// today; it is `None` and serialized as `null`. Kept in the struct so
     /// the envelope shape is locked now and later fills are additive-only.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
 }
 
@@ -114,12 +110,17 @@ pub fn write_data_error<T: Serialize>(
     std::process::exit(error.exit_code());
 }
 
+/// The result of a JSON command: data plus warnings, or a boxed error plus
+/// warnings. The error is boxed to keep the `Err` variant small.
+pub type JsonResult<T> = Result<(T, Vec<String>), Box<(StitchError, Vec<String>)>>;
+
 /// Run a computation and emit the appropriate JSON envelope.
 ///
 /// On error the JSON envelope is written to stdout and the process exits with
 /// the error's class code so callers never return a successful exit code for a
-/// failed run.
-pub fn run_json<T: Serialize, F: FnOnce() -> Result<(T, Vec<String>), StitchError>>(
+/// failed run. The closure returns warnings alongside the result so load-time
+/// warnings are preserved even when a later step fails.
+pub fn run_json<T: Serialize, F: FnOnce() -> JsonResult<T>>(
     command: &'static str,
     f: F,
 ) -> Result<(), StitchError> {
@@ -128,8 +129,9 @@ pub fn run_json<T: Serialize, F: FnOnce() -> Result<(T, Vec<String>), StitchErro
             write(command, data, warnings);
             Ok(())
         }
-        Err(error) => {
-            write_error(command, &error, Vec::new());
+        Err(boxed) => {
+            let (error, warnings) = *boxed;
+            write_error(command, &error, warnings);
             std::process::exit(error.exit_code());
         }
     }
@@ -379,20 +381,42 @@ pub struct PruneData {
 pub struct PruneRow {
     pub link: String,
     pub resolves_to: String,
+    pub status: String,
 }
 
 pub fn prune(orphans: &[FoundLink], removed: usize, failed: usize) -> PruneData {
     PruneData {
-        orphans: orphans.iter().map(prune_row).collect(),
+        orphans: orphans
+            .iter()
+            .map(|link| prune_row(link, "listed"))
+            .collect(),
         removed,
         failed,
     }
 }
 
-fn prune_row(link: &FoundLink) -> PruneRow {
+pub fn prune_with_status(
+    orphans: &[FoundLink],
+    statuses: &[String],
+    removed: usize,
+    failed: usize,
+) -> PruneData {
+    PruneData {
+        orphans: orphans
+            .iter()
+            .zip(statuses.iter())
+            .map(|(link, status)| prune_row(link, status))
+            .collect(),
+        removed,
+        failed,
+    }
+}
+
+fn prune_row(link: &FoundLink, status: &str) -> PruneRow {
     PruneRow {
         link: path_to_string(&link.link),
         resolves_to: path_to_string(&link.resolves_to),
+        status: status.to_string(),
     }
 }
 

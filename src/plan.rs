@@ -184,7 +184,7 @@ impl LinkRequires {
 #[serde(tag = "target", content = "value", rename_all = "snake_case")]
 pub enum TargetState {
     Absent,
-    RealFile,
+    RealEntry,
     SymlinkTo(String),
     SymlinkIntoRepo,
 }

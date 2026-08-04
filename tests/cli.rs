@@ -1161,6 +1161,36 @@ target = "{target_str}"
 }
 
 #[test]
+fn diff_force_fails_when_bak_already_exists() {
+    // diff --force must preview the .bak backup honestly: if a .bak already
+    // exists, the operation is a conflict even in dry-run.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let backup = format!("{}.bak", target.display());
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "current").unwrap();
+    fs::write(&backup, "previous backup").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .args(["diff", "--force"])
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    assert!(target.is_file());
+    assert!(!target.is_symlink());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
+}
+
+#[test]
 fn diff_only_unknown_store_errors() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
@@ -1178,6 +1208,58 @@ target = "{}"
         .assert()
         .failure()
         .stderr(contains("unknown store"));
+}
+
+#[test]
+fn diff_real_file_conflict_exits_6() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .code(6)
+        .stdout(contains("conflict"));
+
+    assert!(target.is_file());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "real file");
+}
+
+#[test]
+fn diff_foreign_symlink_conflict_exits_7() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/etc/foreign", &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .code(7)
+        .stdout(contains("conflict"));
+
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), Path::new("/etc/foreign"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1747,6 +1829,7 @@ target = "{}"
         .arg("doctor")
         .assert()
         .failure()
+        .code(13)
         .stdout(contains("[error]"))
         .stdout(contains("nvim"));
 }
@@ -3734,17 +3817,57 @@ fn json_output(output: &std::process::Output) -> Value {
     serde_json::from_str(stdout).expect("valid JSON envelope")
 }
 
+fn assert_plan_summary_fields(summary: &Value) {
+    for key in [
+        "created",
+        "replaced",
+        "backed_up",
+        "removed",
+        "content_changed",
+        "already_linked",
+        "conflicts",
+        "errors",
+        "skipped",
+    ] {
+        assert!(
+            summary.get(key).and_then(Value::as_u64).is_some(),
+            "summary[{key}] must be a non-negative integer"
+        );
+    }
+}
+
 fn assert_envelope_shape(value: &Value, command: &str, ok: bool) {
     assert_eq!(value.get("schema").and_then(Value::as_u64), Some(1));
     assert_eq!(value.get("command").and_then(Value::as_str), Some(command));
     assert_eq!(value.get("ok").and_then(Value::as_bool), Some(ok));
     assert!(value.get("warnings").is_some());
+    // Lock the schema-stable omission pattern: both `data` and `error` are
+    // always present; the absent one serializes as `null`.
+    assert!(
+        value.get("data").is_some(),
+        "envelope must carry a data field"
+    );
+    assert!(
+        value.get("error").is_some(),
+        "envelope must carry an error field"
+    );
+    if ok {
+        assert!(
+            value["error"].is_null(),
+            "error must be null on a successful envelope"
+        );
+    } else {
+        assert!(
+            value["error"].is_object(),
+            "error must be an object on a failed envelope"
+        );
+    }
 }
 
-/// Lock the §1 error-object contract: `{class, code, message, hint, details?}`.
+/// Lock the §1 error-object contract: `{class, code, message, hint, details}`.
 /// Every `--json` failure envelope must carry a non-empty class, the matching
-/// numeric code, a non-empty message, and a hint. `details` is optional
-/// (reserved for M3/M4) so we only assert presence of the four core fields.
+/// numeric code, a non-empty message, and the `hint` and `details` keys
+/// (serialized as `null` when not populated).
 fn assert_error_shape(value: &Value, class: &str, code: i64) {
     let error = value
         .get("error")
@@ -3757,8 +3880,13 @@ fn assert_error_shape(value: &Value, class: &str, code: i64) {
         .expect("error.message present");
     assert!(!message.is_empty(), "error.message must be non-empty");
     assert!(
-        error.get("hint").is_some(),
-        "error.hint must be present (even if null-ish, the field is required)"
+        error.get("hint").is_some() && (error["hint"].is_string() || error["hint"].is_null()),
+        "error.hint must be present as a string or null"
+    );
+    assert!(
+        error.get("details").is_some()
+            && (error["details"].is_string() || error["details"].is_null()),
+        "error.details must be present as a string or null"
     );
 }
 
@@ -4023,6 +4151,7 @@ target = "{}"
 fn json_render_renders_template() {
     let repo = Repo::new();
     let store_dir = repo.make_store("git", &[]);
+    repo.write_state("[stores.git]\n");
     let src = store_dir.join("gitconfig.tmpl");
     fs::write(
         &src,
@@ -4089,6 +4218,7 @@ files = [".bashrc"]
 
     // The link was actually created.
     assert!(home.join(".bashrc").is_symlink());
+    assert_plan_summary_fields(&data["summary"]);
 }
 
 #[test]
@@ -4129,12 +4259,92 @@ target = "{}"
         requires["value"].as_str().unwrap(),
         repo.path().join("nvim").to_string_lossy()
     );
+    assert_plan_summary_fields(&data["summary"]);
+}
+
+#[test]
+fn json_apply_reports_conflict_real_file() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(6));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", false);
+    assert_error_shape(&value, "conflict-real", 6);
+
+    let data = value["data"].as_object().expect("partial plan data");
+    let summary = &data["summary"];
+    assert_plan_summary_fields(summary);
+    assert_eq!(summary["conflicts"].as_u64().unwrap(), 1);
+    let stores = data["stores"].as_array().unwrap();
+    assert!(stores.iter().any(|s| {
+        s["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op["action"] == "conflict")
+    }));
+
+    assert!(target.is_file());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "real file");
+}
+
+#[test]
+fn json_diff_reports_conflict_foreign_symlink() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/etc/foreign", &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo.cmd().args(["--json", "diff"]).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(7));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "diff", false);
+    assert_error_shape(&value, "conflict-foreign", 7);
+
+    let data = value["data"].as_object().expect("partial plan data");
+    let summary = &data["summary"];
+    assert_plan_summary_fields(summary);
+    assert_eq!(summary["conflicts"].as_u64().unwrap(), 1);
+    let stores = data["stores"].as_array().unwrap();
+    assert!(stores.iter().any(|s| {
+        s["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op["action"] == "conflict")
+    }));
+
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), Path::new("/etc/foreign"));
 }
 
 #[test]
 fn render_text_prints_content() {
     let repo = Repo::new();
     let store_dir = repo.make_store("git", &[]);
+    repo.write_state("[stores.git]\n");
     fs::write(
         store_dir.join("gitconfig.tmpl"),
         "host={{ env(\"STITCH_TEST_RENDER2\", \"fallback\") }}\n",
@@ -4292,7 +4502,7 @@ files = [".bashrc"]
     assert_eq!(output.status.code(), Some(6));
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
     let plan: Value = serde_json::from_str(stdout).expect("plan emitted despite conflict");
-    assert_eq!(plan["conflicts"][0]["kind"], "real_file");
+    assert_eq!(plan["conflicts"][0]["kind"], "real_entry");
     assert!(
         std::str::from_utf8(&output.stderr)
             .unwrap()
@@ -4525,7 +4735,7 @@ files = [".bashrc"]
         ops[0]["backup"].as_str().unwrap(),
         home.join(".bashrc.bak").to_string_lossy()
     );
-    assert_eq!(ops[0]["requires"]["target"], "real_file");
+    assert_eq!(ops[0]["requires"]["target"], "real_entry");
     assert_eq!(ops[0]["requires"]["backup"], "absent");
 }
 

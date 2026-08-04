@@ -652,9 +652,12 @@ fn cmd_status(
 ) -> Result<(), StitchError> {
     if json {
         return report::run_json("status", || {
-            let loaded = Config::load(root)?;
+            let loaded =
+                Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
+            let warnings = loaded.warnings;
             if let Some(filter) = name {
-                check_unknown_names(std::iter::once(filter.as_str()), &loaded.config)?;
+                check_unknown_names(std::iter::once(filter.as_str()), &loaded.config)
+                    .map_err(|e| Box::new((e, warnings.clone())))?;
             }
             let platform = Platform::detect();
             let entries = store::status_all(root, &loaded.config, &platform);
@@ -667,7 +670,7 @@ fn cmd_status(
                 entries
             };
             let data = report::status(root, &filtered);
-            Ok((data, loaded.warnings))
+            Ok((data, warnings))
         });
     }
 
@@ -789,7 +792,8 @@ fn cmd_diff(
 fn cmd_list(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     if json {
         return report::run_json("list", || {
-            let loaded = Config::load(root)?;
+            let loaded =
+                Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             let data = report::list(&loaded.config);
             Ok((data, loaded.warnings))
         });
@@ -1443,15 +1447,17 @@ fn collapse_home(path: &std::path::Path) -> String {
 fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     if json {
         return report::run_json("doctor", || {
-            let loaded = Config::load(root)?;
+            let loaded =
+                Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             let platform = Platform::detect();
             let result = store::doctor(root, &loaded, &platform);
             let data = report::doctor(&result);
+            let warnings = loaded.warnings;
             if data.summary.errors > 0 {
                 let error = StitchError::doctor(data.summary.errors);
-                report::write_data_error("doctor", data, &error, loaded.warnings);
+                report::write_data_error("doctor", data, &error, warnings);
             }
-            Ok((data, loaded.warnings))
+            Ok((data, warnings))
         });
     }
 
@@ -1611,7 +1617,9 @@ fn cmd_prune(
 ) -> Result<(), StitchError> {
     if json {
         return report::run_json("prune", || {
-            let loaded = Config::load(root)?;
+            let loaded =
+                Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
+            let warnings = loaded.warnings;
             let platform = Platform::detect();
             let roots = prune_roots(scan_dirs);
             let found = scan::scan_for_repo_links(root, &roots);
@@ -1620,26 +1628,36 @@ fn cmd_prune(
 
             if !yes || dry_run {
                 let data = report::prune(&orphans, 0, 0);
-                return Ok((data, loaded.warnings));
+                return Ok((data, warnings));
             }
 
             let mut removed = 0;
             let mut failed = 0;
+            let mut statuses = Vec::with_capacity(orphans.len());
             for fl in &orphans {
                 match linker::remove_link(&fl.link, root) {
-                    Ok(true) => removed += 1,
-                    Ok(false) => failed += 1,
-                    Err(_) => failed += 1,
+                    Ok(true) => {
+                        removed += 1;
+                        statuses.push("removed".to_string());
+                    }
+                    Ok(false) => {
+                        failed += 1;
+                        statuses.push("failed".to_string());
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        statuses.push("failed".to_string());
+                    }
                 }
             }
 
-            let data = report::prune(&orphans, removed, failed);
+            let data = report::prune_with_status(&orphans, &statuses, removed, failed);
             if failed > 0 {
                 let error =
-                    StitchError::internal("prune could not remove some links — see warnings above");
-                report::write_data_error("prune", data, &error, loaded.warnings);
+                    StitchError::internal(format!("prune could not remove {failed} link(s)"));
+                report::write_data_error("prune", data, &error, warnings);
             }
-            Ok((data, loaded.warnings))
+            Ok((data, warnings))
         });
     }
 
@@ -1720,6 +1738,31 @@ fn prune_roots(scan_dirs: &[String]) -> Vec<scan::ScanRoot> {
     }
 }
 
+fn validate_render_spec(
+    loaded: &Loaded,
+    store_name: &str,
+    source_rel: &str,
+) -> Result<(), StitchError> {
+    if !config::is_safe_fragment(store_name) {
+        return Err(StitchError::path_validation(format!(
+            "invalid store name '{store_name}': must be relative and contain no '..' or leading '/'"
+        )));
+    }
+    if !config::is_safe_fragment(source_rel) {
+        return Err(StitchError::path_validation(format!(
+            "invalid source path '{source_rel}': must be relative and contain no '..' or leading '/'"
+        )));
+    }
+    if !loaded.config.stores.contains_key(store_name) {
+        let valid: Vec<_> = loaded.config.stores.keys().cloned().collect();
+        return Err(StitchError::unknown_store(
+            vec![store_name.to_string()],
+            valid,
+        ));
+    }
+    Ok(())
+}
+
 fn cmd_render(root: &std::path::Path, spec: &str, json: bool) -> Result<(), StitchError> {
     let (store_name, source_rel) = spec.split_once('/').ok_or_else(|| {
         StitchError::usage("render: expected <store>/<file>, e.g. git/gitconfig.tmpl")
@@ -1735,26 +1778,36 @@ fn cmd_render(root: &std::path::Path, spec: &str, json: bool) -> Result<(), Stit
 
     if json {
         return report::run_json("render", || {
-            let loaded = Config::load(root)?;
+            let loaded =
+                Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
+            validate_render_spec(&loaded, store_name, source_rel)
+                .map_err(|e| Box::new((e, loaded.warnings.clone())))?;
+            let warnings = loaded.warnings;
             let store_dir = root.join(store_name);
             let source_path = store_dir.join(source_rel);
             if !source_path.is_file() {
-                return Err(StitchError::internal(format!(
-                    "source does not exist: {}",
-                    source_path.display()
+                return Err(Box::new((
+                    StitchError::internal(format!(
+                        "source does not exist: {}",
+                        source_path.display()
+                    )),
+                    warnings,
                 )));
             }
             let platform = Platform::detect();
             let content =
                 render::render_file(&source_path, source_rel, &platform, &loaded.config.vars)
-                    .map_err(|e| StitchError::render(&source_path, e))?;
+                    .map_err(|e| {
+                        Box::new((StitchError::render(&source_path, e), warnings.clone()))
+                    })?;
             let data = report::render(&source_path, source_rel, &content);
-            Ok((data, loaded.warnings))
+            Ok((data, warnings))
         });
     }
 
     let loaded = Config::load(root)?;
     print_warnings(&loaded);
+    validate_render_spec(&loaded, store_name, source_rel)?;
     let store_dir = root.join(store_name);
     let source_path = store_dir.join(source_rel);
     if !source_path.is_file() {

@@ -372,6 +372,9 @@ impl From<ConfigError> for StitchError {
     fn from(source: ConfigError) -> Self {
         match source {
             ConfigError::InvalidPath(msg) => Self::PathValidation { message: msg },
+            ConfigError::Write(e, path) => Self::Internal {
+                message: format!("could not write {}: {e}", path.display()),
+            },
             other => Self::Config(other),
         }
     }
