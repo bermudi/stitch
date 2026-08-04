@@ -2427,6 +2427,334 @@ fn state_toml_emits_files_sorted() {
 }
 
 // ===========================================================================
+// Red-line regression nets: read/plan commands leave stitch.toml untouched;
+// remove dispatches its hooks; post-hook failure warns rather than aborts.
+//
+// Each of these locks an invariant that a refactor can silently break with no
+// other test firing. They are not "assert the error path exists" ceremony —
+// they pin behavior the SPEC/AGENTS red lines call out by name.
+// ===========================================================================
+
+/// Red line: "Authored config is read-only to the tool." Only `init`/`migrate`
+/// (which create it), `add`/`remove` (covered by
+/// `stitch_toml_is_byte_stable_across_add_remove`), and `import` (covered by
+/// `import_leaves_stitch_toml_byte_stable`) are allowed to touch config files
+/// — and all three write only `state.toml`, never `stitch.toml`. The read/plan
+/// commands (`apply`, `diff`, `plan`, `status`, `list`, `doctor`, `prune`,
+/// `render`) must never write it. (`edit` intentionally opens `stitch.toml` in
+/// `$EDITOR` — that's the user, not the tool, so it's excluded from this net.)
+/// A stray `loaded.config.save()` or `config::atomic_write(&authored_path, …)`
+/// threaded into any of them would silently destroy user comments — the
+/// motivating bug of the v0.3 split — and today nothing catches it. This test
+/// pins all eight commands in one place.
+#[test]
+fn read_and_plan_commands_leave_stitch_toml_byte_stable() {
+    let repo = Repo::new();
+    // Authored half with a comment + a `when` clause + a `vars` table — the
+    // exact shape a v0.2 reserializer would mangle. Include a configured store
+    // so apply/diff/plan have something to operate on.
+    let store = repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    let authored = "# do not let the tool rewrite this — comment must survive\n\
+         [vars]\neditor = \"nvim\"\n\
+         \n[stores.nvim]\nwhen = { os = \"linux\" }\n";
+    repo.write_split(
+        &format!("\n[stores.nvim]\ntarget = \"{target_str}\"\n"),
+        authored,
+    );
+
+    let before = fs::read(repo.path().join("stitch.toml")).unwrap();
+
+    for cmd in [
+        ["apply"],
+        ["diff"],
+        ["plan"],
+        ["status"],
+        ["list"],
+        ["doctor"],
+        ["prune"],
+    ] {
+        repo.cmd().args(cmd).assert().success();
+    }
+    // render needs a templated entry; add one without re-running apply.
+    fs::write(store.join("init.lua.tmpl"), "{{ vars.editor }}\n").unwrap();
+    repo.cmd()
+        .args(["render", "nvim/init.lua.tmpl"])
+        .assert()
+        .success();
+
+    let after = fs::read(repo.path().join("stitch.toml")).unwrap();
+    assert_eq!(
+        before, after,
+        "stitch.toml must be byte-stable across read/plan commands \
+         (apply/diff/plan/status/list/doctor/prune/render)"
+    );
+}
+
+/// Red line: `cmd_remove` dispatches `pre-remove` and `post-remove` global
+/// hooks. The dispatch exists in main.rs but no test exercises it — a refactor
+/// that drops either call (or renames the hook file lookup) regresses silently.
+/// This test pins both hooks firing on a real remove, with `STITCH_ACTION=remove`
+/// visible to the hook so the action dispatch is also locked.
+#[test]
+fn remove_dispatches_pre_and_post_remove_hooks() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!("\n[stores.s]\ntarget = \"{target_str}\"\n"));
+
+    // Apply first so there's a real link to remove.
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink());
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let pre_marker = repo.path().join("pre-remove-ran");
+    let post_marker = repo.path().join("post-remove-ran");
+    // The hooks record the STITCH_ACTION they saw, so the action dispatch is
+    // pinned alongside the hook dispatch itself. The post-remove hook also
+    // asserts the link is already gone — pinning pre-before-unlink,
+    // post-after-unlink ordering.
+    fs::write(
+        hooks_dir.join("pre-remove"),
+        format!(
+            "#!/bin/sh\necho \"pre:$STITCH_ACTION:$STITCH_STORE\" > {}\n\
+             test -e \"$STITCH_TARGET\" && echo \"link-still-present\" >> {} || \
+             echo \"link-already-gone\" >> {}\n",
+            pre_marker.display(),
+            pre_marker.display(),
+            pre_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        hooks_dir.join("post-remove"),
+        format!(
+            "#!/bin/sh\necho \"post:$STITCH_ACTION:$STITCH_STORE\" > {}\n\
+             test -e \"$STITCH_TARGET\" && echo \"link-still-present\" >> {} || \
+             echo \"link-already-gone\" >> {}\n",
+            post_marker.display(),
+            post_marker.display(),
+            post_marker.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&hooks_dir.join("pre-remove"));
+    make_executable(&hooks_dir.join("post-remove"));
+
+    repo.cmd().args(["remove", "s"]).assert().success();
+
+    assert!(pre_marker.exists(), "pre-remove hook must run on remove");
+    assert!(post_marker.exists(), "post-remove hook must run on remove");
+    let pre_text = fs::read_to_string(&pre_marker).unwrap();
+    let post_text = fs::read_to_string(&post_marker).unwrap();
+    assert_eq!(
+        pre_text.lines().next().unwrap(),
+        "pre:remove:s",
+        "pre-remove must see STITCH_ACTION=remove and the store name"
+    );
+    assert!(
+        pre_text.contains("link-still-present"),
+        "pre-remove must fire before the link is unlinked, got: {pre_text}"
+    );
+    assert_eq!(
+        post_text.lines().next().unwrap(),
+        "post:remove:s",
+        "post-remove must see STITCH_ACTION=remove and the store name"
+    );
+    assert!(
+        post_text.contains("link-already-gone"),
+        "post-remove must fire after the link is unlinked, got: {post_text}"
+    );
+    assert!(!target.exists(), "remove must still unlink the target");
+}
+
+/// Red line: per SPEC §Hooks, "post failure warns" — it must NOT abort the
+/// operation. The code uses `eprintln!("warning: …")` + continue (not `?`); a
+/// one-character refactor to `?` would turn a post-hook hiccup into a failed
+/// apply that leaves the user unsure whether their links were created. This
+/// test pins the warn-don't-abort contract for both per-store and global
+/// post-hooks: the post hook fails, the apply still exits 0, the link is in
+/// place, and stderr carries the warning.
+#[test]
+fn post_hook_failure_warns_without_aborting_apply() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+
+    // Per-store post hook fails.
+    repo.write_split(
+        &format!("\n[stores.s]\ntarget = \"{target_str}\"\n"),
+        "\n[stores.s]\nhooks = { post = \"exit 1\" }\n",
+    );
+
+    let output = repo.cmd().arg("apply").assert().success();
+    assert!(
+        target.is_symlink(),
+        "link must be created even when the post hook fails"
+    );
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("warning:"),
+        "post-hook failure must surface as a warning: line on stderr, got: {stderr}"
+    );
+
+    // Global post-apply hook fails too — same contract: warn, don't abort.
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(hooks_dir.join("post-apply"), "#!/bin/sh\nexit 1\n").unwrap();
+    make_executable(&hooks_dir.join("post-apply"));
+
+    // Reset the link so apply has work to do (otherwise it's a no-op and the
+    // post-apply hook path still runs, but we want to assert success end-to-end
+    // with both per-store and global post hooks failing in the same run).
+    fs::remove_file(&target).unwrap();
+    let output = repo.cmd().arg("apply").assert().success();
+    assert!(
+        target.is_symlink(),
+        "link must be created even with per-store + global post hooks both failing"
+    );
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("post-apply"),
+        "global post-apply failure must be named in the warning, got: {stderr}"
+    );
+}
+
+/// Red line: `cmd_import` writes `state.toml` but must never rewrite
+/// `stitch.toml` — its own doc comment says so ("Never rewrites
+/// `stitch.toml`"). Import is the fourth mutation command (after init/migrate
+/// and add/remove), and it falls through the existing byte-stability nets: the
+/// add/remove test doesn't cover it, and the read/plan test doesn't cover
+/// mutation commands. A stray `atomic_write(&authored_path, …)` in import
+/// would regress silently — precisely the failure mode this diff exists to
+/// catch. This test pins the red line for import specifically.
+#[test]
+fn import_leaves_stitch_toml_byte_stable() {
+    let repo = Repo::new();
+    // Authored half with a comment — the shape a reserializer would destroy.
+    repo.write_authored("# my dotfiles — do not rewrite\n[vars]\neditor = \"nvim\"\n");
+    let store = repo.make_store("nvim", &["init.lua"]);
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store, &target).unwrap();
+
+    let before = fs::read(repo.path().join("stitch.toml")).unwrap();
+
+    repo.cmd()
+        .arg("import")
+        .arg("--scan-dir")
+        .arg(home.path().join(".config"))
+        .assert()
+        .success()
+        .stdout(contains("Imported 1"));
+
+    let after = fs::read(repo.path().join("stitch.toml")).unwrap();
+    assert_eq!(
+        before, after,
+        "stitch.toml must be byte-stable across import — \
+         import writes state.toml only, never the authored half"
+    );
+
+    // Sanity: import did write state.toml (so the test isn't vacuously passing
+    // because import was a no-op).
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("[stores.nvim]"),
+        "import must record the store in state.toml: {state}"
+    );
+}
+
+/// Red line: `pre-remove` hook failure aborts the removal via `?` → exit 10
+/// (SPEC §Hooks: "pre failure aborts the store"). `cmd_remove` has its own
+/// inline hook dispatch (not a shared runner), so the same one-character `?`
+/// refactor risk that test 3 pins for apply exists independently here. This
+/// test pins: non-zero exit, the store entry survives in `state.toml`, and
+/// the link is still present — i.e. the remove was genuinely aborted, not
+/// completed-and-then-errored.
+#[test]
+fn pre_remove_hook_failure_aborts_remove() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!("\n[stores.s]\ntarget = \"{target_str}\"\n"));
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink());
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(hooks_dir.join("pre-remove"), "#!/bin/sh\nexit 1\n").unwrap();
+    make_executable(&hooks_dir.join("pre-remove"));
+
+    repo.cmd()
+        .args(["remove", "s"])
+        .assert()
+        .failure()
+        .stderr(contains("pre-remove"));
+
+    // The remove was aborted: link survives, store survives in state.toml.
+    assert!(
+        target.is_symlink(),
+        "link must survive when pre-remove aborts"
+    );
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("[stores.s]"),
+        "store entry must survive in state.toml when pre-remove aborts: {state}"
+    );
+}
+
+/// Red line: `post-remove` hook failure warns, not aborts — the mirror of test
+/// 3 for the remove side. `cmd_remove`'s post-remove dispatch uses
+/// `eprintln!("warning: …")` + continue (main.rs:1377), the same pattern as
+/// post-apply. A `?` refactor would turn a post-remove hiccup into a failed
+/// remove that leaves the user unsure whether the link was unlinked. This
+/// test pins: exit 0, link gone, warning on stderr.
+#[test]
+fn post_remove_hook_failure_warns_without_aborting() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!("\n[stores.s]\ntarget = \"{target_str}\"\n"));
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink());
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(hooks_dir.join("post-remove"), "#!/bin/sh\nexit 1\n").unwrap();
+    make_executable(&hooks_dir.join("post-remove"));
+
+    let output = repo.cmd().args(["remove", "s"]).assert().success();
+    assert!(
+        !target.exists(),
+        "link must be unlinked even when post-remove fails"
+    );
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("warning:"),
+        "post-remove failure must surface as a warning: line on stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("post-remove"),
+        "post-remove failure must name the hook in the warning, got: {stderr}"
+    );
+    // Store entry is gone — the remove completed.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state.contains("[stores.s]"),
+        "store entry must be removed from state.toml even when post-remove fails: {state}"
+    );
+}
+
+// ===========================================================================
 // migrate (item 4)
 // ===========================================================================
 
