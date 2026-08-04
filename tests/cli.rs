@@ -4195,3 +4195,422 @@ fn json_rejected_on_write_commands_as_usage_envelope() {
     assert_envelope_shape(&value, "remove", false);
     assert_error_shape(&value, "usage", 2);
 }
+
+// ---------------------------------------------------------------------------
+// v0.7 M4 plan / apply --plan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_captures_executable_plan_file() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let plan: Value = serde_json::from_str(stdout).expect("plan is valid JSON");
+    assert_eq!(plan["schema"], 1);
+    assert_eq!(plan["kind"], "stitch/plan");
+    assert_eq!(
+        plan["repo"].as_str().unwrap(),
+        repo.path().to_string_lossy()
+    );
+    assert!(plan["config_sha256"].as_str().is_some());
+    let platform = &plan["platform"];
+    assert!(platform["os"].is_string());
+    assert!(platform["arch"].is_string());
+    assert!(platform["hostname"].is_string());
+    assert!(platform["shell"].is_string());
+    let ops = plan["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "create_link");
+    assert_eq!(
+        ops[0]["target"].as_str().unwrap(),
+        home.join(".bashrc").to_string_lossy()
+    );
+    assert_eq!(
+        ops[0]["source"].as_str().unwrap(),
+        repo.path().join("shells/.bashrc").to_string_lossy()
+    );
+    assert_eq!(ops[0]["requires"]["target"], "absent");
+    assert!(plan["conflicts"].as_array().unwrap().is_empty());
+    if let Some(errors) = plan.get("errors") {
+        assert!(errors.as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn plan_json_wraps_in_envelope() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["--json", "plan"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "plan", true);
+    let data = value.get("data").unwrap();
+    assert_eq!(data["kind"], "stitch/plan");
+    assert!(data["ops"].as_array().unwrap().len() == 1);
+}
+
+#[test]
+fn plan_reports_conflicts_and_exits_nonzero() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".bashrc"), "existing").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(6));
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let plan: Value = serde_json::from_str(stdout).expect("plan emitted despite conflict");
+    assert_eq!(plan["conflicts"][0]["kind"], "real_file");
+    assert!(
+        std::str::from_utf8(&output.stderr)
+            .unwrap()
+            .contains("conflict")
+    );
+}
+
+#[test]
+fn apply_plan_executes_create_link() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    repo.cmd()
+        .arg("plan")
+        .assert()
+        .success()
+        .stdout(predicates::function::function(|s: &str| {
+            fs::write(&plan_path, s).unwrap();
+            true
+        }));
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Executed 1/1 ops"));
+
+    assert!(home.join(".bashrc").is_symlink());
+}
+
+#[test]
+fn apply_plan_dry_run_does_not_mutate() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap(), "--dry-run"])
+        .assert()
+        .success()
+        .stdout(contains("Dry run"))
+        .stdout(contains("Executed 0/1 ops"));
+
+    assert!(!home.join(".bashrc").exists());
+}
+
+#[test]
+fn apply_plan_rejects_force_and_only_as_usage_error() {
+    let repo = Repo::new();
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, "{}").unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap(), "--force"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("--plan is not compatible with --force"));
+
+    repo.cmd()
+        .args([
+            "apply",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--only",
+            "shells",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("--plan is not compatible with --only"));
+}
+
+#[test]
+fn apply_plan_detects_stale_env_render_hash() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    fs::write(
+        store_dir.join("gitconfig.tmpl"),
+        "host={{ env(\"STITCH_PLAN_TEST\", \"fallback\") }}\n",
+    )
+    .unwrap();
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo
+        .cmd()
+        .arg("plan")
+        .env("STITCH_PLAN_TEST", "alpha")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .env("STITCH_PLAN_TEST", "beta")
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("render hash mismatch"));
+}
+
+#[test]
+fn apply_plan_detects_stale_config_hash() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    // Mutate the pinned config: editing state.toml changes the hash.
+    let state_path = repo.path().join(".stitch/state.toml");
+    let mut state = fs::read_to_string(&state_path).unwrap();
+    state.push_str("\n# mutation\n");
+    fs::write(&state_path, state).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("config hash mismatch"));
+}
+
+#[test]
+fn apply_plan_detects_target_state_drift() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    // Someone put a foreign symlink at the target after the plan was captured.
+    std::os::unix::fs::symlink("/tmp/foreign", home.join(".bashrc")).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("preflight failed"));
+
+    // The foreign link must not have been touched.
+    assert_eq!(
+        fs::read_link(home.join(".bashrc"))
+            .unwrap()
+            .to_string_lossy(),
+        "/tmp/foreign"
+    );
+}
+
+#[test]
+fn plan_force_captures_backup_and_link() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".bashrc"), "existing").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["plan", "--force"]).output().unwrap();
+    assert!(output.status.success());
+    let plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    let ops = plan["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "backup_and_link");
+    assert_eq!(
+        ops[0]["backup"].as_str().unwrap(),
+        home.join(".bashrc.bak").to_string_lossy()
+    );
+    assert_eq!(ops[0]["requires"]["target"], "real_file");
+    assert_eq!(ops[0]["requires"]["backup"], "absent");
+}
+
+#[test]
+fn apply_plan_executes_backup_and_link() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".bashrc"), "existing").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().args(["plan", "--force"]).output().unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert!(home.join(".bashrc").is_symlink());
+    assert!(home.join(".bashrc.bak").is_file());
+    assert_eq!(
+        fs::read_to_string(home.join(".bashrc.bak")).unwrap(),
+        "existing"
+    );
+}
+
+#[test]
+fn apply_plan_json_envelope_reports_partial_execution_on_hook_failure() {
+    let repo = Repo::new();
+    repo.make_store("alpha", &[".bashrc"]);
+    repo.make_store("omega", &["gitconfig"]);
+    let home = repo.path().join("home");
+    repo.write_split(
+        &format!(
+            r#"
+[stores.alpha]
+target = "{}"
+files = [".bashrc"]
+
+[stores.omega]
+target = "{}"
+files = ["gitconfig"]
+"#,
+            home.to_string_lossy(),
+            home.to_string_lossy(),
+        ),
+        r#"
+[stores.omega.hooks]
+pre = "exit 1"
+"#,
+    );
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--plan", plan_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(10));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", false);
+    assert_error_shape(&value, "hook", 10);
+    let data = value.get("data").expect("abort report must be in data");
+    let executed = data["ops_executed"].as_array().unwrap();
+    let remaining = data["ops_remaining"].as_array().unwrap();
+    assert_eq!(executed.len(), 1, "first store's op should have run");
+    assert_eq!(remaining.len(), 1, "second store's op should remain");
+    assert!(home.join(".bashrc").is_symlink(), "first link should exist");
+    assert!(
+        !home.join("gitconfig").exists(),
+        "second target must not be linked"
+    );
+}

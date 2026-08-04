@@ -4,6 +4,7 @@ mod error;
 mod hooks;
 mod linker;
 mod plan;
+mod plan_exec;
 mod platform;
 mod render;
 mod report;
@@ -13,6 +14,7 @@ mod store;
 use clap::Parser;
 use config::{Config, ConfigError, Loaded, expand_home, find_root};
 use error::{FailureClass, StitchError};
+use plan_exec::PlanFile;
 use platform::Platform;
 use std::collections::BTreeSet;
 
@@ -40,6 +42,7 @@ fn command_name(command: &cli::Commands) -> &'static str {
         Commands::Apply { .. } => "apply",
         Commands::Status { .. } => "status",
         Commands::Diff { .. } => "diff",
+        Commands::Plan { .. } => "plan",
         Commands::List => "list",
         Commands::Add { .. } => "add",
         Commands::Remove { .. } => "remove",
@@ -72,9 +75,24 @@ fn run(cli: cli::Cli) -> Result<(), StitchError> {
             only,
             dry_run,
             force,
+            plan,
         } => {
             let root = resolve_root(repo.as_deref())?;
-            cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
+            if let Some(plan_file) = plan {
+                if !only.is_empty() {
+                    return Err(StitchError::usage("--plan is not compatible with --only"));
+                }
+                if force {
+                    return Err(StitchError::usage("--plan is not compatible with --force"));
+                }
+                cmd_apply_plan(&root, &plan_file, dry_run, json)
+            } else {
+                cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
+            }
+        }
+        cli::Commands::Plan { only, force } => {
+            let root = resolve_root(repo.as_deref())?;
+            cmd_plan(&root, &only, force, json)
         }
         cli::Commands::Status { name } => {
             let root = resolve_root(repo.as_deref())?;
@@ -426,6 +444,151 @@ fn cmd_apply(
     } else {
         Ok(())
     }
+}
+
+fn cmd_plan(
+    root: &std::path::Path,
+    only: &[String],
+    force: bool,
+    json: bool,
+) -> Result<(), StitchError> {
+    let loaded = Config::load(root)?;
+    if !json {
+        print_warnings(&loaded);
+    }
+    check_unknown_names(only.iter().map(|s| s.as_str()), &loaded.config)?;
+
+    let mut filtered_config = loaded.config.clone();
+    if !only.is_empty() {
+        filtered_config.stores.retain(|name, _| only.contains(name));
+    }
+
+    let platform = Platform::detect();
+    let plan = store::compute_plan(
+        root,
+        &filtered_config,
+        &platform,
+        store::ApplyOpts {
+            dry_run: true,
+            force,
+        },
+    );
+    let plan_file = plan_exec::build_plan_file(root, &loaded, &plan, &platform)?;
+
+    if json {
+        let error = if plan_file.conflicts.is_empty() && plan_file.errors.is_empty() {
+            None
+        } else {
+            Some(plan_exec_error(&plan_file))
+        };
+        if let Some(ref e) = error {
+            report::write_data_error("plan", &plan_file, e, loaded.warnings);
+        } else {
+            report::write("plan", &plan_file, loaded.warnings);
+        }
+        Ok(())
+    } else {
+        for w in &loaded.warnings {
+            eprintln!("warning: {w}");
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&plan_file).expect("plan serializable")
+        );
+        if plan_file.conflicts.is_empty() && plan_file.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(plan_exec_error(&plan_file))
+        }
+    }
+}
+
+fn cmd_apply_plan(
+    root: &std::path::Path,
+    plan_path: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), StitchError> {
+    let loaded = Config::load(root)?;
+    if !json {
+        print_warnings(&loaded);
+    }
+
+    let plan_data = std::fs::read_to_string(plan_path).map_err(|e| {
+        StitchError::plan_stale(format!("could not read plan file {plan_path}: {e}"))
+    })?;
+    let plan: PlanFile = serde_json::from_str(&plan_data)
+        .map_err(|e| StitchError::plan_stale(format!("invalid plan file: {e}")))?;
+
+    let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run);
+
+    if json {
+        match result {
+            Ok(report) => {
+                report::write("apply", report, loaded.warnings);
+                Ok(())
+            }
+            Err(e) => {
+                report::write_data_error("apply", e.report, &e.error, loaded.warnings);
+            }
+        }
+    } else {
+        match result {
+            Ok(report) => {
+                for w in &loaded.warnings {
+                    eprintln!("warning: {w}");
+                }
+                if dry_run {
+                    println!("Dry run — no changes will be made.");
+                }
+                println!(
+                    "Executed {}/{} ops",
+                    report.ops_executed.len(),
+                    report.ops_total
+                );
+                if !report.conflicts.is_empty() {
+                    println!("{} conflict(s) in plan", report.conflicts.len());
+                }
+                if !report.staged.is_empty() {
+                    for s in &report.staged {
+                        println!("  staged: {s}");
+                    }
+                }
+                if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
+                    Err(plan_exec_error(&plan))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                for w in &loaded.warnings {
+                    eprintln!("warning: {w}");
+                }
+                Err(*e.error)
+            }
+        }
+    }
+}
+
+fn plan_exec_error(plan: &PlanFile) -> StitchError {
+    let mut classes = BTreeSet::new();
+    for conflict in &plan.conflicts {
+        classes.insert(plan_exec::conflict_class(conflict));
+    }
+    for error in &plan.errors {
+        if let Some(c) = FailureClass::from_id(&error.class) {
+            classes.insert(c);
+        }
+    }
+    if classes.is_empty() {
+        return StitchError::plan_stale("plan reported conflicts or errors");
+    }
+    let message = format!(
+        "{} conflict(s), {} error(s)",
+        plan.conflicts.len(),
+        plan.errors.len()
+    );
+    StitchError::apply(classes.into_iter().collect(), message)
 }
 
 fn apply_json(
