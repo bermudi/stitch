@@ -38,6 +38,21 @@ pub enum Commands {
         /// Auto-create .bak backups for conflicts
         #[arg(long)]
         force: bool,
+
+        /// Execute a previously captured plan file verbatim
+        #[arg(long, value_name = "FILE")]
+        plan: Option<String>,
+    },
+
+    /// Capture an executable plan of what apply would do
+    Plan {
+        /// Only plan these stores (repeatable)
+        #[arg(short, long = "only")]
+        only: Vec<String>,
+
+        /// Preview .bak backup behavior (what `apply --force` would do)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show symlink state for all stores
