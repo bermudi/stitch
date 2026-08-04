@@ -83,6 +83,8 @@ target = "~/.config/git"
 | `stitch status [name]` | Show symlink state per store |
 | `stitch diff` | Preview what `apply` would do (incl. template content drift) |
 | `stitch list` | Print all configured stores and targets |
+| `stitch plan` | Capture `apply`'s exact op list as JSON |
+| `stitch render <store>/<file>` | Render a `.tmpl` to stdout (read-only) |
 | `stitch add <path>` | Move existing content into the repo and link back, or create an empty store if the path doesn't exist |
 | `stitch remove <name>` | Remove symlinks, staging, and the inventory entry |
 | `stitch edit [entry]` | Open `stitch.toml`, or an entry's repo source, in `$EDITOR` |
@@ -91,7 +93,9 @@ target = "~/.config/git"
 | `stitch doctor` | Health check (orphaned behavior, broken links, staging trust) |
 
 `apply`, `diff`, and `add` support `--only <name>` (repeatable), `--dry-run`, and
-`--force` where applicable.
+`--force` where applicable. `apply` also accepts `--plan <file>` to execute a
+captured plan verbatim. A global `--json` flag gives machine-readable output for
+`status`, `list`, `diff`, `apply`, `plan`, `doctor`, `prune`, and `render`.
 
 ## Templates
 

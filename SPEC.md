@@ -371,6 +371,305 @@ name, and validates the merged result (fragment validation, target
 uniqueness). Mutating commands write only `state.toml`; `stitch.toml` is
 read-only to the tool after `init`.
 
+## Agent interface (v0.7)
+
+v0.7 adds machine-readable output and branchable failures for scripted/agent use.
+All read/plan commands share one stable JSON envelope; `stitch plan` and
+`stitch apply --plan` provide a capture-then-execute primitive that replays an
+exact op list with preflight and fingerprint checks.
+
+### Global `--json` flag
+
+`--json` is global. It is supported for `status`, `list`, `diff`, `apply`,
+`plan`, `doctor`, `prune`, and `render`. It is **not** supported for `init`,
+`add`, `remove`, `edit`, `import`, or `migrate`; passing it to those commands
+exits with code 2.
+
+### JSON envelope
+
+Every `--json` command prints one JSON object to **stdout** and exits with the
+appropriate class code. stderr is reserved for hook/subprocess output; command
+warnings and errors travel inside the envelope.
+
+```json
+{
+  "schema": 1,
+  "command": "status",
+  "ok": true,
+  "warnings": [],
+  "data": { "...": "command-specific" },
+  "error": null
+}
+```
+
+- `schema` is always `1` for v0.7.x.
+- `data` and `error` are always present; the unused one is `null`.
+- `error`, when non-null, is `{class, code, message, hint, details}`. `hint`
+  and `details` are always present and `null` when unset.
+- On partial failure (e.g. `apply` with conflicts, `doctor` with error findings)
+  both `data` and `error` are populated and the process exits with the error's
+  class code.
+- Warnings collected at load time are in `warnings[]`; nothing is written to
+  stderr by the reporter.
+
+### Per-command JSON shapes
+
+`status --json`: array of status entries.
+
+```json
+[
+  {
+    "store": "git",
+    "target_name": "laptop",
+    "target": "/home/daniel/.gitconfig",
+    "source": "/home/daniel/dots/git/gitconfig.tmpl",
+    "templated": true,
+    "staged_path": "/home/daniel/dots/.stitch/render/git/gitconfig",
+    "state": "linked",
+    "skipped_platform": false,
+    "resolves_to": null
+  }
+]
+```
+
+- `store`: store name.
+- `target_name`: target entry name for multi-target stores; omitted for
+  single-target stores.
+- `target`: absolute target path.
+- `source`: absolute source path (template source for templated files; store
+  file otherwise).
+- `templated`: `true` when the source ends in `.tmpl`.
+- `staged_path`: absolute staged render path for active templates; omitted
+  otherwise.
+- `state`: `linked`, `missing`, `conflict`, or `broken`.
+- `skipped_platform`: `true` when the store's `when` clause does not match.
+- `resolves_to`: for `broken`, the absolute path the broken symlink resolves to;
+  `null` otherwise.
+
+`list --json`: array of configured stores.
+
+```json
+[
+  {
+    "name": "shells",
+    "mode": "file-mode",
+    "target": "~",
+    "files": [".bashrc", ".zshrc"],
+    "when": { "os": "linux" }
+  }
+]
+```
+
+Modes: `whole-dir`, `file-mode`, `multi-target`, or `none`. Multi-target stores
+have `targets` instead of `target`, `files`, and `patterns`. `when` fields are
+omitted when empty.
+
+`doctor --json`: typed findings.
+
+```json
+{
+  "findings": [
+    {
+      "id": "broken-link",
+      "severity": "error",
+      "message": "...",
+      "path": "/home/daniel/.bashrc",
+      "hint": "..."
+    }
+  ],
+  "summary": { "errors": 1, "warnings": 0, "info": 0 }
+}
+```
+
+`severity` is `error`, `warning`, or `info`. `path` and `hint` are always
+present and `null` when unset.
+
+`diff --json` / `apply --json`: the `Plan` shape consumed by both the text and
+JSON renderers.
+
+```json
+{
+  "stores": [
+    {
+      "store_name": "git",
+      "ops": [ ... ]
+    }
+  ],
+  "summary": {
+    "created": 0,
+    "replaced": 0,
+    "backed_up": 0,
+    "removed": 0,
+    "content_changed": 0,
+    "already_linked": 0,
+    "conflicts": 0,
+    "errors": 0,
+    "skipped": 0
+  }
+}
+```
+
+Plan ops are tagged by `action` (snake_case):
+
+- `stage_render`: `{store, source_rel, source, staged, sha256}`
+- `create_link`: `{target, source, requires}`
+- `replace_link`: `{target, source, old_resolves_to, requires}`
+- `backup_and_link`: `{target, source, backup, requires}`
+- `remove_link`: `{target, source, requires}`
+- `already_linked`: `{target, source, requires}`
+- `content_changed`: `{target, source, requires}`
+- `conflict`: `{target, resolves_to}`
+- `error`: `{message, class}`
+- `skipped_platform`
+
+`requires` is `{target: TargetState, backup?: TargetState}`. `TargetState` is
+tagged by `target` with optional `value`:
+
+```json
+{"target": "symlink_to", "value": "/home/daniel/dots/git/gitconfig"}
+{"target": "absent"}
+{"target": "real_entry"}
+{"target": "symlink_into_repo"}
+```
+
+`stitch plan --json` returns a `PlanFile`, not the above `Plan`. See
+[Plan file format](#plan-file-format-stitchplan) below. Text mode (`stitch plan`)
+emits the raw `PlanFile` object.
+
+`prune --json`:
+
+```json
+{
+  "orphans": [
+    {
+      "link": "/home/daniel/.oldrc",
+      "resolves_to": "/home/daniel/dots/old/.oldrc",
+      "status": "listed"
+    }
+  ],
+  "removed": 0,
+  "failed": 0
+}
+```
+
+`status` is `listed` (preview), `removed`, or `failed`.
+
+`render --json`:
+
+```json
+{
+  "source": "/home/daniel/dots/git/gitconfig.tmpl",
+  "link_name": "gitconfig",
+  "sha256": "...",
+  "content": "..."
+}
+```
+
+### Exit codes
+
+v0.7 maps every non-zero exit to a typed `FailureClass`. Under `--json` the
+error object carries `class` (the stable id) and `code`; text mode prints a
+`hint:` line after the error.
+
+| Code | ID | Class | Hint |
+|---|---|---|---|
+| 0 | `ok` | Success | — |
+| 1 | `internal` | Generic / I/O / unexpected | (none) |
+| 2 | `usage` | CLI usage error | check the command arguments |
+| 3 | `config` | Config load, parse, or v0.2 migration | check the config files or run `stitch migrate` |
+| 4 | `repo-resolution` | Repo root resolution failed | run `stitch init` or pass a valid `--repo` path |
+| 5 | `unknown-store` | Unknown store name | list valid stores with `stitch list` |
+| 6 | `conflict-real` | Real file/dir blocks the target | remove the conflicting target or run `stitch apply --force` |
+| 7 | `conflict-foreign` | Foreign symlink blocks the target | remove or repoint the conflicting symlink yourself |
+| 8 | `render` | Template render failed | set missing environment variables or fix the template |
+| 9 | `path-validation` | Path fragment validation failed | use relative paths without `..` and no leading `/` |
+| 10 | `hook` | Hook execution failed | fix or disable the failing hook |
+| 11 | `mixed` | Multiple failure classes in one run | see the per-entry messages in JSON |
+| 12 | `plan-stale` | Plan is stale or invalid | re-run `stitch plan` |
+| 13 | `doctor` | `doctor` reported error-severity findings | address the findings (per-finding hints in JSON) |
+
+Aggregation rule: for `apply`, `diff`, and `plan`, a single failure class
+present → that class's code; multiple classes → 11. `apply --plan` exits 12 on
+stale or invalid plans, and on any op whose precondition changed between capture
+and execution. `doctor` exits 13 when error-level findings are present.
+
+### Plan file format (`stitch/plan`)
+
+`stitch plan` captures the full executable plan, including staged-render hashes
+and a platform/config fingerprint. Plan files are versioned and self-describing:
+
+```json
+{
+  "schema": 1,
+  "kind": "stitch/plan",
+  "repo": "/home/daniel/dots",
+  "config_sha256": "...",
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64",
+    "distro": "arch",
+    "hostname": "x",
+    "shell": "zsh"
+  },
+  "ops": [ ... ],
+  "conflicts": [ ... ],
+  "errors": [ ... ]
+}
+```
+
+- `config_sha256` is the SHA-256 of `stitch.toml` + `.stitch/state.toml`
+  (concatenated, in that order). Any edit to either file invalidates the plan.
+- `platform` is the fingerprint of the machine where the plan was captured.
+  Plans are single-machine artifacts.
+- `ops` are tagged by `op` (snake_case):
+  - `stage_render`: `{store, source_rel, staged, sha256}` — pins a template
+    render by hash; no plaintext content is stored.
+  - `create_link`: `{target, source, requires}` — target must be absent.
+  - `replace_link`: `{target, source, requires}` — target must be a symlink
+    pointing at the expected source or a real entry.
+  - `backup_and_link`: `{target, backup, source, requires}` — target must be a
+    real entry and the backup path must be absent.
+  - `remove_link`: `{target, source, requires}` — target must be a repo-owned
+    symlink. `source` is optional.
+- `requires` is the plan-file flat form:
+  `{target: "<state>", value?: "...", backup?: "<state>", backup_value?: "..."}`.
+  `target`/`backup` are one of `absent`, `real_entry`, `symlink_to`, or
+  `symlink_into_repo`; `symlink_to` requires a `value`.
+- `conflicts`: `{target, kind, resolves_to}`. `kind` is `foreign_symlink` when
+  `resolves_to` is present, `real_entry` otherwise.
+- `errors`: `{target, message, class}` — op-level errors present at capture
+  time. `target` may be `null`.
+
+Semantics:
+
+- **No plaintext.** `stage_render` carries only the hash, so
+  `stitch plan > /tmp/p.json` does not leak rendered content.
+- **Untrusted input.** `stitch apply --plan` validates every op against the
+  pinned config before acting: sources must live under the repo; targets must
+  fall under a configured store target; path traversal (`..` or absolute) is
+  rejected; backup paths must be in the same directory as the target; and
+  `.stitch/render/` gitignore is checked before staging writes.
+- **Stale-plan detection.** `apply --plan` refuses if `schema`, `kind`,
+  `config_sha256`, or `platform` do not match, or if any `stage_render` hash
+  does not match a fresh in-memory render. All of these exit 12.
+- **Preflight and per-op re-check.** Before any mutation, every op's
+  preconditions are preflighted; each op's precondition is re-checked
+  immediately before execution. Abort at the first failed op.
+- **Abort semantics.** If an op fails, the report lists ops executed and
+  remaining. The error is `plan-stale` (exit 12) when the failure is a changed
+  precondition, or the original class for capture-time conflicts/errors.
+- **Hooks.** Global and per-store hooks are not themselves ops; they run from
+  the pinned config as part of execution, exactly as in a normal `apply`.
+- **Verbatim execution.** `apply --plan` ignores `--only` and `--force`;
+  combining them is a usage error (exit 2). `--dry-run` runs the same
+  validation without mutating anything.
+
+### Schema stability
+
+JSON schemas for v0.7 are additive-only within the v0.7.x line. New fields may
+be added; existing field names and types will not change. The shapes are locked
+by the golden tests in `tests/cli.rs`.
+
 ## Roadmap
 
 ### ✅ v0.2 — shipped (2026-06-17)
@@ -415,13 +714,13 @@ below; planned milestones are renumbered to avoid collision.
 - [x] `stitch edit <entry>` (open `.tmpl` source in `$EDITOR`)
 - [x] `import` — scan existing repo-pointing symlinks into state
 
-### v0.7 — Agent interface (planned)
+### ✅ v0.7 — Agent interface (shipped)
 Machine-readable verification and branchable failures for agent/scripted use.
 See `docs/plans/v0.7-agent-interface.md`.
-- [ ] `--json` on read/plan commands; typed `doctor` findings; `stitch render`
-- [ ] `stitch plan` → `stitch apply --plan` — captured op list, verbatim
+- [x] `--json` on read/plan commands; typed `doctor` findings; `stitch render`
+- [x] `stitch plan` → `stitch apply --plan` — captured op list, verbatim
       execution with preconditions (no re-derivation)
-- [ ] Distinct exit codes per failure class + resolution hints
+- [x] Distinct exit codes per failure class + resolution hints
 
 ### v0.8 — Encrypted secrets (planned, split out — separate trust surface)
 - [ ] `age` or XChaCha20-Poly1305; `.stitch/secrets.enc`
