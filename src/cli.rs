@@ -12,6 +12,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub repo: Option<String>,
 
+    /// Emit structured JSON output instead of human-readable text.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -130,5 +134,11 @@ pub enum Commands {
         /// Remove the orphaned links (default is list-only)
         #[arg(short = 'y', long = "yes")]
         yes: bool,
+    },
+
+    /// Render a .tmpl to stdout (read-only — no staging write, no link touch)
+    Render {
+        /// Store and source file, e.g. `git/gitconfig.tmpl`.
+        spec: String,
     },
 }

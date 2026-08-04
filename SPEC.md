@@ -263,7 +263,7 @@ when a concrete fallback is needed.
 
 Files ending in `.tmpl` are rendered through minijinja and symlinked from a
 staging dir. Non-`.tmpl` files are symlinked directly. Detection is by suffix
-only — no content sniffing. Secrets (`{{ secret }}`) are v0.7.
+only — no content sniffing. Secrets (`{{ secret }}`) are v0.8.
 
 | Expression | Description |
 |---|---|
@@ -274,21 +274,21 @@ only — no content sniffing. Secrets (`{{ secret }}`) are v0.7.
 | `{{ distro }}` | Distro ID; renders `none` when unavailable |
 | `{{ shell }}` | Login shell basename |
 | `{{ vars.key }}` | User-defined variable (`[vars]` in `stitch.toml`) |
-| `{{ secret("name") }}` | Encrypted secret (v0.7 — same render context) |
+| `{{ secret("name") }}` | Encrypted secret (v0.8 — same render context) |
 
 Rendered files go to `.stitch/render/<store>/...` — **inside the repo**, so the
 symlink still satisfies `points_into_repo` and the existing `prune`/`remove`
 machinery works unchanged. (An earlier draft put staging at
 `~/.local/state/stitch/<repo-hash>/`; that location is *outside* the repo and
 would make every templated symlink look foreign to `remove_link`/`prune`, which
-both key off "symlink resolves into `repo_root`".) Secrets, when added in v0.7,
+both key off "symlink resolves into `repo_root`".) Secrets, when added in v0.8,
 live encrypted in `.stitch/secrets.enc`.
 
 Contract (rationale in `docs/plans/v0.6-templates.md`):
 
 - **Detection is by `.tmpl` suffix, at any depth** — deterministic from the directory entry alone, no content sniffing. A whole-dir store containing a `.tmpl` anywhere is promoted to file-mode resolution: one directory symlink becomes N per-file symlinks. Invisible for `~/.config/git`, observable for watched dirs (`conf.d`, systemd units, file watchers) — a documented behavioral consequence, not a surprise.
 - **State records source names.** `state.toml` lists `gitconfig.tmpl`; apply/status/remove/diff strip the suffix through one shared resolution path (`resolve_entry`). A store file name is never used directly as a link target. A store containing both `foo` and `foo.tmpl` is rejected at resolution time.
-- **Staging is locked down from day one.** `.stitch/render/` is `0700`, rendered files `0600`. All rendering (apply and diff) happens in memory — no tempfile ever holds rendered plaintext under a default umask. Threat model: multi-user machines, shared CI runners, `env()` pulling tokens in v0.6, and encrypted secrets in v0.7 all read through these files. `init` appends `.stitch/render/` to the repo's `.gitignore`; an upgraded repo must add the entry manually before its first template apply. `apply` refuses to render without it, and `doctor` errors when templates or staged output make the entry relevant.
+- **Staging is locked down from day one.** `.stitch/render/` is `0700`, rendered files `0600`. All rendering (apply and diff) happens in memory — no tempfile ever holds rendered plaintext under a default umask. Threat model: multi-user machines, shared CI runners, `env()` pulling tokens in v0.6, and encrypted secrets in v0.8 all read through these files. `init` appends `.stitch/render/` to the repo's `.gitignore`; an upgraded repo must add the entry manually before its first template apply. `apply` refuses to render without it, and `doctor` errors when templates or staged output make the entry relevant.
 - **Failure model is per-entry.** A template error (parse failure, missing `env` key) fails that entry and skips its link — never created, never broken. Render is atomic and happens before linking, so staging is never half-written. `apply` continues with other entries and stores, exiting non-zero at the end if anything failed (same aggregation as conflicts).
 - **`diff` gains a content dimension for templated entries only**: a fresh in-memory render compared against the staged file — "would `apply` change anything?" Non-templated entries remain link-state-only.
 - **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed. Hand-edits inside `.stitch/render/` are unsupported and overwritten on the next `apply`; `doctor` flags drift (staged ≠ fresh render) so this is never silent. Writes are hash-gated: unchanged content preserves mtime.
@@ -398,11 +398,19 @@ below; planned milestones are renumbered to avoid collision.
 - [x] `stitch edit <entry>` (open `.tmpl` source in `$EDITOR`)
 - [x] `import` — scan existing repo-pointing symlinks into state
 
-### v0.7 — Encrypted secrets (planned, split out — separate trust surface)
+### v0.7 — Agent interface (planned)
+Machine-readable verification and branchable failures for agent/scripted use.
+See `docs/plans/v0.7-agent-interface.md`.
+- [ ] `--json` on read/plan commands; typed `doctor` findings; `stitch render`
+- [ ] `stitch plan` → `stitch apply --plan` — captured op list, verbatim
+      execution with preconditions (no re-derivation)
+- [ ] Distinct exit codes per failure class + resolution hints
+
+### v0.8 — Encrypted secrets (planned, split out — separate trust surface)
 - [ ] `age` or XChaCha20-Poly1305; `.stitch/secrets.enc`
 - [ ] Key management + threat model (red lines: no external upload, no data exposure)
 
-### v0.8 — TUI (planned)
+### v0.9 — TUI (planned)
 - [ ] Interactive dashboard (ratatui)
 - [ ] Command palette
 - [ ] Activity log

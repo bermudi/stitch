@@ -1,49 +1,92 @@
 mod cli;
 mod config;
+mod error;
 mod hooks;
 mod linker;
+mod plan;
 mod platform;
 mod render;
+mod report;
 mod scan;
 mod store;
 
 use clap::Parser;
-use config::{Config, Loaded, expand_home, find_root};
+use config::{Config, ConfigError, Loaded, expand_home, find_root};
+use error::{FailureClass, StitchError};
 use platform::Platform;
+use std::collections::BTreeSet;
 
 fn main() {
     let cli = cli::Cli::parse();
+    let json = cli.json;
+    let command_name = command_name(&cli.command);
     if let Err(e) = run(cli) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        if json {
+            report::write_error(command_name, &e, Vec::new());
+        } else {
+            eprintln!("error: {e}");
+            if let Some(hint) = e.hint() {
+                eprintln!("hint: {hint}");
+            }
+        }
+        std::process::exit(e.exit_code());
     }
 }
 
-fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn command_name(command: &cli::Commands) -> &'static str {
+    use cli::Commands;
+    match command {
+        Commands::Init => "init",
+        Commands::Apply { .. } => "apply",
+        Commands::Status { .. } => "status",
+        Commands::Diff { .. } => "diff",
+        Commands::List => "list",
+        Commands::Add { .. } => "add",
+        Commands::Remove { .. } => "remove",
+        Commands::Edit { .. } => "edit",
+        Commands::Doctor => "doctor",
+        Commands::Import { .. } => "import",
+        Commands::Migrate { .. } => "migrate",
+        Commands::Prune { .. } => "prune",
+        Commands::Render { .. } => "render",
+    }
+}
+
+fn run(cli: cli::Cli) -> Result<(), StitchError> {
     // `init` is cwd-anchored: it creates a new repo in the current directory,
     // so it must not honor --repo/STITCH_REPO. Every other command resolves
     // the repo once here (flag > env > cwd walk) and receives `&root`.
-    match cli.command {
-        cli::Commands::Init => cmd_init(),
+    let cli::Cli {
+        repo,
+        json,
+        command,
+    } = cli;
+    match command {
+        cli::Commands::Init => {
+            if json {
+                return Err(StitchError::usage("--json is not supported for init"));
+            }
+            cmd_init()
+        }
         cli::Commands::Apply {
             only,
             dry_run,
             force,
         } => {
-            let root = resolve_root(cli.repo.as_deref())?;
-            cmd_apply(&root, &only, store::ApplyOpts { dry_run, force })
+            let root = resolve_root(repo.as_deref())?;
+            cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
         }
         cli::Commands::Status { name } => {
-            let root = resolve_root(cli.repo.as_deref())?;
-            cmd_status(&root, &name)
+            let root = resolve_root(repo.as_deref())?;
+            cmd_status(&root, &name, json)
         }
         cli::Commands::Diff { only, force } => {
-            let root = resolve_root(cli.repo.as_deref())?;
-            cmd_diff(&root, &only, force)
+            let root = resolve_root(repo.as_deref())?;
+            cmd_diff(&root, &only, force, json)
         }
         cli::Commands::List => {
-            let root = resolve_root(cli.repo.as_deref())?;
-            cmd_list(&root)
+            let root = resolve_root(repo.as_deref())?;
+            cmd_list(&root, json)
         }
         cli::Commands::Add {
             path,
@@ -52,27 +95,42 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
             patterns,
             dry_run,
         } => {
-            let root = resolve_root(cli.repo.as_deref())?;
+            if json {
+                return Err(StitchError::usage("--json is not supported for add"));
+            }
+            let root = resolve_root(repo.as_deref())?;
             cmd_add(&root, &path, &name, &files, &patterns, dry_run)
         }
         cli::Commands::Remove { name } => {
-            let root = resolve_root(cli.repo.as_deref())?;
+            if json {
+                return Err(StitchError::usage("--json is not supported for remove"));
+            }
+            let root = resolve_root(repo.as_deref())?;
             cmd_remove(&root, &name)
         }
         cli::Commands::Edit { entry } => {
-            let root = resolve_root(cli.repo.as_deref())?;
+            if json {
+                return Err(StitchError::usage("--json is not supported for edit"));
+            }
+            let root = resolve_root(repo.as_deref())?;
             cmd_edit(&root, entry.as_deref())
         }
         cli::Commands::Import { scan_dirs, dry_run } => {
-            let root = resolve_root(cli.repo.as_deref())?;
+            if json {
+                return Err(StitchError::usage("--json is not supported for import"));
+            }
+            let root = resolve_root(repo.as_deref())?;
             cmd_import(&root, &scan_dirs, dry_run)
         }
         cli::Commands::Doctor => {
-            let root = resolve_root(cli.repo.as_deref())?;
-            cmd_doctor(&root)
+            let root = resolve_root(repo.as_deref())?;
+            cmd_doctor(&root, json)
         }
         cli::Commands::Migrate { dry_run } => {
-            let root = resolve_root(cli.repo.as_deref())?;
+            if json {
+                return Err(StitchError::usage("--json is not supported for migrate"));
+            }
+            let root = resolve_root(repo.as_deref())?;
             cmd_migrate(&root, dry_run)
         }
         cli::Commands::Prune {
@@ -80,8 +138,12 @@ fn run(cli: cli::Cli) -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
             yes,
         } => {
-            let root = resolve_root(cli.repo.as_deref())?;
-            cmd_prune(&root, &scan_dirs, dry_run, yes)
+            let root = resolve_root(repo.as_deref())?;
+            cmd_prune(&root, &scan_dirs, dry_run, yes, json)
+        }
+        cli::Commands::Render { spec } => {
+            let root = resolve_root(repo.as_deref())?;
+            cmd_render(&root, &spec, json)
         }
     }
 }
@@ -99,20 +161,49 @@ fn print_warnings(loaded: &Loaded) {
 fn check_unknown_names(
     only: impl IntoIterator<Item = impl AsRef<str>>,
     config: &Config,
-) -> Result<(), String> {
+) -> Result<(), StitchError> {
     let unknown: Vec<_> = only
         .into_iter()
         .filter(|n| !config.stores.contains_key(n.as_ref()))
+        .map(|n| n.as_ref().to_string())
         .collect();
     if unknown.is_empty() {
         Ok(())
     } else {
-        let names = unknown
-            .iter()
-            .map(|n| format!("'{}'", n.as_ref()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(format!("unknown store(s): {names}"))
+        let valid: Vec<_> = config.stores.keys().cloned().collect();
+        Err(StitchError::unknown_store(unknown, valid))
+    }
+}
+
+/// Build an apply error from the failure actions in a single store result.
+fn apply_error_from_actions(actions: &[store::ApplyAction]) -> Option<StitchError> {
+    let mut classes = BTreeSet::new();
+    for action in actions {
+        match action {
+            store::ApplyAction::Conflict {
+                resolves_to: Some(_),
+                ..
+            } => {
+                classes.insert(FailureClass::ConflictForeign);
+            }
+            store::ApplyAction::Conflict {
+                resolves_to: None, ..
+            } => {
+                classes.insert(FailureClass::ConflictReal);
+            }
+            store::ApplyAction::Error(e) => {
+                classes.insert(e.class());
+            }
+            _ => {}
+        }
+    }
+    if classes.is_empty() {
+        None
+    } else {
+        Some(StitchError::apply(
+            classes.into_iter().collect(),
+            "apply reported conflicts or errors",
+        ))
     }
 }
 
@@ -123,9 +214,7 @@ fn check_unknown_names(
 /// does not call this. An override (flag or env) must point at a directory
 /// that actually contains `.stitch/` — we don't trust a bare path, so a typo
 /// can't silently operate on the wrong directory.
-fn resolve_root(
-    override_path: Option<&str>,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+fn resolve_root(override_path: Option<&str>) -> Result<std::path::PathBuf, StitchError> {
     if let Some(p) = override_path {
         return resolve_override(p, "--repo");
     }
@@ -135,45 +224,108 @@ fn resolve_root(
         return resolve_override(&p, "STITCH_REPO");
     }
     let cwd = std::env::current_dir()?;
-    find_root(&cwd).ok_or_else(|| "not inside a stitch repo (no .stitch/ found)".into())
+    find_root(&cwd).ok_or_else(|| StitchError::repo_resolution("cwd", cwd))
 }
 
 /// Validate an explicit repo override (from `--repo` or `STITCH_REPO`):
 /// expand `~`, require a `.stitch/` dir so a typo can't silently operate on
 /// the wrong directory, and canonicalize when possible. `label` prefixes the
 /// error so the user knows which override was bad.
-fn resolve_override(
-    path: &str,
-    label: &str,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+fn resolve_override(path: &str, label: &str) -> Result<std::path::PathBuf, StitchError> {
     let root = expand_home(path);
     if !root.join(".stitch").is_dir() {
-        return Err(format!(
-            "{label} {} does not point at a stitch repo (no .stitch/ found)",
-            root.display()
-        )
-        .into());
+        return Err(StitchError::repo_resolution(label, root));
     }
     Ok(root.canonicalize().unwrap_or(root))
 }
 
-fn cmd_init() -> Result<(), Box<dyn std::error::Error>> {
+fn render_plan(plan: &plan::Plan, dry_run: bool) {
+    if dry_run {
+        println!("Dry run — no changes will be made.\n");
+    }
+
+    for store in &plan.stores {
+        print!("  {} ", store.store_name);
+        for op in &store.ops {
+            match op {
+                plan::PlanOp::CreateLink { target, .. } => println!("create: {target}"),
+                plan::PlanOp::ReplaceLink { target, .. } => println!("replace: {target}"),
+                plan::PlanOp::BackupAndLink { target, backup, .. } => {
+                    println!("backed up: {target} → {backup}");
+                }
+                plan::PlanOp::Conflict { target, .. } => {
+                    println!("conflict: {target}");
+                }
+                plan::PlanOp::SkippedPlatform => println!("(skipped: platform)"),
+                plan::PlanOp::AlreadyLinked { .. } => println!("ok"),
+                plan::PlanOp::ContentChanged { target, .. } => println!("content: {target}"),
+                plan::PlanOp::RemoveLink { target, .. } => println!("remove: {target}"),
+                plan::PlanOp::Error { message, .. } => println!("error: {message}"),
+                plan::PlanOp::StageRender { .. } => {}
+            }
+        }
+    }
+
+    let s = &plan.summary;
+    let replaced = s.replaced + s.content_changed;
+    println!(
+        "\nSummary: {} ok, {} created, {} replaced, {} backed up, {} removed, {} conflicts, {} errors, {} skipped",
+        s.already_linked,
+        s.created,
+        replaced,
+        s.backed_up,
+        s.removed,
+        s.conflicts,
+        s.errors,
+        s.skipped
+    );
+}
+
+fn plan_error(plan: &plan::Plan) -> StitchError {
+    let mut classes = BTreeSet::new();
+    for store in &plan.stores {
+        for op in &store.ops {
+            match op {
+                plan::PlanOp::Conflict { resolves_to, .. } => {
+                    if resolves_to.is_some() {
+                        classes.insert(FailureClass::ConflictForeign);
+                    } else {
+                        classes.insert(FailureClass::ConflictReal);
+                    }
+                }
+                plan::PlanOp::Error { class, .. } => {
+                    if let Some(c) = FailureClass::from_id(class) {
+                        classes.insert(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let conflicts = plan.summary.conflicts;
+    let errors = plan.summary.errors;
+    StitchError::apply(
+        classes.into_iter().collect(),
+        format!("{conflicts} conflict(s), {errors} error(s)"),
+    )
+}
+
+fn cmd_init() -> Result<(), StitchError> {
     let cwd = std::env::current_dir()?;
     let stitch_dir = cwd.join(".stitch");
     std::fs::create_dir_all(&stitch_dir)?;
 
     let authored_path = cwd.join("stitch.toml");
     if authored_path.exists() {
-        return Err(format!("config already exists at {}", authored_path.display()).into());
+        return Err(StitchError::internal(format!(
+            "config already exists at {}",
+            authored_path.display()
+        )));
     }
     // Refuse if a v0.2 repo is present — the user should `migrate`, not re-init.
     let legacy_path = stitch_dir.join("config.toml");
     if legacy_path.exists() {
-        return Err(format!(
-            "v0.2 config found at {} — run `stitch migrate` instead of init",
-            legacy_path.display()
-        )
-        .into());
+        return Err(StitchError::config(ConfigError::LegacyV02(legacy_path)));
     }
 
     // Authored half: written exactly once, with a header explaining it is the
@@ -204,20 +356,24 @@ fn cmd_apply(
     root: &std::path::Path,
     only: &[String],
     opts: store::ApplyOpts,
-) -> Result<(), Box<dyn std::error::Error>> {
+    json: bool,
+) -> Result<(), StitchError> {
     let loaded = Config::load(root)?;
-    print_warnings(&loaded);
+    if !json {
+        print_warnings(&loaded);
+    }
     check_unknown_names(only.iter().map(|s| s.as_str()), &loaded.config)?;
-    let platform = Platform::detect();
 
     let mut filtered_config = loaded.config.clone();
     if !only.is_empty() {
         filtered_config.stores.retain(|name, _| only.contains(name));
     }
 
-    if opts.dry_run {
-        println!("Dry run — no changes will be made.\n");
+    if json {
+        return apply_json(root, &filtered_config, opts, "apply", loaded.warnings);
     }
+
+    let platform = Platform::detect();
 
     // Upgraded plain repos need no migration, but a real template apply must
     // not create sensitive staged output before Git is told to ignore it.
@@ -225,11 +381,10 @@ fn cmd_apply(
         && store::has_active_template_sources(root, &filtered_config, &platform)
         && !render::repo_gitignore_covers_render(root)
     {
-        return Err(format!(
+        return Err(StitchError::internal(format!(
             "repo .gitignore is missing `{}` — add that entry before applying templates",
             render::RENDER_GITIGNORE_ENTRY
-        )
-        .into());
+        )));
     }
 
     // Global pre-apply hook (skipped under dry-run — hooks have side effects).
@@ -241,70 +396,16 @@ fn cmd_apply(
             action: "apply",
         };
         hooks::run_global_hook(root, "pre-apply", &env, &platform)
-            .map_err(|e| format!("pre-apply hook: {e}"))?;
+            .map_err(|e| StitchError::hook("pre-apply", e))?;
     }
 
-    let results = store::apply_all(root, &filtered_config, &platform, opts);
+    let (plan, warnings) = store::apply_all(root, &filtered_config, &platform, opts);
 
-    let mut created = 0;
-    let mut replaced = 0;
-    let mut backed_up = 0;
-    let mut removed = 0;
-    let mut conflicts = 0;
-    let mut errors = 0;
-    let mut skipped = 0;
-    let mut already = 0;
-
-    for result in &results {
-        print!("  {} ", result.store_name);
-        for action in &result.actions {
-            match action {
-                store::ApplyAction::Created(p) => {
-                    created += 1;
-                    println!("create: {}", p.display());
-                }
-                store::ApplyAction::Replaced(p) => {
-                    replaced += 1;
-                    println!("replace: {}", p.display());
-                }
-                store::ApplyAction::BackedUp { target, backup } => {
-                    backed_up += 1;
-                    println!("backed up: {} → {}", target.display(), backup.display());
-                }
-                store::ApplyAction::Conflict(p) => {
-                    conflicts += 1;
-                    println!("conflict: {}", p.display());
-                }
-                store::ApplyAction::SkippedPlatform => {
-                    skipped += 1;
-                    println!("(skipped: platform)");
-                }
-                store::ApplyAction::AlreadyLinked => {
-                    already += 1;
-                    println!("ok");
-                }
-                store::ApplyAction::ContentChanged(p) => {
-                    // Count as a real change so apply/diff are non-empty when
-                    // only template content drifted (link state unchanged).
-                    replaced += 1;
-                    println!("content: {}", p.display());
-                }
-                store::ApplyAction::Removed(p) => {
-                    removed += 1;
-                    println!("remove: {}", p.display());
-                }
-                store::ApplyAction::Error(e) => {
-                    errors += 1;
-                    println!("error: {e}");
-                }
-            }
-        }
+    for w in &warnings {
+        eprintln!("warning: {w}");
     }
 
-    println!(
-        "\nSummary: {} ok, {} created, {} replaced, {} backed up, {} removed, {} conflicts, {} errors, {} skipped",
-        already, created, replaced, backed_up, removed, conflicts, errors, skipped
-    );
+    render_plan(&plan, opts.dry_run);
 
     // Global post-apply hook (skipped under dry-run). Warns on failure — the
     // apply already happened, so post-hook failure does not abort.
@@ -320,17 +421,93 @@ fn cmd_apply(
         }
     }
 
-    if errors > 0 || conflicts > 0 {
-        Err(format!("{} errors, {} conflicts", errors, conflicts).into())
+    if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
+        Err(plan_error(&plan))
     } else {
         Ok(())
     }
 }
 
+fn apply_json(
+    root: &std::path::Path,
+    config: &config::Config,
+    opts: store::ApplyOpts,
+    command: &'static str,
+    loaded_warnings: Vec<String>,
+) -> Result<(), StitchError> {
+    let platform = Platform::detect();
+
+    if !opts.dry_run
+        && store::has_active_template_sources(root, config, &platform)
+        && !render::repo_gitignore_covers_render(root)
+    {
+        return Err(StitchError::internal(format!(
+            "repo .gitignore is missing `{}` — add that entry before applying templates",
+            render::RENDER_GITIGNORE_ENTRY
+        )));
+    }
+
+    if !opts.dry_run {
+        let env = hooks::HookEnv {
+            root,
+            store: None,
+            target: None,
+            action: "apply",
+        };
+        hooks::run_global_hook(root, "pre-apply", &env, &platform)
+            .map_err(|e| StitchError::hook("pre-apply", e))?;
+    }
+
+    let (plan, mut warnings) = store::apply_all(root, config, &platform, opts);
+    warnings.extend(loaded_warnings);
+
+    if !opts.dry_run {
+        let env = hooks::HookEnv {
+            root,
+            store: None,
+            target: None,
+            action: "apply",
+        };
+        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform) {
+            warnings.push(format!("post-apply hook: {e}"));
+        }
+    }
+
+    if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
+        let error = plan_error(&plan);
+        report::write_data_error(command, plan, &error, warnings);
+    }
+
+    report::write(command, plan, warnings);
+    Ok(())
+}
+
 fn cmd_status(
     root: &std::path::Path,
     name: &Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    json: bool,
+) -> Result<(), StitchError> {
+    if json {
+        return report::run_json("status", || {
+            let loaded = Config::load(root)?;
+            if let Some(filter) = name {
+                check_unknown_names(std::iter::once(filter.as_str()), &loaded.config)?;
+            }
+            let platform = Platform::detect();
+            let entries = store::status_all(root, &loaded.config, &platform);
+            let filtered: Vec<_> = if let Some(filter) = name {
+                entries
+                    .into_iter()
+                    .filter(|e| &e.store_name == filter)
+                    .collect()
+            } else {
+                entries
+            };
+            let data = report::status(root, &filtered);
+            Ok((data, loaded.warnings))
+        });
+    }
+
     let loaded = Config::load(root)?;
     print_warnings(&loaded);
     if let Some(name) = name {
@@ -394,18 +571,67 @@ fn cmd_diff(
     root: &std::path::Path,
     only: &[String],
     force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    cmd_apply(
+    json: bool,
+) -> Result<(), StitchError> {
+    let loaded = Config::load(root)?;
+    if !json {
+        print_warnings(&loaded);
+    }
+    check_unknown_names(only.iter().map(|s| s.as_str()), &loaded.config)?;
+
+    let mut filtered_config = loaded.config.clone();
+    if !only.is_empty() {
+        filtered_config.stores.retain(|name, _| only.contains(name));
+    }
+
+    if json {
+        return report::run_json("diff", || {
+            let platform = Platform::detect();
+            let plan = store::compute_plan(
+                root,
+                &filtered_config,
+                &platform,
+                store::ApplyOpts {
+                    dry_run: true,
+                    force,
+                },
+            );
+            if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
+                let error = plan_error(&plan);
+                report::write_data_error("diff", plan, &error, loaded.warnings);
+            }
+            Ok((plan, loaded.warnings))
+        });
+    }
+
+    let platform = Platform::detect();
+    let plan = store::compute_plan(
         root,
-        only,
+        &filtered_config,
+        &platform,
         store::ApplyOpts {
             dry_run: true,
             force,
         },
-    )
+    );
+    render_plan(&plan, true);
+
+    if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
+        Err(plan_error(&plan))
+    } else {
+        Ok(())
+    }
 }
 
-fn cmd_list(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_list(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
+    if json {
+        return report::run_json("list", || {
+            let loaded = Config::load(root)?;
+            let data = report::list(&loaded.config);
+            Ok((data, loaded.warnings))
+        });
+    }
+
     let loaded = Config::load(root)?;
     print_warnings(&loaded);
 
@@ -460,7 +686,9 @@ fn discard_uncommitted_add(
 ) {
     if let Some(results) = results {
         for action in &results.actions {
-            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced { target: p, .. } =
+                action
+            {
                 let _ = linker::remove_link(p, repo_root);
             }
         }
@@ -475,7 +703,7 @@ fn cmd_add(
     files: &[String],
     patterns: &[String],
     dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), StitchError> {
     let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
 
@@ -484,12 +712,11 @@ fn cmd_add(
     // A symlink at the target is always an error — we never silently clobber
     // or repoint a foreign symlink.
     if source.is_symlink() {
-        return Err(format!(
+        return Err(StitchError::internal(format!(
             "{} is already a symlink — add expects a real file or directory \
              (remove the symlink first if you want stitch to manage it)",
             source.display()
-        )
-        .into());
+        )));
     }
 
     // Derive store name from basename, leading dot stripped. Override via --name.
@@ -504,10 +731,16 @@ fn cmd_add(
 
     // Pre-checks: reject any collision BEFORE mutating anything.
     if loaded.config.stores.contains_key(&store_name) {
-        return Err(format!("store '{}' already exists", store_name).into());
+        return Err(StitchError::internal(format!(
+            "store '{}' already exists",
+            store_name
+        )));
     }
     if store_dir.symlink_metadata().is_ok() {
-        return Err(format!("store path '{}' already exists", store_dir.display()).into());
+        return Err(StitchError::internal(format!(
+            "store path '{}' already exists",
+            store_dir.display()
+        )));
     }
 
     // Validate user-supplied fragments before touching the filesystem: a
@@ -523,12 +756,11 @@ fn cmd_add(
     // "stitch says done, did nothing useful" footgun this command was created to
     // fix.
     if source_exists && (!files.is_empty() || !patterns.is_empty()) {
-        return Err(format!(
+        return Err(StitchError::usage(format!(
             "{} exists — --files/--patterns only apply when creating a new empty store \
              (the existing content is moved into the repo as-is)",
             source.display()
-        )
-        .into());
+        )));
     }
 
     if dry_run {
@@ -602,6 +834,7 @@ fn cmd_add(
         // If this fails, roll back the move so the user's file is back where
         // it was. State was never touched.
         let platform = Platform::detect();
+        let mut _warnings = Vec::new();
         let results = store::apply_store(
             root,
             &store_name,
@@ -612,32 +845,31 @@ fn cmd_add(
                 dry_run: false,
                 force: false,
             },
+            &mut _warnings,
         );
         if results.actions.iter().any(|a| {
             matches!(
                 a,
-                store::ApplyAction::Conflict(_) | store::ApplyAction::Error(_)
+                store::ApplyAction::Conflict { .. } | store::ApplyAction::Error(_)
             )
         }) {
             for action in &results.actions {
-                if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+                if let store::ApplyAction::Created(p)
+                | store::ApplyAction::Replaced { target: p, .. } = action
+                {
                     let _ = linker::remove_link(p, root);
                 }
             }
             rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|e| {
-                format!(
+                StitchError::internal(format!(
                     "ADD FAILED and rollback also failed: {} is stranded in {} ({})",
                     source.display(),
                     store_dir.display(),
                     e
-                )
+                ))
             })?;
-            return Err(format!(
-                "could not link {} back; rolled back (file restored to {})",
-                store_name,
-                source.display()
-            )
-            .into());
+            return Err(apply_error_from_actions(&results.actions)
+                .unwrap_or_else(|| StitchError::internal("apply reported conflicts or errors")));
         }
 
         // Record: persist state.toml (generated half only). stitch.toml is
@@ -653,18 +885,20 @@ fn cmd_add(
         );
         if let Err(e) = loaded.generated.save(root) {
             for action in &results.actions {
-                if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced(p) = action {
+                if let store::ApplyAction::Created(p)
+                | store::ApplyAction::Replaced { target: p, .. } = action
+                {
                     let _ = linker::remove_link(p, root);
                 }
             }
             rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|re| {
-                format!(
+                StitchError::internal(format!(
                     "state save failed ({e}) and rollback also failed: {} is stranded in {} ({re})",
                     source.display(),
                     store_dir.display(),
-                )
+                ))
             })?;
-            return Err(e.into());
+            return Err(StitchError::from(e));
         }
 
         println!(
@@ -675,7 +909,7 @@ fn cmd_add(
         for action in &results.actions {
             match action {
                 store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
-                store::ApplyAction::AlreadyLinked => println!("  already linked"),
+                store::ApplyAction::AlreadyLinked(_) => println!("  already linked"),
                 _ => {}
             }
         }
@@ -696,6 +930,7 @@ fn cmd_add(
         std::fs::create_dir_all(&store_dir)?;
 
         let platform = Platform::detect();
+        let mut _warnings = Vec::new();
         let results = store::apply_store(
             root,
             &store_name,
@@ -706,13 +941,16 @@ fn cmd_add(
                 dry_run: false,
                 force: false,
             },
+            &mut _warnings,
         );
 
         for action in &results.actions {
             match action {
                 store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
-                store::ApplyAction::AlreadyLinked => println!("  already linked"),
-                store::ApplyAction::Conflict(p) => println!("  conflict at {}", p.display()),
+                store::ApplyAction::AlreadyLinked(_) => println!("  already linked"),
+                store::ApplyAction::Conflict { target, .. } => {
+                    println!("  conflict at {}", target.display())
+                }
                 store::ApplyAction::Error(e) => println!("  error: {e}"),
                 _ => {}
             }
@@ -721,13 +959,14 @@ fn cmd_add(
         let failed = results.actions.iter().any(|a| {
             matches!(
                 a,
-                store::ApplyAction::Conflict(_) | store::ApplyAction::Error(_)
+                store::ApplyAction::Conflict { .. } | store::ApplyAction::Error(_)
             )
         });
 
         if failed {
             discard_uncommitted_add(Some(&results), &store_dir, root);
-            return Err("apply reported conflicts or errors".into());
+            return Err(apply_error_from_actions(&results.actions)
+                .unwrap_or_else(|| StitchError::internal("apply reported conflicts or errors")));
         }
 
         // Persist state.toml (generated half only). If save fails after apply
@@ -744,7 +983,7 @@ fn cmd_add(
         );
         if let Err(e) = loaded.generated.save(root) {
             discard_uncommitted_add(Some(&results), &store_dir, root);
-            return Err(e.into());
+            return Err(StitchError::from(e));
         }
 
         println!("Added store '{}'", store_name);
@@ -753,7 +992,7 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), StitchError> {
     let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
@@ -764,7 +1003,10 @@ fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), Box<dyn std::err
         .config
         .stores
         .get(name)
-        .ok_or_else(|| format!("store '{}' not found in config", name))?
+        .ok_or_else(|| {
+            let valid: Vec<_> = loaded.config.stores.keys().cloned().collect();
+            StitchError::unknown_store(vec![name.to_string()], valid)
+        })?
         .target
         .as_deref()
         .map(str::to_owned);
@@ -778,7 +1020,7 @@ fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), Box<dyn std::err
             action: "remove",
         };
         hooks::run_global_hook(root, "pre-remove", &env, &platform)
-            .map_err(|e| format!("pre-remove hook: {e}"))?;
+            .map_err(|e| StitchError::hook("pre-remove", e))?;
     }
 
     // Compute link statuses from the still-complete merged view, then drop the
@@ -822,23 +1064,22 @@ fn cmd_remove(root: &std::path::Path, name: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), StitchError> {
     let path = match entry {
         None => {
             let authored_path = root.join("stitch.toml");
             if !authored_path.exists() {
-                return Err(format!(
+                return Err(StitchError::internal(format!(
                     "{} does not exist — run `stitch init` first",
                     authored_path.display()
-                )
-                .into());
+                )));
             }
             authored_path
         }
         Some(e) => {
             let loaded = Config::load(root)?;
             print_warnings(&loaded);
-            render::resolve_edit_source(root, &loaded.config, e)?
+            render::resolve_edit_source(root, &loaded.config, e).map_err(StitchError::internal)?
         }
     };
 
@@ -846,7 +1087,7 @@ fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), Box<dyn s
     let status = std::process::Command::new(&editor).arg(&path).status()?;
 
     if !status.success() {
-        return Err("editor exited with error".into());
+        return Err(StitchError::internal("editor exited with error"));
     }
     Ok(())
 }
@@ -861,7 +1102,7 @@ fn cmd_import(
     root: &std::path::Path,
     scan_dirs: &[String],
     dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), StitchError> {
     let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
@@ -1036,7 +1277,21 @@ fn collapse_home(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-fn cmd_doctor(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
+    if json {
+        return report::run_json("doctor", || {
+            let loaded = Config::load(root)?;
+            let platform = Platform::detect();
+            let result = store::doctor(root, &loaded, &platform);
+            let data = report::doctor(&result);
+            if data.summary.errors > 0 {
+                let error = StitchError::doctor(data.summary.errors);
+                report::write_data_error("doctor", data, &error, loaded.warnings);
+            }
+            Ok((data, loaded.warnings))
+        });
+    }
+
     let loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
@@ -1045,55 +1300,64 @@ fn cmd_doctor(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> 
 
     let result = store::doctor(root, &loaded, &platform);
 
-    for msg in &result.info {
-        println!("  [info]  {msg}");
-    }
-    for msg in &result.warnings {
-        println!("  [warn]  {msg}");
-    }
-    for msg in &result.errors {
-        println!("  [error] {msg}");
+    for finding in &result.findings {
+        let label = match finding.severity {
+            store::Severity::Info => "[info] ",
+            store::Severity::Warning => "[warn] ",
+            store::Severity::Error => "[error]",
+        };
+        println!("  {label} {}", finding.message);
     }
 
-    let total = result.errors.len() + result.warnings.len() + result.info.len();
+    let (errors, warnings, info) =
+        result
+            .findings
+            .iter()
+            .fold((0, 0, 0), |acc, f| match f.severity {
+                store::Severity::Error => (acc.0 + 1, acc.1, acc.2),
+                store::Severity::Warning => (acc.0, acc.1 + 1, acc.2),
+                store::Severity::Info => (acc.0, acc.1, acc.2 + 1),
+            });
+    let total = errors + warnings + info;
     if total == 0 {
         println!("  All checks passed ✓");
     } else {
         println!(
             "\n  {} issues ({} errors, {} warnings, {} info)",
-            total,
-            result.errors.len(),
-            result.warnings.len(),
-            result.info.len(),
+            total, errors, warnings, info
         );
     }
 
-    if !result.errors.is_empty() {
-        Err(format!("{} errors found", result.errors.len()).into())
+    if errors > 0 {
+        Err(StitchError::doctor(errors))
     } else {
         Ok(())
     }
 }
 
-fn cmd_migrate(root: &std::path::Path, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_migrate(root: &std::path::Path, dry_run: bool) -> Result<(), StitchError> {
     let legacy_path = root.join(".stitch").join("config.toml");
     let authored_path = root.join("stitch.toml");
     let state_path = root.join(".stitch").join("state.toml");
 
     if !legacy_path.exists() {
         if authored_path.exists() {
-            return Err("already migrated: stitch.toml exists".into());
+            return Err(StitchError::internal(
+                "already migrated: stitch.toml exists",
+            ));
         }
-        return Err(format!("nothing to migrate: {} not found", legacy_path.display()).into());
+        return Err(StitchError::internal(format!(
+            "nothing to migrate: {} not found",
+            legacy_path.display()
+        )));
     }
     // Refuse to overwrite an existing stitch.toml — a half-finished migrate
     // should not clobber the user's authored file.
     if authored_path.exists() {
-        return Err(format!(
+        return Err(StitchError::internal(format!(
             "{} already exists — refusing to overwrite; remove it if you want to re-migrate",
             authored_path.display()
-        )
-        .into());
+        )));
     }
     // Refuse if the .bak backup target already exists — we'd have nowhere to
     // preserve the original. Checked up front (before parse, before any write)
@@ -1101,19 +1365,18 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool) -> Result<(), Box<dyn std:
     // fail-before-mutate invariant the other writers uphold.
     let backup_path = legacy_path.with_extension("toml.bak");
     if backup_path.exists() {
-        return Err(format!(
+        return Err(StitchError::internal(format!(
             "{} already exists — move it aside first (it's where the original \
              .stitch/config.toml would be backed up during migration)",
             backup_path.display()
-        )
-        .into());
+        )));
     }
 
     // Parse the v0.2 file into the frozen LegacyConfig shape (not the
     // post-split types, which no longer carry the v0.2 layout).
     let contents = std::fs::read_to_string(&legacy_path)?;
     let legacy: config::LegacyConfig = toml::from_str(&contents)
-        .map_err(|e| format!("could not parse {}: {e}", legacy_path.display()))?;
+        .map_err(|e| StitchError::config(ConfigError::Parse(e, legacy_path.clone())))?;
 
     let (authored, generated) = config::split_legacy(&legacy);
 
@@ -1181,24 +1444,47 @@ fn cmd_prune(
     scan_dirs: &[String],
     dry_run: bool,
     yes: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    json: bool,
+) -> Result<(), StitchError> {
+    if json {
+        return report::run_json("prune", || {
+            let loaded = Config::load(root)?;
+            let platform = Platform::detect();
+            let roots = prune_roots(scan_dirs);
+            let found = scan::scan_for_repo_links(root, &roots);
+            let orphan_refs = scan::orphan_links(root, &found, &loaded.config, &platform);
+            let orphans: Vec<scan::FoundLink> = orphan_refs.iter().map(|&fl| fl.clone()).collect();
+
+            if !yes || dry_run {
+                let data = report::prune(&orphans, 0, 0);
+                return Ok((data, loaded.warnings));
+            }
+
+            let mut removed = 0;
+            let mut failed = 0;
+            for fl in &orphans {
+                match linker::remove_link(&fl.link, root) {
+                    Ok(true) => removed += 1,
+                    Ok(false) => failed += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+
+            let data = report::prune(&orphans, removed, failed);
+            if failed > 0 {
+                let error =
+                    StitchError::internal("prune could not remove some links — see warnings above");
+                report::write_data_error("prune", data, &error, loaded.warnings);
+            }
+            Ok((data, loaded.warnings))
+        });
+    }
+
     let loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
 
-    // Scan dirs are a parameter (never hardwired to home_dir) so the scanner is
-    // testable without overriding $HOME, and so a user can scope a prune. No
-    // args → the defaults: `~` shallow (top-level dotfiles only), `~/.config`
-    // and `~/.local/share` full depth. An explicit `--scan-dir` is always full
-    // depth, so `--scan-dir ~` is the escape hatch for a complete home sweep.
-    let roots: Vec<scan::ScanRoot> = if scan_dirs.is_empty() {
-        scan::default_scan_dirs()
-    } else {
-        scan_dirs
-            .iter()
-            .map(|s| scan::ScanRoot::from(expand_home(s)))
-            .collect()
-    };
+    let roots = prune_roots(scan_dirs);
 
     let found = scan::scan_for_repo_links(root, &roots);
     let orphans = scan::orphan_links(root, &found, &loaded.config, &platform);
@@ -1253,7 +1539,70 @@ fn cmd_prune(
         // must not sail past links that couldn't be removed — mirror the
         // non-zero exit cmd_apply returns on conflicts/errors.
         eprintln!("{failed} link(s) could not be removed — see warnings above.");
-        return Err("prune could not remove some links — see warnings above".into());
+        return Err(StitchError::internal(
+            "prune could not remove some links — see warnings above",
+        ));
     }
+    Ok(())
+}
+
+fn prune_roots(scan_dirs: &[String]) -> Vec<scan::ScanRoot> {
+    if scan_dirs.is_empty() {
+        scan::default_scan_dirs()
+    } else {
+        scan_dirs
+            .iter()
+            .map(|s| scan::ScanRoot::from(expand_home(s)))
+            .collect()
+    }
+}
+
+fn cmd_render(root: &std::path::Path, spec: &str, json: bool) -> Result<(), StitchError> {
+    let (store_name, source_rel) = spec.split_once('/').ok_or_else(|| {
+        StitchError::usage("render: expected <store>/<file>, e.g. git/gitconfig.tmpl")
+    })?;
+    if source_rel.is_empty() {
+        return Err(StitchError::usage("render: missing file name"));
+    }
+    if !render::is_template(source_rel) {
+        return Err(StitchError::usage(
+            "render: only .tmpl files can be rendered",
+        ));
+    }
+
+    if json {
+        return report::run_json("render", || {
+            let loaded = Config::load(root)?;
+            let store_dir = root.join(store_name);
+            let source_path = store_dir.join(source_rel);
+            if !source_path.is_file() {
+                return Err(StitchError::internal(format!(
+                    "source does not exist: {}",
+                    source_path.display()
+                )));
+            }
+            let platform = Platform::detect();
+            let content =
+                render::render_file(&source_path, source_rel, &platform, &loaded.config.vars)
+                    .map_err(|e| StitchError::render(&source_path, e))?;
+            let data = report::render(&source_path, source_rel, &content);
+            Ok((data, loaded.warnings))
+        });
+    }
+
+    let loaded = Config::load(root)?;
+    print_warnings(&loaded);
+    let store_dir = root.join(store_name);
+    let source_path = store_dir.join(source_rel);
+    if !source_path.is_file() {
+        return Err(StitchError::internal(format!(
+            "source does not exist: {}",
+            source_path.display()
+        )));
+    }
+    let platform = Platform::detect();
+    let content = render::render_file(&source_path, source_rel, &platform, &loaded.config.vars)
+        .map_err(|e| StitchError::render(&source_path, e))?;
+    print!("{content}");
     Ok(())
 }

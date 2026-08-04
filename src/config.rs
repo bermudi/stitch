@@ -143,16 +143,22 @@ pub struct Loaded {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WhenClause {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distro: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+}
+
+impl WhenClause {
+    pub fn is_default(&self) -> bool {
+        self == &WhenClause::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

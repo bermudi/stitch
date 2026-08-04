@@ -5,6 +5,7 @@
 //! layout (`stitch.toml` authored + `.stitch/state.toml` generated) directly
 //! (bypassing `init`) to keep the test bodies focused.
 
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
+use serde_json::Value;
 
 /// A scratch repo: a tempdir with `.stitch/` initialized and the two-file
 /// config layout written (`stitch.toml` + `.stitch/state.toml`). Tests can
@@ -179,7 +181,7 @@ fn apply_outside_repo_errors() {
         .arg("apply")
         .assert()
         .failure()
-        .stderr(contains("not inside a stitch repo"));
+        .stderr(contains("does not point at a stitch repo"));
 }
 
 #[test]
@@ -192,7 +194,7 @@ fn list_outside_repo_errors() {
         .arg("list")
         .assert()
         .failure()
-        .stderr(contains("not inside a stitch repo"));
+        .stderr(contains("does not point at a stitch repo"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1701,7 +1703,7 @@ fn remove_missing_store_errors() {
         .args(["remove", "nope"])
         .assert()
         .failure()
-        .stderr(contains("not found in config"));
+        .stderr(contains("unknown store"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2014,7 +2016,7 @@ hooks = { pre = "exit 1" }
         .arg("apply")
         .assert()
         .failure()
-        .stdout(contains("pre-hook"));
+        .stdout(contains("hook failed").and(contains("pre")));
 
     assert!(
         !target.exists(),
@@ -2134,7 +2136,7 @@ target = "{target_str}"
         .arg("apply")
         .assert()
         .failure()
-        .stderr(contains("pre-apply hook"));
+        .stderr(contains("pre-apply"));
     assert!(!target.exists(), "apply must abort when pre-apply fails");
 }
 
@@ -3499,4 +3501,697 @@ fn import_registers_existing_links() {
         state.contains("target"),
         "state must have a target: {state}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Exit code + resolution hint tests (v0.7 Milestone 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exit_code_and_hint_outside_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(tmp.path())
+        .env_remove("STITCH_REPO")
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(4)
+        .stderr(contains("does not point at a stitch repo"))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn exit_code_and_hint_legacy_v02_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stitch = tmp.path().join(".stitch");
+    fs::create_dir_all(&stitch).unwrap();
+    fs::write(stitch.join("config.toml"), "[store]\npath = '.stitch'\n").unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(tmp.path())
+        .env_remove("STITCH_REPO")
+        .arg("list")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("v0.2 config"))
+        .stderr(contains("stitch migrate"))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn exit_code_and_hint_unknown_store() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "{tmp}/.config/nvim"
+"#,
+    );
+    repo.cmd()
+        .args(["apply", "--only", "missing"])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(contains("unknown store"))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn exit_code_and_hint_real_file_conflict() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(6)
+        .stdout(contains("conflict"))
+        .stderr(contains("apply --force"))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn exit_code_and_hint_foreign_symlink_conflict() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/etc/foreign", &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(7)
+        .stdout(contains("conflict"))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn exit_code_and_hint_render_missing_env() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("env", &[]);
+    fs::write(
+        store_dir.join("foo.tmpl"),
+        "value={{ env('STITCH_EXIT_CODE_TEST_MISSING_ENV') }}\n",
+    )
+    .unwrap();
+    let target = repo.path().join("home").join(".foo");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.env]
+target = "{target_str}"
+files = ["foo.tmpl"]
+"#
+    ));
+    unsafe { env::remove_var("STITCH_EXIT_CODE_TEST_MISSING_ENV") };
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(8)
+        .stderr(contains("hint:"))
+        .stderr(contains("env"));
+}
+
+#[test]
+fn exit_code_and_hint_path_validation() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+files = ["../init.lua"]
+"#
+    ));
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn exit_code_and_hint_hook_failure() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join(".s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_authored(&format!(
+        r#"
+[stores.s]
+target = "{target_str}"
+files = ["f"]
+
+[stores.s.hooks]
+pre = "exit 1"
+"#
+    ));
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(10)
+        .stdout(contains("hook"))
+        .stderr(contains("hook"))
+        .stderr(contains("hint:"));
+}
+
+#[test]
+fn exit_code_mixed_when_apply_has_multiple_failure_classes() {
+    // §3 aggregation rule: a single failure class → that class's code;
+    // multiple classes → 11. Exercise the multi-class path by giving one
+    // store a real-file conflict (code 6) and another a foreign symlink
+    // (code 7) in the same `apply` run.
+    let repo = Repo::new();
+    repo.make_store("real", &["init.lua"]);
+    repo.make_store("foreign", &["init.lua"]);
+
+    let real_target = repo.path().join("home").join(".config").join("real");
+    let foreign_target = repo.path().join("home").join(".config").join("foreign");
+    fs::create_dir_all(real_target.parent().unwrap()).unwrap();
+    fs::create_dir_all(foreign_target.parent().unwrap()).unwrap();
+
+    // Real file blocks `real`; foreign symlink blocks `foreign`.
+    fs::write(&real_target, "real file").unwrap();
+    std::os::unix::fs::symlink("/etc/foreign", &foreign_target).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.real]
+target = "{real}"
+
+[stores.foreign]
+target = "{foreign}"
+"#,
+        real = real_target.to_string_lossy(),
+        foreign = foreign_target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(11)
+        .stdout(contains("conflict"))
+        .stderr(contains("hint:"));
+}
+
+// ---------------------------------------------------------------------------
+// v0.7 JSON / agent interface (M2)
+// ---------------------------------------------------------------------------
+
+fn json_output(output: &std::process::Output) -> Value {
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf8 stdout");
+    serde_json::from_str(stdout).expect("valid JSON envelope")
+}
+
+fn assert_envelope_shape(value: &Value, command: &str, ok: bool) {
+    assert_eq!(value.get("schema").and_then(Value::as_u64), Some(1));
+    assert_eq!(value.get("command").and_then(Value::as_str), Some(command));
+    assert_eq!(value.get("ok").and_then(Value::as_bool), Some(ok));
+    assert!(value.get("warnings").is_some());
+}
+
+/// Lock the §1 error-object contract: `{class, code, message, hint, details?}`.
+/// Every `--json` failure envelope must carry a non-empty class, the matching
+/// numeric code, a non-empty message, and a hint. `details` is optional
+/// (reserved for M3/M4) so we only assert presence of the four core fields.
+fn assert_error_shape(value: &Value, class: &str, code: i64) {
+    let error = value
+        .get("error")
+        .expect("envelope must carry an error object on failure");
+    assert_eq!(error["class"].as_str(), Some(class), "error.class mismatch");
+    assert_eq!(error["code"].as_i64(), Some(code), "error.code mismatch");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .expect("error.message present");
+    assert!(!message.is_empty(), "error.message must be non-empty");
+    assert!(
+        error.get("hint").is_some(),
+        "error.hint must be present (even if null-ish, the field is required)"
+    );
+}
+
+#[test]
+fn json_status_reports_linked_and_missing() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.make_store("shells", &[".bashrc"]);
+
+    let nvim_target = repo.path().join("home").join(".config").join("nvim");
+    let shells_target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        nvim_target.to_string_lossy(),
+        shells_target.to_string_lossy(),
+    ));
+
+    // Link nvim, leave shells unlinked.
+    fs::create_dir_all(nvim_target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(
+        repo.path().join("nvim").canonicalize().unwrap(),
+        &nvim_target,
+    )
+    .unwrap();
+
+    let output = repo.cmd().args(["--json", "status"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "status", true);
+    let data = value.get("data").unwrap().as_array().unwrap();
+    assert_eq!(data.len(), 2);
+
+    let states: std::collections::BTreeMap<&str, &str> = data
+        .iter()
+        .map(|row| {
+            (
+                row["store"].as_str().unwrap(),
+                row["state"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(states["nvim"], "linked");
+    assert_eq!(states["shells"], "missing");
+
+    // Whole-dir and file-mode rows have the expected shapes.
+    let nvim = data.iter().find(|r| r["store"] == "nvim").unwrap();
+    assert_eq!(nvim["templated"], false);
+    assert_eq!(nvim.get("staged_path"), None);
+
+    let shells = data.iter().find(|r| r["store"] == "shells").unwrap();
+    assert_eq!(
+        shells["source"].as_str().unwrap(),
+        repo.path().join("shells/.bashrc").to_string_lossy()
+    );
+    assert_eq!(
+        shells["target"].as_str().unwrap(),
+        shells_target.join(".bashrc").to_string_lossy()
+    );
+    assert_eq!(shells["state"], "missing");
+}
+
+#[test]
+fn json_status_filter_by_name() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.make_store("shells", &[".bashrc"]);
+
+    let nvim_target = repo.path().join("home").join(".config").join("nvim");
+    let shells_target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        nvim_target.to_string_lossy(),
+        shells_target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "status", "nvim"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let data = value.get("data").unwrap().as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["store"], "nvim");
+}
+
+#[test]
+fn json_status_unknown_store_returns_typed_error() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let nvim_target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        nvim_target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "status", "nope"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "status", false);
+    assert_error_shape(&value, "unknown-store", 5);
+    let error = value.get("error").unwrap();
+    assert!(error["hint"].as_str().unwrap().contains("nvim"));
+}
+
+#[test]
+fn json_list_reports_stores_and_targets() {
+    let repo = Repo::new();
+    let t1 = repo.path().join("home1");
+    let t2 = repo.path().join("home2");
+    repo.write_authored(
+        r#"
+[stores.shells.targets.laptop]
+when = { hostname = "laptop" }
+
+[stores.shells.targets.server]
+when = { hostname = "server" }
+"#,
+    );
+    repo.write_state(&format!(
+        r#"
+[stores.shells.targets.laptop]
+target = "{t1}"
+
+[stores.shells.targets.server]
+target = "{t2}"
+"#,
+        t1 = t1.to_string_lossy(),
+        t2 = t2.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["--json", "list"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "list", true);
+    let data = value.get("data").unwrap().as_array().unwrap();
+    assert_eq!(data.len(), 1);
+
+    let shells = &data[0];
+    assert_eq!(shells["name"], "shells");
+    assert_eq!(shells["mode"], "multi-target");
+    let targets = shells["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert!(targets.iter().any(|t| t["name"] == "laptop"));
+    assert!(targets.iter().any(|t| t["name"] == "server"));
+}
+
+#[test]
+fn json_doctor_passes() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy()
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "doctor", true);
+    let summary = value["data"]["summary"].as_object().unwrap();
+    assert_eq!(summary["errors"], 0);
+}
+
+#[test]
+fn json_doctor_reports_error_findings() {
+    let repo = Repo::new();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        repo.path()
+            .join("home")
+            .join(".config")
+            .join("nvim")
+            .to_string_lossy()
+    ));
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(!output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "doctor", false);
+    assert_error_shape(&value, "doctor", 13);
+    let summary = value["data"]["summary"].as_object().unwrap();
+    assert!(summary["errors"].as_u64().unwrap() > 0);
+    let findings = value["data"]["findings"].as_array().unwrap();
+    assert!(findings.iter().any(|f| f["id"] == "missing-store-dir"));
+}
+
+#[test]
+fn json_prune_lists_orphan() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = tempfile::tempdir().unwrap();
+    let covered = home.path().join(".config").join("nvim");
+    let orphan = home.path().join("orphan");
+    fs::create_dir_all(covered.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(repo.path().join("nvim"), &covered).unwrap();
+    std::os::unix::fs::symlink(repo.path().join("nvim"), &orphan).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        covered.to_string_lossy()
+    ));
+
+    let output = repo
+        .cmd()
+        .args([
+            "--json",
+            "prune",
+            "--scan-dir",
+            home.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "prune", true);
+    let data = value.get("data").unwrap();
+    let orphans = data["orphans"].as_array().unwrap();
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(
+        orphans[0]["link"].as_str().unwrap(),
+        orphan.to_string_lossy()
+    );
+    assert_eq!(data["removed"], 0);
+    assert_eq!(data["failed"], 0);
+}
+
+#[test]
+fn json_render_renders_template() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    let src = store_dir.join("gitconfig.tmpl");
+    fs::write(
+        &src,
+        "# managed by stitch\nhost={{ env(\"STITCH_TEST_RENDER\", \"x\") }}\n",
+    )
+    .unwrap();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "render", "git/gitconfig.tmpl"])
+        .env("STITCH_TEST_RENDER", "myhost")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "render", true);
+
+    let data = value.get("data").unwrap();
+    assert_eq!(data["source"].as_str().unwrap(), src.to_string_lossy());
+    assert_eq!(data["link_name"], "gitconfig");
+    assert_eq!(data["content"], "# managed by stitch\nhost=myhost\n");
+    let sha = data["sha256"].as_str().unwrap();
+    assert_eq!(sha.len(), 64);
+}
+
+#[test]
+fn json_apply_reports_plan() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    let data = value.get("data").unwrap();
+    let stores = data["stores"].as_array().expect("stores array");
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0]["store_name"], "shells");
+    let ops = stores[0]["ops"].as_array().expect("ops array");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["action"], "create_link");
+    assert_eq!(
+        ops[0]["target"].as_str().unwrap(),
+        home.join(".bashrc").to_string_lossy()
+    );
+    assert_eq!(
+        ops[0]["source"].as_str().unwrap(),
+        repo.path().join("shells/.bashrc").to_string_lossy()
+    );
+    assert_eq!(
+        ops[0]["requires"]["target"],
+        serde_json::json!({"target": "absent"})
+    );
+
+    // The link was actually created.
+    assert!(home.join(".bashrc").is_symlink());
+}
+
+#[test]
+fn json_diff_reports_plan() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo.cmd().args(["--json", "diff"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "diff", true);
+
+    let data = value.get("data").unwrap();
+    let stores = data["stores"].as_array().expect("stores array");
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0]["store_name"], "nvim");
+    let ops = stores[0]["ops"].as_array().expect("ops array");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["action"], "already_linked");
+    assert_eq!(ops[0]["target"].as_str().unwrap(), target.to_string_lossy());
+    assert_eq!(
+        ops[0]["source"].as_str().unwrap(),
+        repo.path().join("nvim").to_string_lossy()
+    );
+    let requires = &ops[0]["requires"]["target"];
+    assert_eq!(requires["target"].as_str().unwrap(), "symlink_to");
+    assert_eq!(
+        requires["value"].as_str().unwrap(),
+        repo.path().join("nvim").to_string_lossy()
+    );
+}
+
+#[test]
+fn render_text_prints_content() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    fs::write(
+        store_dir.join("gitconfig.tmpl"),
+        "host={{ env(\"STITCH_TEST_RENDER2\", \"fallback\") }}\n",
+    )
+    .unwrap();
+
+    repo.cmd()
+        .args(["render", "git/gitconfig.tmpl"])
+        .env("STITCH_TEST_RENDER2", "rendered")
+        .assert()
+        .success()
+        .stdout("host=rendered\n");
+}
+
+#[test]
+fn render_rejects_non_template() {
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig"]);
+    repo.cmd()
+        .args(["render", "git/gitconfig"])
+        .assert()
+        .failure()
+        .stderr(contains("only .tmpl files"));
+}
+
+#[test]
+fn json_rejected_on_write_commands_as_usage_envelope() {
+    // Write/mutating commands other than `apply`/`diff` are not JSON-enabled.
+    // The rejection must go through the same envelope contract an agent already
+    // parses — a `usage` error (code 2) on stdout, honest exit 2 — not a prose
+    // stderr line. The check fires before repo resolution, so no real repo is
+    // needed, but we use one to keep the test realistic.
+    let repo = Repo::new();
+    let output = repo.cmd().args(["--json", "add", "~/x"]).output().unwrap();
+    assert!(!output.status.success(), "add --json must not succeed");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "add --json must exit with the usage code 2"
+    );
+
+    // The envelope goes to stdout (one-stream rule); stderr is hook passthrough.
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", false);
+    assert_error_shape(&value, "usage", 2);
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--json is not supported for add"),
+        "message should name the unsupported flag"
+    );
+
+    // Spot-check a second write command so the boundary isn't single-cmd.
+    let output = repo.cmd().args(["--json", "remove", "x"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", false);
+    assert_error_shape(&value, "usage", 2);
 }
