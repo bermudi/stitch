@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.0 — Agent interface
+
+### Features
+
+- **Typed error taxonomy** (`StitchError` / `FailureClass`): 14 stable exit
+  codes (0–13) with class names, messages, and resolution hints. Text mode
+  prints `hint:` lines; `--json` envelopes include `class`, `code`, `message`,
+  `hint`, and `details`.
+- **JSON envelope** with a stable `schema: 1`. Global `--json` flag on
+  `status`, `list`, `doctor`, `prune`, `render`, `apply`, `diff`, and `plan`.
+  The envelope (including `error`) goes to stdout; the exit code stays honest;
+  stderr is reserved for hook/subprocess output.
+- **`stitch render <store>/<file>`**: read-only in-memory template render to
+  stdout; `--json` emits `{source, link_name, sha256, content}`.
+- **`stitch plan`**: capture `apply`'s exact op list as a `stitch/plan` JSON
+  file. Includes staged-render hashes, config hash, and platform fingerprint.
+  Text mode emits the raw plan; `--json` wraps it in the envelope.
+- **`stitch apply --plan <file>`**: verbatim plan execution with preflight +
+  per-op precondition re-checks + stale-plan detection. Aborts at the first
+  failed op. `--dry-run` runs validation with no mutations. `--plan` is
+  incompatible with `--only` and `--force` (usage error, exit 2).
+
+### Trust & safety
+
+- **Plan files are untrusted input.** `apply --plan` validates every op
+  against the pinned config: path traversal rejection, backup path validation
+  (same directory as target), source under repo, target under configured
+  target, and `.stitch/render/` gitignore guard.
+- **No plaintext in plans.** `stage_render` ops pin only the SHA-256 of the
+  approved render; rendered content is not stored in the plan.
+- **Stale-plan refusal.** Config edits, `state.toml` edits, platform drift, or
+  render-hash drift cause `apply --plan` to exit 12 before any mutation.
+- **Honest exit codes for agents.** `diff`/`plan` exit with the conflict/error
+  class; `apply` aggregates per-entry classes (single → that code, multiple →
+  11); `doctor` exits 13 on error-level findings.
+
+### Internals
+
+- **Refactored `compute_plan`**. `apply`, `diff`, `plan`, and the JSON/text
+  renderers all consume the same `Plan` struct, so the two views cannot drift.
+- **New dependencies:** `serde_json`, `sha2`.
+
 ## 0.6.0 — 2026-08-03
 
 ### Features
