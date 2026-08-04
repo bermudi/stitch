@@ -14,7 +14,7 @@ mod store;
 use clap::Parser;
 use config::{Config, ConfigError, Loaded, expand_home, find_root};
 use error::{FailureClass, StitchError};
-use plan_exec::PlanFile;
+use plan_exec::{PlanExecError, PlanFile, PlanFileOp};
 use platform::Platform;
 use std::collections::BTreeSet;
 
@@ -479,7 +479,7 @@ fn cmd_plan(
         let error = if plan_file.conflicts.is_empty() && plan_file.errors.is_empty() {
             None
         } else {
-            Some(plan_exec_error(&plan_file))
+            Some(plan_exec::plan_exec_error(&plan_file))
         };
         if let Some(ref e) = error {
             report::write_data_error("plan", &plan_file, e, loaded.warnings);
@@ -498,7 +498,7 @@ fn cmd_plan(
         if plan_file.conflicts.is_empty() && plan_file.errors.is_empty() {
             Ok(())
         } else {
-            Err(plan_exec_error(&plan_file))
+            Err(plan_exec::plan_exec_error(&plan_file))
         }
     }
 }
@@ -519,6 +519,19 @@ fn cmd_apply_plan(
     })?;
     let plan: PlanFile = serde_json::from_str(&plan_data)
         .map_err(|e| StitchError::plan_stale(format!("invalid plan file: {e}")))?;
+
+    // Real template staging requires the render tree to be gitignored.
+    if plan
+        .ops
+        .iter()
+        .any(|op| matches!(op, PlanFileOp::StageRender { .. }))
+        && !render::repo_gitignore_covers_render(root)
+    {
+        return Err(StitchError::internal(format!(
+            "repo .gitignore is missing `{}` — add that entry before applying templates",
+            render::RENDER_GITIGNORE_ENTRY
+        )));
+    }
 
     let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run);
 
@@ -555,7 +568,7 @@ fn cmd_apply_plan(
                     }
                 }
                 if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
-                    Err(plan_exec_error(&plan))
+                    Err(plan_exec::plan_exec_error(&plan))
                 } else {
                     Ok(())
                 }
@@ -564,31 +577,29 @@ fn cmd_apply_plan(
                 for w in &loaded.warnings {
                     eprintln!("warning: {w}");
                 }
-                Err(*e.error)
+                let PlanExecError { report, error } = e;
+                eprintln!(
+                    "Aborted after {} of {} ops: {}",
+                    report.ops_executed.len(),
+                    report.ops_total,
+                    error
+                );
+                if !report.ops_executed.is_empty() {
+                    eprintln!("  executed:");
+                    for op in &report.ops_executed {
+                        eprintln!("    {op}");
+                    }
+                }
+                if !report.ops_remaining.is_empty() {
+                    eprintln!("  remaining:");
+                    for op in &report.ops_remaining {
+                        eprintln!("    {op}");
+                    }
+                }
+                Err(*error)
             }
         }
     }
-}
-
-fn plan_exec_error(plan: &PlanFile) -> StitchError {
-    let mut classes = BTreeSet::new();
-    for conflict in &plan.conflicts {
-        classes.insert(plan_exec::conflict_class(conflict));
-    }
-    for error in &plan.errors {
-        if let Some(c) = FailureClass::from_id(&error.class) {
-            classes.insert(c);
-        }
-    }
-    if classes.is_empty() {
-        return StitchError::plan_stale("plan reported conflicts or errors");
-    }
-    let message = format!(
-        "{} conflict(s), {} error(s)",
-        plan.conflicts.len(),
-        plan.errors.len()
-    );
-    StitchError::apply(classes.into_iter().collect(), message)
 }
 
 fn apply_json(

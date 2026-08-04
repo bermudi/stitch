@@ -4824,3 +4824,176 @@ pre = "exit 1"
         "second target must not be linked"
     );
 }
+
+#[test]
+fn apply_plan_rejects_hand_edited_source_outside_repo() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    plan["ops"][0]["source"] = serde_json::json!("/tmp/evil.bashrc");
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("is not under the repo"));
+}
+
+#[test]
+fn apply_plan_rejects_hand_edited_target_with_parent_dir() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    let bad_target = format!("{}/.bashrc/../evil", home.to_string_lossy());
+    plan["ops"][0]["target"] = serde_json::json!(bad_target);
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("contains '..'"));
+}
+
+#[test]
+fn apply_plan_rejects_hand_edited_backup_outside_target_dir() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".bashrc"), "existing").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().args(["plan", "--force"]).output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    let bad_backup = repo
+        .path()
+        .join(".bashrc.bak")
+        .to_string_lossy()
+        .into_owned();
+    plan["ops"][0]["backup"] = serde_json::json!(bad_backup);
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("not under the same directory"));
+}
+
+#[test]
+fn apply_plan_rejects_hand_edited_unknown_store() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    let bad_source = repo
+        .path()
+        .join("badstore/.bashrc")
+        .to_string_lossy()
+        .into_owned();
+    plan["ops"][0]["source"] = serde_json::json!(bad_source);
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("not in config"));
+}
+
+#[test]
+fn apply_plan_executes_remove_link_with_null_source() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // Apply once so the target is a repo-owned symlink.
+    repo.cmd().arg("apply").assert().success();
+    assert!(home.join(".bashrc").is_symlink());
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
+        .expect("plan is valid JSON");
+    plan["ops"] = serde_json::json!([{
+        "op": "remove_link",
+        "target": home.join(".bashrc").to_string_lossy(),
+        "source": null,
+        "requires": { "target": "symlink_into_repo" }
+    }]);
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Executed 1/1 ops"));
+
+    assert!(!home.join(".bashrc").exists());
+}
