@@ -617,8 +617,9 @@ and a platform/config fingerprint. Plan files are versioned and self-describing:
 }
 ```
 
-- `config_sha256` is the SHA-256 of `stitch.toml` + `.stitch/state.toml`
-  (concatenated, in that order). Any edit to either file invalidates the plan.
+- `config_sha256` is a domain-separated SHA-256 fingerprint of
+  `stitch.toml` and `.stitch/state.toml`, including each file's identity,
+  presence, length, and bytes. Any edit to either file invalidates the plan.
 - `platform` is the fingerprint of the machine where the plan was captured.
   Plans are single-machine artifacts.
 - `ops` are tagged by `op` (snake_case):
@@ -631,6 +632,8 @@ and a platform/config fingerprint. Plan files are versioned and self-describing:
     real entry and the backup path must be absent.
   - `remove_link`: `{target, source, requires}` — target must be a repo-owned
     symlink. `source` is optional.
+  - `remove_staged`: `{store, rel}` — remove a stale rendered template from
+    `.stitch/render/<store>/<rel>`.
 - `requires` is the plan-file flat form:
   `{target: "<state>", value?: "...", backup?: "<state>", backup_value?: "..."}`.
   `target`/`backup` are one of `absent`, `real_entry`, `symlink_to`, or
@@ -660,9 +663,9 @@ Semantics:
   precondition, or the original class for capture-time conflicts/errors.
 - **Hooks.** Global and per-store hooks are not themselves ops; they run from
   the pinned config as part of execution, exactly as in a normal `apply`.
-- **Verbatim execution.** `apply --plan` ignores `--only` and `--force`;
-  combining them is a usage error (exit 2). `--dry-run` runs the same
-  validation without mutating anything.
+- **Verbatim execution.** Combining `apply --plan` with `--only` or `--force`
+  is a usage error (exit 2). `--dry-run` runs the same validation without
+  mutating anything.
 
 ### Schema stability
 

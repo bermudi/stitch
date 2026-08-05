@@ -545,9 +545,6 @@ fn cmd_plan(
         }
         Ok(())
     } else {
-        for w in &loaded.warnings {
-            eprintln!("warning: {w}");
-        }
         println!(
             "{}",
             serde_json::to_string(&plan_file).expect("plan serializable")
@@ -609,9 +606,6 @@ fn cmd_apply_plan(
     } else {
         match result {
             Ok(report) => {
-                for w in &loaded.warnings {
-                    eprintln!("warning: {w}");
-                }
                 for w in &report.warnings {
                     eprintln!("warning: {w}");
                 }
@@ -638,9 +632,6 @@ fn cmd_apply_plan(
                 }
             }
             Err(e) => {
-                for w in &loaded.warnings {
-                    eprintln!("warning: {w}");
-                }
                 let PlanExecError { report, error } = e;
                 for w in &report.warnings {
                     eprintln!("warning: {w}");

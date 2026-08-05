@@ -984,6 +984,12 @@ fn unresolved_source_op(target: &str) -> PlanOp {
     }
 }
 
+fn whole_dir_link_target(target: &Path, store_dir: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::read_link(target).ok()?;
+    let canonical_store = store_dir.canonicalize().ok()?;
+    (resolved == canonical_store).then_some(resolved)
+}
+
 fn resolve_remove_source(
     repo_root: &Path,
     store_dir: &Path,
@@ -991,17 +997,13 @@ fn resolve_remove_source(
     store_name: &str,
     target: &Path,
 ) -> Option<String> {
-    if !target.is_symlink() {
+    if !target.is_symlink() || !linker::points_into_repo(target, repo_root) {
         return None;
     }
-    let resolved = std::fs::read_link(target).ok()?;
-    if !linker::points_into_repo(target, repo_root) {
-        return None;
-    }
-    // Whole-directory root removal: the link points exactly at the store dir.
-    if let Ok(rel) = store_dir.canonicalize()
-        && resolved == rel
-    {
+    // Whole-directory root removal: the link points exactly at the canonical
+    // store dir. Keep the configured path as the source in the plan so it
+    // remains consistent with normal whole-directory link planning.
+    if whole_dir_link_target(target, store_dir).is_some() {
         return Some(path_to_string(store_dir));
     }
     // File-mode stale link: resolve back to the store-relative source.
@@ -1015,9 +1017,18 @@ fn remove_requires(
     target: &Path,
     source: &Option<String>,
 ) -> LinkRequires {
+    // The source recorded for a whole-directory link uses the configured repo
+    // path, while the symlink contains the canonical path. Pin the raw link
+    // target in `requires` so plan preflight and execution compare the same
+    // bytes that read_link returns.
+    if whole_dir_link_target(target, store_dir).is_some()
+        && let Ok(resolved) = std::fs::read_link(target)
+    {
+        return LinkRequires::new(TargetState::SymlinkTo(path_to_string(&resolved)));
+    }
     if let Some(src) = source
         && let Ok(resolved) = std::fs::read_link(target)
-        && (resolved == store_dir || resolved == Path::new(src))
+        && resolved == Path::new(src)
     {
         return LinkRequires::new(TargetState::SymlinkTo(src.clone()));
     }
@@ -1037,47 +1048,79 @@ pub(crate) fn resolve_link_source(
     store_name: &str,
     target: &Path,
 ) -> Option<String> {
-    // Whole-directory link: target is the store target itself.
     let store_config = store?;
-    for target_path in target_paths_for_store(store_config) {
-        if target == target_path {
-            return Some(path_to_string(store_dir));
-        }
-        if let Ok(rel) = target.strip_prefix(&target_path) {
-            let link_rel = rel.to_string_lossy().into_owned();
-            let names = resolve_target_names(
-                store_dir,
-                &store_config.files,
-                &store_config.patterns,
-                &store_config.ignore,
-            );
-            if let LinkTargets::Files(source_names) = names {
-                for source_name in source_names {
-                    let entry = render::resolve_entry(&source_name);
-                    if entry.link_rel == link_rel {
-                        if entry.is_template {
-                            return Some(path_to_string(&render::staging_path(
-                                repo_root, store_name, &link_rel,
-                            )));
-                        }
-                        return Some(path_to_string(&store_dir.join(&entry.source_rel)));
-                    }
-                }
-            }
+
+    // A single-target store carries its inventory on Store itself.
+    if !store_config.is_multi_target()
+        && let Some(target_str) = &store_config.target
+        && let Some(source) = resolve_link_source_for_target(
+            repo_root,
+            store_dir,
+            store_name,
+            target,
+            &config::expand_home(target_str),
+            &store_config.files,
+            &store_config.patterns,
+            &store_config.ignore,
+        )
+    {
+        return Some(source);
+    }
+
+    // Multi-target stores carry independent inventories and ignore rules on
+    // each TargetEntry. A target path must be resolved with the entry that
+    // owns it, not with the store-level (usually empty) lists.
+    for target_entry in store_config.targets.values() {
+        if let Some(source) = resolve_link_source_for_target(
+            repo_root,
+            store_dir,
+            store_name,
+            target,
+            &config::expand_home(&target_entry.target),
+            &target_entry.files,
+            &target_entry.patterns,
+            &target_entry.ignore,
+        ) {
+            return Some(source);
         }
     }
     None
 }
 
-fn target_paths_for_store(store: &Store) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(ref target_str) = store.target {
-        paths.push(config::expand_home(target_str));
+#[allow(clippy::too_many_arguments)]
+fn resolve_link_source_for_target(
+    repo_root: &Path,
+    store_dir: &Path,
+    store_name: &str,
+    target: &Path,
+    target_path: &Path,
+    files: &[String],
+    patterns: &[String],
+    ignore: &[String],
+) -> Option<String> {
+    // Whole-directory link: target is the store target itself.
+    if target == target_path {
+        return Some(path_to_string(store_dir));
     }
-    for target_entry in store.targets.values() {
-        paths.push(config::expand_home(&target_entry.target));
+
+    let rel = target.strip_prefix(target_path).ok()?;
+    let link_rel = rel.to_string_lossy().into_owned();
+    let LinkTargets::Files(source_names) = resolve_target_names(store_dir, files, patterns, ignore)
+    else {
+        return None;
+    };
+    for source_name in source_names {
+        let entry = render::resolve_entry(&source_name);
+        if entry.link_rel == link_rel {
+            if entry.is_template {
+                return Some(path_to_string(&render::staging_path(
+                    repo_root, store_name, &link_rel,
+                )));
+            }
+            return Some(path_to_string(&store_dir.join(&entry.source_rel)));
+        }
     }
-    paths
+    None
 }
 
 #[derive(Debug)]

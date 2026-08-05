@@ -5,7 +5,6 @@
 //! layout (`stitch.toml` authored + `.stitch/state.toml` generated) directly
 //! (bypassing `init`) to keep the test bodies focused.
 
-use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1324,6 +1323,50 @@ target = "{t2}"
     // Names appear alongside targets.
     assert!(stdout.contains("laptop"), "got: {stdout}");
     assert!(stdout.contains("server"), "got: {stdout}");
+}
+
+#[test]
+fn plan_resolves_multi_target_inventory_per_target() {
+    let repo = Repo::new();
+    repo.make_store("shells", &["laptop", "server"]);
+    let laptop = repo.path().join("home-laptop");
+    let server = repo.path().join("home-server");
+    repo.write_state(&format!(
+        r#"
+[stores.shells.targets.laptop]
+target = "{laptop}"
+files = ["laptop"]
+
+[stores.shells.targets.server]
+target = "{server}"
+files = ["server"]
+"#,
+        laptop = laptop.to_string_lossy(),
+        server = server.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(plan["errors"].as_array().unwrap().is_empty());
+    let ops = plan["ops"].as_array().unwrap();
+    assert!(ops.iter().any(|op| {
+        op["op"] == "create_link"
+            && op["source"] == repo.path().join("shells/laptop").to_string_lossy().as_ref()
+    }));
+    assert!(ops.iter().any(|op| {
+        op["op"] == "create_link"
+            && op["source"] == repo.path().join("shells/server").to_string_lossy().as_ref()
+    }));
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, &output.stdout).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(laptop.join("laptop").is_symlink());
+    assert!(server.join("server").is_symlink());
 }
 
 #[test]
@@ -3956,12 +3999,14 @@ fn exit_code_and_hint_legacy_v02_config() {
 fn exit_code_and_hint_unknown_store() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
-    repo.write_state(
+    let target = repo.path().join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
         r#"
 [stores.nvim]
-target = "{tmp}/.config/nvim"
+target = "{target_str}"
 "#,
-    );
+    ));
     repo.cmd()
         .args(["apply", "--only", "missing"])
         .assert()
@@ -4036,9 +4081,8 @@ target = "{target_str}"
 files = ["foo.tmpl"]
 "#
     ));
-    unsafe { env::remove_var("STITCH_EXIT_CODE_TEST_MISSING_ENV") };
-
     repo.cmd()
+        .env_remove("STITCH_EXIT_CODE_TEST_MISSING_ENV")
         .arg("apply")
         .assert()
         .failure()
@@ -4781,9 +4825,8 @@ files = [".bashrc"]
     );
     assert_eq!(ops[0]["requires"]["target"], "absent");
     assert!(plan["conflicts"].as_array().unwrap().is_empty());
-    if let Some(errors) = plan.get("errors") {
-        assert!(errors.as_array().unwrap().is_empty());
-    }
+    let errors = plan["errors"].as_array().expect("plan errors array");
+    assert!(errors.is_empty());
 }
 
 #[test]
@@ -4966,6 +5009,24 @@ files = ["gitconfig.tmpl"]
 }
 
 #[test]
+fn apply_plan_rejects_a_different_repository() {
+    let first = Repo::new();
+    let second = Repo::new();
+    let output = first.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let plan_path = second.path().join("plan.json");
+    fs::write(&plan_path, output.stdout).unwrap();
+
+    second
+        .cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("repository mismatch"));
+}
+
+#[test]
 fn apply_plan_detects_stale_config_hash() {
     let repo = Repo::new();
     repo.make_store("shells", &[".bashrc"]);
@@ -5122,7 +5183,7 @@ files = ["gitconfig"]
             home.to_string_lossy(),
         ),
         r#"
-[stores.omega.hooks]
+[stores.alpha.hooks]
 pre = "exit 1"
 "#,
     );
@@ -5130,7 +5191,11 @@ pre = "exit 1"
     let plan_path = repo.path().join("plan.json");
     let output = repo.cmd().arg("plan").output().unwrap();
     assert!(output.status.success());
-    fs::write(&plan_path, &output.stdout).unwrap();
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Execute the store groups in the opposite order from the plan ops. The
+    // remainder must still be reconstructed from operation identity/index.
+    plan["stores"] = serde_json::json!(["omega", "alpha"]);
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
 
     let output = repo
         .cmd()
@@ -5146,9 +5211,20 @@ pre = "exit 1"
     let remaining = data["ops_remaining"].as_array().unwrap();
     assert_eq!(executed.len(), 1, "first store's op should have run");
     assert_eq!(remaining.len(), 1, "second store's op should remain");
-    assert!(home.join(".bashrc").is_symlink(), "first link should exist");
+    assert_eq!(
+        executed[0],
+        format!("create_link {}", home.join("gitconfig").display())
+    );
+    assert_eq!(
+        remaining[0],
+        format!("create_link {}", home.join(".bashrc").display())
+    );
     assert!(
-        !home.join("gitconfig").exists(),
+        home.join("gitconfig").is_symlink(),
+        "first link should exist"
+    );
+    assert!(
+        !home.join(".bashrc").exists(),
         "second target must not be linked"
     );
 }

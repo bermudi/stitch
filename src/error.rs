@@ -121,7 +121,7 @@ impl FailureClass {
                 Some("use relative paths without `..` and no leading `/`".into())
             }
             FailureClass::Hook => Some("fix or disable the failing hook".into()),
-            FailureClass::Mixed => Some("see the per-entry messages above".into()),
+            FailureClass::Mixed => Some("see the per-entry messages in JSON".into()),
             FailureClass::PlanStale => Some("re-run `stitch plan`".into()),
             FailureClass::Doctor => {
                 Some("address the findings above (per-finding hints in JSON)".into())
