@@ -92,10 +92,11 @@ target = "~/.config/git"
 | `stitch prune` | List (or `--yes` remove) orphaned repo-pointing symlinks |
 | `stitch doctor` | Health check (orphaned behavior, broken links, staging trust) |
 
-`apply`, `diff`, and `add` support `--only <name>` (repeatable), `--dry-run`, and
-`--force` where applicable. `apply` also accepts `--plan <file>` to execute a
-captured plan verbatim. A global `--json` flag gives machine-readable output for
-`status`, `list`, `diff`, `apply`, `plan`, `doctor`, `prune`, and `render`.
+`apply` and `diff` support `--only <name>` (repeatable); `apply`, `diff`, `add`,
+and `remove` support `--dry-run`; `--force` is available where applicable.
+`apply` also accepts `--plan <file>` to execute a captured plan verbatim. A
+global `--json` flag gives machine-readable output for `status`, `list`, `diff`,
+`apply`, `plan`, `doctor`, `prune`, and `render`.
 
 ## Templates
 

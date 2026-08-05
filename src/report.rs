@@ -401,6 +401,11 @@ pub fn prune_with_status(
     removed: usize,
     failed: usize,
 ) -> PruneData {
+    assert_eq!(
+        orphans.len(),
+        statuses.len(),
+        "prune statuses must match orphan count"
+    );
     PruneData {
         orphans: orphans
             .iter()

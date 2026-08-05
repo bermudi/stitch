@@ -43,7 +43,7 @@ pub struct PlanFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<String>,
     pub conflicts: Vec<PlanConflict>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub errors: Vec<PlanError>,
 }
 
@@ -531,13 +531,32 @@ fn target_state_from(target: &str, value: &Option<String>) -> Result<TargetState
 
 pub fn compute_config_hash(repo_root: &Path) -> Result<String, StitchError> {
     let mut hasher = Sha256::new();
-    let stitch = repo_root.join("stitch.toml");
-    let state = repo_root.join(".stitch").join("state.toml");
+    hasher.update(b"stitch/config-hash/v2\0");
 
-    for path in [stitch, state] {
-        if path.exists() {
-            let bytes = std::fs::read(&path)?;
-            hasher.update(&bytes);
+    let files = [
+        ("stitch.toml", repo_root.join("stitch.toml")),
+        (
+            ".stitch/state.toml",
+            repo_root.join(".stitch").join("state.toml"),
+        ),
+    ];
+    for (label, path) in files {
+        // The label and presence marker domain-separate the two config
+        // components and distinguish a missing file from an existing empty
+        // file. The length also prevents concatenation-boundary collisions.
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                hasher.update([1]);
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update([0]);
+                hasher.update(0u64.to_be_bytes());
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -563,6 +582,13 @@ fn base_report(plan: &PlanFile) -> PlanExecReport {
         staged: Vec::new(),
         warnings: Vec::new(),
     }
+}
+
+fn sync_ops_remaining(report: &mut PlanExecReport, plan: &PlanFile, remaining: &BTreeSet<usize>) {
+    report.ops_remaining = remaining
+        .iter()
+        .map(|&idx| op_description(&plan.ops[idx]))
+        .collect();
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +909,19 @@ pub fn execute_plan(
         ));
     }
 
+    let actual_repo = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let planned_repo = Path::new(&plan.repo)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&plan.repo));
+    if planned_repo != actual_repo {
+        return Err(PlanExecError::new(
+            base_report(plan),
+            StitchError::plan_stale("repository mismatch — re-run `stitch plan`"),
+        ));
+    }
+
     let platform = Platform::detect();
     if !plan.platform.matches(&platform) {
         return Err(PlanExecError::new(
@@ -924,10 +963,83 @@ pub fn execute_plan(
         })?;
     }
 
+    let mut report = base_report(plan);
+    let mut remaining: BTreeSet<usize> = (0..plan.ops.len()).collect();
+
+    // Group ops by store, preserving each store's plan order while retaining
+    // the original operation indices for accurate remainder reporting.
+    let mut ops_by_store: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (idx, op) in plan.ops.iter().enumerate() {
+        let Some(op_store) = op.op_store(repo_root, &loaded.config) else {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(format!("op {idx}: cannot derive store for execution")),
+            ));
+        };
+        ops_by_store.entry(op_store).or_default().push(idx);
+    }
+
+    let selected_stores: Vec<String> = if plan.stores.is_empty() {
+        loaded.config.stores.keys().cloned().collect()
+    } else {
+        plan.stores.clone()
+    };
+    let selected_set: BTreeSet<String> = selected_stores.iter().cloned().collect();
+
+    for store_name in &selected_stores {
+        if !loaded.config.stores.contains_key(store_name) {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(format!("selected store '{store_name}' not in config")),
+            ));
+        }
+    }
+
+    // A captured plan must not silently drop an operation because its store
+    // was omitted, or because the store is no longer active on this platform.
+    // Keep those operations in `remaining` and reject the plan before hooks or
+    // mutations, so a successful result can never imply that they ran.
+    let mut skipped_ops = Vec::new();
+    for (store_name, indices) in &ops_by_store {
+        if !selected_set.contains(store_name) {
+            skipped_ops.extend(indices.iter().map(|&idx| {
+                format!(
+                    "{} (store '{store_name}' omitted from selected stores)",
+                    op_description(&plan.ops[idx])
+                )
+            }));
+        }
+    }
+    for store_name in &selected_stores {
+        let store = &loaded.config.stores[store_name];
+        if !platform.matches_when(&store.when)
+            && let Some(indices) = ops_by_store.get(store_name)
+        {
+            skipped_ops.extend(indices.iter().map(|&idx| {
+                format!(
+                    "{} (store '{store_name}' skipped by platform conditions)",
+                    op_description(&plan.ops[idx])
+                )
+            }));
+        }
+    }
+    if !skipped_ops.is_empty() {
+        sync_ops_remaining(&mut report, plan, &remaining);
+        return Err(PlanExecError::new(
+            report,
+            StitchError::plan_stale(format!(
+                "plan contains operations that cannot execute: {}",
+                skipped_ops.join("; ")
+            )),
+        ));
+    }
+
     if dry_run {
-        let report = base_report(plan);
+        sync_ops_remaining(&mut report, plan, &remaining);
         if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
-            return Err(PlanExecError::new(report.clone(), plan_exec_error(plan)));
+            return Err(PlanExecError::new(report, plan_exec_error(plan)));
         }
         return Ok(report);
     }
@@ -939,64 +1051,49 @@ pub fn execute_plan(
         target: None,
         action: "apply",
     };
-    hooks::run_global_hook(repo_root, "pre-apply", &env, &platform)
-        .map_err(|e| PlanExecError::new(base_report(plan), StitchError::hook("pre-apply", e)))?;
-
-    let mut report = base_report(plan);
-
-    // Group ops by store, preserving the plan's own ordering.
-    let mut ops_by_store: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (idx, op) in plan.ops.iter().enumerate() {
-        let op_store = op.op_store(repo_root, &loaded.config).ok_or_else(|| {
-            PlanExecError::new(
-                report.clone(),
-                StitchError::plan_stale(format!("op {idx}: cannot derive store for execution")),
-            )
-        })?;
-        ops_by_store.entry(op_store).or_default().push(idx);
+    if let Err(e) = hooks::run_global_hook(repo_root, "pre-apply", &env, &platform) {
+        sync_ops_remaining(&mut report, plan, &remaining);
+        return Err(PlanExecError::new(
+            report,
+            StitchError::hook("pre-apply", e),
+        ));
     }
 
-    let selected_stores: Vec<String> = if plan.stores.is_empty() {
-        loaded.config.stores.keys().cloned().collect()
-    } else {
-        plan.stores.clone()
-    };
-
     for store_name in &selected_stores {
-        let Some(store) = loaded.config.stores.get(store_name) else {
-            return Err(PlanExecError::new(
-                report.clone(),
-                StitchError::plan_stale(format!("selected store '{store_name}' not in config")),
-            ));
-        };
+        let store = &loaded.config.stores[store_name];
         if !platform.matches_when(&store.when) {
             continue;
         }
 
-        run_store_pre_hook(repo_root, store_name, &loaded.config, &platform)
-            .map_err(|e| PlanExecError::new(report.clone(), e))?;
+        if let Err(e) = run_store_pre_hook(repo_root, store_name, &loaded.config, &platform) {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(report, e));
+        }
 
         if let Some(indices) = ops_by_store.get(store_name) {
             for &idx in indices {
                 let op = &plan.ops[idx];
 
                 // Re-check the precondition immediately before acting.
-                preflight_op(repo_root, loaded, &platform, op).map_err(|e| {
-                    PlanExecError::new(
-                        report.clone(),
+                if let Err(e) = preflight_op(repo_root, loaded, &platform, op) {
+                    sync_ops_remaining(&mut report, plan, &remaining);
+                    return Err(PlanExecError::new(
+                        report,
                         StitchError::plan_stale(format!(
                             "op {idx} ({}) precondition changed: {e}",
                             op_description(op)
                         )),
-                    )
-                })?;
+                    ));
+                }
 
                 match execute_op(repo_root, loaded, &platform, op, idx, &mut report) {
                     Ok(()) => {
                         report.ops_executed.push(op_description(op));
-                        report.ops_remaining.pop_front();
+                        remaining.remove(&idx);
+                        sync_ops_remaining(&mut report, plan, &remaining);
                     }
                     Err(e) => {
+                        sync_ops_remaining(&mut report, plan, &remaining);
                         return Err(PlanExecError::new(
                             report,
                             StitchError::plan_stale(format!(
@@ -1014,6 +1111,8 @@ pub fn execute_plan(
             report.warnings.push(warning);
         }
     }
+
+    sync_ops_remaining(&mut report, plan, &remaining);
 
     // Global post-apply hook (warn on failure, never clobber the apply result).
     let env = HookEnv {
@@ -1612,14 +1711,21 @@ fn target_paths_for_store(store: &Store) -> Vec<PathBuf> {
 }
 
 fn find_store_for_target(_repo_root: &Path, config: &Config, target: &Path) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
     for (name, store) in &config.stores {
         for target_path in target_paths_for_store(store) {
-            if target == target_path || target.starts_with(target_path) {
-                return Some(name.clone());
+            if target == target_path || target.starts_with(&target_path) {
+                let depth = target_path.components().count();
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_depth, _)| depth > *best_depth)
+                {
+                    best = Some((depth, name.clone()));
+                }
             }
         }
     }
-    None
+    best.map(|(_, name)| name)
 }
 
 fn is_under_any_target(config: &Config, store: &str, target: &Path) -> bool {
@@ -1954,4 +2060,72 @@ fn validate_backup_path(idx: usize, target: &str, backup: &str) -> Result<(), St
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::ApplyOpts;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn config_hash_distinguishes_missing_from_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::write(tmp.path().join("stitch.toml"), "").unwrap();
+
+        let missing = compute_config_hash(tmp.path()).unwrap();
+        fs::write(stitch_dir.join("state.toml"), "").unwrap();
+        let empty = compute_config_hash(tmp.path()).unwrap();
+
+        assert_ne!(missing, empty);
+    }
+
+    #[test]
+    fn whole_dir_removal_from_symlinked_repo_root_executes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("repo");
+        let stitch_dir = real_root.join(".stitch");
+        let store_dir = real_root.join("shells");
+        let target = tmp.path().join("home").join(".shells");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(real_root.join("stitch.toml"), "").unwrap();
+        fs::write(store_dir.join("profile"), "profile\n").unwrap();
+        fs::write(
+            stitch_dir.join("state.toml"),
+            format!(
+                "[stores.shells]\ntarget = \"{}\"\nfiles = [\"profile\"]\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+
+        let repo_alias = tmp.path().join("repo-alias");
+        symlink(&real_root, &repo_alias).unwrap();
+        linker::create_link(&target, &store_dir).unwrap();
+
+        let loaded = Config::load(&repo_alias).unwrap();
+        let platform = Platform::detect();
+        let computed = store::compute_plan(
+            &repo_alias,
+            &loaded.config,
+            &platform,
+            ApplyOpts {
+                dry_run: true,
+                force: false,
+            },
+        );
+        let plan = build_plan_file(&repo_alias, &loaded, &computed, &platform).unwrap();
+        assert!(plan.ops.iter().any(|op| {
+            matches!(op, PlanFileOp::RemoveLink { target: path, .. } if path == &target.display().to_string())
+        }));
+
+        execute_plan(&repo_alias, &loaded, &plan, false).unwrap();
+
+        assert!(!target.is_symlink());
+        assert!(target.join("profile").is_symlink());
+    }
 }
