@@ -74,7 +74,12 @@ release commit itself, not on a later follow-up.
 ```sh
 # after the Release vX.Y.Z commit lands on main:
 git tag -a vX.Y.Z <release-commit> -m "vX.Y.Z: <one-line summary>"
+git push origin main && git push origin vX.Y.Z
+scripts/gh-release.sh vX.Y.Z "<one-line summary>"  # publishes the GitHub release (notes from the CHANGELOG section)
 ```
+
+The GitHub release is published after the tag is pushed; `scripts/gh-release.sh`
+extracts the version's CHANGELOG section as the notes (first one: v0.7.0).
 
 Existing tags: `v0.2.0` (d35496a), `v0.3.0` (76fc01f), `v0.3.1` (6d10de3),
 `v0.4.0`, `v0.4.1`, `v0.5.0`, `v0.6.0` (23f2dbd), `v0.7.0`.
