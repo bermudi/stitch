@@ -6,6 +6,11 @@
 #
 # Preconditions: the annotated tag vX.Y.Z exists (release commits are always
 # tagged) and the CHANGELOG has a "## X.Y.Z — <date>" section.
+#
+# As of the release workflow (.github/workflows/release.yml), pushing a `v*`
+# tag already creates the release with notes + build artifacts. This script is
+# now a manual fallback for re-publishing notes; it is idempotent — if the
+# release already exists, it edits the title/notes in place instead of failing.
 set -euo pipefail
 
 ver="${1:-}"
@@ -42,4 +47,8 @@ printf '%s\n' "$(cat "$notes")" > "$notes"
     exit 1
 }
 
-gh release create "$ver" --title "$ver — $summary" --notes-file "$notes"
+if gh release view "$ver" >/dev/null 2>&1; then
+    gh release edit "$ver" --title "$ver — $summary" --notes-file "$notes"
+else
+    gh release create "$ver" --title "$ver — $summary" --notes-file "$notes"
+fi
