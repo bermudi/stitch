@@ -1,0 +1,133 @@
+name: release
+
+# On a `vX.Y.Z` tag push, build release binaries for the supported Linux
+# targets and attach them to the GitHub release for that tag. The release
+# itself (title + CHANGELOG notes) is created here too, so pushing the tag is
+# now the whole release ritual — scripts/gh-release.sh remains as a manual
+# fallback for re-publishing notes.
+#
+# Supported targets match AGENTS.md (Linux only). macOS is not officially
+# supported or tested, so it is intentionally not built here.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install aarch64 cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build (release, locked)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          # aarch64 is cross-compiled on an x86_64 runner; point cargo at the
+          # cross toolchain's linker. No-op for the x86_64 host target.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Strip and package
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          bin="target/$target/release/stitch"
+          case "$target" in
+            aarch64-unknown-linux-gnu) strip="aarch64-linux-gnu-strip" ;;
+            *)                          strip="strip" ;;
+          esac
+          "$strip" "$bin"
+          tar -C "target/$target/release" -czf \
+            "stitch-${GITHUB_REF_NAME}-${target}.tar.gz" stitch
+          sha256sum "stitch-${GITHUB_REF_NAME}-${target}.tar.gz" \
+            > "stitch-${GITHUB_REF_NAME}-${target}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stitch-${{ matrix.target }}
+          path: |
+            stitch-*.tar.gz
+            stitch-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tag refs so `git tag -l` can read the annotated
+          # tag's subject for the release title.
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Extract CHANGELOG notes for this version
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          notes="$(mktemp)"
+          awk -v v="$ver" '
+            /^## / { if (insec) exit; insec = ($2 == v); next }
+            insec { print }
+          ' CHANGELOG.md > "$notes"
+          # Command substitution strips trailing newlines; add exactly one back.
+          printf '%s\n' "$(cat "$notes")" > "$notes"
+          if [ ! -s "$notes" ]; then
+            echo "error: no CHANGELOG section for $GITHUB_REF_NAME (expected \"## $ver — <date>\")" >&2
+            exit 1
+          fi
+          echo "NOTES_PATH=$notes" >> "$GITHUB_ENV"
+
+      - name: Read one-line summary from the annotated tag
+        run: |
+          set -euo pipefail
+          subject="$(git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME")"
+          # The tag subject is "vX.Y.Z: <summary>"; drop the leading version.
+          summary="${subject#*: }"
+          [ -n "$summary" ] || summary="$GITHUB_REF_NAME"
+          echo "SUMMARY=$summary" >> "$GITHUB_ENV"
+
+      - name: Create or update release with artifacts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/stitch-*.tar.gz dist/stitch-*.tar.gz.sha256)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Release already exists (e.g. re-run, or manual gh-release.sh);
+            # just refresh artifacts and notes.
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --notes-file "$NOTES_PATH" \
+              --title "$GITHUB_REF_NAME — $SUMMARY"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME — $SUMMARY" \
+              --notes-file "$NOTES_PATH" \
+              "${files[@]}"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
