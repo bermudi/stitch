@@ -5677,3 +5677,265 @@ ignore = ["gitconfig.tmpl"]
     assert!(!staged.exists(), "staged render must be removed");
     assert!(!home.join("gitconfig").exists());
 }
+
+/// Malformed `requires.backup != "absent"` on a BackupAndLink op must fail at
+/// whole-plan preflight, not after earlier ops have mutated the filesystem.
+#[test]
+fn apply_plan_preflight_rejects_malformed_backup_requires_before_mutation() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc", ".zshrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".bashrc"), "existing").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc", ".zshrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // Capture a normal --force plan, then hand-edit it so the backup_and_link
+    // op requires its backup path to be a real entry instead of absent.
+    // With the backup path actually present as a real file, the old preflight
+    // would pass (backup state matches), execute the earlier create_link, and
+    // only fail at the per-op re-check. The new whole-plan preflight must
+    // reject backup != "absent" before any filesystem mutation.
+    let output = repo.cmd().args(["plan", "--force"]).output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Reorder so create_link (for .zshrc) precedes the malformed backup_and_link.
+    let ops = plan["ops"].as_array_mut().unwrap();
+    let mut create = None;
+    let mut backup = None;
+    for op in ops.drain(..) {
+        match op["op"].as_str() {
+            Some("create_link") => create = Some(op),
+            Some("backup_and_link") => backup = Some(op),
+            _ => {}
+        }
+    }
+    let reordered = vec![
+        create.expect("create_link for .zshrc"),
+        backup.expect("backup_and_link for .bashrc"),
+    ];
+    *plan["ops"].as_array_mut().unwrap() = reordered;
+
+    // Set the malformed backup precondition and create the backup as a real file.
+    plan["ops"][1]["requires"]["backup"] = "real_entry".into();
+    let backup_path = Path::new(plan["ops"][1]["backup"].as_str().unwrap()).to_path_buf();
+    fs::write(&backup_path, "backup").unwrap();
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("preflight failed for op"))
+        .stderr(contains("backup_and_link requires backup=absent"));
+
+    // The create_link must not have run; the real target and backup are untouched.
+    assert!(
+        !home.join(".zshrc").exists(),
+        "no earlier op should have run"
+    );
+    assert!(home.join(".bashrc").is_file());
+    assert!(backup_path.is_file());
+}
+
+/// Preflight must simulate the executor's store-grouped order, not the raw
+/// plan.ops order, so a plan whose raw order is internally consistent but whose
+/// grouped order is not is rejected before any filesystem mutation.
+#[test]
+fn apply_plan_preflight_simulates_store_grouped_execution_order() {
+    let repo = Repo::new();
+    repo.make_store("alpha", &["x"]);
+    repo.make_store("beta", &["x", "y"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.alpha]
+target = "{0}"
+files = ["x"]
+
+[stores.beta]
+target = "{0}"
+files = ["x", "y"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // The captured plan wants to create home/x for both alpha and beta. Hand-edit
+    // it so the raw op order is: alpha create x, beta create y, beta replace x
+    // (replacing alpha's link with beta's). In that raw order the preflight
+    // passes. But the executor runs stores in the `stores` field order, which we
+    // set to ["beta", "alpha"]; the grouped exec order becomes beta create y,
+    // beta replace x, alpha create x. The replace op now sees home/x absent and
+    // must fail at whole-plan preflight before any fs mutation.
+    let alpha_create = plan["ops"][0].clone();
+    let beta_create_y = plan["ops"][2].clone();
+    let beta_replace = serde_json::json!({
+        "op": "replace_link",
+        "target": home.join("x").to_string_lossy(),
+        "source": repo.path().join("beta").join("x").to_string_lossy(),
+        "requires": {
+            "target": "symlink_to",
+            "value": repo.path().join("alpha").join("x").to_string_lossy(),
+        },
+    });
+    plan["ops"] = serde_json::json!([alpha_create, beta_create_y, beta_replace]);
+    plan["stores"] = serde_json::json!(["beta", "alpha"]);
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("preflight failed for op 2"))
+        .stderr(contains("does not match expected"));
+
+    // If the preflight had used the raw plan.ops order, home/y would have been
+    // created before the replace failed. The grouped-order preflight must catch
+    // the problem first.
+    assert!(
+        !home.join("y").exists(),
+        "grouped-order preflight must not mutate"
+    );
+    assert!(!home.join("x").exists());
+}
+
+/// An inactive store's leftover staged render must not produce a RemoveStaged op
+/// and must not block `apply --plan`.
+#[test]
+fn apply_plan_skips_stale_render_sweep_for_inactive_store() {
+    let repo = Repo::new();
+    repo.make_store("inactive", &["gitconfig.tmpl"]);
+    let home = repo.path().join("home");
+    repo.write_split(
+        &format!(
+            r#"
+[stores.inactive]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+            home.to_string_lossy(),
+        ),
+        r#"
+[stores.inactive]
+when = { os = "definitely-not-this-os" }
+"#,
+    );
+
+    // Pre-create a stale staged render as if the store was once active.
+    let staged_dir = repo.path().join(".stitch").join("render").join("inactive");
+    fs::create_dir_all(&staged_dir).unwrap();
+    let staged = staged_dir.join("gitconfig");
+    fs::write(&staged, "stale").unwrap();
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !plan["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["op"] == "remove_staged"),
+        "inactive store must not produce RemoveStaged ops"
+    );
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Executed 0/0 ops"));
+
+    assert!(
+        staged.exists(),
+        "stale render of inactive store must not be swept"
+    );
+}
+
+/// A target-level `when` skip must preserve its configured staged render, just
+/// as normal `apply` does, even while active siblings in the store are planned.
+#[test]
+fn apply_plan_preserves_staging_for_inactive_target() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("a.tmpl"), "a = {{ os }}\n").unwrap();
+    fs::write(store.join("b.tmpl"), "b = {{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy();
+    repo.write_state(&format!(
+        r#"
+[stores.git.targets.active]
+target = "{target_str}"
+files = ["a.tmpl"]
+
+[stores.git.targets.skipped]
+target = "{target_str}"
+files = ["b.tmpl"]
+"#,
+    ));
+
+    // Establish live renders and links while both targets are active.
+    repo.cmd().arg("apply").assert().success();
+    let link = target.join("b");
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("b");
+    assert!(link.is_symlink());
+    assert!(staged.is_file());
+
+    repo.write_authored(
+        r#"
+[stores.git.targets.skipped]
+when = { os = "definitely-not-this-os" }
+"#,
+    );
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !plan["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| { op["op"] == "remove_staged" && op["store"] == "git" && op["rel"] == "b" }),
+        "inactive target's configured render must not be swept"
+    );
+
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, &output.stdout).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert!(link.is_symlink(), "inactive target link must remain");
+    assert!(staged.is_file(), "inactive target render must remain");
+    assert!(
+        fs::read_to_string(&link).is_ok(),
+        "inactive target link must remain readable"
+    );
+}

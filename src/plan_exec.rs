@@ -295,6 +295,37 @@ fn convert_store_ops(
     let mut keep_staged: BTreeSet<String> = BTreeSet::new();
     let store_config = loaded.config.stores.get(store_name);
 
+    // Reconciliation is based on configured sources, not only successful plan
+    // ops. Per-target `when` skips and render/resolution errors produce no
+    // render op, but their existing staged output must remain live. This
+    // mirrors `store::apply_store` and prevents preserved links from dangling.
+    let mut target_keep_links = BTreeMap::new();
+    if let Some(store) = store_config {
+        if store.is_multi_target() {
+            for target in store.targets.values() {
+                store::collect_reconciliation_keeps(
+                    store_dir,
+                    &config::expand_home(&target.target),
+                    &target.files,
+                    &target.patterns,
+                    &target.ignore,
+                    &mut keep_staged,
+                    &mut target_keep_links,
+                );
+            }
+        } else if let Some(target) = &store.target {
+            store::collect_reconciliation_keeps(
+                store_dir,
+                &config::expand_home(target),
+                &store.files,
+                &store.patterns,
+                &store.ignore,
+                &mut keep_staged,
+                &mut target_keep_links,
+            );
+        }
+    }
+
     for op in ops {
         let maybe_render =
             stage_render_for_op(repo_root, loaded, store_name, store_dir, op, platform)?;
@@ -375,8 +406,11 @@ fn convert_store_ops(
     }
 
     // Emit staged-render cleanup for any stale renders in this store.
+    // A store that is skipped on this platform is not swept: its ops would be
+    // rejected as unexecutable at apply time.
+    let store_active = store_config.is_some_and(|s| platform.matches_when(&s.when));
     let staged_dir = render::store_render_dir(repo_root, store_name);
-    if staged_dir.exists() {
+    if store_active && staged_dir.exists() {
         for entry in walkdir::WalkDir::new(&staged_dir)
             .follow_links(false)
             .into_iter()
@@ -591,6 +625,48 @@ fn sync_ops_remaining(report: &mut PlanExecReport, plan: &PlanFile, remaining: &
         .collect();
 }
 
+/// Verify that a `StageRender` op's staged path and pinned hash are consistent
+/// with the fresh in-memory render of its template source.
+fn verify_stage_render(
+    repo_root: &Path,
+    loaded: &Loaded,
+    platform: &Platform,
+    store: &str,
+    source_rel: &str,
+    staged: &str,
+    sha256: &str,
+) -> Result<PathBuf, String> {
+    let source_path = repo_root.join(store).join(source_rel);
+    let expected_staged = render::staging_path(
+        repo_root,
+        store,
+        &render::resolve_entry(source_rel).link_rel,
+    );
+    if path_to_string(&expected_staged) != staged {
+        return Err(format!(
+            "staged path mismatch: expected {}",
+            expected_staged.display()
+        ));
+    }
+    let content = render::render_file(&source_path, source_rel, platform, &loaded.config.vars)
+        .map_err(|e| format!("render failed: {e}"))?;
+    if sha256_hex(&content) != sha256 {
+        return Err("render hash mismatch".into());
+    }
+    Ok(source_path)
+}
+
+/// Check that a link source exists, unless it is a staged render (which may be
+/// created by an earlier `StageRender` op in the same plan).
+fn check_source_exists_for_preflight(repo_root: &Path, source: &str) -> Result<(), String> {
+    let source_path = Path::new(source);
+    let is_staged = source_path.starts_with(render::render_root(repo_root));
+    if !is_staged && !source_path.exists() {
+        return Err(format!("source does not exist: {source}"));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Preflight state simulation
 // ---------------------------------------------------------------------------
@@ -711,15 +787,6 @@ impl<'a> PreflightState<'a> {
         }
     }
 
-    fn check_source_exists_for_preflight(&self, source: &str) -> Result<(), String> {
-        let source_path = Path::new(source);
-        let is_staged = source_path.starts_with(render::render_root(self.repo_root));
-        if !is_staged && !source_path.exists() {
-            return Err(format!("source does not exist: {source}"));
-        }
-        Ok(())
-    }
-
     fn set_ancestors_to_real(&mut self, path: &Path) {
         if let Some(parent) = path.parent() {
             self.set_ancestors_to_real(parent);
@@ -738,28 +805,15 @@ impl<'a> PreflightState<'a> {
                 staged,
                 sha256,
             } => {
-                let source_path = self.repo_root.join(store).join(source_rel);
-                let expected_staged = render::staging_path(
+                let _ = verify_stage_render(
                     self.repo_root,
-                    store,
-                    &render::resolve_entry(source_rel).link_rel,
-                );
-                if path_to_string(&expected_staged) != *staged {
-                    return Err(format!(
-                        "staged path mismatch: expected {}",
-                        expected_staged.display()
-                    ));
-                }
-                let content = render::render_file(
-                    &source_path,
-                    source_rel,
+                    loaded,
                     self.platform,
-                    &loaded.config.vars,
-                )
-                .map_err(|e| format!("render failed: {e}"))?;
-                if sha256_hex(&content) != *sha256 {
-                    return Err("render hash mismatch".into());
-                }
+                    store,
+                    source_rel,
+                    staged,
+                    sha256,
+                )?;
                 Ok(())
             }
             PlanFileOp::CreateLink {
@@ -800,6 +854,9 @@ impl<'a> PreflightState<'a> {
                 } else {
                     TargetState::Absent
                 };
+                if !matches!(backup_state, TargetState::Absent) {
+                    return Err("backup_and_link requires backup=absent".into());
+                }
                 self.state_matches(
                     Path::new(backup),
                     &backup_state,
@@ -870,7 +927,7 @@ impl<'a> PreflightState<'a> {
         has_backup: bool,
     ) -> Result<(), String> {
         self.parent_is_writable_dir(target_path)?;
-        self.check_source_exists_for_preflight(source)?;
+        check_source_exists_for_preflight(self.repo_root, source)?;
         let target_state = target_state_from(&requires.target, &requires.value)
             .map_err(|e| format!("invalid requires: {e}"))?;
         self.state_matches(
@@ -952,17 +1009,10 @@ pub fn execute_plan(
         })?;
     }
 
-    // Preflight all ops against a simulated filesystem state before mutating.
-    let mut state = PreflightState::new(repo_root, &loaded.config, &platform);
-    for (idx, op) in plan.ops.iter().enumerate() {
-        state.apply_op(loaded, op).map_err(|e| {
-            PlanExecError::new(
-                base_report(plan),
-                StitchError::plan_stale(format!("preflight failed for op {idx}: {e}")),
-            )
-        })?;
-    }
-
+    // Build the store-grouped execution sequence first. The executor runs each
+    // selected store's ops in `selected_stores` order (see the loop below); the
+    // preflight must simulate that exact order so cross-store ordering and path
+    // interactions are checked before any filesystem mutation.
     let mut report = base_report(plan);
     let mut remaining: BTreeSet<usize> = (0..plan.ops.len()).collect();
 
@@ -1034,6 +1084,26 @@ pub fn execute_plan(
                 skipped_ops.join("; ")
             )),
         ));
+    }
+
+    // Flatten the store groups into the exact order the executor uses below.
+    let mut exec_order: Vec<usize> = Vec::with_capacity(plan.ops.len());
+    for store_name in &selected_stores {
+        if let Some(indices) = ops_by_store.get(store_name) {
+            exec_order.extend(indices);
+        }
+    }
+
+    // Preflight the execution sequence against a simulated filesystem state.
+    let mut state = PreflightState::new(repo_root, &loaded.config, &platform);
+    for &idx in &exec_order {
+        let op = &plan.ops[idx];
+        state.apply_op(loaded, op).map_err(|e| {
+            PlanExecError::new(
+                base_report(plan),
+                StitchError::plan_stale(format!("preflight failed for op {idx}: {e}")),
+            )
+        })?;
     }
 
     if dry_run {
@@ -1283,15 +1353,6 @@ fn check_target_state(path: &Path, expected: &TargetState) -> Result<(), String>
     Ok(())
 }
 
-fn check_source_exists_for_preflight(repo_root: &Path, source: &str) -> Result<(), String> {
-    let source_path = Path::new(source);
-    let is_staged = source_path.starts_with(render::render_root(repo_root));
-    if !is_staged && !source_path.exists() {
-        return Err(format!("source does not exist: {source}"));
-    }
-    Ok(())
-}
-
 fn preflight_op(
     repo_root: &Path,
     loaded: &Loaded,
@@ -1305,25 +1366,9 @@ fn preflight_op(
             staged,
             sha256,
         } => {
-            let source_path = repo_root.join(store).join(source_rel);
-            let expected_staged = render::staging_path(
-                repo_root,
-                store,
-                &render::resolve_entry(source_rel).link_rel,
-            );
-            if path_to_string(&expected_staged) != *staged {
-                return Err(format!(
-                    "staged path mismatch: expected {}",
-                    expected_staged.display()
-                ));
-            }
-            let content =
-                render::render_file(&source_path, source_rel, platform, &loaded.config.vars)
-                    .map_err(|e| format!("render failed: {e}"))?;
-            let actual_hash = sha256_hex(&content);
-            if actual_hash != *sha256 {
-                return Err("render hash mismatch".into());
-            }
+            let _ = verify_stage_render(
+                repo_root, loaded, platform, store, source_rel, staged, sha256,
+            )?;
             Ok(())
         }
         PlanFileOp::CreateLink {
@@ -1496,8 +1541,15 @@ fn replace_link_real_entry(
     // Move the new link into place.
     if let Err(e) = std::fs::rename(&tmp_link, target_path) {
         // Roll back on failure.
-        let _ = std::fs::rename(&tmp_orig, target_path);
+        let rollback = std::fs::rename(&tmp_orig, target_path);
         let _ = std::fs::remove_file(&tmp_link);
+        if let Err(re) = rollback {
+            return Err(format!(
+                "could not place symlink at {}: {e}; rollback also failed ({re}); the original entry is at {}",
+                target_path.display(),
+                tmp_orig.display()
+            ));
+        }
         return Err(format!(
             "could not place symlink at {}: {e}",
             target_path.display()
@@ -1537,25 +1589,9 @@ fn execute_op(
             staged,
             sha256,
         } => {
-            let source_path = repo_root.join(store).join(source_rel);
-            let expected_staged = render::staging_path(
-                repo_root,
-                store,
-                &render::resolve_entry(source_rel).link_rel,
-            );
-            if path_to_string(&expected_staged) != *staged {
-                return Err(format!(
-                    "staged path mismatch: expected {}",
-                    expected_staged.display()
-                ));
-            }
-            let content =
-                render::render_file(&source_path, source_rel, platform, &loaded.config.vars)
-                    .map_err(|e| format!("render failed: {e}"))?;
-            let actual_hash = sha256_hex(&content);
-            if actual_hash != *sha256 {
-                return Err("render hash mismatch".into());
-            }
+            let source_path = verify_stage_render(
+                repo_root, loaded, platform, store, source_rel, staged, sha256,
+            )?;
             render::stage_template(
                 repo_root,
                 store,
