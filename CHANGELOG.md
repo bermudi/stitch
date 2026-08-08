@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.1 — 2026-08-07
+
+### Trust & safety
+
+Closes all seven remaining items from the 2026-06 trust review. Each
+upholds the core contract: never surprise the user with data movement,
+exposure, or silent replacement.
+
+- **P0 — nested ignore promotion no longer writes through foreign parent
+  symlinks.** A `foreign_ancestor` guard in `apply_file_entry` rejects
+  nested link creation when a parent symlink resolves outside the repo,
+  for both dry-run and real operations.
+- **P1 — `edit` rejects path traversal.** `match_target_to_source`
+  validates relative target fragments with `is_safe_fragment`, rejecting
+  `.` and `..` components before joining onto the store directory.
+- **P1 — `apply --plan` rejects parent symlinks that resolve into the
+  repo.** `resolved_target_points_into_repo` in `plan_exec` blocks
+  executable plans from clobbering repository content through symlinked
+  parents, closing the TOCTOU gap from the P0 fix.
+- **P1 — ignore promotion preserves source symlinks.** `resolve_files`
+  now accepts `is_symlink()` entries, and `create_link_to_entry` links
+  to the source symlink path without canonicalizing — so relative,
+  absolute, and dangling symlinks match whole-dir behavior after
+  promotion to file mode.
+- **P1 — `doctor` allows mutually-exclusive `when` targets sharing a
+  path.** `WhenClause::are_compatible` makes duplicate-target detection
+  `when`-aware, matching SPEC's documented laptop/server multi-target
+  layout. Genuine duplicates (compatible or absent `when`) are still
+  reported.
+- **P2 — init/migrate overwrite guards detect dangling symlinks.** The
+  refuse-existing-path guards now use `symlink_metadata` instead of
+  `Path::exists`, so a dangling `state.toml`/`stitch.toml`/`.bak`
+  symlink is refused rather than silently replaced by a regular file.
+- **P2 — `migrate` validates the split state before writing.** A v0.2
+  entry the new validator rejects (e.g. `files = ["./bashrc"]`) now
+  fails fast before any file is written or the legacy config is backed
+  up, instead of stranding the user with unloadable state.
+
+All changes are covered by unit + integration tests. `cargo fmt`,
+`cargo clippy -D warnings`, and the full suite (91 unit + 213 CLI) are
+clean.
+
 ## 0.7.0 — 2026-08-06
 
 ### Features
