@@ -1,7 +1,7 @@
-use crate::config::{self, Config, Loaded, Store};
+use crate::config::{self, Config, Loaded, Store, WhenClause};
 use crate::error::{FailureClass, StitchError};
 use crate::hooks::{self, HookEnv};
-use crate::linker::{self, LinkStatus};
+use crate::linker::{self, LinkError, LinkStatus};
 use crate::plan::{LinkRequires, Plan, PlanOp, PlanStore, TargetState, path_to_string};
 use crate::platform::Platform;
 use crate::render;
@@ -486,7 +486,10 @@ fn preflight_file_mode_promotion(
         .collect();
     for entry in &entries {
         let source_path = store_dir.join(&entry.source_rel);
-        if !source_path.exists() {
+        // `symlink_metadata` does not follow symlinks, so a dangling symlink
+        // source is still a valid entry. The render step below will fail for a
+        // template whose source is missing.
+        if std::fs::symlink_metadata(&source_path).is_err() {
             return Err(internal_error(format!(
                 "source does not exist: {}",
                 source_path.display()
@@ -655,6 +658,37 @@ fn remove_empty_target_dir(target_path: &Path) -> Result<bool, String> {
     }
 }
 
+/// Walk the ancestor directories of `target` between `target_root` (exclusive)
+/// and `target` (exclusive). Return the first that exists as a symlink and does
+/// not point into `repo_root`, along with its read-link target.
+///
+/// This is the nested-link safety guard: `create_dir_all` follows symlinks, so
+/// a foreign symlink at `<target>/lua` would cause `<target>/lua/plugin.lua` to
+/// be written into the foreign directory while `stitch` reports success. Every
+/// intermediate component is checked before linking; repo-pointing symlinks are
+/// allowed (stitch-managed territory), foreign symlinks are hard conflicts.
+fn foreign_ancestor(
+    target_root: &Path,
+    target: &Path,
+    repo_root: &Path,
+) -> Option<(PathBuf, Option<PathBuf>)> {
+    let mut ancestor = target.parent()?;
+    while ancestor != target_root {
+        if !ancestor.starts_with(target_root) {
+            break;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(ancestor)
+            && meta.file_type().is_symlink()
+            && !linker::points_into_repo(ancestor, repo_root)
+        {
+            let resolves_to = std::fs::read_link(ancestor).ok();
+            return Some((ancestor.to_path_buf(), resolves_to));
+        }
+        ancestor = ancestor.parent()?;
+    }
+    None
+}
+
 /// Apply one resolved file-mode entry. Templates render to staging first;
 /// non-templates link the store source directly.
 #[allow(clippy::too_many_arguments)] // mirrors apply_target's parameter set
@@ -671,6 +705,16 @@ fn apply_file_entry(
     let entry = render::resolve_entry(source_name);
     let source_path = store_dir.join(&entry.source_rel);
     let target = target_path.join(&entry.link_rel);
+
+    // Safety: do not create a nested link through a foreign symlink ancestor.
+    // The target itself is handled by `apply_single_link`; this guards every
+    // intermediate parent directory.
+    if let Some((ancestor, resolves_to)) = foreign_ancestor(target_path, &target, repo_root) {
+        return ApplyAction::Conflict {
+            target: ancestor,
+            resolves_to,
+        };
+    }
 
     if !entry.is_template {
         return apply_single_link(&source_path, &target, repo_root, opts);
@@ -721,6 +765,20 @@ fn apply_file_entry(
     }
 }
 
+fn source_is_symlink(source: &Path) -> bool {
+    std::fs::symlink_metadata(source)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn create_link_for(target: &Path, source: &Path) -> Result<(), LinkError> {
+    if source_is_symlink(source) {
+        linker::create_link_to_entry(target, source)
+    } else {
+        linker::create_link(target, source)
+    }
+}
+
 fn apply_single_link(
     source: &Path,
     target: &Path,
@@ -735,7 +793,7 @@ fn apply_single_link(
             if opts.dry_run {
                 ApplyAction::Created(target.to_path_buf())
             } else {
-                match linker::create_link(target, source) {
+                match create_link_for(target, source) {
                     Ok(()) => ApplyAction::Created(target.to_path_buf()),
                     Err(e) => internal_error(e.to_string()),
                 }
@@ -777,7 +835,7 @@ fn apply_single_link(
             if let Err(e) = std::fs::remove_file(target) {
                 return internal_error(e.to_string());
             }
-            match linker::create_link(target, source) {
+            match create_link_for(target, source) {
                 Ok(()) => ApplyAction::Replaced {
                     target: target.to_path_buf(),
                     old_resolves_to: Some(old_resolves_to),
@@ -821,7 +879,7 @@ fn force_backup_link(source: &Path, target: &Path, dry_run: bool) -> ApplyAction
             e
         ));
     }
-    if let Err(e) = linker::create_link(target, source) {
+    if let Err(e) = create_link_for(target, source) {
         // Restore the original so the user is left with their file, not a
         // missing target. Best-effort: a (near-impossible) restore failure
         // is ignored rather than masking the original link error.
@@ -1273,6 +1331,41 @@ pub struct DoctorResult {
     pub findings: Vec<DoctorFinding>,
 }
 
+/// Build a `duplicate-target` message that names both stores, and names the
+/// specific target entry when the collision involves a multi-target store.
+fn duplicate_target_message(
+    a_store: &str,
+    a_tname: Option<&str>,
+    b_store: &str,
+    b_tname: Option<&str>,
+    path: &Path,
+) -> String {
+    match (a_tname, b_tname) {
+        (None, None) => {
+            format!(
+                "stores '{a_store}' and '{b_store}' both target '{}'",
+                path.display()
+            )
+        }
+        (None, Some(b)) => format!(
+            "store '{a_store}' and target '{b}' of store '{b_store}' both target '{}'",
+            path.display()
+        ),
+        (Some(a), None) => format!(
+            "target '{a}' of store '{a_store}' and store '{b_store}' both target '{}'",
+            path.display()
+        ),
+        (Some(a), Some(b)) if a_store == b_store => format!(
+            "targets '{a}' and '{b}' of store '{a_store}' both target '{}'",
+            path.display()
+        ),
+        (Some(a), Some(b)) => format!(
+            "target '{a}' of store '{a_store}' and target '{b}' of store '{b_store}' both target '{}'",
+            path.display()
+        ),
+    }
+}
+
 /// Run health checks.
 ///
 /// Takes [`Loaded`] (both halves) rather than just the merged [`Config`] so it
@@ -1364,7 +1457,38 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
         }
     }
 
-    let mut seen_targets: BTreeMap<PathBuf, String> = BTreeMap::new();
+    struct Claim {
+        store: String,
+        tname: Option<String>,
+        whens: Vec<WhenClause>,
+    }
+
+    fn make_claim(
+        store_name: &str,
+        tname: Option<&str>,
+        store_when: &WhenClause,
+        target_when: Option<&WhenClause>,
+    ) -> Claim {
+        let mut whens = Vec::with_capacity(2);
+        whens.push(store_when.clone());
+        if let Some(w) = target_when {
+            whens.push(w.clone());
+        }
+        Claim {
+            store: store_name.to_string(),
+            tname: tname.map(|s| s.to_string()),
+            whens,
+        }
+    }
+
+    fn claims_compatible(a: &Claim, b: &Claim) -> bool {
+        let mut combined: Vec<&WhenClause> = Vec::with_capacity(a.whens.len() + b.whens.len());
+        combined.extend(a.whens.iter());
+        combined.extend(b.whens.iter());
+        WhenClause::are_compatible(&combined)
+    }
+
+    let mut seen_targets: BTreeMap<PathBuf, Vec<Claim>> = BTreeMap::new();
 
     // Compute status once, not per store.
     let all_statuses = status_all(repo_root, config, platform);
@@ -1400,6 +1524,59 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
             });
         }
 
+        // Duplicate targets are a config-level problem and must be reported
+        // regardless of whether the current platform would apply the store.
+        // They are only a conflict if both claimants could be active on the
+        // same platform, i.e. their combined `when` constraints are jointly
+        // satisfiable.
+        if let Some(ref target_str) = store.target {
+            let target_path = config::expand_home(target_str);
+            let new_claim = make_claim(name, None, &store.when, None);
+            if let Some(existing) = seen_targets
+                .get(&target_path)
+                .and_then(|claims| claims.iter().find(|c| claims_compatible(c, &new_claim)))
+            {
+                findings.push(DoctorFinding {
+                    id: "duplicate-target",
+                    severity: Severity::Error,
+                    message: duplicate_target_message(
+                        name,
+                        None,
+                        &existing.store,
+                        existing.tname.as_deref(),
+                        &target_path,
+                    ),
+                    path: Some(target_path.clone()),
+                    hint: Some("reconfigure one store to a different target".into()),
+                });
+            }
+            seen_targets.entry(target_path).or_default().push(new_claim);
+        }
+
+        for (tname, tentry) in &store.targets {
+            let target_path = config::expand_home(&tentry.target);
+            let new_claim = make_claim(name, Some(tname), &store.when, Some(&tentry.when));
+            if let Some(existing) = seen_targets
+                .get(&target_path)
+                .and_then(|claims| claims.iter().find(|c| claims_compatible(c, &new_claim)))
+            {
+                findings.push(DoctorFinding {
+                    id: "duplicate-target",
+                    severity: Severity::Error,
+                    message: duplicate_target_message(
+                        name,
+                        Some(tname),
+                        &existing.store,
+                        existing.tname.as_deref(),
+                        &target_path,
+                    ),
+                    path: Some(target_path.clone()),
+                    hint: Some("reconfigure one store to a different target".into()),
+                });
+            }
+            seen_targets.entry(target_path).or_default().push(new_claim);
+        }
+
         if !platform.matches_when(&store.when) {
             findings.push(DoctorFinding {
                 id: "platform-skipped",
@@ -1409,26 +1586,6 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                 hint: None,
             });
             continue;
-        }
-
-        if let Some(ref target_str) = store.target {
-            let target_path = config::expand_home(target_str);
-            if let Some(other) = seen_targets.get(&target_path) {
-                findings.push(DoctorFinding {
-                    id: "duplicate-target",
-                    severity: Severity::Error,
-                    message: format!(
-                        "stores '{}' and '{}' both target '{}'",
-                        name,
-                        other,
-                        target_path.display()
-                    ),
-                    path: Some(target_path),
-                    hint: Some("reconfigure one store to a different target".into()),
-                });
-            } else {
-                seen_targets.insert(target_path, name.clone());
-            }
         }
 
         for entry in all_statuses
@@ -1561,19 +1718,6 @@ fn build_globset(patterns: &[String]) -> Option<GlobSet> {
     builder.build().ok()
 }
 
-/// Sorted, deduped top-level entry names in `store_dir` (non-recursive).
-fn top_level_entries(store_dir: &Path) -> Vec<String> {
-    let mut names: BTreeSet<String> = BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir(store_dir) {
-        for entry in entries.flatten() {
-            if let Some(n) = entry.file_name().to_str() {
-                names.insert(n.to_string());
-            }
-        }
-    }
-    names.into_iter().collect()
-}
-
 /// Populate the link and staging keep-sets from actual desired sources.
 ///
 /// This intentionally bypasses collision validation: both sides of a
@@ -1604,7 +1748,11 @@ pub(crate) fn collect_reconciliation_keeps(
         // A vanished configured source is stale by definition and therefore
         // must not retain its old target link/render. Existing templates stay
         // live even when their render or resolution subsequently fails.
-        if source_path.exists() {
+        // Use `symlink_metadata` (which does not follow symlinks) so a dangling
+        // symlink source is still considered present.
+        if let Ok(meta) = std::fs::symlink_metadata(&source_path)
+            && !meta.is_dir()
+        {
             target_links.insert(entry.link_rel.clone());
             if entry.is_template {
                 staging_keep_links.insert(entry.link_rel);
@@ -1628,6 +1776,75 @@ fn resolve_targets(
     Ok(targets)
 }
 
+fn is_ignored_path(
+    name: &str,
+    rel: &str,
+    is_dir: bool,
+    globset: Option<&GlobSet>,
+    dir_patterns: &[&str],
+) -> bool {
+    if let Some(g) = globset {
+        if g.is_match(name) || g.is_match(rel) {
+            return true;
+        }
+        if is_dir {
+            let rel_slash = format!("{rel}/");
+            if g.is_match(&rel_slash) {
+                return true;
+            }
+        }
+    }
+
+    for d in dir_patterns {
+        if rel.starts_with(d) {
+            return true;
+        }
+        if is_dir
+            && let Some(prefix) = d.strip_suffix('/')
+            && rel == prefix
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_ignored_entry(store_dir: &Path, ignore: &[String]) -> bool {
+    let ignore_glob = build_globset(ignore);
+    let ignore_dirs: Vec<&str> = ignore
+        .iter()
+        .filter(|p| p.ends_with('/'))
+        .map(|s| s.as_str())
+        .collect();
+
+    for entry in walkdir::WalkDir::new(store_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(store_dir) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy();
+        let name = entry.file_name().to_string_lossy();
+        if is_ignored_path(
+            &name,
+            &rel_str,
+            entry.file_type().is_dir(),
+            ignore_glob.as_ref(),
+            &ignore_dirs,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Resolve the desired mode and source names without collision validation.
 /// Kept separate so reconciliation can conservatively preserve a live template
 /// when normal resolution reports an error.
@@ -1641,34 +1858,11 @@ pub(crate) fn resolve_target_names(
     let explicit = !files.is_empty() || !patterns.is_empty();
     let names = if !explicit {
         let has_templates = render::store_has_templates(store_dir);
-        let entries = top_level_entries(store_dir);
-        let ignore_hit = build_globset(&ignore)
-            .map(|g| entries.iter().any(|n| g.is_match(n)))
-            .unwrap_or(false);
-
-        if has_templates || ignore_hit {
+        if has_templates || has_ignored_entry(store_dir, &ignore) {
             // Promote: expand to every non-ignored file (full tree), so nested
             // `.tmpl` files become individual links rather than riding inside a
             // whole-dir symlink as literal `.tmpl` sources.
-            let all = resolve_files(store_dir, &[], &["**/*".into(), "*".into()], &ignore);
-            // `resolve_files` with patterns only includes matches; `**/*` + `*`
-            // covers files at any depth. Filter out directories implicitly
-            // (resolve_files is file-only).
-            //
-            // For ignore-only promotion (no templates) the historical behavior
-            // listed top-level entries only. Preserve that when there are no
-            // templates so a `.git` in a store still promotes to top-level
-            // file links rather than exploding into a recursive file list.
-            if has_templates {
-                all
-            } else if let Some(globset) = build_globset(&ignore) {
-                entries
-                    .into_iter()
-                    .filter(|n| !globset.is_match(n))
-                    .collect()
-            } else {
-                entries
-            }
+            resolve_files(store_dir, &[], &["**/*".into(), "*".into()], &ignore)
         } else {
             return LinkTargets::WholeDir;
         }
@@ -1711,12 +1905,34 @@ fn resolve_files(
         .map(|s| s.as_str())
         .collect();
 
+    let filter = |entry: &walkdir::DirEntry| -> bool {
+        if entry.depth() == 0 {
+            return true;
+        }
+        let Ok(rel) = entry.path().strip_prefix(store_dir) else {
+            return true;
+        };
+        let rel_str = rel.to_string_lossy();
+        let name = entry.file_name().to_string_lossy();
+        !is_ignored_path(
+            &name,
+            &rel_str,
+            entry.file_type().is_dir(),
+            ignore_glob.as_ref(),
+            &ignore_dirs,
+        )
+    };
+
     for entry in walkdir::WalkDir::new(store_dir)
         .follow_links(false)
         .into_iter()
+        .filter_entry(filter)
         .filter_map(|e| e.ok())
     {
-        if !entry.file_type().is_file() {
+        // Include regular files and symlinks (both file and directory symlinks).
+        // Plain directories are represented by their children, so they are still
+        // skipped here.
+        if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(store_dir) else {
@@ -1724,15 +1940,6 @@ fn resolve_files(
         };
         let rel_str = rel.to_string_lossy();
         let file_name = entry.file_name().to_string_lossy();
-
-        // Check ignore patterns first — if ignored, skip entirely.
-        let ignored = ignore_glob
-            .as_ref()
-            .is_some_and(|g| g.is_match(rel_str.as_ref()) || g.is_match(file_name.as_ref()))
-            || ignore_dirs.iter().any(|d| rel_str.starts_with(d));
-        if ignored {
-            continue;
-        }
 
         // Include if the pattern matches file name or relative path.
         if include_glob
@@ -1917,5 +2124,242 @@ mod tests {
         // Empty directories produce no matches, no errors.
         let resolved = resolve_files(&store_dir, &[], &["*.conf".into()], &[]);
         assert_eq!(resolved, vec!["real.conf"]);
+    }
+
+    #[test]
+    fn test_foreign_ancestor_detects_foreign_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let target_root = tmp.path().join("target");
+        std::fs::create_dir_all(&target_root).unwrap();
+        let foreign = tmp.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::os::unix::fs::symlink(&foreign, target_root.join("lua")).unwrap();
+
+        let target = target_root.join("lua").join("plugin.lua");
+        let (ancestor, resolves_to) =
+            foreign_ancestor(&target_root, &target, &repo_root).expect("foreign ancestor found");
+        assert_eq!(ancestor, target_root.join("lua"));
+        assert_eq!(resolves_to, Some(foreign));
+    }
+
+    #[test]
+    fn test_foreign_ancestor_allows_repo_owned_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store = repo_root.join("nvim").join("lua");
+        std::fs::create_dir_all(&store).unwrap();
+        let target_root = tmp.path().join("target");
+        std::fs::create_dir_all(&target_root).unwrap();
+        std::os::unix::fs::symlink(&store, target_root.join("lua")).unwrap();
+
+        let target = target_root.join("lua").join("plugin.lua");
+        assert!(
+            foreign_ancestor(&target_root, &target, &repo_root).is_none(),
+            "repo-pointing ancestor must not block"
+        );
+    }
+
+    #[test]
+    fn test_apply_store_blocks_nested_link_through_foreign_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store_dir = repo_root.join("nvim");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        let lua = store_dir.join("lua");
+        std::fs::create_dir_all(&lua).unwrap();
+        std::fs::write(lua.join("plugin.lua"), "plugin").unwrap();
+        std::fs::write(lua.join("secret.bak"), "secret").unwrap();
+
+        let target = tmp.path().join("home").join(".config").join("nvim");
+        std::fs::create_dir_all(&target).unwrap();
+        let foreign = tmp.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::os::unix::fs::symlink(&foreign, target.join("lua")).unwrap();
+
+        let store = crate::config::Store {
+            target: Some(target.to_string_lossy().into_owned()),
+            files: Vec::new(),
+            patterns: Vec::new(),
+            ignore: vec!["*.bak".into()],
+            when: crate::config::WhenClause::default(),
+            hooks: crate::config::Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let platform = crate::platform::Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: None,
+            hostname: "test".into(),
+            shell: "bash".into(),
+        };
+        let mut warnings = Vec::new();
+        let result = apply_store(
+            &repo_root,
+            "nvim",
+            &store,
+            &platform,
+            &BTreeMap::new(),
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut warnings,
+        );
+
+        // One nested entry should conflict on the foreign ancestor.
+        let conflict = result
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                ApplyAction::Conflict {
+                    target,
+                    resolves_to,
+                } => Some((target.clone(), resolves_to.clone())),
+                _ => None,
+            })
+            .expect("expected conflict for foreign ancestor");
+        assert_eq!(conflict.0, target.join("lua"));
+        assert_eq!(conflict.1, Some(foreign.clone()));
+
+        // The top-level link was created, the foreign directory was not written.
+        assert!(target.join("init.lua").is_symlink());
+        assert!(target.join("lua").is_symlink());
+        assert!(!foreign.join("plugin.lua").exists());
+    }
+
+    #[test]
+    fn test_resolve_files_includes_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        std::os::unix::fs::symlink("init.lua", store_dir.join("init.vim")).unwrap();
+
+        let resolved = resolve_files(&store_dir, &[], &["**/*".into(), "*".into()], &[]);
+        assert_eq!(resolved, vec!["init.lua", "init.vim"]);
+    }
+
+    #[test]
+    fn test_resolve_files_includes_dangling_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        std::os::unix::fs::symlink("missing", store_dir.join("dangling")).unwrap();
+
+        let resolved = resolve_files(&store_dir, &[], &["**/*".into(), "*".into()], &[]);
+        assert_eq!(resolved, vec!["dangling", "init.lua"]);
+    }
+
+    #[test]
+    fn test_apply_store_preserves_symlink_source_through_promotion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store_dir = repo_root.join("nvim");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        std::os::unix::fs::symlink("init.lua", store_dir.join("init.vim")).unwrap();
+        std::fs::write(store_dir.join("secret.bak"), "secret").unwrap();
+
+        let target = tmp.path().join("home").join(".config").join("nvim");
+
+        let store = crate::config::Store {
+            target: Some(target.to_string_lossy().into_owned()),
+            files: Vec::new(),
+            patterns: Vec::new(),
+            ignore: vec!["*.bak".into()],
+            when: crate::config::WhenClause::default(),
+            hooks: crate::config::Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let platform = crate::platform::Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: None,
+            hostname: "test".into(),
+            shell: "bash".into(),
+        };
+        let mut warnings = Vec::new();
+        apply_store(
+            &repo_root,
+            "nvim",
+            &store,
+            &platform,
+            &BTreeMap::new(),
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut warnings,
+        );
+
+        assert!(target.is_dir());
+        assert!(!target.is_symlink());
+        assert!(target.join("init.lua").is_symlink());
+        assert!(target.join("init.vim").is_symlink());
+        assert_eq!(
+            std::fs::read_link(target.join("init.vim")).unwrap(),
+            store_dir.join("init.vim")
+        );
+        assert!(!target.join("secret.bak").exists());
+    }
+
+    #[test]
+    fn test_apply_store_preserves_dangling_symlink_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store_dir = repo_root.join("nvim");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        std::os::unix::fs::symlink("missing", store_dir.join("dangling")).unwrap();
+        std::fs::write(store_dir.join("secret.bak"), "secret").unwrap();
+
+        let target = tmp.path().join("home").join(".config").join("nvim");
+
+        let store = crate::config::Store {
+            target: Some(target.to_string_lossy().into_owned()),
+            files: Vec::new(),
+            patterns: Vec::new(),
+            ignore: vec!["*.bak".into()],
+            when: crate::config::WhenClause::default(),
+            hooks: crate::config::Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let platform = crate::platform::Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: None,
+            hostname: "test".into(),
+            shell: "bash".into(),
+        };
+        let mut warnings = Vec::new();
+        apply_store(
+            &repo_root,
+            "nvim",
+            &store,
+            &platform,
+            &BTreeMap::new(),
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut warnings,
+        );
+
+        assert!(target.is_dir());
+        assert!(!target.is_symlink());
+        assert!(target.join("init.lua").is_symlink());
+        assert!(target.join("dangling").is_symlink());
+        assert!(!target.join("dangling").exists());
+        assert_eq!(
+            std::fs::read_link(target.join("dangling")).unwrap(),
+            store_dir.join("dangling")
+        );
+        assert!(!target.join("secret.bak").exists());
     }
 }

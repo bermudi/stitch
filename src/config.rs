@@ -159,6 +159,35 @@ impl WhenClause {
     pub fn is_default(&self) -> bool {
         self == &WhenClause::default()
     }
+
+    /// Returns `true` if every clause in `whens` could all match a single
+    /// platform simultaneously. This is the case iff, for every field, no two
+    /// clauses supply distinct `Some` values.
+    pub fn are_compatible(whens: &[&WhenClause]) -> bool {
+        for i in 0..whens.len() {
+            for j in (i + 1)..whens.len() {
+                if !whens[i].is_compatible_with(whens[j]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn is_compatible_with(&self, other: &WhenClause) -> bool {
+        Self::field_compatible(self.os.as_deref(), other.os.as_deref())
+            && Self::field_compatible(self.arch.as_deref(), other.arch.as_deref())
+            && Self::field_compatible(self.distro.as_deref(), other.distro.as_deref())
+            && Self::field_compatible(self.hostname.as_deref(), other.hostname.as_deref())
+            && Self::field_compatible(self.shell.as_deref(), other.shell.as_deref())
+    }
+
+    fn field_compatible(a: Option<&str>, b: Option<&str>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +345,23 @@ impl GeneratedState {
     /// serialization errors rather than silently printing an empty preview.
     pub fn render_for_display(&self) -> Result<String, ConfigError> {
         self.render()
+    }
+
+    /// Validate that no `files`/`patterns` fragment can escape its store or
+    /// target dir. Mirrors [`Config::validate`], but runs on the generated
+    /// inventory before `migrate` writes or previews the split state.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, store) in &self.stores {
+            validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            for target in store.targets.values() {
+                validate_fragments(
+                    &target.files,
+                    &target.patterns,
+                    &format!("store '{name}' (target '{}')", target.target),
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -614,16 +660,33 @@ fn skip_if_default<T: Default + PartialEq>(t: &T) -> bool {
 
 /// Whether `fragment` is safe to join onto a store or target directory.
 ///
-/// Safe means: non-empty, relative (no leading `/`), and containing no `..`
-/// component. Nested paths like `config/app.conf` are allowed; a leading `./`
-/// is harmless and accepted. The check is lexical — it inspects
-/// [`Path::components`] without touching the filesystem, so it is TOCTOU-free
-/// and accepts entries for files that do not exist yet.
+/// Safe means: non-empty, relative (no leading `/`), and containing only
+/// normal path components — no `.` or `..` components. Nested paths like
+/// `config/app.conf` are allowed; a leading `./` or any other `.` component is
+/// rejected as pointless and potentially self-referential. The check is lexical
+/// — it inspects [`Path::components`] and the raw `/`-separated segments
+/// without touching the filesystem, so it is TOCTOU-free and accepts entries
+/// for files that do not exist yet.
 pub fn is_safe_fragment(fragment: &str) -> bool {
-    !fragment.is_empty()
-        && Path::new(fragment)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    if fragment.is_empty() {
+        return false;
+    }
+    let path = Path::new(fragment);
+    if path.is_absolute() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return false;
+    }
+    for part in fragment.split('/') {
+        if part == "." || part == ".." {
+            return false;
+        }
+    }
+    true
 }
 
 /// Reject any `files`/`patterns` entry that is not a safe fragment.
@@ -639,14 +702,14 @@ pub fn validate_fragments(
     for f in files {
         if !is_safe_fragment(f) {
             return Err(ConfigError::InvalidPath(format!(
-                "invalid file entry '{f}' in {context}: paths must be relative to the store and contain no '..' or leading '/'"
+                "invalid file entry '{f}' in {context}: paths must be relative to the store and contain no '.', '..' or leading '/'"
             )));
         }
     }
     for p in patterns {
         if !is_safe_fragment(p) {
             return Err(ConfigError::InvalidPath(format!(
-                "invalid pattern '{p}' in {context}: patterns must be relative to the store and contain no '..' or leading '/'"
+                "invalid pattern '{p}' in {context}: patterns must be relative to the store and contain no '.', '..' or leading '/'"
             )));
         }
     }
@@ -1187,7 +1250,7 @@ mod tests {
     fn test_is_safe_fragment() {
         assert!(is_safe_fragment(".bashrc"));
         assert!(is_safe_fragment("config/app.conf"));
-        assert!(is_safe_fragment("./bashrc"));
+        assert!(!is_safe_fragment("./bashrc"));
         assert!(!is_safe_fragment(""));
         assert!(!is_safe_fragment("/"));
         assert!(!is_safe_fragment("/etc/passwd"));
@@ -1195,6 +1258,14 @@ mod tests {
         assert!(!is_safe_fragment("../escape"));
         assert!(!is_safe_fragment("foo/../bar"));
         assert!(!is_safe_fragment("ok/../../escape"));
+    }
+
+    #[test]
+    fn test_is_safe_fragment_rejects_dot() {
+        assert!(!is_safe_fragment("."));
+        assert!(!is_safe_fragment("foo/./bar"));
+        assert!(is_safe_fragment("gitconfig"));
+        assert!(is_safe_fragment("lua/plugin.lua"));
     }
 
     #[test]

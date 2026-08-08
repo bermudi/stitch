@@ -616,10 +616,23 @@ pub fn resolve_edit_source(
 
     // 2. Target path → owning store + file.
     let expanded = config::expand_home(entry);
-    let expanded = if expanded.exists() {
-        expanded.canonicalize().unwrap_or(expanded)
-    } else {
-        expanded
+
+    // If the path is a symlink, keep its own path for target-prefix matching.
+    // Resolving through a repo-owned symlink (e.g. an already-linked dotfile)
+    // would break the prefix match against the configured target path and land
+    // us in the repo or the staging tree. For foreign symlinks we must not
+    // silently resolve to a repo source.
+    let expanded = match std::fs::symlink_metadata(&expanded) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if !linker::points_into_repo(&expanded, repo_root) {
+                return Err(format!(
+                    "'{entry}' is a foreign symlink and does not point into this repo"
+                ));
+            }
+            expanded
+        }
+        _ if expanded.exists() => expanded.canonicalize().unwrap_or(expanded),
+        _ => expanded,
     };
 
     for (name, store) in &config.stores {
@@ -675,6 +688,9 @@ fn match_target_to_source(
         return Some(store_dir.to_path_buf());
     }
     let rel_str = rel.to_string_lossy();
+    if !config::is_safe_fragment(&rel_str) {
+        return None;
+    }
 
     // Prefer the template source when present — that's what the user edits.
     let tmpl = store_dir.join(format!("{rel_str}{TMPL_SUFFIX}"));
@@ -876,5 +892,189 @@ mod tests {
             1,
             "must not duplicate the entry"
         );
+    }
+
+    #[test]
+    fn resolve_edit_source_finds_repo_owned_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let store = repo.join("git");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("gitconfig"), "hello\n").unwrap();
+
+        let target = repo.join("home");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = target.join("gitconfig");
+        std::os::unix::fs::symlink(store.join("gitconfig"), &link).unwrap();
+
+        let config = config::Config {
+            vars: BTreeMap::new(),
+            stores: BTreeMap::from([(
+                "git".into(),
+                config::Store {
+                    target: Some(target.to_string_lossy().into_owned()),
+                    files: vec!["gitconfig".into()],
+                    patterns: vec![],
+                    ignore: vec![],
+                    when: config::WhenClause::default(),
+                    hooks: config::Hooks::default(),
+                    targets: BTreeMap::new(),
+                },
+            )]),
+        };
+
+        let resolved = resolve_edit_source(repo, &config, &link.to_string_lossy()).unwrap();
+        assert_eq!(resolved, store.join("gitconfig"));
+    }
+
+    #[test]
+    fn resolve_edit_source_rejects_foreign_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let store = repo.join("git");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("gitconfig"), "hello\n").unwrap();
+
+        let target = repo.join("home");
+        std::fs::create_dir_all(&target).unwrap();
+
+        // Place the foreign target outside the repo so the symlink is not repo-owned.
+        let foreign_tmp = tempfile::tempdir().unwrap();
+        let foreign = foreign_tmp.path().join("foreign");
+        std::fs::write(&foreign, "not ours\n").unwrap();
+
+        let link = target.join("gitconfig");
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+
+        let config = config::Config {
+            vars: BTreeMap::new(),
+            stores: BTreeMap::from([(
+                "git".into(),
+                config::Store {
+                    target: Some(target.to_string_lossy().into_owned()),
+                    files: vec!["gitconfig".into()],
+                    patterns: vec![],
+                    ignore: vec![],
+                    when: config::WhenClause::default(),
+                    hooks: config::Hooks::default(),
+                    targets: BTreeMap::new(),
+                },
+            )]),
+        };
+
+        let err = resolve_edit_source(repo, &config, &link.to_string_lossy()).unwrap_err();
+        assert!(
+            err.contains("foreign"),
+            "expected foreign-symlink error, got {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_edit_source_rejects_target_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let store = repo.join("git");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let target = repo.join("home");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let config = config::Config {
+            vars: BTreeMap::new(),
+            stores: BTreeMap::from([(
+                "git".into(),
+                config::Store {
+                    target: Some(target.to_string_lossy().into_owned()),
+                    files: vec![],
+                    patterns: vec![],
+                    ignore: vec![],
+                    when: config::WhenClause::default(),
+                    hooks: config::Hooks::default(),
+                    targets: BTreeMap::new(),
+                },
+            )]),
+        };
+
+        let entry = format!("{}/../../../outside", target.display());
+        let result = resolve_edit_source(repo, &config, &entry);
+        assert!(
+            result.is_err(),
+            "expected traversal to be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_edit_source_rejects_dotdot_in_repo_owned_symlink_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let store = repo.join("git");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("gitconfig"), "hello\n").unwrap();
+
+        let target = repo.join("home");
+        std::fs::create_dir_all(&target).unwrap();
+        let sub = target.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let link = target.join("gitconfig");
+        std::os::unix::fs::symlink(store.join("gitconfig"), &link).unwrap();
+
+        let config = config::Config {
+            vars: BTreeMap::new(),
+            stores: BTreeMap::from([(
+                "git".into(),
+                config::Store {
+                    target: Some(target.to_string_lossy().into_owned()),
+                    files: vec!["gitconfig".into()],
+                    patterns: vec![],
+                    ignore: vec![],
+                    when: config::WhenClause::default(),
+                    hooks: config::Hooks::default(),
+                    targets: BTreeMap::new(),
+                },
+            )]),
+        };
+
+        // The path resolves to a repo-owned symlink, but the unnormalized form
+        // contains parent-dir components and must be rejected.
+        let entry = format!("{}/sub/../gitconfig", target.display());
+        let result = resolve_edit_source(repo, &config, &entry);
+        assert!(
+            result.is_err(),
+            "expected `..` in symlink path to be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_edit_source_resolves_nested_file_under_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let store = repo.join("nvim");
+        let lua_dir = store.join("lua");
+        std::fs::create_dir_all(&lua_dir).unwrap();
+        std::fs::write(lua_dir.join("plugin.lua"), "--\n").unwrap();
+
+        let target = repo.join("home").join(".config").join("nvim");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let config = config::Config {
+            vars: BTreeMap::new(),
+            stores: BTreeMap::from([(
+                "nvim".into(),
+                config::Store {
+                    target: Some(target.to_string_lossy().into_owned()),
+                    files: vec!["lua/plugin.lua".into()],
+                    patterns: vec![],
+                    ignore: vec![],
+                    when: config::WhenClause::default(),
+                    hooks: config::Hooks::default(),
+                    targets: BTreeMap::new(),
+                },
+            )]),
+        };
+
+        let entry = target.join("lua").join("plugin.lua");
+        let resolved = resolve_edit_source(repo, &config, &entry.to_string_lossy()).unwrap();
+        assert_eq!(resolved, lua_dir.join("plugin.lua"));
     }
 }

@@ -26,6 +26,27 @@ fn has_parent_dir(p: &Path) -> bool {
     p.components().any(|c| c == Component::ParentDir)
 }
 
+/// Whether a resolved symlink target (the destination path, not a path that
+/// is itself a symlink) lies inside `repo_root`. Existing paths are canonicalized;
+/// dangling or not-yet-created paths are compared after lexical normalization.
+fn resolved_target_points_into_repo(resolved: &Path, repo_root: &Path) -> bool {
+    let normalized_root = if repo_root.exists() {
+        repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| linker::normalize_lexical(repo_root))
+    } else {
+        linker::normalize_lexical(repo_root)
+    };
+    let normalized = if resolved.exists() {
+        resolved
+            .canonicalize()
+            .unwrap_or_else(|_| linker::normalize_lexical(resolved))
+    } else {
+        linker::normalize_lexical(resolved)
+    };
+    normalized.starts_with(&normalized_root)
+}
+
 /// The on-disk plan file format. Kept intentionally close to the §2 spec so
 /// that hand inspection and external tooling can rely on its shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -741,7 +762,48 @@ impl<'a> PreflightState<'a> {
                     Err(format!("parent {} is not a directory", parent.display()))
                 }
             }
-            TargetState::SymlinkTo(_) | TargetState::SymlinkIntoRepo => {
+            TargetState::SymlinkTo(value) => {
+                // A symlinked parent is only safe when it resolves to a directory
+                // *outside* the repository. A repo-pointing parent would cause the
+                // operation to write through the symlink into the repo.
+                let resolved = if self.overrides.contains_key(parent) {
+                    let target = Path::new(&value);
+                    if target.is_absolute() {
+                        target.to_path_buf()
+                    } else {
+                        parent.parent().unwrap_or(Path::new(".")).join(target)
+                    }
+                } else {
+                    parent.canonicalize().map_err(|e| {
+                        format!(
+                            "parent {} is a symlink that cannot be resolved: {e}",
+                            parent.display()
+                        )
+                    })?
+                };
+                let points_into_repo = if self.overrides.contains_key(parent) {
+                    resolved_target_points_into_repo(&resolved, self.repo_root)
+                } else {
+                    linker::points_into_repo(parent, self.repo_root)
+                };
+                if points_into_repo {
+                    Err(format!(
+                        "parent {} is a symlink into the repository; refusing to write through it",
+                        parent.display()
+                    ))
+                } else if resolved.is_dir() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "parent {} resolves to {} which is not a directory",
+                        parent.display(),
+                        resolved.display()
+                    ))
+                }
+            }
+            TargetState::SymlinkIntoRepo => {
+                // The symlink target cannot be read, so we cannot verify that the
+                // parent resolves to a directory. Keep the conservative error.
                 Err(format!("parent {} is a symlink", parent.display()))
             }
         }
@@ -1525,9 +1587,7 @@ fn replace_link_real_entry(
 
     // Create the new symlink at a temporary path first so the original is not
     // removed until the link is known to work.
-    if let Err(e) = linker::create_link(&tmp_link, source_path) {
-        return Err(link_error(e));
-    }
+    create_link_for_plan(&tmp_link, source_path)?;
 
     // Move the existing entry aside.
     if let Err(e) = std::fs::rename(target_path, &tmp_orig) {
@@ -1574,6 +1634,20 @@ fn replace_link_real_entry(
     Ok(())
 }
 
+fn is_symlink_source(source: &Path) -> bool {
+    std::fs::symlink_metadata(source)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn create_link_for_plan(target: &Path, source: &Path) -> Result<(), String> {
+    if is_symlink_source(source) {
+        linker::create_link_to_entry(target, source).map_err(|e| e.to_string())
+    } else {
+        linker::create_link(target, source).map_err(|e| e.to_string())
+    }
+}
+
 fn execute_op(
     repo_root: &Path,
     loaded: &Loaded,
@@ -1607,7 +1681,7 @@ fn execute_op(
         PlanFileOp::CreateLink { target, source, .. } => {
             let target_path = Path::new(target);
             let source_path = Path::new(source);
-            linker::create_link(target_path, source_path).map_err(link_error)?;
+            create_link_for_plan(target_path, source_path)?;
             Ok(())
         }
         PlanFileOp::ReplaceLink {
@@ -1628,7 +1702,7 @@ fn execute_op(
                     {
                         return Err(format!("{} was repointed", target_path.display()));
                     }
-                    linker::create_link(target_path, source_path).map_err(link_error)?;
+                    create_link_for_plan(target_path, source_path)?;
                 }
                 TargetState::RealEntry => {
                     replace_link_real_entry(target_path, source_path, idx)?;
@@ -1664,10 +1738,10 @@ fn execute_op(
             }
 
             std::fs::rename(target_path, backup_path).map_err(|e| format!("{e}"))?;
-            if let Err(e) = linker::create_link(target_path, source_path) {
+            if let Err(e) = create_link_for_plan(target_path, source_path) {
                 // Restore the original on failure.
                 let _ = std::fs::rename(backup_path, target_path);
-                return Err(link_error(e));
+                return Err(e);
             }
             Ok(())
         }
