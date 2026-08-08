@@ -40,7 +40,14 @@ movement, data exposure, or silent replacement.** New code must uphold:
 - **No external upload by default.** Backups/snapshots stay local unless an explicit
   opt-in flag is set.
 - **Foreign symlinks are conflicts, not replacements.** A symlink not pointing into this
-  repo is never silently clobbered.
+  repo is never silently clobbered. Ownership is two-tier: the broad `points_into_repo`
+  follows the symlink chain *canonically* (so a link pointing *through* a repo gateway
+  symlink to an external path is foreign, not repo-owned); the exact-entry `points_at_source`
+  handles the special case where the configured source is itself a symlink resolving outside
+  the repo (a stitch-created link pointing directly at that source entry is still
+  stitch-owned). Use `points_into_repo` for broad decisions (apply Broken arm, scan/prune,
+  wildcard `remove_link`) and `points_at_source`/`remove_link_to` where the configured
+  source is known. (2026-08-08, shipped.)
 - **Exit codes are honest.** `add`/`apply`/`diff`/`prune` return non-zero on real errors
   and conflicts (including partial removal failure in `prune --yes`).
 - **Validate path fragments.** Reject absolute and `..`-containing file entries; nothing

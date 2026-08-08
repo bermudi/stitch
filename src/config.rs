@@ -275,9 +275,10 @@ impl Config {
             GeneratedState::default()
         };
 
-        let (config, merge_warnings) = merge(&authored, &generated);
+        let (mut config, merge_warnings) = merge(&authored, &generated);
         warnings.extend(merge_warnings);
         config.validate()?;
+        config.normalize();
 
         Ok(Loaded {
             authored,
@@ -302,6 +303,28 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Normalize safe `files`/`patterns` fragments by stripping harmless
+    /// current-directory (`./`) components. This keeps the on-disk state
+    /// compatible while ensuring the in-memory view uses clean link names.
+    fn normalize(&mut self) {
+        for store in self.stores.values_mut() {
+            store.files = store.files.iter().map(|f| normalize_fragment(f)).collect();
+            store.patterns = store
+                .patterns
+                .iter()
+                .map(|p| normalize_fragment(p))
+                .collect();
+            for target in store.targets.values_mut() {
+                target.files = target.files.iter().map(|f| normalize_fragment(f)).collect();
+                target.patterns = target
+                    .patterns
+                    .iter()
+                    .map(|p| normalize_fragment(p))
+                    .collect();
+            }
+        }
     }
 }
 
@@ -658,15 +681,30 @@ fn skip_if_default<T: Default + PartialEq>(t: &T) -> bool {
     t == &T::default()
 }
 
+/// Remove harmless current-directory (`./`) components from a fragment.
+///
+/// `is_safe_fragment` must already have accepted the fragment; this helper only
+/// strips `CurDir` components so the rest of the pipeline deals with normalized
+/// names (`bashrc` instead of `./bashrc`). It does not touch `..`, `RootDir`,
+/// or `Prefix` components.
+fn normalize_fragment(fragment: &str) -> String {
+    Path::new(fragment)
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Whether `fragment` is safe to join onto a store or target directory.
 ///
 /// Safe means: non-empty, relative (no leading `/`), and containing only
-/// normal path components — no `.` or `..` components. Nested paths like
-/// `config/app.conf` are allowed; a leading `./` or any other `.` component is
-/// rejected as pointless and potentially self-referential. The check is lexical
-/// — it inspects [`Path::components`] and the raw `/`-separated segments
-/// without touching the filesystem, so it is TOCTOU-free and accepts entries
-/// for files that do not exist yet.
+/// normal path components and harmless current-directory (`./`) components.
+/// `..`, a leading `/`, and a bare `.` are rejected. Nested paths like
+/// `config/app.conf` and `./bashrc` are allowed; `.` is rejected because it
+/// normalizes to an empty path. The check is lexical — it inspects
+/// [`Path::components`] without touching the filesystem, so it is TOCTOU-free
+/// and accepts entries for files that do not exist yet.
 pub fn is_safe_fragment(fragment: &str) -> bool {
     if fragment.is_empty() {
         return false;
@@ -675,18 +713,15 @@ pub fn is_safe_fragment(fragment: &str) -> bool {
     if path.is_absolute() {
         return false;
     }
-    if path
-        .components()
-        .any(|c| !matches!(c, Component::Normal(_)))
-    {
-        return false;
-    }
-    for part in fragment.split('/') {
-        if part == "." || part == ".." {
-            return false;
+    let mut has_normal = false;
+    for c in path.components() {
+        match c {
+            Component::Normal(_) => has_normal = true,
+            Component::CurDir => {}
+            _ => return false,
         }
     }
-    true
+    has_normal
 }
 
 /// Reject any `files`/`patterns` entry that is not a safe fragment.
@@ -1250,10 +1285,14 @@ mod tests {
     fn test_is_safe_fragment() {
         assert!(is_safe_fragment(".bashrc"));
         assert!(is_safe_fragment("config/app.conf"));
-        assert!(!is_safe_fragment("./bashrc"));
+        assert!(is_safe_fragment("./bashrc"));
+        assert!(is_safe_fragment("bashrc"));
+        assert!(is_safe_fragment("foo/./bar"));
+        assert!(is_safe_fragment("././bashrc"));
         assert!(!is_safe_fragment(""));
         assert!(!is_safe_fragment("/"));
         assert!(!is_safe_fragment("/etc/passwd"));
+        assert!(!is_safe_fragment("."));
         assert!(!is_safe_fragment(".."));
         assert!(!is_safe_fragment("../escape"));
         assert!(!is_safe_fragment("foo/../bar"));
@@ -1263,9 +1302,13 @@ mod tests {
     #[test]
     fn test_is_safe_fragment_rejects_dot() {
         assert!(!is_safe_fragment("."));
-        assert!(!is_safe_fragment("foo/./bar"));
+        assert!(!is_safe_fragment("./."));
+        assert!(!is_safe_fragment("././"));
+        assert!(is_safe_fragment("foo/./bar"));
         assert!(is_safe_fragment("gitconfig"));
         assert!(is_safe_fragment("lua/plugin.lua"));
+        assert!(is_safe_fragment("./bashrc"));
+        assert!(is_safe_fragment("././bashrc"));
     }
 
     #[test]

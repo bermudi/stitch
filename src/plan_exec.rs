@@ -681,8 +681,10 @@ fn verify_stage_render(
 /// created by an earlier `StageRender` op in the same plan).
 fn check_source_exists_for_preflight(repo_root: &Path, source: &str) -> Result<(), String> {
     let source_path = Path::new(source);
-    let is_staged = source_path.starts_with(render::render_root(repo_root));
-    if !is_staged && !source_path.exists() {
+    if source_path.starts_with(render::render_root(repo_root)) {
+        return Ok(());
+    }
+    if std::fs::symlink_metadata(source_path).is_err() {
         return Err(format!("source does not exist: {source}"));
     }
     Ok(())
@@ -744,69 +746,71 @@ impl<'a> PreflightState<'a> {
     }
 
     fn parent_is_writable_dir(&self, path: &Path) -> Result<(), String> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
-        match self.get_effective_state(parent) {
-            TargetState::Absent => Ok(()),
-            TargetState::RealEntry => {
-                // If the plan created this parent, it will be a real directory.
-                if self
-                    .overrides
-                    .get(parent)
-                    .is_some_and(|s| matches!(s, TargetState::RealEntry))
-                    || parent.is_dir()
-                {
-                    Ok(())
-                } else {
-                    Err(format!("parent {} is not a directory", parent.display()))
-                }
-            }
-            TargetState::SymlinkTo(value) => {
-                // A symlinked parent is only safe when it resolves to a directory
-                // *outside* the repository. A repo-pointing parent would cause the
-                // operation to write through the symlink into the repo.
-                let resolved = if self.overrides.contains_key(parent) {
-                    let target = Path::new(&value);
-                    if target.is_absolute() {
-                        target.to_path_buf()
+        // `create_dir_all` follows symlinks for any missing ancestor, so every
+        // ancestor of the target (not just the immediate parent) must be safe.
+        for ancestor in path.ancestors().skip(1) {
+            match self.get_effective_state(ancestor) {
+                TargetState::Absent => continue,
+                TargetState::RealEntry => {
+                    // If the plan created this ancestor, it will be a real directory.
+                    if self
+                        .overrides
+                        .get(ancestor)
+                        .is_some_and(|s| matches!(s, TargetState::RealEntry))
+                        || ancestor.is_dir()
+                    {
+                        continue;
                     } else {
-                        parent.parent().unwrap_or(Path::new(".")).join(target)
+                        return Err(format!("parent {} is not a directory", ancestor.display()));
                     }
-                } else {
-                    parent.canonicalize().map_err(|e| {
-                        format!(
-                            "parent {} is a symlink that cannot be resolved: {e}",
-                            parent.display()
-                        )
-                    })?
-                };
-                let points_into_repo = if self.overrides.contains_key(parent) {
-                    resolved_target_points_into_repo(&resolved, self.repo_root)
-                } else {
-                    linker::points_into_repo(parent, self.repo_root)
-                };
-                if points_into_repo {
-                    Err(format!(
-                        "parent {} is a symlink into the repository; refusing to write through it",
-                        parent.display()
-                    ))
-                } else if resolved.is_dir() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "parent {} resolves to {} which is not a directory",
-                        parent.display(),
-                        resolved.display()
-                    ))
                 }
-            }
-            TargetState::SymlinkIntoRepo => {
-                // The symlink target cannot be read, so we cannot verify that the
-                // parent resolves to a directory. Keep the conservative error.
-                Err(format!("parent {} is a symlink", parent.display()))
+                TargetState::SymlinkTo(value) => {
+                    // A symlinked ancestor is only safe when it resolves to a directory
+                    // *outside* the repository. A repo-pointing ancestor would cause the
+                    // operation to write through the symlink into the repo.
+                    let resolved = if self.overrides.contains_key(ancestor) {
+                        let target = Path::new(&value);
+                        if target.is_absolute() {
+                            target.to_path_buf()
+                        } else {
+                            ancestor.parent().unwrap_or(Path::new(".")).join(target)
+                        }
+                    } else {
+                        ancestor.canonicalize().map_err(|e| {
+                            format!(
+                                "parent {} is a symlink that cannot be resolved: {e}",
+                                ancestor.display()
+                            )
+                        })?
+                    };
+                    let points_into_repo = if self.overrides.contains_key(ancestor) {
+                        resolved_target_points_into_repo(&resolved, self.repo_root)
+                    } else {
+                        linker::points_into_repo(ancestor, self.repo_root)
+                    };
+                    if points_into_repo {
+                        return Err(format!(
+                            "parent {} is a symlink into the repository; refusing to write through it",
+                            ancestor.display()
+                        ));
+                    } else if resolved.is_dir() {
+                        continue;
+                    } else {
+                        return Err(format!(
+                            "parent {} resolves to {} which is not a directory",
+                            ancestor.display(),
+                            resolved.display()
+                        ));
+                    }
+                }
+                TargetState::SymlinkIntoRepo => {
+                    // The symlink target cannot be read, so we cannot verify that the
+                    // parent resolves to a directory. Keep the conservative error.
+                    return Err(format!("parent {} is a symlink", ancestor.display()));
+                }
             }
         }
+        Ok(())
     }
 
     fn state_matches(
@@ -1379,6 +1383,19 @@ fn staged_store(path: &Path) -> Option<String> {
     None
 }
 
+/// Check that every ancestor of `target` is safe to create directories under.
+/// This is the per-operation re-check that runs after hooks, so a hook cannot
+/// swap in a repo-pointing symlink after the initial preflight has passed.
+fn check_ancestors_writable(
+    repo_root: &Path,
+    loaded: &Loaded,
+    platform: &Platform,
+    target: &Path,
+) -> Result<(), String> {
+    let state = PreflightState::new(repo_root, &loaded.config, platform);
+    state.parent_is_writable_dir(target)
+}
+
 /// Check that a target state matches the filesystem reality.
 fn check_target_state(path: &Path, expected: &TargetState) -> Result<(), String> {
     match expected {
@@ -1438,6 +1455,7 @@ fn preflight_op(
             source,
             requires,
         } => {
+            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             check_source_exists_for_preflight(repo_root, source)?;
@@ -1449,6 +1467,7 @@ fn preflight_op(
             source,
             requires,
         } => {
+            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             check_source_exists_for_preflight(repo_root, source)?;
@@ -1461,6 +1480,7 @@ fn preflight_op(
             source,
             requires,
         } => {
+            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             if !matches!(target_state, TargetState::RealEntry) {
@@ -1486,6 +1506,7 @@ fn preflight_op(
             source,
             requires,
         } => {
+            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             let target_path = Path::new(target);
@@ -1503,7 +1524,20 @@ fn preflight_op(
                             expected
                         ));
                     }
-                    if !linker::points_into_repo(target_path, repo_root) {
+                    // The link points exactly at `expected` (checked above).
+                    // Accept it as repo-owned if either the broad canonical
+                    // check resolves the link into the repo, or the exact-entry
+                    // check recognizes `expected` as a configured repo source.
+                    // The OR is needed because `expected` may be the canonical
+                    // readlink (whole-dir link, repo root reached through a
+                    // symlink — only the broad check matches) or a configured
+                    // source path that is itself a symlink resolving outside
+                    // the repo (source-symlink entry — only the exact-entry
+                    // check matches). This mirrors the remove_link_to /
+                    // remove_link checks used at execution time.
+                    if !(linker::points_into_repo(target_path, repo_root)
+                        || linker::points_at_source(target_path, Path::new(&expected), repo_root))
+                    {
                         return Err(format!(
                             "{} does not point into repo",
                             target_path.display()
@@ -2023,7 +2057,11 @@ fn validate_link_op(
             if rel_str.ends_with(render::TMPL_SUFFIX) {
                 return Err(format!("op {idx}: template source must use staged path"));
             }
-            if !ctx.repo_root.join(&source_store).join(&rel_str).is_file() {
+            let source = ctx.repo_root.join(&source_store).join(&rel_str);
+            if !std::fs::symlink_metadata(&source)
+                .map(|m| !m.file_type().is_dir())
+                .unwrap_or(false)
+            {
                 return Err(format!("op {idx}: source file does not exist: {rel_str}"));
             }
         }
