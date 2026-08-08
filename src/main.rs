@@ -391,7 +391,7 @@ fn cmd_init() -> Result<(), StitchError> {
     std::fs::create_dir_all(&stitch_dir)?;
 
     let authored_path = cwd.join("stitch.toml");
-    if authored_path.exists() {
+    if std::fs::symlink_metadata(&authored_path).is_ok() {
         return Err(StitchError::internal(format!(
             "config already exists at {}",
             authored_path.display()
@@ -399,8 +399,18 @@ fn cmd_init() -> Result<(), StitchError> {
     }
     // Refuse if a v0.2 repo is present — the user should `migrate`, not re-init.
     let legacy_path = stitch_dir.join("config.toml");
-    if legacy_path.exists() {
+    if std::fs::symlink_metadata(&legacy_path).is_ok() {
         return Err(StitchError::config(ConfigError::LegacyV02(legacy_path)));
+    }
+
+    // Refuse if the generated state already exists — `init` must not silently
+    // overwrite an existing link inventory.
+    let state_path = stitch_dir.join("state.toml");
+    if std::fs::symlink_metadata(&state_path).is_ok() {
+        return Err(StitchError::internal(format!(
+            "state already exists at {}",
+            state_path.display()
+        )));
     }
 
     // Authored half: written exactly once, with a header explaining it is the
@@ -1066,11 +1076,11 @@ fn cmd_add(
         // the store layout (whole-dir for dirs, single-file for files).
         let is_dir = source.is_dir();
         let target_str = if is_dir {
-            source.to_string_lossy().into_owned()
+            collapse_home(&source)
         } else {
             source
                 .parent()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(collapse_home)
                 .unwrap_or_else(|| "~".into())
         };
 
@@ -1479,13 +1489,15 @@ fn cmd_import(
             bucket.whole_dir_target = Some(target_str);
         } else {
             let source_rel = rest.to_string_lossy().into_owned();
-            // Target parent is where the file link lives; for file-mode the
-            // store target is that parent.
-            let parent = fl
-                .link
-                .parent()
-                .map(collapse_home)
-                .unwrap_or_else(|| target_str.clone());
+            // The store target is the directory that the source path is
+            // relative to. Strip the entire source-rel portion from where the
+            // symlink lives (so nested files like lua/plugin.lua resolve to
+            // the common target dir, e.g. ~/.config/nvim, not its immediate
+            // parent ~/.config/nvim/lua).
+            let Some(target_dir) = target_dir_for_file_link(&fl.link, &rest) else {
+                continue;
+            };
+            let parent = collapse_home(&target_dir);
             bucket.files.insert(source_rel, parent);
         }
     }
@@ -1641,6 +1653,33 @@ fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
     ca == cb
 }
 
+/// For a file-mode symlink, return the target directory by stripping the
+/// repo-relative source path from the end of the symlink's location.
+///
+/// `link` is where the symlink lives (e.g. `~/.config/nvim/lua/plugin.lua`);
+/// `source_rel` is its path inside the store (e.g. `lua/plugin.lua`). The
+/// result is the common directory the store is linked into
+/// (e.g. `~/.config/nvim`).
+fn target_dir_for_file_link(
+    link: &std::path::Path,
+    source_rel: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let link_comps: Vec<_> = link.components().collect();
+    let source_comps: Vec<_> = source_rel.components().collect();
+    if link_comps.len() < source_comps.len() {
+        return None;
+    }
+    let split = link_comps.len() - source_comps.len();
+    if link_comps[split..] != source_comps[..] {
+        return None;
+    }
+    let mut target = std::path::PathBuf::new();
+    for c in &link_comps[..split] {
+        target.push(c.as_os_str());
+    }
+    Some(target)
+}
+
 /// Collapse `$HOME` prefix to `~` for state.toml target strings.
 fn collapse_home(path: &std::path::Path) -> String {
     if let Some(home) = dirs::home_dir()
@@ -1732,7 +1771,7 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
     }
     // Refuse to overwrite an existing stitch.toml — a half-finished migrate
     // should not clobber the user's authored file.
-    if authored_path.exists() {
+    if std::fs::symlink_metadata(&authored_path).is_ok() {
         return Err(StitchError::internal(format!(
             "{} already exists — refusing to overwrite; remove it if you want to re-migrate",
             authored_path.display()
@@ -1743,11 +1782,19 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
     // so a .bak collision fails before touching anything, matching the
     // fail-before-mutate invariant the other writers uphold.
     let backup_path = legacy_path.with_extension("toml.bak");
-    if backup_path.exists() {
+    if std::fs::symlink_metadata(&backup_path).is_ok() {
         return Err(StitchError::internal(format!(
             "{} already exists — move it aside first (it's where the original \
              .stitch/config.toml would be backed up during migration)",
             backup_path.display()
+        )));
+    }
+    // Refuse to overwrite an existing state.toml — a half-finished migrate
+    // should not clobber the generated state file.
+    if std::fs::symlink_metadata(&state_path).is_ok() {
+        return Err(StitchError::internal(format!(
+            "{} already exists — refusing to overwrite; remove it if you want to re-migrate",
+            state_path.display()
         )));
     }
 
@@ -1758,6 +1805,11 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
         .map_err(|e| StitchError::config(ConfigError::Parse(e, legacy_path.clone())))?;
 
     let (authored, generated) = config::split_legacy(&legacy);
+
+    // Validate the split inventory before rendering, previewing, or writing.
+    // v0.2 accepted entries the new validator rejects (e.g. `./bashrc`); we
+    // must fail fast so migration does not create state that cannot load.
+    generated.validate()?;
 
     // Render both halves once: authored (with the read-only header prepended)
     // and generated (sorted + header-stamped). The state string is reused for
@@ -1965,12 +2017,12 @@ fn validate_render_spec(
 ) -> Result<(), StitchError> {
     if !config::is_safe_fragment(store_name) {
         return Err(StitchError::path_validation(format!(
-            "invalid store name '{store_name}': must be relative and contain no '..' or leading '/'"
+            "invalid store name '{store_name}': must be relative and contain no '.', '..' or leading '/'"
         )));
     }
     if !config::is_safe_fragment(source_rel) {
         return Err(StitchError::path_validation(format!(
-            "invalid source path '{source_rel}': must be relative and contain no '..' or leading '/'"
+            "invalid source path '{source_rel}': must be relative and contain no '.', '..' or leading '/'"
         )));
     }
     if !loaded.config.stores.contains_key(store_name) {

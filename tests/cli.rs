@@ -166,6 +166,80 @@ fn init_fails_on_v02_repo() {
         .stderr(contains("stitch migrate"));
 }
 
+#[test]
+fn init_fails_when_state_already_exists() {
+    // An existing .stitch/state.toml (e.g. from a script or partial migration)
+    // must not be silently overwritten.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let state = dir.path().join(".stitch").join("state.toml");
+    let original = "[stores.bash]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n";
+    fs::write(&state, original).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(contains("state already exists"));
+
+    // The pre-existing state must be preserved byte-for-byte.
+    let after = fs::read_to_string(&state).unwrap();
+    assert_eq!(
+        after, original,
+        "pre-existing state.toml must not be overwritten"
+    );
+}
+
+#[test]
+fn init_refuses_dangling_state_symlink() {
+    // A dangling .stitch/state.toml symlink must not be silently replaced
+    // by a regular file.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let state = dir.path().join(".stitch").join("state.toml");
+    std::os::unix::fs::symlink("some/nonexistent", &state).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(contains("state already exists"));
+
+    // The symlink is still a dangling symlink, not replaced by a regular file.
+    assert!(state.is_symlink(), "state.toml must remain a symlink");
+    assert_eq!(
+        fs::read_link(&state).unwrap(),
+        Path::new("some/nonexistent")
+    );
+    assert!(!state.exists(), "state.toml must still be dangling");
+}
+
+#[test]
+fn init_refuses_dangling_stitch_toml_symlink() {
+    // A dangling stitch.toml symlink must not be overwritten by `init`.
+    let dir = tempfile::tempdir().unwrap();
+    let authored = dir.path().join("stitch.toml");
+    std::os::unix::fs::symlink("some/nonexistent", &authored).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(contains("config already exists"));
+
+    assert!(authored.is_symlink(), "stitch.toml must remain a symlink");
+    assert_eq!(
+        fs::read_link(&authored).unwrap(),
+        Path::new("some/nonexistent")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // not in a repo
 // ---------------------------------------------------------------------------
@@ -1473,6 +1547,74 @@ fn add_adopt_dir_with_trailing_slash() {
 }
 
 #[test]
+fn add_adopt_dir_collapses_home_target() {
+    // state.toml must record the portable ~-collapsed target, not the raw
+    // machine-specific absolute path.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let src = home_path.join(".config").join("nvim");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("init.lua"), "vim config").unwrap();
+    let home_str = home_path.to_str().unwrap();
+
+    repo.cmd()
+        .args(["add", "~/.config/nvim"])
+        .env("HOME", home_str)
+        .assert()
+        .success()
+        .stdout(contains("Added store"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains(r#"target = "~/.config/nvim""#),
+        "state.toml must record ~-collapsed target:\n{state}"
+    );
+
+    // The symlink still resolves into the repo.
+    let link = home_path.join(".config").join("nvim");
+    assert!(link.is_symlink());
+    let resolved = fs::read_link(&link).unwrap();
+    assert!(resolved.starts_with(repo.path()));
+}
+
+#[test]
+fn add_adopt_file_collapses_home_target() {
+    // File-mode adopt must collapse the parent directory, not the file itself.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let parent = home_path.join(".config").join("myapp");
+    let src = parent.join(".myrc");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(&src, "data").unwrap();
+    let home_str = home_path.to_str().unwrap();
+
+    repo.cmd()
+        .args(["add", "~/.config/myapp/.myrc"])
+        .env("HOME", home_str)
+        .assert()
+        .success()
+        .stdout(contains("Added store"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains(r#"target = "~/.config/myapp""#),
+        "state.toml must record ~-collapsed parent target:\n{state}"
+    );
+    assert!(
+        state.contains(r#"".myrc""#),
+        "state.toml must record the adopted file:\n{state}"
+    );
+
+    let link = parent.join(".myrc");
+    assert!(link.is_symlink());
+    let resolved = fs::read_link(&link).unwrap();
+    assert!(resolved.starts_with(repo.path()));
+    assert_eq!(fs::read_to_string(&link).unwrap(), "data");
+}
+
+#[test]
 fn add_rejects_existing_symlink_at_target() {
     let repo = Repo::new();
     let src = repo.path().join("external").join("myrc");
@@ -1920,6 +2062,189 @@ target = "{target_str}"
         .stdout(contains("both target"));
 }
 
+#[test]
+fn doctor_warns_on_duplicate_targets_between_multi_target_stores() {
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("shared");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.make_store("a", &[]);
+    repo.make_store("b", &[]);
+    repo.write_state(&format!(
+        r#"
+[stores.a.targets.main]
+target = "{target_str}"
+
+[stores.b.targets.main]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(contains("both target"))
+        .stdout(contains("target 'main'"))
+        .stdout(contains("store 'a'"))
+        .stdout(contains("store 'b'"));
+}
+
+#[test]
+fn doctor_warns_on_duplicate_targets_single_and_multi_store() {
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("shared");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.make_store("a", &[]);
+    repo.make_store("b", &[]);
+    repo.write_state(&format!(
+        r#"
+[stores.a]
+target = "{target_str}"
+
+[stores.b.targets.main]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(contains("both target"))
+        .stdout(contains("store 'a'"))
+        .stdout(contains("target 'main' of store 'b'"));
+}
+
+#[test]
+fn doctor_allows_duplicate_targets_within_same_multi_target_store() {
+    // Same-store targets can share a path when their `when` clauses are
+    // mutually exclusive — only one applies per machine.
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("shared");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.make_store("a", &[]);
+    repo.write_authored(
+        r#"
+[stores.a.targets.main]
+when = { hostname = "laptop" }
+
+[stores.a.targets.alt]
+when = { hostname = "server" }
+"#,
+    );
+    repo.write_state(&format!(
+        r#"
+[stores.a.targets.main]
+target = "{target_str}"
+
+[stores.a.targets.alt]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(contains("both target").not());
+}
+
+#[test]
+fn doctor_allows_duplicate_target_across_mutually_exclusive_stores() {
+    // Different stores can share a target path when their store-level `when`
+    // clauses are mutually exclusive.
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("shared");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.make_store("a", &[]);
+    repo.make_store("b", &[]);
+    repo.write_authored(
+        r#"
+[stores.a]
+when = { hostname = "laptop" }
+
+[stores.b]
+when = { hostname = "server" }
+"#,
+    );
+    repo.write_state(&format!(
+        r#"
+[stores.a]
+target = "{target_str}"
+
+[stores.b]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(contains("both target").not());
+}
+
+#[test]
+fn doctor_warns_on_duplicate_targets_within_same_store_compatible_when() {
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("shared");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.make_store("a", &[]);
+    repo.write_state(&format!(
+        r#"
+[stores.a.targets.main]
+target = "{target_str}"
+
+[stores.a.targets.alt]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(contains("both target"))
+        .stdout(contains("targets 'main' and 'alt' of store 'a'"));
+}
+
+#[test]
+fn doctor_warns_on_duplicate_targets_for_platform_filtered_stores() {
+    // A duplicate target is a config problem, not a filesystem problem, so
+    // `doctor` must report it even when the current platform skips the stores.
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("shared");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.make_store("a", &[]);
+    repo.make_store("b", &[]);
+    repo.write_authored(
+        r#"
+[stores.a]
+when = { os = "macos" }
+
+[stores.b]
+when = { os = "macos" }
+"#,
+    );
+    repo.write_state(&format!(
+        r#"
+[stores.a]
+target = "{target_str}"
+
+[stores.b]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(contains("both target"))
+        .stdout(contains("store 'a'"))
+        .stdout(contains("store 'b'"));
+}
+
 // ---------------------------------------------------------------------------
 // doctor: orphaned-behavior detection (v0.3)
 // ---------------------------------------------------------------------------
@@ -2075,6 +2400,324 @@ target = "{target_str}"
     // Unchanged: single symlink to the whole dir.
     assert!(target.is_symlink());
     assert!(target.join("init.lua").exists());
+}
+
+/// A whole-dir store with a nested ignored file (e.g. `lua/secret.bak`) must
+/// promote to file mode and not symlink the ignored file into the target.
+#[test]
+fn whole_dir_promoted_when_nested_ignored_file() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+    let lua = store_dir.join("lua");
+    fs::create_dir_all(&lua).unwrap();
+    fs::write(lua.join("plugin.lua"), "plugin").unwrap();
+    fs::write(lua.join("secret.bak"), "secret").unwrap();
+
+    repo.write_authored(
+        r#"
+[stores.nvim]
+ignore = ["*.bak"]
+"#,
+    );
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.is_dir());
+    assert!(
+        !target.is_symlink(),
+        "promoted store must not be a whole-dir symlink"
+    );
+    assert!(target.join("init.lua").is_symlink());
+    assert!(target.join("lua").join("plugin.lua").is_symlink());
+    assert!(
+        !target.join("lua").join("secret.bak").exists(),
+        "nested ignored file must not be linked"
+    );
+}
+
+/// A promoted whole-dir store must not write a nested link through a foreign
+/// symlink ancestor. A foreign `<target>/lua` must be reported as a conflict,
+/// not silently followed.
+#[test]
+fn apply_conflicts_on_foreign_symlink_ancestor() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+    let lua = store_dir.join("lua");
+    fs::create_dir_all(&lua).unwrap();
+    fs::write(lua.join("plugin.lua"), "plugin").unwrap();
+    fs::write(lua.join("secret.bak"), "secret").unwrap();
+
+    repo.write_authored(
+        r#"
+[stores.nvim]
+ignore = ["*.bak"]
+"#,
+    );
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(&target).unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_dir = foreign.path().join("lua");
+    fs::create_dir_all(&foreign_dir).unwrap();
+    std::os::unix::fs::symlink(&foreign_dir, target.join("lua")).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    // The top-level file links, but the nested file was blocked and the
+    // foreign directory was not written through.
+    assert!(target.join("init.lua").is_symlink());
+    assert!(target.join("lua").is_symlink());
+    assert!(!foreign_dir.join("plugin.lua").exists());
+    assert!(!target.join("lua").join("plugin.lua").exists());
+}
+
+/// A whole-dir store with a nested ignored directory (e.g. `pack/plugins/foo/.git`)
+/// must promote to file mode and not symlink the ignored directory or its children.
+#[test]
+fn whole_dir_promoted_when_nested_ignored_dir() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+    let git = store_dir
+        .join("pack")
+        .join("plugins")
+        .join("foo")
+        .join(".git");
+    fs::create_dir_all(&git).unwrap();
+    fs::write(git.join("config"), "[core]\n").unwrap();
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.is_dir());
+    assert!(
+        !target.is_symlink(),
+        "promoted store must not be a whole-dir symlink"
+    );
+    assert!(target.join("init.lua").is_symlink());
+    assert!(
+        !target
+            .join("pack")
+            .join("plugins")
+            .join("foo")
+            .join(".git")
+            .exists(),
+        "nested ignored .git directory must not be linked"
+    );
+}
+
+/// A clean whole-dir store with nested but non-ignored content stays whole-dir.
+#[test]
+fn whole_dir_stays_with_deep_clean_nesting() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+    let lua = store_dir.join("lua");
+    fs::create_dir_all(&lua).unwrap();
+    fs::write(lua.join("plugin.lua"), "plugin").unwrap();
+    let pack = store_dir.join("pack").join("plugins").join("foo");
+    fs::create_dir_all(&pack).unwrap();
+    fs::write(pack.join("init.lua"), "foo init").unwrap();
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.is_symlink(), "clean nested store stays whole-dir");
+    assert!(target.join("init.lua").exists());
+    assert!(target.join("lua").join("plugin.lua").exists());
+    assert!(
+        target
+            .join("pack")
+            .join("plugins")
+            .join("foo")
+            .join("init.lua")
+            .exists()
+    );
+}
+
+// --- P1: preserve symlink sources when whole-dir promotion to file mode ---
+
+/// A whole-dir store with a nested ignored file and a non-ignored symlink
+/// source must promote to file mode without dropping the symlink.
+#[test]
+fn whole_dir_promoted_preserves_symlink_source() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+    std::os::unix::fs::symlink("init.lua", store_dir.join("init.vim")).unwrap();
+    fs::write(store_dir.join("secret.bak"), "secret").unwrap();
+
+    repo.write_authored(
+        r#"
+[stores.nvim]
+ignore = ["*.bak"]
+"#,
+    );
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.is_dir());
+    assert!(
+        !target.is_symlink(),
+        "promoted store must not be a whole-dir symlink"
+    );
+    assert!(target.join("init.lua").is_symlink());
+    assert!(target.join("init.vim").is_symlink());
+    assert_eq!(
+        std::fs::read_link(target.join("init.vim")).unwrap(),
+        store_dir.join("init.vim"),
+        "target link must point at the source symlink path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("init.vim")).unwrap(),
+        "contents of init.lua",
+        "following the target symlink must resolve through the source symlink"
+    );
+    assert!(
+        !target.join("secret.bak").exists(),
+        "ignored file must not be linked"
+    );
+}
+
+/// A dangling symlink source in a promoted whole-dir store must be carried to
+/// the target as-is, not dropped or resolved.
+#[test]
+fn whole_dir_promoted_preserves_dangling_symlink_source() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+    std::os::unix::fs::symlink("nonexistent", store_dir.join("dangling")).unwrap();
+    fs::write(store_dir.join("secret.bak"), "secret").unwrap();
+
+    repo.write_authored(
+        r#"
+[stores.nvim]
+ignore = ["*.bak"]
+"#,
+    );
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.is_dir());
+    assert!(
+        !target.is_symlink(),
+        "promoted store must not be a whole-dir symlink"
+    );
+    assert!(target.join("init.lua").is_symlink());
+    assert!(target.join("dangling").is_symlink());
+    assert!(
+        !target.join("dangling").exists(),
+        "dangling target link must remain dangling"
+    );
+    assert_eq!(
+        std::fs::read_link(target.join("dangling")).unwrap(),
+        store_dir.join("dangling"),
+        "target link must point at the dangling source symlink path"
+    );
+    assert!(
+        !target.join("secret.bak").exists(),
+        "ignored file must not be linked"
+    );
+}
+
+/// A promoted store with both nested regular files and a nested symlink should
+/// link all of them and skip only ignored content.
+#[test]
+fn whole_dir_promoted_links_nested_regular_files_and_symlinks() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("nvim", &["init.lua"]);
+    let lua = store_dir.join("lua");
+    fs::create_dir_all(&lua).unwrap();
+    fs::write(lua.join("plugin.lua"), "plugin").unwrap();
+    fs::write(lua.join("secret.bak"), "secret").unwrap();
+    std::os::unix::fs::symlink("plugin.lua", lua.join("plugin.vim")).unwrap();
+
+    repo.write_authored(
+        r#"
+[stores.nvim]
+ignore = ["*.bak"]
+"#,
+    );
+
+    let target = repo.path().join("home").join(".config").join("nvim");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(target.is_dir());
+    assert!(
+        !target.is_symlink(),
+        "promoted store must not be a whole-dir symlink"
+    );
+    assert!(target.join("init.lua").is_symlink());
+    assert!(target.join("lua").join("plugin.lua").is_symlink());
+    assert!(target.join("lua").join("plugin.vim").is_symlink());
+    assert_eq!(
+        std::fs::read_link(target.join("lua").join("plugin.vim")).unwrap(),
+        lua.join("plugin.vim"),
+        "nested symlink target must point at the source symlink path"
+    );
+    assert!(
+        !target.join("lua").join("secret.bak").exists(),
+        "ignored file must not be linked"
+    );
 }
 
 // --- Hooks (P1#8 C) ---
@@ -2955,6 +3598,189 @@ fn migrate_fails_before_writing_when_bak_exists() {
     );
 }
 
+/// migrate refuses to overwrite an existing state.toml and fails before
+/// writing anything — the fail-before-mutate invariant the other writers
+/// uphold. A pre-existing state.toml must be preserved and the legacy
+/// config must not be renamed.
+#[test]
+fn migrate_refuses_when_state_toml_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+    // Plant an existing state.toml that would be silently overwritten.
+    let state_path = dir.path().join(".stitch").join("state.toml");
+    fs::write(&state_path, "pre-existing state content\n").unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("state.toml"))
+        .stderr(contains("already exists"))
+        .stderr(contains("refusing to overwrite"));
+
+    // The pre-existing state.toml is preserved, not overwritten.
+    let state = fs::read_to_string(&state_path).unwrap();
+    assert_eq!(state, "pre-existing state content\n");
+
+    // No partial migration happened.
+    assert!(
+        !dir.path().join("stitch.toml").exists(),
+        "must not write stitch.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("config.toml.bak").exists(),
+        "must not create backup"
+    );
+    assert!(
+        dir.path().join(".stitch").join("config.toml").exists(),
+        "legacy config intact"
+    );
+}
+
+/// migrate refuses to overwrite a dangling .stitch/state.toml symlink.
+#[test]
+fn migrate_refuses_dangling_state_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+    let state_path = dir.path().join(".stitch").join("state.toml");
+    std::os::unix::fs::symlink("some/nonexistent", &state_path).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("state.toml"))
+        .stderr(contains("already exists"))
+        .stderr(contains("refusing to overwrite"));
+
+    // The dangling symlink is preserved.
+    assert!(state_path.is_symlink(), "state.toml must remain a symlink");
+    assert_eq!(
+        fs::read_link(&state_path).unwrap(),
+        Path::new("some/nonexistent")
+    );
+    assert!(!state_path.exists(), "state.toml must still be dangling");
+
+    // No partial migration happened.
+    assert!(
+        !dir.path().join("stitch.toml").exists(),
+        "must not write stitch.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("config.toml.bak").exists(),
+        "must not create backup"
+    );
+    assert!(
+        dir.path().join(".stitch").join("config.toml").exists(),
+        "legacy config intact"
+    );
+}
+
+/// migrate refuses to overwrite a dangling .stitch/config.toml.bak symlink.
+#[test]
+fn migrate_refuses_dangling_backup_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+    let backup = dir.path().join(".stitch").join("config.toml.bak");
+    std::os::unix::fs::symlink("some/nonexistent", &backup).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("config.toml.bak"))
+        .stderr(contains("already exists"));
+
+    // The dangling backup symlink is preserved.
+    assert!(backup.is_symlink(), "backup must remain a symlink");
+    assert_eq!(
+        fs::read_link(&backup).unwrap(),
+        Path::new("some/nonexistent")
+    );
+    assert!(!backup.exists(), "backup must still be dangling");
+
+    // No partial migration happened.
+    assert!(
+        !dir.path().join("stitch.toml").exists(),
+        "must not write stitch.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("state.toml").exists(),
+        "must not write state.toml"
+    );
+    assert!(
+        dir.path().join(".stitch").join("config.toml").exists(),
+        "legacy config intact"
+    );
+}
+
+/// migrate refuses to overwrite a dangling stitch.toml symlink.
+#[test]
+fn migrate_refuses_dangling_authored_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+    let authored = dir.path().join("stitch.toml");
+    std::os::unix::fs::symlink("some/nonexistent", &authored).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("stitch.toml"))
+        .stderr(contains("already exists"))
+        .stderr(contains("refusing to overwrite"));
+
+    // The dangling stitch.toml symlink is preserved.
+    assert!(authored.is_symlink(), "stitch.toml must remain a symlink");
+    assert_eq!(
+        fs::read_link(&authored).unwrap(),
+        Path::new("some/nonexistent")
+    );
+    assert!(!authored.exists(), "stitch.toml must still be dangling");
+
+    // No partial migration happened.
+    assert!(
+        !dir.path().join(".stitch").join("state.toml").exists(),
+        "must not write state.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("config.toml.bak").exists(),
+        "must not create backup"
+    );
+    assert!(
+        dir.path().join(".stitch").join("config.toml").exists(),
+        "legacy config intact"
+    );
+}
+
 /// migrate with nothing to migrate reports so.
 #[test]
 fn migrate_nothing_to_do() {
@@ -2968,6 +3794,75 @@ fn migrate_nothing_to_do() {
         .assert()
         .failure()
         .stderr(contains("nothing to migrate"));
+}
+
+/// migrate rejects v0.2 entries that the new validator would refuse (e.g.
+/// `files = ["./bashrc"]`) and fails *before* writing or backing up.
+#[test]
+fn migrate_rejects_invalid_file_fragment_before_mutating() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let original = "[stores.shells]\ntarget = \"~\"\nfiles = [\"./bashrc\"]\n";
+    fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("invalid file entry"))
+        .stderr(contains("./bashrc"));
+
+    // No partial migration: legacy is untouched, no new files written.
+    assert!(
+        !dir.path().join("stitch.toml").exists(),
+        "must not write stitch.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("state.toml").exists(),
+        "must not write state.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("config.toml.bak").exists(),
+        "must not create backup"
+    );
+    let legacy = fs::read_to_string(dir.path().join(".stitch").join("config.toml")).unwrap();
+    assert_eq!(legacy, original, "legacy config must be unchanged");
+}
+
+/// migrate --dry-run also rejects invalid v0.2 fragments before previewing.
+#[test]
+fn migrate_dry_run_rejects_invalid_file_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let original = "[stores.shells]\ntarget = \"~\"\nfiles = [\"./bashrc\"]\n";
+    fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["migrate", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains("invalid file entry"))
+        .stderr(contains("./bashrc"));
+
+    // Nothing is written in dry-run, and the legacy config is untouched.
+    assert!(
+        !dir.path().join("stitch.toml").exists(),
+        "must not write stitch.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("state.toml").exists(),
+        "must not write state.toml"
+    );
+    assert!(
+        !dir.path().join(".stitch").join("config.toml.bak").exists(),
+        "must not create backup"
+    );
+    let legacy = fs::read_to_string(dir.path().join(".stitch").join("config.toml")).unwrap();
+    assert_eq!(legacy, original, "legacy config must be unchanged");
 }
 
 // ---------------------------------------------------------------------------
@@ -3928,6 +4823,88 @@ files = ["gitconfig.tmpl"]
 }
 
 #[test]
+fn edit_linked_target_opens_source() {
+    // The standard post-apply state: the target is a symlink into the repo.
+    // `stitch edit <target_path>` must resolve back to the source, not the
+    // staged render or the symlink's own resolved path.
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    let tmpl = store.join("gitconfig.tmpl");
+    fs::write(&tmpl, "x={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let marker = repo.path().join("edited");
+    let editor = repo.path().join("fake-editor.sh");
+    fs::write(
+        &editor,
+        format!("#!/bin/sh\necho \"$1\" > {}\n", marker.to_string_lossy()),
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let entry_path = target.join("gitconfig");
+    let entry_str = entry_path.to_string_lossy().into_owned();
+    repo.cmd()
+        .env("EDITOR", &editor)
+        .args(["edit", &entry_str])
+        .assert()
+        .success();
+
+    let opened = fs::read_to_string(&marker).unwrap();
+    let opened = opened.trim();
+    assert!(
+        opened.ends_with("gitconfig.tmpl"),
+        "edit must open the .tmpl source, got {opened}"
+    );
+    assert!(
+        !opened.contains(".stitch/render"),
+        "edit must never open staging: {opened}"
+    );
+}
+
+#[test]
+fn edit_rejects_foreign_symlink() {
+    // A foreign symlink at the target must not be silently resolved to a repo
+    // source when the user runs `stitch edit` on it.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig"]);
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig"]
+"#
+    ));
+
+    fs::create_dir_all(&target).unwrap();
+
+    let foreign_tmp = tempfile::tempdir().unwrap();
+    let foreign = foreign_tmp.path().join("foreign");
+    fs::write(&foreign, "not ours\n").unwrap();
+    let link = target.join("gitconfig");
+    std::os::unix::fs::symlink(&foreign, &link).unwrap();
+
+    repo.cmd()
+        .args(["edit", &link.to_string_lossy()])
+        .assert()
+        .failure()
+        .stderr(contains("foreign"));
+}
+
+#[test]
 fn import_registers_existing_links() {
     let repo = Repo::new();
     // Build a store dir with a file, hand-create a symlink into a scan area.
@@ -3955,6 +4932,66 @@ fn import_registers_existing_links() {
         state.contains("target"),
         "state must have a target: {state}"
     );
+}
+
+#[test]
+fn import_registers_nested_file_links() {
+    let repo = Repo::new();
+
+    // Build a store with nested files under lua/.
+    let store = repo.path().join("nvim");
+    fs::create_dir_all(&store).unwrap();
+    for f in &["init.lua", "lua/plugin.lua", "lua/foo/bar.lua"] {
+        let p = store.join(f);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, format!("contents of {f}")).unwrap();
+    }
+
+    // Create hand-made symlinks for each file under a fake ~/.config/nvim.
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let target = home_path.join(".config").join("nvim");
+    for f in &["init.lua", "lua/plugin.lua", "lua/foo/bar.lua"] {
+        let link = target.join(f);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(store.join(f), &link).unwrap();
+    }
+
+    let home_str = home_path.to_str().unwrap();
+
+    repo.cmd()
+        .arg("import")
+        .arg("--scan-dir")
+        .arg(home_path.join(".config"))
+        .env("HOME", home_str)
+        .assert()
+        .success()
+        .stdout(contains("import 'nvim'"))
+        .stdout(contains("Imported 1"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("[stores.nvim]"),
+        "state must record nvim: {state}"
+    );
+    assert!(
+        state.contains(r#"target = "~/.config/nvim""#),
+        "state must record the common target dir: {state}"
+    );
+    for f in &["init.lua", "lua/plugin.lua", "lua/foo/bar.lua"] {
+        assert!(
+            state.contains(&format!("\"{f}\"")),
+            "state must record file {f}: {state}"
+        );
+    }
+
+    // The imported state must be directly re-applicable.
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .success()
+        .stdout(contains("Summary: 3 ok"));
 }
 
 // ---------------------------------------------------------------------------
@@ -4912,6 +5949,116 @@ files = [".bashrc"]
         .stdout(contains("Executed 1/1 ops"));
 
     assert!(home.join(".bashrc").is_symlink());
+}
+
+#[test]
+fn apply_plan_succeeds_when_parent_dir_is_symlink() {
+    // Regression for review item #5: `~/.config` is a symlink to a real
+    // directory *outside* the repository. `apply --plan` must resolve the
+    // symlinked parent, verify it points at a real directory, and still link
+    // through it. The symlink is introduced after the plan is captured so the
+    // plan-build phase does not see a foreign parent symlink as a conflict.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    // The resolved config directory lives outside the repo.
+    let external = tempfile::tempdir().unwrap();
+    let real_config = external.path().join("real_config");
+    fs::create_dir_all(&real_config).unwrap();
+
+    // Capture the plan while the parent is a real directory.
+    let config_link = home.join(".config");
+    fs::create_dir_all(&config_link).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        config_link.to_string_lossy(),
+    ));
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    // Replace the real parent with a foreign symlink before applying.
+    fs::remove_dir(&config_link).unwrap();
+    std::os::unix::fs::symlink(&real_config, &config_link).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Executed 1/1 ops"));
+
+    // The link should be visible through the symlinked parent and physically
+    // live in the resolved directory.
+    assert!(config_link.join(".bashrc").is_symlink());
+    assert!(real_config.join(".bashrc").is_symlink());
+    assert_eq!(
+        fs::read_link(config_link.join(".bashrc")).unwrap(),
+        repo.path().join("shells/.bashrc")
+    );
+}
+
+#[test]
+fn apply_plan_rejects_symlinked_parent_into_repo() {
+    // P1: a parent symlink that resolves *inside* the repo must be refused,
+    // otherwise the link is created inside another store/directory.
+    let repo = Repo::new();
+    let store_dir = repo.make_store("shells", &[]);
+    let nested = store_dir.join(".config");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join(".bashrc"), "contents").unwrap();
+
+    // Directory inside the repo that the parent symlink will resolve to.
+    let real_dir = repo.path().join("real_dir");
+    fs::create_dir_all(&real_dir).unwrap();
+
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let config_link = home.join(".config");
+    std::os::unix::fs::symlink(&real_dir, &config_link).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".config/.bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // Plan-build allows repo-pointing parent symlinks, so the plan is captured.
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("symlink into the repository"));
+
+    // No write-through: nothing was created or renamed inside real_dir.
+    assert!(!real_dir.join(".bashrc").exists());
+    assert!(!real_dir.join(".bashrc.bak").exists());
 }
 
 #[test]

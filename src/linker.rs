@@ -20,23 +20,53 @@ pub fn check_link(target: &Path, source: &Path) -> LinkStatus {
             if meta.file_type().is_symlink() {
                 match std::fs::read_link(target) {
                     Ok(resolved) => {
-                        let source_abs = if source.exists() {
-                            source
-                                .canonicalize()
-                                .unwrap_or_else(|_| source.to_path_buf())
-                        } else {
-                            source.to_path_buf()
-                        };
-                        let resolved_abs = if resolved.exists() {
-                            resolved.canonicalize().unwrap_or(resolved.clone())
-                        } else {
-                            resolved.clone()
-                        };
+                        let source_is_symlink = std::fs::symlink_metadata(source)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false);
 
-                        if resolved_abs == source_abs {
-                            LinkStatus::Linked
+                        if source_is_symlink {
+                            // The desired link points directly at the source
+                            // symlink entry, not through its target. Preserve
+                            // that indirection (including dangling or relative
+                            // targets) by comparing the link paths without
+                            // following the source symlink.
+                            let resolved_abs = if resolved.is_absolute() {
+                                resolved.clone()
+                            } else {
+                                target.parent().unwrap_or(Path::new(".")).join(&resolved)
+                            };
+                            let source_abs = if source.is_absolute() {
+                                source.to_path_buf()
+                            } else {
+                                std::env::current_dir()
+                                    .map(|cwd| cwd.join(source))
+                                    .unwrap_or_else(|_| source.to_path_buf())
+                            };
+
+                            if normalize_lexical(&resolved_abs) == normalize_lexical(&source_abs) {
+                                LinkStatus::Linked
+                            } else {
+                                LinkStatus::Broken(resolved)
+                            }
                         } else {
-                            LinkStatus::Broken(resolved)
+                            let source_abs = if source.exists() {
+                                source
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| source.to_path_buf())
+                            } else {
+                                source.to_path_buf()
+                            };
+                            let resolved_abs = if resolved.exists() {
+                                resolved.canonicalize().unwrap_or(resolved.clone())
+                            } else {
+                                resolved.clone()
+                            };
+
+                            if resolved_abs == source_abs {
+                                LinkStatus::Linked
+                            } else {
+                                LinkStatus::Broken(resolved)
+                            }
                         }
                     }
                     Err(_) => LinkStatus::Broken(PathBuf::from("(unreadable)")),
@@ -68,6 +98,40 @@ pub fn create_link(target: &Path, source: &Path) -> Result<(), LinkError> {
     let source_abs = source
         .canonicalize()
         .map_err(|e| LinkError::Canonicalize(e, source.to_path_buf()))?;
+
+    symlink(&source_abs, target).map_err(|e| LinkError::Create(e, target.to_path_buf()))?;
+
+    Ok(())
+}
+
+/// Create a symlink at an absent `target` pointing directly to the source
+/// filesystem entry, without following or canonicalizing `source`.
+///
+/// Use this when `source` is itself a symlink (or any directory entry whose
+/// identity matters). The link target is the absolute source path as given, so
+/// relative and dangling symlink targets are preserved faithfully. Callers must
+/// classify the target first (as with [`create_link`]).
+pub fn create_link_to_entry(target: &Path, source: &Path) -> Result<(), LinkError> {
+    // `symlink_metadata` does not follow symlinks, so a dangling source is
+    // still a valid entry. Regular `exists()` would reject it.
+    if std::fs::symlink_metadata(source).is_err() {
+        return Err(LinkError::SourceMissing(source.to_path_buf()));
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| LinkError::Mkdir(e, parent.to_path_buf()))?;
+    }
+
+    // The source is passed as an absolute path by all callers. Use it directly
+    // rather than canonicalizing; for a symlink source, canonicalization would
+    // collapse the indirection and fail for dangling targets.
+    let source_abs = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(source))
+            .map_err(|e| LinkError::Canonicalize(e, source.to_path_buf()))?
+    };
 
     symlink(&source_abs, target).map_err(|e| LinkError::Create(e, target.to_path_buf()))?;
 
@@ -123,7 +187,7 @@ pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
 /// Lexically normalize a path by collapsing `.` and `..` components without
 /// touching the filesystem. The result may still contain symlinks if the path
 /// does not exist — use `canonicalize` for existing paths.
-fn normalize_lexical(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
