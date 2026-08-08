@@ -1350,15 +1350,47 @@ fn cmd_remove(
             .map_err(|e| StitchError::hook("pre-remove", e))?;
     }
 
-    // Drop the entry from the generated half. stitch.toml behavior is deliberately
-    // left in place (the tool never rewrites authored config); `doctor` flags the
-    // orphaned behavior if the user wants to clean it up via `stitch edit`.
-    loaded.generated.stores.remove(name);
-
+    // Remove links before deleting state. If a link that was repo-owned when
+    // status_all ran can no longer be removed (e.g. it was repointed to a
+    // foreign target), preserve the store's state so the user can retry and
+    // do not claim the store was removed.
+    //
+    // Removal uses the exact-entry `remove_link_to` with the effective link
+    // source recorded by status_all, so a source-symlink entry that resolves
+    // outside the repo (still stitch-owned) is removed, while a link repointed
+    // to a foreign target between status and removal is left untouched.
     for entry in &linked {
-        linker::remove_link(&entry.target, root)?;
+        if !linker::remove_link_to(&entry.target, &entry.link_source, root)? {
+            match std::fs::symlink_metadata(&entry.target) {
+                // A symlink that no longer points into the repo is a foreign
+                // conflict: do not remove state and do not clobber it.
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(StitchError::conflict_foreign(
+                        &entry.target,
+                        std::fs::read_link(&entry.target).ok(),
+                    ));
+                }
+                // A real file or dir now occupies the target. Something
+                // replaced the symlink between status and removal; abort.
+                Ok(_) => {
+                    return Err(StitchError::conflict_real(&entry.target));
+                }
+                // The symlink is already gone (e.g. a pre-remove hook removed
+                // it). The goal is achieved, so keep removing other links.
+                Err(_) => {
+                    println!("  note: {} is already gone", entry.target.display());
+                    continue;
+                }
+            }
+        }
         println!("  removed {}", entry.target.display());
     }
+
+    // All links removed safely: now drop the generated state entry.
+    // stitch.toml behavior is deliberately left in place (the tool never
+    // rewrites authored config); `doctor` flags the orphaned behavior if the
+    // user wants to clean it up via `stitch edit`.
+    loaded.generated.stores.remove(name);
 
     // Staging is tool-owned: drop the store's render tree alongside its links.
     if let Err(e) = render::remove_store_staging(root, name) {
@@ -2093,4 +2125,153 @@ fn cmd_render(root: &std::path::Path, spec: &str, json: bool) -> Result<(), Stit
         .map_err(|e| StitchError::render(&source_path, e))?;
     print!("{content}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::platform::Platform;
+    use crate::store::ApplyOpts;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn remove_store_with_external_source_symlink_cleans_link_and_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let stitch = repo.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(repo.join("stitch.toml"), "").unwrap();
+        fs::write(stitch.join("state.toml"), "").unwrap();
+        fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        // External file that the repo source symlink will resolve to.
+        let external = tmp.path().join("external").join("real");
+        fs::create_dir_all(external.parent().unwrap()).unwrap();
+        fs::write(&external, "outside").unwrap();
+
+        // Store with one regular file and one source symlink to the external path.
+        let store_dir = repo.join("app");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("regular"), "regular").unwrap();
+        let source_alias = store_dir.join("alias");
+        symlink(&external, &source_alias).unwrap();
+
+        let target_dir = tmp.path().join("home").join("app");
+
+        let state = format!(
+            r#"
+[stores.app]
+target = "{}"
+files = ["regular", "alias"]
+"#,
+            target_dir.to_string_lossy()
+        );
+        fs::write(stitch.join("state.toml"), &state).unwrap();
+
+        // Apply creates the target links. `alias` points directly at the repo
+        // source entry, not through the source symlink.
+        let platform = Platform::detect();
+        let loaded = Config::load(repo).unwrap();
+        let store = loaded.config.stores.get("app").unwrap();
+        crate::store::apply_store(
+            repo,
+            "app",
+            store,
+            &platform,
+            &loaded.config.vars,
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(target_dir.join("regular").is_symlink());
+        assert!(target_dir.join("alias").is_symlink());
+        assert_eq!(
+            fs::read_link(target_dir.join("alias")).unwrap(),
+            source_alias
+        );
+        assert_eq!(
+            fs::read_to_string(target_dir.join("alias")).unwrap(),
+            "outside"
+        );
+
+        // `remove` must remove the target link and the state, then exit 0.
+        cmd_remove(repo, "app", false, false).unwrap();
+
+        assert!(
+            !target_dir.join("alias").exists(),
+            "target link must be gone"
+        );
+        let state_text = fs::read_to_string(stitch.join("state.toml")).unwrap();
+        assert!(
+            !state_text.contains("[stores.app]"),
+            "state entry must be removed"
+        );
+
+        // The repo source symlink is user config and must be untouched.
+        assert!(source_alias.is_symlink());
+    }
+
+    #[test]
+    fn remove_store_succeeds_when_pre_remove_hook_already_removed_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let stitch = repo.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(repo.join("stitch.toml"), "").unwrap();
+        fs::write(stitch.join("state.toml"), "").unwrap();
+        fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let store_dir = repo.join("app");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("regular"), "regular").unwrap();
+
+        let target_dir = tmp.path().join("home").join("app");
+
+        let state = format!(
+            r#"
+[stores.app]
+target = "{}"
+files = ["regular"]
+"#,
+            target_dir.to_string_lossy()
+        );
+        fs::write(stitch.join("state.toml"), &state).unwrap();
+
+        let platform = Platform::detect();
+        let loaded = Config::load(repo).unwrap();
+        let store = loaded.config.stores.get("app").unwrap();
+        crate::store::apply_store(
+            repo,
+            "app",
+            store,
+            &platform,
+            &loaded.config.vars,
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(target_dir.join("regular").is_symlink());
+
+        // Simulate a pre-remove hook (or an external process) that removes the
+        // target symlink before the remove loop runs.
+        fs::remove_file(target_dir.join("regular")).unwrap();
+
+        // `remove` must still succeed and delete the state, not error with a
+        // foreign-symlink conflict.
+        cmd_remove(repo, "app", false, false).unwrap();
+
+        let state_text = fs::read_to_string(stitch.join("state.toml")).unwrap();
+        assert!(
+            !state_text.contains("[stores.app]"),
+            "state entry must be removed"
+        );
+    }
 }

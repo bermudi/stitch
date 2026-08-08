@@ -138,13 +138,17 @@ pub fn create_link_to_entry(target: &Path, source: &Path) -> Result<(), LinkErro
     Ok(())
 }
 
-/// Whether the symlink at `target` resolves beneath `root`.
+/// Whether the symlink at `target` points beneath `root` by its *immediate
+/// hop* — the readlink is compared lexically (collapsing `.` and `..`
+/// components) without following further symlink chains.
 ///
 /// Relative symlink targets are resolved against the symlink's own parent
-/// directory. Returns `false` for non-symlinks or unreadable links. Existing
-/// paths are canonicalized to resolve symlink chains; dangling paths are
-/// compared after lexical normalization so ownership checks remain useful for
-/// stale links whose source was removed.
+/// directory. Returns `false` for non-symlinks or unreadable links. This is
+/// the narrow, store-scoped check: "does this link point at an entry inside
+/// this directory?" A link that points directly at a `root` entry is accepted
+/// even when that entry is itself a symlink to an external path (the
+/// indirection is not chased). Use [`points_into_repo`] for the broad,
+/// repo-scoped ownership decision that *does* follow the chain.
 pub fn points_into(target: &Path, root: &Path) -> bool {
     let Ok(resolved) = std::fs::read_link(target) else {
         return false;
@@ -155,16 +159,7 @@ pub fn points_into(target: &Path, root: &Path) -> bool {
         target.parent().unwrap_or(Path::new(".")).join(resolved)
     };
 
-    // If the path exists, canonicalize to resolve any symlink chains and `..`
-    // components. Fall back to lexical normalization if canonicalize fails
-    // (e.g. permission error) — never use an unnormalized path.
-    let normalized = if resolved_abs.exists() {
-        resolved_abs
-            .canonicalize()
-            .unwrap_or_else(|_| normalize_lexical(&resolved_abs))
-    } else {
-        normalize_lexical(&resolved_abs)
-    };
+    let normalized = normalize_lexical(&resolved_abs);
     let normalized_root = if root.exists() {
         root.canonicalize()
             .unwrap_or_else(|_| normalize_lexical(root))
@@ -175,13 +170,118 @@ pub fn points_into(target: &Path, root: &Path) -> bool {
     normalized.starts_with(&normalized_root)
 }
 
-/// Whether the symlink at `target` points into `repo_root`.
+/// Whether the symlink at `target` resolves beneath `repo_root`, following the
+/// full symlink chain.
 ///
-/// Distinguishes stitch-owned links (safe to replace/remove) from foreign ones
+/// This is the broad repo-ownership predicate that distinguishes stitch-owned
+/// links (safe to replace/remove) from foreign ones
 /// (stow/chezmoi/Nix/Home-Manager/hand-managed — must never be silently
-/// clobbered). This is the repo-scoped form of [`points_into`].
+/// clobbered). Ownership is *canonical*: a link that points *through* a repo
+/// gateway symlink to an external path (e.g. `home/file ->
+/// repo/gateway/victim` where `repo/gateway -> /external`) resolves outside the
+/// repo and is foreign, not repo-owned.
+///
+/// Resolvable targets are canonicalized (chasing the whole chain). Dangling
+/// targets are resolved as far as the filesystem allows — the longest existing
+/// prefix is canonicalized and the non-existent tail is appended and
+/// lexically normalized — so a link through a *resolvable* gateway to a
+/// non-existent victim is still classified as foreign, while a stale stitch
+/// link whose source entry was simply removed remains repo-owned and self-heals.
 pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
-    points_into(target, repo_root)
+    let Ok(resolved) = std::fs::read_link(target) else {
+        return false;
+    };
+    let resolved_abs = if resolved.is_absolute() {
+        resolved
+    } else {
+        target.parent().unwrap_or(Path::new(".")).join(resolved)
+    };
+
+    let normalized_root = if repo_root.exists() {
+        repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical(repo_root))
+    } else {
+        normalize_lexical(repo_root)
+    };
+
+    resolve_as_far_as_possible(&resolved_abs).starts_with(&normalized_root)
+}
+
+/// Whether the symlink at `target` points exactly at the repo entry
+/// `expected_source` — the exact-entry companion to the broad
+/// [`points_into_repo`].
+///
+/// A stitch-created link may point directly at a repo source entry that is
+/// itself a symlink resolving *outside* the repo (e.g. a file-mode store whose
+/// `alias` source is a symlink to `/external/real`). The broad canonical
+/// [`points_into_repo`] correctly classifies such a link as foreign, but since
+/// it points exactly at a configured repo entry it is stitch-owned and safe to
+/// manage. This compares the link's readlink against `expected_source` without
+/// following `expected_source` (so a symlink source — including a dangling one
+/// — is matched by its entry path) and requires `expected_source` to be inside
+/// `repo_root`.
+pub fn points_at_source(target: &Path, expected_source: &Path, repo_root: &Path) -> bool {
+    // The expected source must be a repo entry. `expected_source` is built by
+    // callers as `repo_root.join(<store-relative>)`, so it shares repo_root's
+    // path prefix — including when repo_root is itself accessed through a
+    // symlink. Compare lexically (collapsing `.`/`..`) rather than
+    // canonicalizing repo_root, which would diverge from the configured path
+    // in the symlinked-repo-root case. `..` escapes are rejected here by the
+    // normalization, and at the plan layer by fragment validation.
+    let root_norm = normalize_lexical(repo_root);
+    let source_abs = if expected_source.is_absolute() {
+        expected_source.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(expected_source)
+    };
+    if !normalize_lexical(&source_abs).starts_with(&root_norm) {
+        return false;
+    }
+    // check_link's source-symlink branch compares the readlink against the
+    // source entry lexically (without following it) — exactly the exact-entry
+    // semantics we want; for a regular source it canonicalizes both sides.
+    check_link(target, expected_source) == LinkStatus::Linked
+}
+
+/// Resolve `path` as far as the filesystem allows, following symlinks, then
+/// lexically normalize any non-existent trailing tail.
+///
+/// Unlike [`std::fs::canonicalize`], this never fails for a dangling path: the
+/// longest existing prefix is canonicalized (chasing symlinks) and the
+/// non-existent tail is appended and normalized. This catches links that point
+/// *through* a resolvable repo gateway symlink to an external path even when
+/// the final destination does not exist, while still keeping a stale stitch
+/// link whose source entry was simply removed beneath the repo.
+fn resolve_as_far_as_possible(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<PathBuf> = Vec::new();
+    // Walk up to the longest existing ancestor. `exists()` follows symlinks,
+    // so a dangling symlink component is treated as non-existent and walked
+    // past (a dangling gateway is indistinguishable from a removed entry).
+    while !existing.exists() {
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                tail.push(PathBuf::from(name));
+                existing = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    let base = if existing.exists() {
+        existing
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical(&existing))
+    } else {
+        normalize_lexical(&existing)
+    };
+    let mut full = base;
+    for component in tail.iter().rev() {
+        full.push(component);
+    }
+    normalize_lexical(&full)
 }
 
 /// Lexically normalize a path by collapsing `.` and `..` components without
@@ -212,16 +312,20 @@ pub fn remove_link(target: &Path, repo_root: &Path) -> Result<bool, LinkError> {
 }
 
 /// Remove `target` only when it still points exactly at `expected_source` in
-/// this repo. Used for whole-directory → file-mode promotion: a link repointed
-/// to another store between inspection and removal must remain untouched.
+/// this repo. Used for whole-directory → file-mode promotion and store removal:
+/// a link repointed to another store (or a foreign target) between inspection
+/// and removal must remain untouched.
+///
+/// Uses the exact-entry [`points_at_source`] check rather than the broad
+/// [`points_into_repo`], so a link pointing directly at a repo source entry
+/// that is itself a symlink resolving outside the repo is still recognized as
+/// stitch-owned and removed.
 pub fn remove_link_to(
     target: &Path,
     expected_source: &Path,
     repo_root: &Path,
 ) -> Result<bool, LinkError> {
-    if check_link(target, expected_source) != LinkStatus::Linked
-        || !points_into_repo(target, repo_root)
-    {
+    if !points_at_source(target, expected_source, repo_root) {
         return Ok(false);
     }
     std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
@@ -406,5 +510,199 @@ mod tests {
         std::os::unix::fs::symlink(repo.join("..").join("nonexistent"), &link).unwrap();
 
         assert!(!points_into_repo(&link, &repo));
+    }
+
+    #[test]
+    fn test_points_into_repo_rejects_source_symlink_resolving_outside() {
+        // Broad ownership is canonical: a link pointing at a repo source entry
+        // that is itself a symlink to an external path resolves outside the
+        // repo, so points_into_repo (the broad predicate) classifies it as
+        // foreign. The exact-entry points_at_source check handles the
+        // legitimate stitch-managed case (see test_points_at_source_*).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let store = repo.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let external = tmp.path().join("external").join("real");
+        std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+        std::fs::write(&external, "outside").unwrap();
+        let source = store.join("alias");
+        std::os::unix::fs::symlink(&external, &source).unwrap();
+
+        let target = tmp.path().join("target");
+        create_link_to_entry(&target, &source).unwrap();
+
+        assert!(
+            !points_into_repo(&target, &repo),
+            "broad canonical check must follow the source symlink out of the repo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "outside",
+            "following the target still resolves through the source symlink"
+        );
+    }
+
+    #[test]
+    fn test_points_into_repo_rejects_gateway_to_outside() {
+        // The reported P0: a hand-managed link that points *through* a repo
+        // gateway symlink to an external path must be foreign, not repo-owned.
+        //
+        //   repo/gateway -> /external
+        //   home/file    -> repo/gateway/victim
+        //
+        // The immediate-hop readlink is beneath the repo, but the chain
+        // resolves outside it. Broad canonical ownership must reject this.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let victim = external.join("victim");
+        std::fs::write(&victim, "foreign").unwrap();
+
+        let gateway = repo.join("gateway");
+        std::os::unix::fs::symlink(&external, &gateway).unwrap();
+
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let file = home.join("file");
+        std::os::unix::fs::symlink(gateway.join("victim"), &file).unwrap();
+
+        assert!(
+            !points_into_repo(&file, &repo),
+            "a link through a repo gateway to an external path is foreign"
+        );
+        // And the broad remove_link must refuse to clobber it.
+        assert!(!remove_link(&file, &repo).unwrap());
+        assert!(
+            file.is_symlink(),
+            "foreign gateway link must not be removed"
+        );
+    }
+
+    #[test]
+    fn test_points_into_repo_rejects_dangling_victim_through_gateway() {
+        // Same gateway shape, but the victim does not exist. The gateway
+        // itself resolves, so partial resolution still follows it out of the
+        // repo — the dangling-through-gateway link is foreign, not a stale
+        // stitch link.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+
+        let gateway = repo.join("gateway");
+        std::os::unix::fs::symlink(&external, &gateway).unwrap();
+
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let file = home.join("file");
+        std::os::unix::fs::symlink(gateway.join("gone"), &file).unwrap();
+
+        assert!(
+            !points_into_repo(&file, &repo),
+            "a dangling link through a resolvable gateway is still foreign"
+        );
+    }
+
+    #[test]
+    fn test_points_at_source_accepts_source_symlink_resolving_outside() {
+        // The exact-entry check recognizes a stitch-created link pointing
+        // directly at a repo source entry, even when that entry is a symlink
+        // resolving outside the repo.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let store = repo.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let external = tmp.path().join("external").join("real");
+        std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+        std::fs::write(&external, "outside").unwrap();
+        let source = store.join("alias");
+        std::os::unix::fs::symlink(&external, &source).unwrap();
+
+        let target = tmp.path().join("target");
+        create_link_to_entry(&target, &source).unwrap();
+
+        assert!(points_at_source(&target, &source, &repo));
+        // A link pointing elsewhere (through the gateway) is not at this source.
+        let other = tmp.path().join("home").join("other");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(gateway_victim(&repo), &other).unwrap();
+        assert!(!points_at_source(&other, &source, &repo));
+    }
+
+    #[test]
+    fn test_points_at_source_rejects_foreign_link_at_configured_target() {
+        // A foreign link sitting at a configured target location must not be
+        // mistaken for stitch-owned just because the expected source is a repo
+        // entry: the link does not point at it.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let store = repo.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let source = store.join("file");
+        std::fs::write(&source, "repo").unwrap();
+
+        let foreign_target = tmp.path().join("external").join("real");
+        std::fs::create_dir_all(foreign_target.parent().unwrap()).unwrap();
+        std::fs::write(&foreign_target, "foreign").unwrap();
+
+        let target = tmp.path().join("target");
+        std::os::unix::fs::symlink(&foreign_target, &target).unwrap();
+
+        assert!(
+            !points_at_source(&target, &source, &repo),
+            "a foreign link is not at the expected repo source"
+        );
+    }
+
+    #[test]
+    fn test_remove_link_to_removes_target_to_source_symlink_resolving_outside() {
+        // remove_link_to uses the exact-entry check, so a stitch-created link
+        // pointing at a source symlink (resolving outside the repo) is removed.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let store = repo.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let external = tmp.path().join("external").join("real");
+        std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+        std::fs::write(&external, "outside").unwrap();
+        let source = store.join("alias");
+        std::os::unix::fs::symlink(&external, &source).unwrap();
+
+        let target = tmp.path().join("target");
+        create_link_to_entry(&target, &source).unwrap();
+        assert!(target.is_symlink());
+
+        // remove_link (broad) refuses — the link resolves outside the repo.
+        assert!(
+            !remove_link(&target, &repo).unwrap(),
+            "broad remove_link must not touch a link resolving outside the repo"
+        );
+        assert!(target.is_symlink());
+
+        // remove_link_to (exact-entry) removes it: it points exactly at the
+        // configured repo source entry.
+        assert!(remove_link_to(&target, &source, &repo).unwrap());
+        assert!(target.symlink_metadata().is_err());
+    }
+
+    /// Helper: build `repo/gateway -> /external` and return `repo/gateway/x`.
+    fn gateway_victim(repo: &Path) -> PathBuf {
+        let tmp = repo.parent().unwrap();
+        let external = tmp.join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let gateway = repo.join("gateway");
+        if !gateway.exists() {
+            std::os::unix::fs::symlink(&external, &gateway).unwrap();
+        }
+        gateway.join("victim")
     }
 }

@@ -659,19 +659,17 @@ fn remove_empty_target_dir(target_path: &Path) -> Result<bool, String> {
 }
 
 /// Walk the ancestor directories of `target` between `target_root` (exclusive)
-/// and `target` (exclusive). Return the first that exists as a symlink and does
-/// not point into `repo_root`, along with its read-link target.
+/// and `target` (exclusive). Return the first that exists as a symlink, along
+/// with its read-link target.
 ///
 /// This is the nested-link safety guard: `create_dir_all` follows symlinks, so
-/// a foreign symlink at `<target>/lua` would cause `<target>/lua/plugin.lua` to
-/// be written into the foreign directory while `stitch` reports success. Every
-/// intermediate component is checked before linking; repo-pointing symlinks are
-/// allowed (stitch-managed territory), foreign symlinks are hard conflicts.
-fn foreign_ancestor(
-    target_root: &Path,
-    target: &Path,
-    repo_root: &Path,
-) -> Option<(PathBuf, Option<PathBuf>)> {
+/// a symlink at `<target>/lua` would cause `<target>/lua/plugin.lua` to be
+/// written through the link. Every intermediate component is checked before
+/// linking; any symlink ancestor is a hard conflict — even one that points into
+/// the repository — because writing through it can create links inside another
+/// store, move repository content to `.bak` under `--force`, or delete repo
+/// content through an aliased broken link.
+fn symlink_ancestor(target_root: &Path, target: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
     let mut ancestor = target.parent()?;
     while ancestor != target_root {
         if !ancestor.starts_with(target_root) {
@@ -679,7 +677,6 @@ fn foreign_ancestor(
         }
         if let Ok(meta) = std::fs::symlink_metadata(ancestor)
             && meta.file_type().is_symlink()
-            && !linker::points_into_repo(ancestor, repo_root)
         {
             let resolves_to = std::fs::read_link(ancestor).ok();
             return Some((ancestor.to_path_buf(), resolves_to));
@@ -706,10 +703,10 @@ fn apply_file_entry(
     let source_path = store_dir.join(&entry.source_rel);
     let target = target_path.join(&entry.link_rel);
 
-    // Safety: do not create a nested link through a foreign symlink ancestor.
-    // The target itself is handled by `apply_single_link`; this guards every
-    // intermediate parent directory.
-    if let Some((ancestor, resolves_to)) = foreign_ancestor(target_path, &target, repo_root) {
+    // Safety: do not create a nested link through any symlink ancestor, even
+    // one that points into the repository. The target itself is handled by
+    // `apply_single_link`; this guards every intermediate parent directory.
+    if let Some((ancestor, resolves_to)) = symlink_ancestor(target_path, &target) {
         return ApplyAction::Conflict {
             target: ancestor,
             resolves_to,
@@ -1055,7 +1052,7 @@ fn resolve_remove_source(
     store_name: &str,
     target: &Path,
 ) -> Option<String> {
-    if !target.is_symlink() || !linker::points_into_repo(target, repo_root) {
+    if !target.is_symlink() {
         return None;
     }
     // Whole-directory root removal: the link points exactly at the canonical
@@ -1064,8 +1061,21 @@ fn resolve_remove_source(
     if whole_dir_link_target(target, store_dir).is_some() {
         return Some(path_to_string(store_dir));
     }
-    // File-mode stale link: resolve back to the store-relative source.
-    resolve_link_source(repo_root, store_dir, store, store_name, target)
+    // File-mode stale link: resolve back to the store-relative source, then
+    // verify the link actually points at it (exact-entry). A foreign link
+    // sitting at a configured target location — or one pointing *through* a
+    // repo gateway symlink to outside the repo — fails the exact match and is
+    // not planned for removal. This replaces the old broad points_into_repo
+    // gate, which was too strict for source-symlink entries (a configured
+    // source that is itself a symlink resolving outside the repo) and too lax
+    // for gateway links (it classified them as repo-owned by immediate hop).
+    let candidate = resolve_link_source(repo_root, store_dir, store, store_name, target)?;
+    let expected = Path::new(&candidate);
+    if linker::points_at_source(target, expected, repo_root) {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn remove_requires(
@@ -1191,6 +1201,12 @@ pub struct StatusEntry {
     /// Never the staged render — status compares the *link* against the
     /// effective source (staging for templates).
     pub source: PathBuf,
+    /// The effective source the link is compared against (staging path for
+    /// templates, the repo source otherwise). Carried so removal can re-check
+    /// the exact entry — including source-symlink entries that resolve outside
+    /// the repo — via the exact-entry `remove_link_to` rather than the broad
+    /// `remove_link`.
+    pub link_source: PathBuf,
     pub target: PathBuf,
     pub status: LinkStatus,
     pub skipped_platform: bool,
@@ -1209,6 +1225,7 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                 store_name: name.clone(),
                 target_name: None,
                 source: PathBuf::new(),
+                link_source: PathBuf::new(),
                 target: PathBuf::new(),
                 status: LinkStatus::Missing,
                 skipped_platform: true,
@@ -1275,6 +1292,7 @@ fn collect_statuses(
                 store_name: name.to_string(),
                 target_name: target_name.map(str::to_owned),
                 source: store_dir.to_path_buf(),
+                link_source: store_dir.to_path_buf(),
                 target: target_path.to_path_buf(),
                 status: linker::check_link(target_path, store_dir),
                 skipped_platform: false,
@@ -1292,12 +1310,14 @@ fn collect_statuses(
                 } else {
                     repo_source.clone()
                 };
+                let status = linker::check_link(&target, &link_source);
                 entries.push(StatusEntry {
                     store_name: name.to_string(),
                     target_name: target_name.map(str::to_owned),
                     source: repo_source,
+                    link_source,
                     target: target.clone(),
-                    status: linker::check_link(&target, &link_source),
+                    status,
                     skipped_platform: false,
                     is_template: entry.is_template,
                 });
@@ -2127,10 +2147,8 @@ mod tests {
     }
 
     #[test]
-    fn test_foreign_ancestor_detects_foreign_symlink() {
+    fn test_symlink_ancestor_detects_foreign_symlink() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo_root = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo_root).unwrap();
         let target_root = tmp.path().join("target");
         std::fs::create_dir_all(&target_root).unwrap();
         let foreign = tmp.path().join("foreign");
@@ -2139,13 +2157,13 @@ mod tests {
 
         let target = target_root.join("lua").join("plugin.lua");
         let (ancestor, resolves_to) =
-            foreign_ancestor(&target_root, &target, &repo_root).expect("foreign ancestor found");
+            symlink_ancestor(&target_root, &target).expect("symlink ancestor found");
         assert_eq!(ancestor, target_root.join("lua"));
         assert_eq!(resolves_to, Some(foreign));
     }
 
     #[test]
-    fn test_foreign_ancestor_allows_repo_owned_symlink() {
+    fn test_symlink_ancestor_detects_repo_owned_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repo");
         let store = repo_root.join("nvim").join("lua");
@@ -2155,10 +2173,10 @@ mod tests {
         std::os::unix::fs::symlink(&store, target_root.join("lua")).unwrap();
 
         let target = target_root.join("lua").join("plugin.lua");
-        assert!(
-            foreign_ancestor(&target_root, &target, &repo_root).is_none(),
-            "repo-pointing ancestor must not block"
-        );
+        let (ancestor, resolves_to) =
+            symlink_ancestor(&target_root, &target).expect("symlink ancestor found");
+        assert_eq!(ancestor, target_root.join("lua"));
+        assert_eq!(resolves_to, Some(store));
     }
 
     #[test]
@@ -2228,6 +2246,156 @@ mod tests {
         assert!(target.join("init.lua").is_symlink());
         assert!(target.join("lua").is_symlink());
         assert!(!foreign.join("plugin.lua").exists());
+    }
+
+    #[test]
+    fn test_apply_store_blocks_nested_link_through_repo_owned_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store_dir = repo_root.join("nvim");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        let lua = store_dir.join("lua");
+        std::fs::create_dir_all(&lua).unwrap();
+        std::fs::write(lua.join("plugin.lua"), "plugin").unwrap();
+
+        // Another directory inside the repo that the ancestor symlink will resolve to.
+        let other = repo_root.join("other").join("lua");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let target = tmp.path().join("home").join(".config").join("nvim");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&other, target.join("lua")).unwrap();
+
+        let store = crate::config::Store {
+            target: Some(target.to_string_lossy().into_owned()),
+            files: Vec::new(),
+            patterns: vec!["**/*".into()],
+            ignore: Vec::new(),
+            when: crate::config::WhenClause::default(),
+            hooks: crate::config::Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let platform = crate::platform::Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: None,
+            hostname: "test".into(),
+            shell: "bash".into(),
+        };
+        let mut warnings = Vec::new();
+        let result = apply_store(
+            &repo_root,
+            "nvim",
+            &store,
+            &platform,
+            &BTreeMap::new(),
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut warnings,
+        );
+
+        // The nested entry must conflict on the repo-pointing ancestor.
+        let conflict = result
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                ApplyAction::Conflict {
+                    target,
+                    resolves_to,
+                } => Some((target.clone(), resolves_to.clone())),
+                _ => None,
+            })
+            .expect("expected conflict for repo-pointing ancestor");
+        assert_eq!(conflict.0, target.join("lua"));
+        assert_eq!(conflict.1, Some(other.clone()));
+
+        // The top-level link was created, but nothing was written through the
+        // repo-pointing symlink into the other store.
+        assert!(target.join("init.lua").is_symlink());
+        assert!(target.join("lua").is_symlink());
+        assert!(!other.join("plugin.lua").exists());
+        assert!(lua.join("plugin.lua").exists());
+    }
+
+    #[test]
+    fn test_apply_store_force_does_not_write_through_repo_owned_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store_dir = repo_root.join("nvim");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        let lua = store_dir.join("lua");
+        std::fs::create_dir_all(&lua).unwrap();
+        std::fs::write(lua.join("plugin.lua"), "nvim plugin").unwrap();
+
+        // Another directory inside the repo with an existing file at the
+        // aliased destination. `--force` must not back it up through the symlink.
+        let other = repo_root.join("other").join("lua");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_plugin = other.join("plugin.lua");
+        std::fs::write(&other_plugin, "other plugin").unwrap();
+
+        let target = tmp.path().join("home").join(".config").join("nvim");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&other, target.join("lua")).unwrap();
+
+        let store = crate::config::Store {
+            target: Some(target.to_string_lossy().into_owned()),
+            files: Vec::new(),
+            patterns: vec!["**/*".into()],
+            ignore: Vec::new(),
+            when: crate::config::WhenClause::default(),
+            hooks: crate::config::Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let platform = crate::platform::Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: None,
+            hostname: "test".into(),
+            shell: "bash".into(),
+        };
+        let mut warnings = Vec::new();
+        let result = apply_store(
+            &repo_root,
+            "nvim",
+            &store,
+            &platform,
+            &BTreeMap::new(),
+            ApplyOpts {
+                dry_run: false,
+                force: true,
+            },
+            &mut warnings,
+        );
+
+        let conflict = result
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                ApplyAction::Conflict {
+                    target,
+                    resolves_to,
+                } => Some((target.clone(), resolves_to.clone())),
+                _ => None,
+            })
+            .expect("expected conflict for repo-pointing ancestor even with --force");
+        assert_eq!(conflict.0, target.join("lua"));
+        assert_eq!(conflict.1, Some(other.clone()));
+
+        // No backup was created inside the repo and the existing file is unchanged.
+        assert!(!other.join("plugin.lua.bak").exists());
+        assert_eq!(
+            std::fs::read_to_string(&other_plugin).unwrap(),
+            "other plugin"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lua.join("plugin.lua")).unwrap(),
+            "nvim plugin"
+        );
     }
 
     #[test]

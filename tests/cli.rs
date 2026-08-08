@@ -698,6 +698,97 @@ target = "{target_str}"
     );
 }
 
+#[test]
+fn apply_does_not_clobber_gateway_foreign_symlink() {
+    // P0 regression: a hand-managed link that points *through* a repo gateway
+    // symlink to an external path must be a conflict, not silently replaced.
+    //
+    //   repo/gateway -> /external
+    //   home/file    -> repo/gateway/victim
+    //
+    // The immediate-hop readlink is beneath the repo, so the old lexical
+    // ownership check classified this link as repo-owned and apply silently
+    // replaced it. Broad canonical ownership follows the chain out of the repo
+    // and reports a conflict instead.
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    let target_dir = repo.path().join("home");
+    fs::create_dir_all(&target_dir).unwrap();
+
+    // Repo gateway symlink -> external dir with a real victim inside.
+    let external = tempfile::tempdir().unwrap();
+    fs::write(external.path().join("victim"), "foreign").unwrap();
+    let gateway = repo.path().join("gateway");
+    std::os::unix::fs::symlink(external.path(), &gateway).unwrap();
+
+    // Hand-managed link pointing through the gateway.
+    let target = target_dir.join("file");
+    std::os::unix::fs::symlink(gateway.join("victim"), &target).unwrap();
+
+    let target_str = target_dir.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+files = ["file"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    // The hand-managed link is untouched and still resolves through the gateway.
+    assert!(
+        target.is_symlink(),
+        "gateway foreign link must not be clobbered"
+    );
+    assert_eq!(fs::read_link(&target).unwrap(), gateway.join("victim"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "foreign");
+}
+
+#[test]
+fn apply_does_not_clobber_dangling_gateway_foreign_symlink() {
+    // Same gateway shape, but the victim does not exist. The gateway itself
+    // resolves, so partial resolution still follows it out of the repo — the
+    // dangling-through-gateway link is foreign, not a stale stitch link, and
+    // apply must not replace it.
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    let target_dir = repo.path().join("home");
+    fs::create_dir_all(&target_dir).unwrap();
+
+    let external = tempfile::tempdir().unwrap();
+    let gateway = repo.path().join("gateway");
+    std::os::unix::fs::symlink(external.path(), &gateway).unwrap();
+
+    let target = target_dir.join("file");
+    std::os::unix::fs::symlink(gateway.join("gone"), &target).unwrap();
+
+    let target_str = target_dir.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+files = ["file"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    assert!(
+        target.is_symlink(),
+        "dangling gateway link must not be clobbered"
+    );
+    assert_eq!(fs::read_link(&target).unwrap(), gateway.join("gone"));
+}
+
 // ---------------------------------------------------------------------------
 // apply --force (.bak backups)
 // ---------------------------------------------------------------------------
@@ -901,6 +992,36 @@ files = ["lua/init.lua"]
     repo.cmd().arg("apply").assert().success();
 
     assert!(target.join("lua").join("init.lua").is_symlink());
+}
+
+/// v0.7.0 accepted `files = ["./bashrc"]`; v0.7.1 regressed and rejected it
+/// at load time. Config validation must pass and the link must be created.
+#[test]
+fn apply_accepts_dot_slash_file_entries() {
+    let repo = Repo::new();
+    repo.make_store("shells", &["bashrc"]);
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{target_str}"
+files = ["./bashrc"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let link = target.join("bashrc");
+    assert!(link.is_symlink());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        repo.path()
+            .join("shells")
+            .join("bashrc")
+            .canonicalize()
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1971,6 +2092,147 @@ fn remove_missing_store_errors() {
         .assert()
         .failure()
         .stderr(contains("unknown store"));
+}
+
+/// P0 regression: a pre-remove hook repoints a store's link to a truly foreign
+/// target between `status_all` and the unlink. `remove` must refuse to clobber
+/// it, leave the repointed symlink untouched, and preserve the store's state
+/// entry because removal aborted before the generated state was saved.
+#[test]
+fn remove_refuses_foreign_repoint_after_status_collection() {
+    let repo = Repo::new();
+    repo.make_store("a", &["f"]);
+    let target = repo.path().join("home").join("file");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.a]
+target = "{target_str}"
+"#
+    ));
+
+    // A truly foreign target, outside the repo root.
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_path = foreign.path().join("foreign.txt");
+    fs::write(&foreign_path, "not ours").unwrap();
+    let foreign_str = foreign_path.to_string_lossy().into_owned();
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), repo.path().join("a"));
+
+    // Global pre-remove hook repoints the link after status collection.
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(
+        hooks_dir.join("pre-remove"),
+        format!(
+            "#!/bin/sh\nrm -f \"$STITCH_TARGET\" && ln -s \"{foreign_str}\" \"$STITCH_TARGET\"\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&hooks_dir.join("pre-remove"));
+
+    // Removal must fail with a foreign conflict, not clobber the repointed link.
+    repo.cmd()
+        .args(["remove", "a"])
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    // The repointed symlink is untouched and still points at the foreign path.
+    assert!(target.is_symlink(), "repointed symlink must remain");
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        foreign_path,
+        "repointed symlink must still point at the foreign target"
+    );
+
+    // The generated state entry must be preserved because removal aborted.
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state_text.contains("[stores.a]"),
+        "state entry must be preserved"
+    );
+    assert!(
+        state_text.contains(&target_str),
+        "state target must be preserved"
+    );
+}
+
+/// P0 regression: a pre-remove hook repoints a store's link to another store's
+/// source entry. The exact-entry guard must still refuse because the link no
+/// longer points at the store's own source, and removal must abort without
+/// touching the repointed link or deleting the store's state.
+#[test]
+fn remove_refuses_sibling_store_repoint_after_status_collection() {
+    let repo = Repo::new();
+    repo.make_store("a", &["f"]);
+    repo.make_store("b", &["g"]);
+    let target_a = repo.path().join("home").join("a");
+    let target_b = repo.path().join("home").join("b");
+    let target_a_str = target_a.to_string_lossy().into_owned();
+    let target_b_str = target_b.to_string_lossy().into_owned();
+    let b_source = repo.path().join("b");
+    let b_source_str = b_source.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.a]
+target = "{target_a_str}"
+
+[stores.b]
+target = "{target_b_str}"
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(target_a.is_symlink());
+    assert!(target_b.is_symlink());
+    assert_eq!(fs::read_link(&target_a).unwrap(), repo.path().join("a"));
+    assert_eq!(fs::read_link(&target_b).unwrap(), repo.path().join("b"));
+
+    // Global pre-remove hook repoints a's link to b's repo source.
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(
+        hooks_dir.join("pre-remove"),
+        format!(
+            "#!/bin/sh\nrm -f \"$STITCH_TARGET\" && ln -s \"{b_source_str}\" \"$STITCH_TARGET\"\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&hooks_dir.join("pre-remove"));
+
+    // The exact-source guard must reject the mismatch even though the new link
+    // still resolves into the repo.
+    repo.cmd()
+        .args(["remove", "a"])
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    assert!(target_a.is_symlink(), "repointed symlink must remain");
+    assert_eq!(
+        fs::read_link(&target_a).unwrap(),
+        b_source,
+        "repointed symlink must still point at store b's source"
+    );
+
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state_text.contains("[stores.a]"),
+        "state entry for a must be preserved"
+    );
+    assert!(
+        state_text.contains(&target_a_str),
+        "state target for a must be preserved"
+    );
+    assert!(
+        state_text.contains("[stores.b]"),
+        "state entry for b must be untouched"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3797,12 +4059,12 @@ fn migrate_nothing_to_do() {
 }
 
 /// migrate rejects v0.2 entries that the new validator would refuse (e.g.
-/// `files = ["./bashrc"]`) and fails *before* writing or backing up.
+/// `files = ["../escape"]`) and fails *before* writing or backing up.
 #[test]
 fn migrate_rejects_invalid_file_fragment_before_mutating() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".stitch")).unwrap();
-    let original = "[stores.shells]\ntarget = \"~\"\nfiles = [\"./bashrc\"]\n";
+    let original = "[stores.shells]\ntarget = \"~\"\nfiles = [\"../escape\"]\n";
     fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
 
     Command::cargo_bin("stitch")
@@ -3812,7 +4074,7 @@ fn migrate_rejects_invalid_file_fragment_before_mutating() {
         .assert()
         .failure()
         .stderr(contains("invalid file entry"))
-        .stderr(contains("./bashrc"));
+        .stderr(contains("../escape"));
 
     // No partial migration: legacy is untouched, no new files written.
     assert!(
@@ -3836,7 +4098,7 @@ fn migrate_rejects_invalid_file_fragment_before_mutating() {
 fn migrate_dry_run_rejects_invalid_file_fragment() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".stitch")).unwrap();
-    let original = "[stores.shells]\ntarget = \"~\"\nfiles = [\"./bashrc\"]\n";
+    let original = "[stores.shells]\ntarget = \"~\"\nfiles = [\"../escape\"]\n";
     fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
 
     Command::cargo_bin("stitch")
@@ -3846,7 +4108,7 @@ fn migrate_dry_run_rejects_invalid_file_fragment() {
         .assert()
         .failure()
         .stderr(contains("invalid file entry"))
-        .stderr(contains("./bashrc"));
+        .stderr(contains("../escape"));
 
     // Nothing is written in dry-run, and the legacy config is untouched.
     assert!(
@@ -3863,6 +4125,40 @@ fn migrate_dry_run_rejects_invalid_file_fragment() {
     );
     let legacy = fs::read_to_string(dir.path().join(".stitch").join("config.toml")).unwrap();
     assert_eq!(legacy, original, "legacy config must be unchanged");
+}
+
+/// v0.7.1 regressed and rejected harmless `./` file entries. They must migrate
+/// successfully and produce a loadable state.
+#[test]
+fn migrate_accepts_dot_slash_file_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let original = "[stores.shells]\ntarget = \"~\"\nfiles = [\"./bashrc\"]\n";
+    fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .success();
+
+    let state = fs::read_to_string(dir.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state.starts_with("# Generated by stitch"));
+    assert!(state.contains("[stores.shells]"));
+    assert!(state.contains("./bashrc"));
+
+    let backup = fs::read_to_string(dir.path().join(".stitch").join("config.toml.bak")).unwrap();
+    assert_eq!(backup, original, "legacy config must be preserved");
+
+    // The migrated repo must load (not repeat the v0.7.1 "invalid file entry" error).
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("shells"));
 }
 
 // ---------------------------------------------------------------------------
@@ -3994,6 +4290,43 @@ fn prune_ignores_foreign_symlink() {
         .stdout(contains("No orphaned links found."));
 
     assert!(foreign_link.is_symlink(), "foreign link untouched");
+}
+
+#[test]
+fn prune_does_not_remove_gateway_foreign_symlink() {
+    // P0 regression: a hand-managed link through a repo gateway symlink to an
+    // external path is foreign. scan must not classify it as repo-pointing, so
+    // prune --yes never lists or removes it — even though the immediate-hop
+    // readlink is beneath the repo.
+    //
+    //   repo/gateway -> /external
+    //   home/file    -> repo/gateway/victim
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+
+    let home = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    fs::write(external.path().join("victim"), "foreign").unwrap();
+    let gateway = repo.path().join("gateway");
+    std::os::unix::fs::symlink(external.path(), &gateway).unwrap();
+
+    let link = home.path().join("file");
+    std::os::unix::fs::symlink(gateway.join("victim"), &link).unwrap();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--yes")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .assert()
+        .success()
+        .stdout(contains("No orphaned links found."));
+
+    assert!(
+        link.is_symlink(),
+        "gateway foreign link must not be removed"
+    );
+    assert_eq!(fs::read_to_string(&link).unwrap(), "foreign");
 }
 
 /// No orphans → friendly message, success.
@@ -6013,7 +6346,7 @@ files = [".bashrc"]
 
 #[test]
 fn apply_plan_rejects_symlinked_parent_into_repo() {
-    // P1: a parent symlink that resolves *inside* the repo must be refused,
+    // P0: a parent symlink that resolves *inside* the repo must be refused,
     // otherwise the link is created inside another store/directory.
     let repo = Repo::new();
     let store_dir = repo.make_store("shells", &[]);
@@ -6028,7 +6361,6 @@ fn apply_plan_rejects_symlinked_parent_into_repo() {
     let home = repo.path().join("home");
     fs::create_dir_all(&home).unwrap();
     let config_link = home.join(".config");
-    std::os::unix::fs::symlink(&real_dir, &config_link).unwrap();
 
     repo.write_state(&format!(
         r#"
@@ -6039,7 +6371,8 @@ files = [".config/.bashrc"]
         home.to_string_lossy(),
     ));
 
-    // Plan-build allows repo-pointing parent symlinks, so the plan is captured.
+    // Capture the plan while the parent is a real directory.
+    fs::create_dir_all(&config_link).unwrap();
     let plan_path = repo.path().join("plan.json");
     let output = repo.cmd().arg("plan").output().unwrap();
     assert!(
@@ -6049,6 +6382,11 @@ files = [".config/.bashrc"]
     );
     fs::write(&plan_path, &output.stdout).unwrap();
 
+    // Replace the real parent with a repo-pointing symlink before execution.
+    fs::remove_dir(&config_link).unwrap();
+    std::os::unix::fs::symlink(&real_dir, &config_link).unwrap();
+
+    // The plan executor must refuse to write through the repo-pointing parent.
     repo.cmd()
         .args(["apply", "--plan", plan_path.to_str().unwrap()])
         .assert()
@@ -6056,9 +6394,191 @@ files = [".config/.bashrc"]
         .code(12)
         .stderr(contains("symlink into the repository"));
 
+    // Direct `apply` must also reject the repo-pointing parent as a conflict.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("conflict"));
+
     // No write-through: nothing was created or renamed inside real_dir.
     assert!(!real_dir.join(".bashrc").exists());
     assert!(!real_dir.join(".bashrc.bak").exists());
+}
+
+#[test]
+fn apply_plan_rejects_symlinked_higher_ancestor_into_repo() {
+    // P1: a higher ancestor (not just the immediate parent) that resolves
+    // *inside* the repo must be refused. The immediate parent is absent, so
+    // create_dir_all would follow the ancestor symlink and write into the repo.
+    let repo = Repo::new();
+    let store_dir = repo.make_store("shells", &[]);
+    let nested = store_dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("file"), "contents").unwrap();
+
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = ["nested/file"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // Capture the plan while home is a real directory and home/nested is absent.
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    // Create a directory inside the repo that the higher ancestor will resolve to.
+    let victim = repo.path().join("victim");
+    fs::create_dir_all(&victim).unwrap();
+
+    // Replace the higher ancestor with a repo-pointing symlink before execution.
+    fs::remove_dir(&home).unwrap();
+    std::os::unix::fs::symlink(&victim, &home).unwrap();
+
+    // The plan executor must refuse to write through the repo-pointing ancestor.
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("symlink into the repository"));
+
+    // No write-through: nothing was created or renamed inside the victim directory.
+    assert!(!victim.join("nested").join("file").exists());
+    assert!(!victim.join("nested").join("file.bak").exists());
+}
+
+#[test]
+fn apply_plan_preflight_rechecks_parent_after_hook_replaces_dir_with_repo_symlink() {
+    // A pre-apply hook can replace a real directory with a repo-pointing
+    // symlink after the initial preflight has passed. The per-op preflight must
+    // re-check ancestors and refuse to write through the new symlink.
+    let repo = Repo::new();
+    let store_dir = repo.make_store("shells", &[]);
+    let nested = store_dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("file"), "contents").unwrap();
+
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let victim = repo.path().join("victim");
+    fs::create_dir_all(&victim).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = ["nested/file"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // The store pre-hook replaces the real `home` directory with a symlink to
+    // `victim` (inside the repo) after the initial preflight has approved it.
+    let hook = format!(
+        "rm -rf {} && ln -s {} {}",
+        home.display(),
+        victim.display(),
+        home.display()
+    );
+    repo.write_authored(&format!(
+        r#"
+[stores.shells]
+hooks = {{ pre = "{}" }}
+"#,
+        hook
+    ));
+
+    // Capture the plan while home is still a real directory.
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    // Apply --plan: the store pre-hook runs between the initial preflight and
+    // the op, and the per-op preflight must reject the new repo-pointing symlink.
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("symlink into the repository"));
+
+    // No write-through: the hook must not have tricked the executor into the repo.
+    assert!(!victim.join("nested").join("file").exists());
+    assert!(!victim.join("nested").join("file.bak").exists());
+}
+
+#[test]
+fn apply_plan_supports_dangling_source_symlink() {
+    // P2: ordinary apply supports dangling source symlink entries (via
+    // create_link_to_entry + symlink_metadata), so an unchanged generated plan
+    // for such an entry must also execute. Previously plan validation used
+    // exists()/is_file() which follow the link and rejected dangling sources.
+    let repo = Repo::new();
+    let store_dir = repo.make_store("app", &["regular"]);
+    // A dangling source symlink: points at a non-existent path.
+    std::os::unix::fs::symlink("nonexistent", store_dir.join("alias")).unwrap();
+
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{}"
+files = ["regular", "alias"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // Capture the plan. Plan-build must succeed (ordinary apply supports this).
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    // Apply the unchanged plan. Must succeed, not fail with
+    // "source file does not exist: alias".
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // The target link for the dangling source must be created and point at the
+    // repo source entry (itself dangling).
+    let target_alias = home.join("alias");
+    assert!(target_alias.is_symlink());
+    assert!(
+        !target_alias.exists(),
+        "dangling target link must remain dangling"
+    );
+    assert_eq!(
+        std::fs::read_link(&target_alias).unwrap(),
+        store_dir.join("alias"),
+        "target link must point at the dangling source symlink path"
+    );
+    assert!(home.join("regular").is_symlink());
 }
 
 #[test]

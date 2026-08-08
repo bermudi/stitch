@@ -622,9 +622,15 @@ pub fn resolve_edit_source(
     // would break the prefix match against the configured target path and land
     // us in the repo or the staging tree. For foreign symlinks we must not
     // silently resolve to a repo source.
+    //
+    // Uses the narrow immediate-hop `points_into` (not the broad canonical
+    // `points_into_repo`): `edit` is read-only source resolution, not a
+    // destructive broad operation, and a link pointing directly at a repo
+    // source entry that is itself a symlink resolving outside the repo is
+    // still stitch-addressable.
     let expanded = match std::fs::symlink_metadata(&expanded) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            if !linker::points_into_repo(&expanded, repo_root) {
+            if !linker::points_into(&expanded, repo_root) {
                 return Err(format!(
                     "'{entry}' is a foreign symlink and does not point into this repo"
                 ));

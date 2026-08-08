@@ -254,3 +254,54 @@ but are worth fixing for defense-in-depth:
 - **Fix:** update the `macos`/`darwin` comment, remove dead Windows code, or
   gate with `cfg`. Effort: **S**.
 - Tracked in: `docs/plans/p2-and-hardening.md`.
+
+---
+
+## Post-review P0 — broad ownership check clobbers foreign symlinks (2026-08-08)
+
+**Resolved 2026-08-08.** A regression in the broad ownership predicate
+(`linker::points_into_repo`) classified a hand-managed link that points
+*through* a repo gateway symlink to an external path as repo-owned, so `apply`
+silently replaced it and `prune --yes` removed it:
+
+```text
+repo/gateway -> /external
+home/file    -> repo/gateway/victim   # resolves to /external/victim
+```
+
+The immediate-hop (lexical) readlink is beneath the repo, so the old check
+matched; the chain resolves outside it.
+
+**Fix — two-tier ownership (`src/linker.rs`):**
+- `points_into_repo` is now *canonical*: it follows the full symlink chain
+  (resolvable targets are canonicalized; dangling targets are resolved as far
+  as the filesystem allows via `resolve_as_far_as_possible`, so a link through
+  a *resolvable* gateway to a non-existent victim is still foreign). This is
+  the broad predicate used by `apply`'s Broken arm, `prune`/`scan`, and the
+  wildcard `remove_link`.
+- A new exact-entry `points_at_source(target, expected_source, repo_root)`
+  handles the special case where the configured source is itself a symlink
+  resolving outside the repo (a stitch-created link pointing directly at the
+  source entry is still stitch-owned). It backs `remove_link_to`, store
+  removal (`cmd_remove` via `StatusEntry::link_source`), removal planning
+  (`resolve_remove_source`), and the plan-exec `RemoveLink` preflight
+  (`points_into_repo || points_at_source`).
+- The narrow `points_into` (store/staging-scoped, immediate-hop) is unchanged;
+  `resolve_edit_source`'s foreign guard now uses it (edit is read-only, not a
+  broad destructive op).
+
+Covered by unit tests (`test_points_into_repo_rejects_gateway_to_outside`,
+`test_points_into_repo_rejects_dangling_victim_through_gateway`,
+`test_points_at_source_*`, `test_remove_link_to_removes_target_to_source_symlink_resolving_outside`)
+and CLI tests (`apply_does_not_clobber_gateway_foreign_symlink`,
+`apply_does_not_clobber_dangling_gateway_foreign_symlink`,
+`prune_does_not_remove_gateway_foreign_symlink`). The existing
+`remove_store_with_external_source_symlink_cleans_link_and_state` and
+`whole_dir_removal_from_symlinked_repo_root_executes` tests confirm the
+legitimate source-symlink and symlinked-repo-root paths still work.
+
+Residual (accepted, not a safety issue): broad operations that do not know the
+configured source — `add`/`adopt` rollback, `reconcile_store_links`, and
+`prune` for an *orphaned* source-symlink link whose store was removed — will
+leave such a link in place rather than remove it. This is a leak, never a
+clobber; the foreign-symlink red line is upheld.
