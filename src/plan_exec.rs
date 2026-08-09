@@ -1590,6 +1590,7 @@ fn is_dir_empty(path: &Path) -> bool {
 }
 
 fn replace_link_real_entry(
+    repo_root: &Path,
     target_path: &Path,
     source_path: &Path,
     idx: usize,
@@ -1621,7 +1622,7 @@ fn replace_link_real_entry(
 
     // Create the new symlink at a temporary path first so the original is not
     // removed until the link is known to work.
-    create_link_for_plan(&tmp_link, source_path)?;
+    create_link_for_plan(repo_root, &tmp_link, source_path)?;
 
     // Move the existing entry aside.
     if let Err(e) = std::fs::rename(target_path, &tmp_orig) {
@@ -1674,11 +1675,25 @@ fn is_symlink_source(source: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn create_link_for_plan(target: &Path, source: &Path) -> Result<(), String> {
-    if is_symlink_source(source) {
-        linker::create_link_to_entry(target, source).map_err(|e| e.to_string())
+fn create_link_for_plan(repo_root: &Path, target: &Path, source: &Path) -> Result<(), String> {
+    // Re-derive the configured source root at the mutation boundary so a hook
+    // cannot replace a source ancestor with a gateway into another store or
+    // outside the repo after plan preflight.
+    let source_root = if let Some(store) = staged_store(source) {
+        render::store_render_dir(repo_root, &store)
     } else {
-        linker::create_link(target, source).map_err(|e| e.to_string())
+        let store = source
+            .strip_prefix(repo_root)
+            .ok()
+            .and_then(|path| path.components().next())
+            .and_then(|component| component.as_os_str().to_str())
+            .ok_or_else(|| format!("source {} is not under a store", source.display()))?;
+        repo_root.join(store)
+    };
+    if is_symlink_source(source) {
+        linker::create_link_to_entry_in(target, source, &source_root).map_err(|e| e.to_string())
+    } else {
+        linker::create_link_in(target, source, &source_root).map_err(|e| e.to_string())
     }
 }
 
@@ -1715,7 +1730,7 @@ fn execute_op(
         PlanFileOp::CreateLink { target, source, .. } => {
             let target_path = Path::new(target);
             let source_path = Path::new(source);
-            create_link_for_plan(target_path, source_path)?;
+            create_link_for_plan(repo_root, target_path, source_path)?;
             Ok(())
         }
         PlanFileOp::ReplaceLink {
@@ -1736,10 +1751,10 @@ fn execute_op(
                     {
                         return Err(format!("{} was repointed", target_path.display()));
                     }
-                    create_link_for_plan(target_path, source_path)?;
+                    create_link_for_plan(repo_root, target_path, source_path)?;
                 }
                 TargetState::RealEntry => {
-                    replace_link_real_entry(target_path, source_path, idx)?;
+                    replace_link_real_entry(repo_root, target_path, source_path, idx)?;
                 }
                 _ => return Err("replace_link requires symlink_to or real_entry".into()),
             }
@@ -1772,7 +1787,7 @@ fn execute_op(
             }
 
             std::fs::rename(target_path, backup_path).map_err(|e| format!("{e}"))?;
-            if let Err(e) = create_link_for_plan(target_path, source_path) {
+            if let Err(e) = create_link_for_plan(repo_root, target_path, source_path) {
                 // Restore the original on failure.
                 let _ = std::fs::rename(backup_path, target_path);
                 return Err(e);
