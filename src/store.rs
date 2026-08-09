@@ -216,37 +216,51 @@ pub fn apply_store(
         // whole-dir target must see a skipped file-mode sibling that shares its
         // path; otherwise it could erase that sibling before its turn.
         for target_entry in store.targets.values() {
+            let target_path = config::expand_home(&target_entry.target);
             collect_reconciliation_keeps(
                 &store_dir,
-                &config::expand_home(&target_entry.target),
+                &target_path,
                 &target_entry.files,
                 &target_entry.patterns,
                 &target_entry.ignore,
                 &mut keep_links,
                 &mut target_keep_links,
             );
+            // Keep desired staged renders, but never scan a target whose path
+            // reaches back into the repo through an ancestor symlink.
+            if target_is_confined(&target_path, repo_root).is_err() {
+                target_keep_links.remove(&target_path);
+            }
         }
         for target_entry in store.targets.values() {
             if !platform.matches_when(&target_entry.when) {
                 continue;
             }
             let target_path = config::expand_home(&target_entry.target);
-            let target_link_rels = target_keep_links
-                .get(&target_path)
-                .unwrap_or(&empty_link_rels);
-            actions.extend(apply_target(
-                name,
-                &store_dir,
-                &target_path,
-                repo_root,
-                &target_entry.files,
-                &target_entry.patterns,
-                &target_entry.ignore,
-                target_link_rels,
-                platform,
-                vars,
-                opts,
-            ));
+            match target_is_confined(&target_path, repo_root) {
+                Ok(()) => {
+                    let target_link_rels = target_keep_links
+                        .get(&target_path)
+                        .unwrap_or(&empty_link_rels);
+                    actions.extend(apply_target(
+                        name,
+                        &store_dir,
+                        &target_path,
+                        repo_root,
+                        &target_entry.files,
+                        &target_entry.patterns,
+                        &target_entry.ignore,
+                        target_link_rels,
+                        platform,
+                        vars,
+                        opts,
+                    ));
+                }
+                Err(action) => {
+                    target_keep_links.remove(&target_path);
+                    actions.push(action);
+                }
+            }
         }
     } else if let Some(ref target_str) = store.target {
         let target_path = config::expand_home(target_str);
@@ -259,22 +273,33 @@ pub fn apply_store(
             &mut keep_links,
             &mut target_keep_links,
         );
-        let target_link_rels = target_keep_links
-            .get(&target_path)
-            .unwrap_or(&empty_link_rels);
-        actions.extend(apply_target(
-            name,
-            &store_dir,
-            &target_path,
-            repo_root,
-            &store.files,
-            &store.patterns,
-            &store.ignore,
-            target_link_rels,
-            platform,
-            vars,
-            opts,
-        ));
+        if target_is_confined(&target_path, repo_root).is_err() {
+            target_keep_links.remove(&target_path);
+        }
+        match target_is_confined(&target_path, repo_root) {
+            Ok(()) => {
+                let target_link_rels = target_keep_links
+                    .get(&target_path)
+                    .unwrap_or(&empty_link_rels);
+                actions.extend(apply_target(
+                    name,
+                    &store_dir,
+                    &target_path,
+                    repo_root,
+                    &store.files,
+                    &store.patterns,
+                    &store.ignore,
+                    target_link_rels,
+                    platform,
+                    vars,
+                    opts,
+                ));
+            }
+            Err(action) => {
+                target_keep_links.remove(&target_path);
+                actions.push(action);
+            }
+        }
     } else {
         actions.push(internal_error("no target configured"));
     }
@@ -674,6 +699,35 @@ fn remove_empty_target_dir(target_path: &Path) -> Result<bool, String> {
             target_path.display()
         )),
     }
+}
+
+/// Reject a target whose ancestors resolve back into the repo. External
+/// volume/gateway symlinks remain valid: only a canonical repo destination is
+/// confinement-breaking.
+fn target_is_confined(target: &Path, repo_root: &Path) -> Result<(), ApplyAction> {
+    let mut ancestor = target.parent();
+    while let Some(path) = ancestor {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta)
+                if meta.file_type().is_symlink() && linker::points_into_repo(path, repo_root) =>
+            {
+                return Err(ApplyAction::Conflict {
+                    target: path.to_path_buf(),
+                    resolves_to: std::fs::read_link(path).ok(),
+                });
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(internal_error(format!(
+                    "could not inspect target ancestor {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+        ancestor = path.parent();
+    }
+    Ok(())
 }
 
 /// Walk the ancestor directories of `target` between `target_root` (exclusive)
@@ -1822,47 +1876,49 @@ fn resolve_targets(
     Ok(targets)
 }
 
+/// Compile trailing-slash patterns as directory roots. A root match applies to
+/// every descendant, including when the root itself contains wildcards.
+fn build_directory_globset(patterns: &[String]) -> Option<GlobSet> {
+    let directories: Vec<String> = patterns
+        .iter()
+        .filter_map(|p| p.strip_suffix('/').map(str::to_owned))
+        .collect();
+    build_globset(&directories)
+}
+
+/// Whether `rel` is a directory-pattern root or a descendant of one.
+fn is_under_directory_pattern(rel: &str, is_dir: bool, globset: Option<&GlobSet>) -> bool {
+    let Some(globset) = globset else {
+        return false;
+    };
+    let mut components: Vec<&str> = rel.split('/').collect();
+    if !is_dir {
+        components.pop();
+    }
+    while !components.is_empty() {
+        if globset.is_match(components.join("/")) {
+            return true;
+        }
+        components.pop();
+    }
+    false
+}
+
 fn is_ignored_path(
     name: &str,
     rel: &str,
     is_dir: bool,
     globset: Option<&GlobSet>,
-    dir_patterns: &[&str],
+    directory_globset: Option<&GlobSet>,
 ) -> bool {
-    if let Some(g) = globset {
-        if g.is_match(name) || g.is_match(rel) {
-            return true;
-        }
-        if is_dir {
-            let rel_slash = format!("{rel}/");
-            if g.is_match(&rel_slash) {
-                return true;
-            }
-        }
-    }
-
-    for d in dir_patterns {
-        if rel.starts_with(d) {
-            return true;
-        }
-        if is_dir
-            && let Some(prefix) = d.strip_suffix('/')
-            && rel == prefix
-        {
-            return true;
-        }
-    }
-
-    false
+    globset.is_some_and(|g| {
+        g.is_match(name) || g.is_match(rel) || (is_dir && g.is_match(format!("{rel}/")))
+    }) || is_under_directory_pattern(rel, is_dir, directory_globset)
 }
 
 fn has_ignored_entry(store_dir: &Path, ignore: &[String]) -> bool {
     let ignore_glob = build_globset(ignore);
-    let ignore_dirs: Vec<&str> = ignore
-        .iter()
-        .filter(|p| p.ends_with('/'))
-        .map(|s| s.as_str())
-        .collect();
+    let ignore_dirs = build_directory_globset(ignore);
 
     for entry in walkdir::WalkDir::new(store_dir)
         .follow_links(false)
@@ -1882,7 +1938,7 @@ fn has_ignored_entry(store_dir: &Path, ignore: &[String]) -> bool {
             &rel_str,
             entry.file_type().is_dir(),
             ignore_glob.as_ref(),
-            &ignore_dirs,
+            ignore_dirs.as_ref(),
         ) {
             return true;
         }
@@ -1944,12 +2000,9 @@ fn resolve_files(
 
     // Walk the store directory recursively.
     let include_glob = build_globset(patterns);
+    let include_dirs = build_directory_globset(patterns);
     let ignore_glob = build_globset(ignore);
-    let ignore_dirs: Vec<&str> = ignore
-        .iter()
-        .filter(|p| p.ends_with('/'))
-        .map(|s| s.as_str())
-        .collect();
+    let ignore_dirs = build_directory_globset(ignore);
 
     let filter = |entry: &walkdir::DirEntry| -> bool {
         if entry.depth() == 0 {
@@ -1965,7 +2018,7 @@ fn resolve_files(
             &rel_str,
             entry.file_type().is_dir(),
             ignore_glob.as_ref(),
-            &ignore_dirs,
+            ignore_dirs.as_ref(),
         )
     };
 
@@ -1991,6 +2044,7 @@ fn resolve_files(
         if include_glob
             .as_ref()
             .is_some_and(|g| g.is_match(rel_str.as_ref()) || g.is_match(file_name.as_ref()))
+            || is_under_directory_pattern(rel_str.as_ref(), false, include_dirs.as_ref())
         {
             seen.insert(rel_str.into_owned());
         }
@@ -2140,6 +2194,23 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_files_trailing_wildcard_directory_patterns_are_recursive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("mystore");
+        std::fs::create_dir_all(store_dir.join("foo123/deep")).unwrap();
+        std::fs::create_dir_all(store_dir.join("other")).unwrap();
+        std::fs::write(store_dir.join("foo123/one.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("foo123/deep/two.conf"), "...").unwrap();
+        std::fs::write(store_dir.join("other/keep.conf"), "...").unwrap();
+
+        let included = resolve_files(&store_dir, &[], &["foo*/".into()], &[]);
+        assert_eq!(included, vec!["foo123/deep/two.conf", "foo123/one.conf"]);
+
+        let ignored = resolve_files(&store_dir, &[], &["*.conf".into()], &["foo*/".into()]);
+        assert_eq!(ignored, vec!["other/keep.conf"]);
+    }
+
+    #[test]
     fn test_resolve_files_ignore_recursive_wildcard() {
         let tmp = tempfile::tempdir().unwrap();
         let store_dir = tmp.path().join("mystore");
@@ -2203,6 +2274,113 @@ mod tests {
             symlink_ancestor(&target_root, &target).expect("symlink ancestor found");
         assert_eq!(ancestor, target_root.join("lua"));
         assert_eq!(resolves_to, Some(store));
+    }
+
+    #[test]
+    fn test_apply_store_rejects_repo_target_ancestor_without_reconciliation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store_dir = repo_root.join("nvim");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("active"), "active").unwrap();
+        std::fs::write(store_dir.join("stale"), "stale").unwrap();
+
+        let victim = repo_root.join("victim/.config");
+        std::fs::create_dir_all(&victim).unwrap();
+        let stale_target = victim.join("stale");
+        std::os::unix::fs::symlink(store_dir.join("stale"), &stale_target).unwrap();
+        let home = tmp.path().join("home");
+        std::os::unix::fs::symlink(repo_root.join("victim"), &home).unwrap();
+
+        let store = crate::config::Store {
+            target: Some(home.join(".config").to_string_lossy().into_owned()),
+            files: vec!["active".into()],
+            patterns: Vec::new(),
+            ignore: Vec::new(),
+            when: crate::config::WhenClause::default(),
+            hooks: crate::config::Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let platform = crate::platform::Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: None,
+            hostname: "test".into(),
+            shell: "bash".into(),
+        };
+        let result = apply_store(
+            &repo_root,
+            "nvim",
+            &store,
+            &platform,
+            &BTreeMap::new(),
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(matches!(
+            result.actions.as_slice(),
+            [ApplyAction::Conflict { target, .. }] if target == &home
+        ));
+        assert!(
+            stale_target.is_symlink(),
+            "unsafe target must not be scanned"
+        );
+        assert!(
+            !victim.join("active").exists(),
+            "must not write through home"
+        );
+    }
+
+    #[test]
+    fn test_apply_store_allows_external_target_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let store_dir = repo_root.join("nvim");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("init.lua"), "init").unwrap();
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let home = tmp.path().join("home");
+        std::os::unix::fs::symlink(&external, &home).unwrap();
+
+        let store = crate::config::Store {
+            target: Some(home.join(".config").to_string_lossy().into_owned()),
+            files: vec!["init.lua".into()],
+            patterns: Vec::new(),
+            ignore: Vec::new(),
+            when: crate::config::WhenClause::default(),
+            hooks: crate::config::Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let platform = crate::platform::Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: None,
+            hostname: "test".into(),
+            shell: "bash".into(),
+        };
+        let result = apply_store(
+            &repo_root,
+            "nvim",
+            &store,
+            &platform,
+            &BTreeMap::new(),
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(matches!(
+            result.actions.as_slice(),
+            [ApplyAction::Created(_)]
+        ));
+        assert!(external.join(".config/init.lua").is_symlink());
     }
 
     #[test]

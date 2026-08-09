@@ -959,6 +959,13 @@ fn cmd_add(
             "--json is not supported for add without --dry-run",
         ));
     }
+    if let Some(name) = name
+        && !config::is_store_name(name)
+    {
+        return Err(StitchError::path_validation(format!(
+            "invalid store name '{name}': store names must be exactly one normal path component"
+        )));
+    }
 
     let source = expand_home(path);
 
@@ -980,6 +987,11 @@ fn cmd_add(
     let store_name = name
         .clone()
         .unwrap_or_else(|| raw_name.trim_start_matches('.').to_string());
+    if !config::is_store_name(&store_name) {
+        return Err(StitchError::path_validation(format!(
+            "invalid store name '{store_name}': store names must be exactly one normal path component"
+        )));
+    }
     let store_dir = root.join(&store_name);
 
     // Pre-checks: reject any collision BEFORE mutating anything.
@@ -1835,6 +1847,7 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
     let contents = std::fs::read_to_string(&legacy_path)?;
     let legacy: config::LegacyConfig = toml::from_str(&contents)
         .map_err(|e| StitchError::config(ConfigError::Parse(e, legacy_path.clone())))?;
+    legacy.validate()?;
 
     let (authored, generated) = config::split_legacy(&legacy);
 
@@ -2135,6 +2148,47 @@ mod tests {
     use crate::store::ApplyOpts;
     use std::fs;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn add_rejects_nested_store_name_before_creating_a_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        fs::create_dir_all(repo.join(".stitch")).unwrap();
+        fs::write(repo.join("stitch.toml"), "").unwrap();
+        fs::write(repo.join(".stitch/state.toml"), "").unwrap();
+
+        let err = cmd_add(
+            repo,
+            &repo.join("target").to_string_lossy(),
+            &Some("nested/name".into()),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 9);
+        assert!(!repo.join("nested").exists());
+    }
+
+    #[test]
+    fn migrate_rejects_invalid_store_name_before_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let stitch = repo.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(
+            stitch.join("config.toml"),
+            "[stores.\"nested/name\"]\ntarget = \"~\"\n",
+        )
+        .unwrap();
+
+        let err = cmd_migrate(repo, false, false).unwrap_err();
+        assert_eq!(err.exit_code(), 9);
+        assert!(!repo.join("stitch.toml").exists());
+        assert!(!stitch.join("state.toml").exists());
+        assert!(!stitch.join("config.toml.bak").exists());
+    }
 
     #[test]
     fn remove_store_with_external_source_symlink_cleans_link_and_state() {

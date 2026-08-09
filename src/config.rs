@@ -261,6 +261,9 @@ impl Config {
         } else {
             AuthoredConfig::default()
         };
+        // Validate each half before merging: an authored-only store otherwise
+        // has no generated entry to force a later validation pass.
+        authored.validate()?;
 
         // Generated half: missing file = empty state.
         let generated = if state_path.exists() {
@@ -274,6 +277,7 @@ impl Config {
         } else {
             GeneratedState::default()
         };
+        generated.validate()?;
 
         let (mut config, merge_warnings) = merge(&authored, &generated);
         warnings.extend(merge_warnings);
@@ -292,6 +296,7 @@ impl Config {
     /// target dir. Operates on the merged view. Logic-unchanged from v0.2; the
     /// only mechanical delta is iterating a name-keyed map via `.values()`.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_store_names(self.stores.keys(), "merged config")?;
         for (name, store) in &self.stores {
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
             for te in store.targets.values() {
@@ -305,26 +310,24 @@ impl Config {
         Ok(())
     }
 
-    /// Normalize safe `files`/`patterns` fragments by stripping harmless
-    /// current-directory (`./`) components. This keeps the on-disk state
-    /// compatible while ensuring the in-memory view uses clean link names.
+    /// Normalize safe path fragments in the merged, in-memory view. This
+    /// keeps the on-disk files untouched: in particular, authored ignore rules
+    /// retain their comments and formatting while apply sees canonical paths.
     fn normalize(&mut self) {
         for store in self.stores.values_mut() {
-            store.files = store.files.iter().map(|f| normalize_fragment(f)).collect();
-            store.patterns = store
-                .patterns
-                .iter()
-                .map(|p| normalize_fragment(p))
-                .collect();
+            normalize_fragment_lists(&mut store.files, &mut store.patterns);
+            normalize_ignores(&mut store.ignore);
             for target in store.targets.values_mut() {
-                target.files = target.files.iter().map(|f| normalize_fragment(f)).collect();
-                target.patterns = target
-                    .patterns
-                    .iter()
-                    .map(|p| normalize_fragment(p))
-                    .collect();
+                normalize_fragment_lists(&mut target.files, &mut target.patterns);
+                normalize_ignores(&mut target.ignore);
             }
         }
+    }
+}
+
+impl AuthoredConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_store_names(self.stores.keys(), "authored config")
     }
 }
 
@@ -339,6 +342,7 @@ impl GeneratedState {
     /// it does not bleed into the caller's view (e.g. a `--dry-run` preview
     /// must not mutate the state that a subsequent real write would persist).
     fn render(&self) -> Result<String, ConfigError> {
+        self.validate()?;
         // Serialize through a sorted clone so ordering is canonical without
         // mutating self. toml::to_string_pretty over a BTreeMap emits keys in
         // sorted order; the Vec fields need an explicit sort.
@@ -374,6 +378,7 @@ impl GeneratedState {
     /// target dir. Mirrors [`Config::validate`], but runs on the generated
     /// inventory before `migrate` writes or previews the split state.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_store_names(self.stores.keys(), "generated state")?;
         for (name, store) in &self.stores {
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
             for target in store.targets.values() {
@@ -532,6 +537,14 @@ pub struct LegacyConfig {
     pub stores: BTreeMap<String, LegacyStore>,
 }
 
+impl LegacyConfig {
+    /// Validate legacy keys before splitting so migration never writes an
+    /// invalid authored or generated config.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_store_names(self.stores.keys(), "legacy config")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LegacyStore {
     #[serde(default)]
@@ -681,19 +694,38 @@ fn skip_if_default<T: Default + PartialEq>(t: &T) -> bool {
     t == &T::default()
 }
 
-/// Remove harmless current-directory (`./`) components from a fragment.
-///
-/// `is_safe_fragment` must already have accepted the fragment; this helper only
-/// strips `CurDir` components so the rest of the pipeline deals with normalized
-/// names (`bashrc` instead of `./bashrc`). It does not touch `..`, `RootDir`,
-/// or `Prefix` components.
-fn normalize_fragment(fragment: &str) -> String {
-    Path::new(fragment)
+/// Normalize a fragment without consulting the filesystem. Current-directory
+/// components and repeated separators disappear through `Path::components()`;
+/// directory patterns retain one trailing separator so their recursive meaning
+/// survives normalization.
+fn normalize_fragment(fragment: &str, preserve_trailing_separator: bool) -> String {
+    let mut normalized = Path::new(fragment)
         .components()
         .filter(|c| !matches!(c, Component::CurDir))
         .collect::<PathBuf>()
         .to_string_lossy()
-        .into_owned()
+        .into_owned();
+    if preserve_trailing_separator && fragment.ends_with('/') && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+fn normalize_fragment_lists(files: &mut [String], patterns: &mut [String]) {
+    for file in files {
+        *file = normalize_fragment(file, false);
+    }
+    for pattern in patterns {
+        *pattern = normalize_fragment(pattern, true);
+    }
+}
+
+/// Ignore patterns are authored and therefore never written back, but safe
+/// ones still need the same in-memory semantics as generated patterns.
+fn normalize_ignores(ignore: &mut [String]) {
+    for pattern in ignore.iter_mut().filter(|p| is_safe_fragment(p)) {
+        *pattern = normalize_fragment(pattern, true);
+    }
 }
 
 /// Whether `fragment` is safe to join onto a store or target directory.
@@ -722,6 +754,30 @@ pub fn is_safe_fragment(fragment: &str) -> bool {
         }
     }
     has_normal
+}
+
+/// Whether `name` is exactly one normal path component. Store names become
+/// repo directory names, so unlike file fragments they may not be nested.
+pub fn is_store_name(name: &str) -> bool {
+    if name.is_empty() || name.contains('/') {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn validate_store_names<'a>(
+    names: impl Iterator<Item = &'a String>,
+    source: &str,
+) -> Result<(), ConfigError> {
+    for name in names {
+        if !is_store_name(name) {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid store name '{name}' in {source}: store names must be exactly one normal path component"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Reject any `files`/`patterns` entry that is not a safe fragment.
@@ -1280,6 +1336,78 @@ mod tests {
     }
 
     // --- path-fragment validation (P1#6) — unchanged semantics ---
+
+    #[test]
+    fn test_is_store_name() {
+        assert!(is_store_name("shells"));
+        assert!(is_store_name(".hidden"));
+        for invalid in ["", ".", "..", "nested/name", "nested/", "/absolute"] {
+            assert!(!is_store_name(invalid), "{invalid:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_load_rejects_invalid_store_name_from_each_config_half() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch = tmp.path().join(".stitch");
+        std::fs::create_dir_all(&stitch).unwrap();
+        std::fs::write(tmp.path().join("stitch.toml"), "[stores.\"bad/name\"]\n").unwrap();
+        let err = Config::load(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("bad/name"));
+        assert!(err.to_string().contains("authored config"));
+
+        std::fs::write(tmp.path().join("stitch.toml"), "").unwrap();
+        std::fs::write(
+            stitch.join("state.toml"),
+            "[stores.\"bad/name\"]\ntarget = \"~\"\n",
+        )
+        .unwrap();
+        let err = Config::load(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("bad/name"));
+        assert!(err.to_string().contains("generated state"));
+    }
+
+    #[test]
+    fn test_load_normalizes_fragments_without_rewriting_authored_ignores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch = tmp.path().join(".stitch");
+        std::fs::create_dir_all(&stitch).unwrap();
+        let authored = r#"[stores.app]
+ignore = ["./cache//"]
+
+[stores.app.targets.work]
+ignore = ["./ignored*//"]
+"#;
+        std::fs::write(tmp.path().join("stitch.toml"), authored).unwrap();
+        std::fs::write(
+            stitch.join("state.toml"),
+            r#"[stores.app]
+target = "~"
+files = ["./dir//file/"]
+patterns = ["./foo*//"]
+
+[stores.app.targets.work]
+target = "~/.config/app"
+files = ["./work//file/"]
+patterns = ["./work*//"]
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load(tmp.path()).unwrap();
+        let store = &loaded.config.stores["app"];
+        assert_eq!(store.files, ["dir/file"]);
+        assert_eq!(store.patterns, ["foo*/"]);
+        assert_eq!(store.ignore, ["cache/"]);
+        let target = &store.targets["work"];
+        assert_eq!(target.files, ["work/file"]);
+        assert_eq!(target.patterns, ["work*/"]);
+        assert_eq!(target.ignore, ["ignored*/"]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("stitch.toml")).unwrap(),
+            authored
+        );
+    }
 
     #[test]
     fn test_is_safe_fragment() {
