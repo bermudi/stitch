@@ -55,6 +55,11 @@ target = "~/.config/git"
 | `files` | `state.toml` | inventory — what to link |
 | `patterns` | `state.toml` | inventory — what to link |
 
+Every `target` must be absolute after `~` expansion. `stitch add` accepts a
+relative command-line path but resolves it against the invocation directory
+before writing `state.toml`, so later commands never depend on their current
+working directory.
+
 ### Load-time merge
 
 A store is the union of its `stitch.toml` behavior and its `state.toml` inventory, merged by store name. A store present in only one file is legal:
@@ -140,11 +145,11 @@ Reconcile all stores. Creates missing symlinks, replaces broken ones, reports co
 | `--only` | `-o` | Apply only named stores (repeatable) |
 | `--dry-run` | | Preview without changes |
 | `--force` | | Back up real-file/dir conflicts to `{target}.bak`, then link |
-| `--plan <file>` | | Execute a previously captured plan file verbatim |
+| `--plan <file>` | | Validate and execute a previously captured plan file |
 
 ### `stitch plan`
 
-Capture the exact operation list `apply` would execute. Text mode prints the raw `stitch/plan` JSON to stdout; `--json` wraps it in the [standard envelope](#json-envelope). Exits non-zero when the captured plan contains conflicts or errors, so `stitch plan && stitch apply --plan p.json` forces a branch.
+Capture an executable operation list for `apply --plan`. Plan capture is intentionally stricter than direct apply: it rejects symlinked target ancestors (including external mount/gateway links) because an editable pathname-based plan cannot safely pin those traversals. Text mode prints the raw `stitch/plan` JSON to stdout; `--json` wraps it in the [standard envelope](#json-envelope). Exits non-zero when the captured plan contains conflicts or errors, so `stitch plan && stitch apply --plan p.json` forces a branch.
 
 | Flag | Short | Description |
 |---|---|---|
@@ -280,7 +285,7 @@ when a concrete fallback is needed.
 
 Files ending in `.tmpl` are rendered through minijinja and symlinked from a
 staging dir. Non-`.tmpl` files are symlinked directly. Detection is by suffix
-only — no content sniffing. Secrets (`{{ secret }}`) are v0.8.
+only — no content sniffing. Secrets (`{{ secret }}`) are planned for v0.9.
 
 | Expression | Description |
 |---|---|
@@ -291,21 +296,21 @@ only — no content sniffing. Secrets (`{{ secret }}`) are v0.8.
 | `{{ distro }}` | Distro ID; renders `none` when unavailable |
 | `{{ shell }}` | Login shell basename |
 | `{{ vars.key }}` | User-defined variable (`[vars]` in `stitch.toml`) |
-| `{{ secret("name") }}` | Encrypted secret (v0.8 — same render context) |
+| `{{ secret("name") }}` | Encrypted secret (planned for v0.9 — same render context) |
 
 Rendered files go to `.stitch/render/<store>/...` — **inside the repo**, so the
 symlink still satisfies `points_into_repo` and the existing `prune`/`remove`
 machinery works unchanged. (An earlier draft put staging at
 `~/.local/state/stitch/<repo-hash>/`; that location is *outside* the repo and
 would make every templated symlink look foreign to `remove_link`/`prune`, which
-both key off "symlink resolves into `repo_root`".) Secrets, when added in v0.8,
+both key off "symlink resolves into `repo_root`".) Secrets, when added in v0.9,
 live encrypted in `.stitch/secrets.enc`.
 
 Contract (rationale in `docs/plans/v0.6-templates.md`):
 
-- **Detection is by `.tmpl` suffix, at any depth** — deterministic from the directory entry alone, no content sniffing. A whole-dir store containing a `.tmpl` anywhere is promoted to file-mode resolution: one directory symlink becomes N per-file symlinks. Invisible for `~/.config/git`, observable for watched dirs (`conf.d`, systemd units, file watchers) — a documented behavioral consequence, not a surprise.
+- **Detection is by `.tmpl` suffix, at any depth** — deterministic from the directory entry alone, no content sniffing. A template source must be a direct regular file; symlinks and other special files are rejected before they can promote or replace a target. A whole-dir store containing a `.tmpl` anywhere is promoted to file-mode resolution: one directory symlink becomes N per-file symlinks. Invisible for `~/.config/git`, observable for watched dirs (`conf.d`, systemd units, file watchers) — a documented behavioral consequence, not a surprise.
 - **State records source names.** `state.toml` lists `gitconfig.tmpl`; apply/status/remove/diff strip the suffix through one shared resolution path (`resolve_entry`). A store file name is never used directly as a link target. A store containing both `foo` and `foo.tmpl` is rejected at resolution time.
-- **Staging is locked down from day one.** `.stitch/render/` is `0700`, rendered files `0600`. All rendering (apply and diff) happens in memory — no tempfile ever holds rendered plaintext under a default umask. Threat model: multi-user machines, shared CI runners, `env()` pulling tokens in v0.6, and encrypted secrets in v0.8 all read through these files. `init` appends `.stitch/render/` to the repo's `.gitignore`; an upgraded repo must add the entry manually before its first template apply. `apply` refuses to render without it, and `doctor` errors when templates or staged output make the entry relevant.
+- **Staging is locked down from day one.** `.stitch/render/` is `0700`, rendered files `0600`. All rendering (apply and diff) happens in memory — no tempfile ever holds rendered plaintext under a default umask. Threat model: multi-user machines, shared CI runners, `env()` pulling tokens in v0.6, and encrypted secrets planned for v0.9 all read through these files. `init` appends `.stitch/render/` to the repo's `.gitignore`; an upgraded repo must add the entry manually before its first template apply. `apply` refuses to render without it, and `doctor` errors when templates or staged output make the entry relevant.
 - **Failure model is per-entry.** A template error (parse failure, missing `env` key) fails that entry and skips its link — never created, never broken. Render is atomic and happens before linking, so staging is never half-written. `apply` continues with other entries and stores, exiting non-zero at the end if anything failed (same aggregation as conflicts).
 - **`diff` gains a content dimension for templated entries only**: a fresh in-memory render compared against the staged file — "would `apply` change anything?" Non-templated entries remain link-state-only.
 - **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed. Hand-edits inside `.stitch/render/` are unsupported and overwritten on the next `apply`; `doctor` flags drift (staged ≠ fresh render) so this is never silent. Writes are hash-gated: unchanged content preserves mtime.
@@ -663,17 +668,21 @@ Semantics:
 - **Abort semantics.** If an op fails, the report lists ops executed and
   remaining. The error is `plan-stale` (exit 12) when the failure is a changed
   precondition, or the original class for capture-time conflicts/errors.
-- **Hooks.** Global and per-store hooks are not themselves ops; they run from
-  the pinned config as part of execution, exactly as in a normal `apply`.
-- **Verbatim execution.** Combining `apply --plan` with `--only` or `--force`
-  is a usage error (exit 2). `--dry-run` runs the same validation without
-  mutating anything.
+- **Hooks.** Global hooks run from the pinned config. Per-store hooks run only
+  for stores owning executable plan operations; a converged store omitted from
+  `ops` does not run hooks. This prevents an edited `stores` list from becoming
+  authority to invoke an otherwise unrelated hook.
+- **Execution authority.** `apply --plan` rejects `--only`; the executable
+  stores are derived from the plan operations. A plan containing
+  `backup_and_link` additionally requires execution-time `--force`, so editable
+  JSON alone cannot authorize moving user data. `--dry-run` runs the same
+  validation without mutating anything.
 
 ### Schema stability
 
-JSON schemas for v0.7 are additive-only within the v0.7.x line. New fields may
-be added; existing field names and types will not change. The shapes are locked
-by the golden tests in `tests/cli.rs`.
+The executable plan schema is `2`; schema-1 plans must be recaptured. Plan
+schema changes require a new minor or major release, and the shapes are locked
+by golden tests in `tests/cli.rs`.
 
 ## Roadmap
 
@@ -723,15 +732,23 @@ below; planned milestones are renumbered to avoid collision.
 Machine-readable verification and branchable failures for agent/scripted use.
 See `docs/plans/v0.7-agent-interface.md`.
 - [x] `--json` on read/plan commands; typed `doctor` findings; `stitch render`
-- [x] `stitch plan` → `stitch apply --plan` — captured op list, verbatim
-      execution with preconditions (no re-derivation)
+- [x] `stitch plan` → `stitch apply --plan` — captured op list with
+      preconditions and fresh safety validation before execution
 - [x] Distinct exit codes per failure class + resolution hints
 
-### v0.8 — Encrypted secrets (planned, split out — separate trust surface)
+### ✅ v0.8 — Filesystem trust hardening (shipped)
+- [x] Plan schema 2 with explicit stale-removal ownership and execution-time
+      force authority
+- [x] POSIX-correct gateway symlink ownership and source/target confinement
+- [x] Exclusive private render staging with strict file-type checks
+- [x] Config/store/path normalization and reserved-name validation
+- [x] Explicit race boundary; no hidden quarantine artifacts
+
+### v0.9 — Encrypted secrets (planned, split out — separate trust surface)
 - [ ] `age` or XChaCha20-Poly1305; `.stitch/secrets.enc`
 - [ ] Key management + threat model (red lines: no external upload, no data exposure)
 
-### v0.9 — TUI (planned)
+### v0.10 — TUI (planned)
 - [ ] Interactive dashboard (ratatui)
 - [ ] Command palette
 - [ ] Activity log

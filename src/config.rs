@@ -8,6 +8,7 @@
 //! the authored file — every mutation (`add`/`remove`) writes
 //! `state.toml` only.
 
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -298,11 +299,24 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_store_names(self.stores.keys(), "merged config")?;
         for (name, store) in &self.stores {
+            if let Some(target) = &store.target {
+                validate_target_absolute(target, &format!("store '{name}'"))?;
+            }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            validate_globs(&store.patterns, &store.ignore, &format!("store '{name}'"))?;
             for te in store.targets.values() {
+                validate_target_absolute(
+                    &te.target,
+                    &format!("store '{name}' (target '{}')", te.target),
+                )?;
                 validate_fragments(
                     &te.files,
                     &te.patterns,
+                    &format!("store '{name}' (target '{}')", te.target),
+                )?;
+                validate_globs(
+                    &te.patterns,
+                    &te.ignore,
                     &format!("store '{name}' (target '{}')", te.target),
                 )?;
             }
@@ -324,6 +338,18 @@ impl Config {
             }
         }
     }
+}
+
+/// Validate authored and generated halves exactly as a subsequent load will.
+/// Migration uses this before either output file is written.
+pub fn validate_merged(
+    authored: &AuthoredConfig,
+    generated: &GeneratedState,
+) -> Result<(), ConfigError> {
+    authored.validate()?;
+    generated.validate()?;
+    let (config, _) = merge(authored, generated);
+    config.validate()
 }
 
 impl AuthoredConfig {
@@ -381,39 +407,83 @@ impl GeneratedState {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_store_names(self.stores.keys(), "generated state")?;
         for (name, store) in &self.stores {
+            if let Some(target) = &store.target {
+                validate_target_absolute(target, &format!("store '{name}'"))?;
+            }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            validate_globs(&store.patterns, &[], &format!("store '{name}'"))?;
             for target in store.targets.values() {
-                validate_fragments(
-                    &target.files,
-                    &target.patterns,
+                validate_target_absolute(
+                    &target.target,
                     &format!("store '{name}' (target '{}')", target.target),
                 )?;
+                let context = format!("store '{name}' (target '{}')", target.target);
+                validate_fragments(&target.files, &target.patterns, &context)?;
+                validate_globs(&target.patterns, &[], &context)?;
             }
         }
         Ok(())
     }
 }
 
-/// Atomically write `contents` to `path` via a temp file in the same directory
-/// then rename. On Linux `rename(2)` is atomic for same-filesystem paths, so
-/// the destination is never truncated or partially written, and the temp file
-/// is fsynced before the rename so a crash leaves either the old file or the
-/// fully-durable new one. The PID-suffixed temp name avoids collisions between
-/// concurrent stitch processes (stitch is single-threaded, so within one
-/// process there are no parallel writers). The temp file is cleaned up on any
-/// error.
-pub fn atomic_write(path: &Path, contents: &str) -> Result<(), ConfigError> {
-    let dir = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e, dir.clone()))?;
+/// Validate an existing atomic-write destination without mutating it.
+pub fn validate_atomic_write_target(path: &Path) -> Result<(), ConfigError> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| ConfigError::Write(e, dir.into()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(ConfigError::Write(
+            std::io::Error::other("refusing non-directory or symlinked state parent"),
+            dir.into(),
+        ));
+    }
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(ConfigError::Write(
             std::io::Error::other("refusing to replace symlinked state file"),
             path.to_path_buf(),
         ));
     }
+    Ok(())
+}
+
+/// Atomically write `contents` to `path` via a temp file in the same directory
+/// then rename. On Linux `rename(2)` is atomic for same-filesystem paths, so
+/// the destination is never truncated or partially written. The file is synced
+/// before the rename and its parent directory after it. A parent-directory sync
+/// failure is reported as a committed write: callers must not roll back work
+/// that the renamed state file already records. The exclusive random temp name
+/// avoids collisions between concurrent stitch processes. The temp file is
+/// cleaned up on errors before the rename.
+pub fn atomic_write(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    // State must never be written through a pre-existing symlinked parent
+    // (notably a hostile `.stitch -> elsewhere`). The final-syscall race is
+    // outside stitch's same-UID threat model, but all state observed before
+    // the operation is rejected rather than followed.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(ConfigError::Write(
+                std::io::Error::other("refusing non-directory or symlinked state parent"),
+                dir,
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e, dir.clone()))?;
+            let meta =
+                std::fs::symlink_metadata(&dir).map_err(|e| ConfigError::Write(e, dir.clone()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(ConfigError::Write(
+                    std::io::Error::other("refusing non-directory or symlinked state parent"),
+                    dir,
+                ));
+            }
+        }
+        Err(e) => return Err(ConfigError::Write(e, dir)),
+    }
+    validate_atomic_write_target(path)?;
     let prefix = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
@@ -440,7 +510,12 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<(), ConfigError> {
             .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
         f.sync_all()
             .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
-        std::fs::rename(&tmp_path, path).map_err(|e| ConfigError::Write(e, path.to_path_buf()))
+        std::fs::rename(&tmp_path, path).map_err(|e| ConfigError::Write(e, path.to_path_buf()))?;
+        let directory = std::fs::File::open(&dir)
+            .map_err(|e| ConfigError::CommittedWrite(e, path.to_path_buf()))?;
+        directory
+            .sync_all()
+            .map_err(|e| ConfigError::CommittedWrite(e, path.to_path_buf()))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
@@ -787,29 +862,66 @@ pub fn is_store_name(name: &str) -> bool {
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
+fn validate_target_absolute(target: &str, context: &str) -> Result<(), ConfigError> {
+    if !expand_home(target).is_absolute() {
+        return Err(ConfigError::InvalidPath(format!(
+            "invalid target '{target}' in {context}: targets must expand to absolute paths"
+        )));
+    }
+    Ok(())
+}
+
+fn normalized_target_path(target: &str) -> PathBuf {
+    let expanded = expand_home(target);
+    if let Some(resolved) = crate::linker::resolve_path_with_missing(&expanded) {
+        return resolved;
+    }
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(expanded)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<(), ConfigError> {
-    let mut targets: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut targets: Vec<(String, String, PathBuf, WhenClause)> = Vec::new();
     for (store_name, store) in stores {
         if store.is_multi_target() {
             targets.extend(store.targets.iter().map(|(target_name, target)| {
                 (
                     store_name.clone(),
                     format!("store '{store_name}' target '{target_name}'"),
-                    expand_home(&target.target),
+                    normalized_target_path(&target.target),
+                    target.when.clone(),
                 )
             }));
         } else if let Some(target) = &store.target {
             targets.push((
                 store_name.clone(),
                 format!("store '{store_name}'"),
-                expand_home(target),
+                normalized_target_path(target),
+                store.when.clone(),
             ));
         }
     }
 
-    for (index, (left_store, left_name, left)) in targets.iter().enumerate() {
-        for (right_store, right_name, right) in targets.iter().skip(index + 1) {
+    for (index, (left_store, left_name, left, left_when)) in targets.iter().enumerate() {
+        for (right_store, right_name, right, right_when) in targets.iter().skip(index + 1) {
             if left_store == right_store
+                && WhenClause::are_compatible(&[left_when, right_when])
                 && left != right
                 && (left.starts_with(right) || right.starts_with(left))
             {
@@ -865,6 +977,28 @@ pub fn validate_fragments(
     Ok(())
 }
 
+/// Reject invalid glob syntax before a command previews or persists it.
+///
+/// `patterns` and `ignore` share glob syntax; callers without ignore entries
+/// pass an empty slice.
+pub fn validate_globs(
+    patterns: &[String],
+    ignore: &[String],
+    context: &str,
+) -> Result<(), ConfigError> {
+    for pattern in patterns.iter().chain(ignore) {
+        GlobBuilder::new(pattern)
+            .literal_separator(false)
+            .build()
+            .map_err(|e| {
+                ConfigError::InvalidPath(format!(
+                    "invalid glob pattern '{pattern}' in {context}: {e}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
 /// Walk upward from `start` to find a directory containing `.stitch/`.
 pub fn find_root(start: &Path) -> Option<PathBuf> {
     let mut current = if start.is_absolute() {
@@ -916,6 +1050,10 @@ pub enum ConfigError {
     Serialize(toml::ser::Error),
     #[error("could not write config: {0}")]
     Write(std::io::Error, PathBuf),
+    #[error(
+        "replaced config at {1}, but could not sync its parent directory: {0}; the new state is visible but may not survive power loss"
+    )]
+    CommittedWrite(std::io::Error, PathBuf),
     #[error("{0}")]
     InvalidPath(String),
     /// A v0.2 single-file repo that has not been migrated. The message tells
@@ -924,6 +1062,14 @@ pub enum ConfigError {
         "v0.2 config found at {0} — run `stitch migrate` to split into stitch.toml + .stitch/state.toml"
     )]
     LegacyV02(PathBuf),
+}
+
+impl ConfigError {
+    /// True when the rename completed and callers must retain the filesystem
+    /// work described by the newly written config.
+    pub fn write_committed(&self) -> bool {
+        matches!(self, Self::CommittedWrite(_, _))
+    }
 }
 
 #[cfg(test)]
@@ -1013,6 +1159,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn test_generated_state_rejects_invalid_glob_before_write() {
+        let generated: GeneratedState =
+            toml::from_str("[stores.app]\ntarget = \"~\"\npatterns = [\"[unterminated\"]\n")
+                .unwrap();
+        let err = generated.render_for_display().unwrap_err();
+        assert!(err.to_string().contains("invalid glob pattern"));
     }
 
     #[test]
@@ -1529,6 +1684,32 @@ patterns = ["./work*//"]
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("invalid pattern"));
         assert!(err.to_string().contains("'../**'"));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_glob_syntax() {
+        let config = config_with_patterns(vec!["[unterminated".into()]);
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid glob pattern"));
+    }
+
+    #[test]
+    fn test_validate_rejects_relative_target() {
+        let mut config = config_with_files(vec!["file".into()]);
+        config.stores.get_mut("s").unwrap().target = Some("relative/target".into());
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("must expand to absolute paths"));
+    }
+
+    #[test]
+    fn test_atomic_write_rejects_symlinked_state_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(external.path(), tmp.path().join(".stitch")).unwrap();
+
+        let err = atomic_write(&tmp.path().join(".stitch/state.toml"), "state").unwrap_err();
+        assert!(err.to_string().contains("symlinked state parent"));
+        assert!(!external.path().join("state.toml").exists());
     }
 
     #[test]

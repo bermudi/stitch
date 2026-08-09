@@ -75,21 +75,53 @@ pub fn apply_all(
     opts: ApplyOpts,
 ) -> (Plan, Vec<String>) {
     let mut warnings = Vec::new();
+    let config_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
+    let root_identity = std::fs::metadata(repo_root)
+        .ok()
+        .filter(|meta| meta.is_dir())
+        .map(|meta| (meta.dev(), meta.ino()));
     let sorted: BTreeMap<_, _> = config.stores.iter().collect();
-    let results: Vec<_> = sorted
-        .into_iter()
-        .map(|(name, store)| {
-            apply_store(
-                repo_root,
-                name,
-                store,
-                platform,
-                &config.vars,
-                opts,
-                &mut warnings,
-            )
-        })
-        .collect();
+    let mut results = Vec::new();
+    for (name, store) in sorted {
+        let current_identity = std::fs::metadata(repo_root)
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .map(|meta| (meta.dev(), meta.ino()));
+        let current_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
+        if root_identity.is_none()
+            || current_identity != root_identity
+            || config_hash.is_none()
+            || current_hash != config_hash
+        {
+            results.push(ApplyResult {
+                store_name: name.clone(),
+                actions: vec![internal_error(format!(
+                    "repository changed before applying store '{name}'"
+                ))],
+            });
+            continue;
+        }
+        let mut result = apply_store(
+            repo_root,
+            name,
+            store,
+            platform,
+            &config.vars,
+            opts,
+            &mut warnings,
+        );
+        let after_identity = std::fs::metadata(repo_root)
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .map(|meta| (meta.dev(), meta.ino()));
+        let after_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
+        if after_identity != root_identity || after_hash != config_hash {
+            result.actions.push(internal_error(format!(
+                "repository or config changed while applying store '{name}'"
+            )));
+        }
+        results.push(result);
+    }
     (to_plan(repo_root, config, &results, opts), warnings)
 }
 
@@ -200,6 +232,14 @@ pub fn apply_store(
     if !opts.dry_run
         && let Some(pre) = &store.hooks.pre
     {
+        // Pin both the repository identity and its loaded configuration across
+        // the hook. Checking only the store directory would let a hook change
+        // target/source rules and have this already-loaded config mutate them.
+        let root_identity = std::fs::metadata(repo_root)
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .map(|meta| (meta.dev(), meta.ino()));
+        let config_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
         let env = HookEnv {
             root: repo_root,
             store: Some(name),
@@ -222,6 +262,20 @@ pub fn apply_store(
             actions.push(internal_error(format!(
                 "store directory '{}' changed during its pre-hook",
                 name
+            )));
+            return ApplyResult {
+                store_name: name.to_string(),
+                actions,
+            };
+        }
+        let current_root_identity = std::fs::metadata(repo_root)
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .map(|meta| (meta.dev(), meta.ino()));
+        let current_config_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
+        if current_root_identity != root_identity || current_config_hash != config_hash {
+            actions.push(internal_error(format!(
+                "repository or config changed during pre-hook for store '{name}'"
             )));
             return ApplyResult {
                 store_name: name.to_string(),
@@ -545,9 +599,15 @@ fn preflight_file_mode_promotion(
         .collect();
     for entry in &entries {
         let source_path = store_dir.join(&entry.source_rel);
-        // `symlink_metadata` does not follow symlinks, so a dangling symlink
-        // source is still a valid entry. The render step below will fail for a
-        // template whose source is missing.
+        // Validate every desired source before removing the live whole-dir
+        // link. Otherwise a source reached through an escaped gateway could
+        // fail only after the old target had already been removed.
+        if let Err(error) = linker::validate_source_in(&source_path, store_dir) {
+            return Err(ApplyAction::Error(error.into()));
+        }
+        // `symlink_metadata` does not follow terminal source symlinks, so a
+        // dangling non-template source remains a valid entry. Template
+        // sources are checked as direct regular files by the render step.
         if std::fs::symlink_metadata(&source_path).is_err() {
             return Err(internal_error(format!(
                 "source does not exist: {}",
@@ -1923,6 +1983,12 @@ fn resolve_targets(
     patterns: &[String],
     store_ignore: &[String],
 ) -> Result<LinkTargets, String> {
+    if let Some(path) = render::unsupported_template_source(store_dir)? {
+        return Err(format!(
+            "template source {} must be a direct regular file",
+            path.display()
+        ));
+    }
     let targets = resolve_target_names(store_dir, files, patterns, store_ignore);
     if let LinkTargets::Files(ref names) = targets {
         render::check_name_collisions(names)?;

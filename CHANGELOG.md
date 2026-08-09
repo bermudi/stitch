@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.8.0 — 2026-08-09
+
+### Trust and safety
+
+- Plan schema 2 rejects schema-1 plans, attributes stale removals to their
+  originating store, revalidates target ancestors after hooks, and requires
+  execution-time `--force` for backup operations.
+- Symlink ownership now resolves gateway chains with POSIX-correct `..`
+  semantics. Broad repo/store ownership remains canonical, while the narrow
+  external source-symlink exception matches only the exact configured entry.
+- Link creation rejects source paths that escape through a store ancestor;
+  target mutations reject ancestors resolving into the repository.
+- Render staging uses private, unpredictable exclusive temporary files,
+  refuses symlink/non-directory ancestors and non-regular leaves, and never
+  chmods a hard-linked staged inode.
+- Store names, file fragments, glob patterns, and ignore patterns are validated
+  and normalized in memory without rewriting authored configuration.
+- Hidden quarantine artifacts were deliberately rejected: successful removal
+  does not retain live links or old rendered secret material.
+
+### Breaking changes
+
+- Executable plan schema is now 2; existing plans must be recaptured.
+- Store names `.git`, `.stitch`, nested paths, and `.`/`..` are invalid.
+- Configured targets must expand to absolute paths; `stitch add` resolves a
+  relative CLI path before persisting it.
+- Overlapping ancestor/descendant targets within one store are rejected because
+  independent reconciliation cannot safely determine ownership.
+- Template sources must be direct regular files, not symlinks, FIFOs, devices,
+  or directories.
+
 ## 0.7.1 — 2026-08-07
 
 ### Trust & safety
