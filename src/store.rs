@@ -553,7 +553,13 @@ fn apply_whole_dir(
     // Do not scan a correct directory symlink: `Path::is_dir` follows it, and
     // treating the root link as a stale child would remove the desired state.
     if target_path.is_symlink() || !target_path.is_dir() {
-        return vec![apply_single_link(store_dir, target_path, repo_root, opts)];
+        return vec![apply_single_link(
+            store_dir,
+            target_path,
+            repo_root,
+            store_dir,
+            opts,
+        )];
     }
 
     let removed = match render::reconcile_store_links(
@@ -574,7 +580,13 @@ fn apply_whole_dir(
     // replace it automatically after proving that we removed stale links for
     // this exact store from it.
     if !had_stale_links {
-        actions.push(apply_single_link(store_dir, target_path, repo_root, opts));
+        actions.push(apply_single_link(
+            store_dir,
+            target_path,
+            repo_root,
+            store_dir,
+            opts,
+        ));
         return actions;
     }
 
@@ -591,7 +603,7 @@ fn apply_whole_dir(
                     old_resolves_to: None,
                 });
             } else {
-                match linker::create_link(target_path, store_dir) {
+                match linker::create_link_in(target_path, store_dir, store_dir) {
                     Ok(()) => actions.push(ApplyAction::Replaced {
                         target: target_path.to_path_buf(),
                         old_resolves_to: None,
@@ -600,7 +612,13 @@ fn apply_whole_dir(
                 }
             }
         }
-        Ok(false) => actions.push(apply_single_link(store_dir, target_path, repo_root, opts)),
+        Ok(false) => actions.push(apply_single_link(
+            store_dir,
+            target_path,
+            repo_root,
+            store_dir,
+            opts,
+        )),
         Err(e) => actions.push(internal_error(e)),
     }
     actions
@@ -714,7 +732,7 @@ fn apply_file_entry(
     }
 
     if !entry.is_template {
-        return apply_single_link(&source_path, &target, repo_root, opts);
+        return apply_single_link(&source_path, &target, repo_root, store_dir, opts);
     }
 
     let staged = render::staging_path(repo_root, store_name, &entry.link_rel);
@@ -732,7 +750,8 @@ fn apply_file_entry(
             Ok(d) => d,
             Err(e) => return ApplyAction::Error(StitchError::render(&source_path, e)),
         };
-        let link_action = apply_single_link(&staged, &target, repo_root, opts);
+        let staged_dir = render::store_render_dir(repo_root, store_name);
+        let link_action = apply_single_link(&staged, &target, repo_root, &staged_dir, opts);
         if content_differs && matches!(link_action, ApplyAction::AlreadyLinked(_)) {
             ApplyAction::ContentChanged(target)
         } else {
@@ -752,7 +771,8 @@ fn apply_file_entry(
             Ok(render::StageOutcome::Unchanged(p)) => (p, false),
             Err(e) => return ApplyAction::Error(StitchError::render(&source_path, e)),
         };
-        let action = apply_single_link(&link_source, &target, repo_root, opts);
+        let staged_dir = render::store_render_dir(repo_root, store_name);
+        let action = apply_single_link(&link_source, &target, repo_root, &staged_dir, opts);
         // Link already correct but staging was refreshed → content changed.
         if wrote && matches!(action, ApplyAction::AlreadyLinked(_)) {
             ApplyAction::ContentChanged(target)
@@ -768,11 +788,11 @@ fn source_is_symlink(source: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn create_link_for(target: &Path, source: &Path) -> Result<(), LinkError> {
+fn create_link_for(target: &Path, source: &Path, source_root: &Path) -> Result<(), LinkError> {
     if source_is_symlink(source) {
-        linker::create_link_to_entry(target, source)
+        linker::create_link_to_entry_in(target, source, source_root)
     } else {
-        linker::create_link(target, source)
+        linker::create_link_in(target, source, source_root)
     }
 }
 
@@ -780,6 +800,7 @@ fn apply_single_link(
     source: &Path,
     target: &Path,
     repo_root: &Path,
+    source_root: &Path,
     opts: ApplyOpts,
 ) -> ApplyAction {
     let status = linker::check_link(target, source);
@@ -790,7 +811,7 @@ fn apply_single_link(
             if opts.dry_run {
                 ApplyAction::Created(target.to_path_buf())
             } else {
-                match create_link_for(target, source) {
+                match create_link_for(target, source, source_root) {
                     Ok(()) => ApplyAction::Created(target.to_path_buf()),
                     Err(e) => internal_error(e.to_string()),
                 }
@@ -807,7 +828,7 @@ fn apply_single_link(
                     resolves_to: None,
                 }
             } else {
-                force_backup_link(source, target, opts.dry_run)
+                force_backup_link(source, target, source_root, opts.dry_run)
             }
         }
         LinkStatus::Broken(resolved) => {
@@ -832,7 +853,7 @@ fn apply_single_link(
             if let Err(e) = std::fs::remove_file(target) {
                 return internal_error(e.to_string());
             }
-            match create_link_for(target, source) {
+            match create_link_for(target, source, source_root) {
                 Ok(()) => ApplyAction::Replaced {
                     target: target.to_path_buf(),
                     old_resolves_to: Some(old_resolves_to),
@@ -849,7 +870,12 @@ fn apply_single_link(
 /// Fails — leaving the original target in place — if a backup already exists
 /// (never silently destroy a prior backup) or the link step fails after the
 /// rename (the backup is restored so the user loses nothing).
-fn force_backup_link(source: &Path, target: &Path, dry_run: bool) -> ApplyAction {
+fn force_backup_link(
+    source: &Path,
+    target: &Path,
+    source_root: &Path,
+    dry_run: bool,
+) -> ApplyAction {
     let backup = backup_path(target);
 
     // Catch anything at the backup path in both dry-run and real modes so the
@@ -876,7 +902,7 @@ fn force_backup_link(source: &Path, target: &Path, dry_run: bool) -> ApplyAction
             e
         ));
     }
-    if let Err(e) = create_link_for(target, source) {
+    if let Err(e) = create_link_for(target, source, source_root) {
         // Restore the original so the user is left with their file, not a
         // missing target. Best-effort: a (near-impossible) restore failure
         // is ignored rather than masking the original link error.

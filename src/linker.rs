@@ -1,5 +1,12 @@
-use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, symlink};
+use std::path::{Component, Path, PathBuf};
+
+/// Linux's pathname symlink-expansion budget.
+const MAX_SYMLINK_EXPANSIONS: usize = 40;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkStatus {
@@ -16,66 +23,39 @@ pub enum LinkStatus {
 /// Check the status of a symlink at `target` pointing to `source`.
 pub fn check_link(target: &Path, source: &Path) -> LinkStatus {
     match std::fs::symlink_metadata(target) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                match std::fs::read_link(target) {
-                    Ok(resolved) => {
-                        let source_is_symlink = std::fs::symlink_metadata(source)
-                            .map(|m| m.file_type().is_symlink())
-                            .unwrap_or(false);
-
-                        if source_is_symlink {
-                            // The desired link points directly at the source
-                            // symlink entry, not through its target. Preserve
-                            // that indirection (including dangling or relative
-                            // targets) by comparing the link paths without
-                            // following the source symlink.
-                            let resolved_abs = if resolved.is_absolute() {
-                                resolved.clone()
-                            } else {
-                                target.parent().unwrap_or(Path::new(".")).join(&resolved)
-                            };
-                            let source_abs = if source.is_absolute() {
-                                source.to_path_buf()
-                            } else {
-                                std::env::current_dir()
-                                    .map(|cwd| cwd.join(source))
-                                    .unwrap_or_else(|_| source.to_path_buf())
-                            };
-
-                            if normalize_lexical(&resolved_abs) == normalize_lexical(&source_abs) {
-                                LinkStatus::Linked
-                            } else {
-                                LinkStatus::Broken(resolved)
-                            }
-                        } else {
-                            let source_abs = if source.exists() {
-                                source
-                                    .canonicalize()
-                                    .unwrap_or_else(|_| source.to_path_buf())
-                            } else {
-                                source.to_path_buf()
-                            };
-                            let resolved_abs = if resolved.exists() {
-                                resolved.canonicalize().unwrap_or(resolved.clone())
-                            } else {
-                                resolved.clone()
-                            };
-
-                            if resolved_abs == source_abs {
-                                LinkStatus::Linked
-                            } else {
-                                LinkStatus::Broken(resolved)
-                            }
-                        }
-                    }
-                    Err(_) => LinkStatus::Broken(PathBuf::from("(unreadable)")),
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(target) {
+            Ok(resolved) => {
+                let source_meta = std::fs::symlink_metadata(source).ok();
+                let linked = if source_meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.file_type().is_symlink())
+                {
+                    // A source symlink is an entry we intentionally preserve,
+                    // rather than an endpoint to canonicalize. Compare the
+                    // actual directory entry identity so alternate spellings
+                    // cannot turn `alias/.` or `alias/..` into `alias`.
+                    is_direct_entry_path(source)
+                        && is_direct_entry_path(&resolved)
+                        && link_target_path(target, &resolved)
+                            .ok()
+                            .and_then(|path| std::fs::symlink_metadata(path).ok())
+                            .is_some_and(|meta| same_entry(&meta, source_meta.as_ref().unwrap()))
+                } else {
+                    let source = source.canonicalize().ok();
+                    let resolved = link_target_path(target, &resolved)
+                        .ok()
+                        .and_then(|path| path.canonicalize().ok());
+                    source.is_some() && source == resolved
+                };
+                if linked {
+                    LinkStatus::Linked
+                } else {
+                    LinkStatus::Broken(resolved)
                 }
-            } else {
-                // Real file or directory — conflict.
-                LinkStatus::Conflict(target.to_path_buf())
             }
-        }
+            Err(_) => LinkStatus::Broken(PathBuf::from("(unreadable)")),
+        },
+        Ok(_) => LinkStatus::Conflict(target.to_path_buf()),
         Err(_) => LinkStatus::Missing,
     }
 }
@@ -122,177 +102,340 @@ pub fn create_link_to_entry(target: &Path, source: &Path) -> Result<(), LinkErro
         std::fs::create_dir_all(parent).map_err(|e| LinkError::Mkdir(e, parent.to_path_buf()))?;
     }
 
-    // The source is passed as an absolute path by all callers. Use it directly
-    // rather than canonicalizing; for a symlink source, canonicalization would
-    // collapse the indirection and fail for dangling targets.
-    let source_abs = if source.is_absolute() {
-        source.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(source))
-            .map_err(|e| LinkError::Canonicalize(e, source.to_path_buf()))?
-    };
-
+    let source_abs =
+        absolute_path(source).map_err(|e| LinkError::Canonicalize(e, source.to_path_buf()))?;
     symlink(&source_abs, target).map_err(|e| LinkError::Create(e, target.to_path_buf()))?;
 
     Ok(())
 }
 
-/// Whether the symlink at `target` points beneath `root` by its *immediate
-/// hop* — the readlink is compared lexically (collapsing `.` and `..`
-/// components) without following further symlink chains.
+/// Create a normal link only when its resolved source remains in its
+/// configured root.
+pub fn create_link_in(target: &Path, source: &Path, source_root: &Path) -> Result<(), LinkError> {
+    if !is_real_directory(source_root) || !source_resolves_within(source, source_root) {
+        return Err(LinkError::SourceOutsideRoot(
+            source.to_path_buf(),
+            source_root.to_path_buf(),
+        ));
+    }
+    create_link(target, source)
+}
+
+/// Create an entry-preserving link only when every *ancestor* of `source`
+/// resolves inside `source_root`. The terminal entry may itself be a symlink
+/// to an external target; that is the deliberately narrow source-symlink
+/// exception handled by [`points_at_source`].
+pub fn create_link_to_entry_in(
+    target: &Path,
+    source: &Path,
+    source_root: &Path,
+) -> Result<(), LinkError> {
+    if !is_real_directory(source_root) || !source_ancestors_within(source, source_root) {
+        return Err(LinkError::SourceOutsideRoot(
+            source.to_path_buf(),
+            source_root.to_path_buf(),
+        ));
+    }
+    create_link_to_entry(target, source)
+}
+
+/// Whether the symlink at `target` resolves inside `root`.
 ///
-/// Relative symlink targets are resolved against the symlink's own parent
-/// directory. Returns `false` for non-symlinks or unreadable links. This is
-/// the narrow, store-scoped check: "does this link point at an entry inside
-/// this directory?" A link that points directly at a `root` entry is accepted
-/// even when that entry is itself a symlink to an external path (the
-/// indirection is not chased). Use [`points_into_repo`] for the broad,
-/// repo-scoped ownership decision that *does* follow the chain.
+/// This is the store-scoped ownership predicate. Like [`points_into_repo`], it
+/// follows every component symlink, rather than accepting an immediate-hop
+/// spelling beneath `root`: a gateway from one store into a sibling store is
+/// not ownership of the first store.
 pub fn points_into(target: &Path, root: &Path) -> bool {
-    let Ok(resolved) = std::fs::read_link(target) else {
+    let Some(root) = resolved_directory(root) else {
         return false;
     };
-    let resolved_abs = if resolved.is_absolute() {
-        resolved
-    } else {
-        target.parent().unwrap_or(Path::new(".")).join(resolved)
+    let Ok(link) = std::fs::read_link(target) else {
+        return false;
     };
-
-    let normalized = normalize_lexical(&resolved_abs);
-    let normalized_root = if root.exists() {
-        root.canonicalize()
-            .unwrap_or_else(|_| normalize_lexical(root))
-    } else {
-        normalize_lexical(root)
+    let Ok(path) = link_target_path(target, &link) else {
+        return false;
     };
-
-    normalized.starts_with(&normalized_root)
+    resolve_path(&path)
+        .map(|path| path.starts_with(&root))
+        .unwrap_or(false)
 }
 
 /// Whether the symlink at `target` resolves beneath `repo_root`, following the
-/// full symlink chain.
+/// complete component-by-component symlink chain.
 ///
-/// This is the broad repo-ownership predicate that distinguishes stitch-owned
-/// links (safe to replace/remove) from foreign ones
-/// (stow/chezmoi/Nix/Home-Manager/hand-managed — must never be silently
-/// clobbered). Ownership is *canonical*: a link that points *through* a repo
-/// gateway symlink to an external path (e.g. `home/file ->
-/// repo/gateway/victim` where `repo/gateway -> /external`) resolves outside the
-/// repo and is foreign, not repo-owned.
-///
-/// Resolvable targets are canonicalized (chasing the whole chain). Dangling
-/// targets are resolved as far as the filesystem allows — the longest existing
-/// prefix is canonicalized and the non-existent tail is appended and
-/// lexically normalized — so a link through a *resolvable* gateway to a
-/// non-existent victim is still classified as foreign, while a stale stitch
-/// link whose source entry was simply removed remains repo-owned and self-heals.
+/// Unlike a lexical prefix check, this recognizes that `repo/gateway/file`
+/// may resolve outside the repo. It deliberately resolves dangling gateway
+/// entries too: `gateway -> /external/missing` is enough to make
+/// `gateway/file` foreign even though the final file is absent. Any I/O error,
+/// loop, malformed traversal after a missing component, or more than Linux's
+/// 40 symlink expansions fails closed.
 pub fn points_into_repo(target: &Path, repo_root: &Path) -> bool {
-    let Ok(resolved) = std::fs::read_link(target) else {
-        return false;
-    };
-    let resolved_abs = if resolved.is_absolute() {
-        resolved
-    } else {
-        target.parent().unwrap_or(Path::new(".")).join(resolved)
-    };
-
-    let normalized_root = if repo_root.exists() {
-        repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| normalize_lexical(repo_root))
-    } else {
-        normalize_lexical(repo_root)
-    };
-
-    resolve_as_far_as_possible(&resolved_abs).starts_with(&normalized_root)
+    points_into(target, repo_root)
 }
 
-/// Whether the symlink at `target` points exactly at the repo entry
-/// `expected_source` — the exact-entry companion to the broad
-/// [`points_into_repo`].
+/// Whether `source` is lexically beneath `root` and resolving its ancestors
+/// never leaves that root. The terminal entry is deliberately not followed.
 ///
-/// A stitch-created link may point directly at a repo source entry that is
-/// itself a symlink resolving *outside* the repo (e.g. a file-mode store whose
-/// `alias` source is a symlink to `/external/real`). The broad canonical
-/// [`points_into_repo`] correctly classifies such a link as foreign, but since
-/// it points exactly at a configured repo entry it is stitch-owned and safe to
-/// manage. This compares the link's readlink against `expected_source` without
-/// following `expected_source` (so a symlink source — including a dangling one
-/// — is matched by its entry path) and requires `expected_source` to be inside
-/// `repo_root`.
-pub fn points_at_source(target: &Path, expected_source: &Path, repo_root: &Path) -> bool {
-    // The expected source must be a repo entry. `expected_source` is built by
-    // callers as `repo_root.join(<store-relative>)`, so it shares repo_root's
-    // path prefix — including when repo_root is itself accessed through a
-    // symlink. Compare lexically (collapsing `.`/`..`) rather than
-    // canonicalizing repo_root, which would diverge from the configured path
-    // in the symlinked-repo-root case. `..` escapes are rejected here by the
-    // normalization, and at the plan layer by fragment validation.
-    let root_norm = normalize_lexical(repo_root);
-    let source_abs = if expected_source.is_absolute() {
-        expected_source.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(expected_source)
-    };
-    if !normalize_lexical(&source_abs).starts_with(&root_norm) {
+/// Callers use this before creating a link to a configured source symlink: an
+/// external terminal source is valid, but an ancestor gateway out of the store
+/// or render tree is not.
+pub fn source_ancestors_within(source: &Path, root: &Path) -> bool {
+    if !is_direct_entry_path(source) {
         return false;
     }
-    // check_link's source-symlink branch compares the readlink against the
-    // source entry lexically (without following it) — exactly the exact-entry
-    // semantics we want; for a regular source it canonicalizes both sides.
-    check_link(target, expected_source) == LinkStatus::Linked
+    let Ok(source) = absolute_path(source) else {
+        return false;
+    };
+    let Ok(root_path) = absolute_path(root) else {
+        return false;
+    };
+    let Ok(relative) = source.strip_prefix(&root_path) else {
+        return false;
+    };
+    let Some(root) = resolved_directory(&root_path) else {
+        return false;
+    };
+
+    let mut components = path_components(relative);
+    // `source` is a direct entry path, so the final component is its entry
+    // name. Resolve only the parent; following the terminal source symlink is
+    // the exception this helper exists to preserve.
+    if components.pop_back().is_none() {
+        return true;
+    }
+    resolve_components(root.clone(), components, Some(&root)).is_ok()
 }
 
-/// Resolve `path` as far as the filesystem allows, following symlinks, then
-/// lexically normalize any non-existent trailing tail.
+/// Whether a normal (non-entry-preserving) source fully resolves within
+/// `root`. This is the companion to [`source_ancestors_within`] for regular
+/// files and directories.
+pub fn source_resolves_within(source: &Path, root: &Path) -> bool {
+    source_ancestors_within(source, root)
+        && resolved_directory(root).is_some_and(|root| {
+            resolve_path(source)
+                .map(|source| source.starts_with(root))
+                .unwrap_or(false)
+        })
+}
+
+/// Whether the symlink at `target` points at this exact configured source
+/// *symlink entry*.
 ///
-/// Unlike [`std::fs::canonicalize`], this never fails for a dangling path: the
-/// longest existing prefix is canonicalized (chasing symlinks) and the
-/// non-existent tail is appended and normalized. This catches links that point
-/// *through* a resolvable repo gateway symlink to an external path even when
-/// the final destination does not exist, while still keeping a stale stitch
-/// link whose source entry was simply removed beneath the repo.
-fn resolve_as_far_as_possible(path: &Path) -> PathBuf {
-    let mut existing = path.to_path_buf();
-    let mut tail: Vec<PathBuf> = Vec::new();
-    // Walk up to the longest existing ancestor. `exists()` follows symlinks,
-    // so a dangling symlink component is treated as non-existent and walked
-    // past (a dangling gateway is indistinguishable from a removed entry).
-    while !existing.exists() {
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
-                tail.push(PathBuf::from(name));
-                existing = parent.to_path_buf();
+/// This is intentionally not a general "does the target resolve to source"
+/// predicate. The broad case belongs to [`points_into_repo`]. This narrow
+/// exception exists only for a configured source entry that is itself a
+/// symlink (including a dangling one) and whose ancestors remain in the repo.
+/// The immediate readlink is compared as a directory-entry identity, never by
+/// lexical normalization. Therefore `alias/`, `alias/.`, terminal `..`, and
+/// a parent path that leaves the repo cannot masquerade as `alias`.
+pub fn points_at_source(target: &Path, expected_source: &Path, repo_root: &Path) -> bool {
+    if !is_direct_entry_path(expected_source)
+        || !source_ancestors_within(expected_source, repo_root)
+    {
+        return false;
+    }
+    let Ok(source_meta) = std::fs::symlink_metadata(expected_source) else {
+        return false;
+    };
+    if !source_meta.file_type().is_symlink() {
+        return false;
+    }
+
+    let Ok(link) = std::fs::read_link(target) else {
+        return false;
+    };
+    if !is_direct_entry_path(&link) {
+        return false;
+    }
+    let Ok(link_entry) = link_target_path(target, &link) else {
+        return false;
+    };
+    if !source_ancestors_within(&link_entry, repo_root) {
+        return false;
+    }
+    std::fs::symlink_metadata(link_entry)
+        .map(|meta| same_entry(&meta, &source_meta))
+        .unwrap_or(false)
+}
+
+#[derive(Debug)]
+enum ResolveError {
+    Io,
+    ExpansionLimit,
+    EscapesRoot,
+    MissingTraversal,
+}
+
+/// Resolve a path component by component, preserving POSIX's ordering: a
+/// symlink target is spliced into the pending component stream before later
+/// `..` components are applied. `std::fs::canonicalize` cannot provide the
+/// needed dangling-path result and the old "longest existing prefix" approach
+/// got this ordering wrong for `gateway/..`.
+fn resolve_path(path: &Path) -> Result<PathBuf, ResolveError> {
+    let path = absolute_path(path).map_err(|_| ResolveError::Io)?;
+    resolve_components(PathBuf::from("/"), path_components(&path), None)
+}
+
+/// Resolve pending components from `current`. If `bound` is supplied, the
+/// path starts at that bound and may never leave it; an absolute symlink target
+/// may walk its way back to the bound, but may not visit another location.
+fn resolve_components(
+    mut current: PathBuf,
+    mut pending: VecDeque<OsString>,
+    bound: Option<&Path>,
+) -> Result<PathBuf, ResolveError> {
+    let mut expansions = 0;
+    let mut reached_bound = bound.is_none() || bound.is_some_and(|root| current.starts_with(root));
+
+    while let Some(component) = pending.pop_front() {
+        if component.as_bytes() == b"." {
+            continue;
+        }
+        if component.as_bytes() == b".." {
+            current.pop();
+            check_bound(&current, bound, &mut reached_bound)?;
+            continue;
+        }
+
+        let next = current.join(&component);
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if expansions >= MAX_SYMLINK_EXPANSIONS {
+                    return Err(ResolveError::ExpansionLimit);
+                }
+                expansions += 1;
+                let link = std::fs::read_link(&next).map_err(|_| ResolveError::Io)?;
+                let mut replacement = path_components(&link);
+                replacement.append(&mut pending);
+                pending = replacement;
+                if link.is_absolute() {
+                    current = PathBuf::from("/");
+                    // The absolute target may be a spelling of `bound` itself.
+                    // Permit its prefixes until it reaches the bound again.
+                    reached_bound = false;
+                    check_bound(&current, bound, &mut reached_bound)?;
+                }
             }
-            _ => break,
+            Ok(meta) => {
+                current.push(&component);
+                check_bound(&current, bound, &mut reached_bound)?;
+                // POSIX requires a directory for every non-final component,
+                // including a following `.` or `..`.
+                if !pending.is_empty() && !meta.is_dir() {
+                    return Err(ResolveError::Io);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                current.push(&component);
+                check_bound(&current, bound, &mut reached_bound)?;
+                // Once a component is missing the kernel cannot resolve later
+                // components. Do not invent ownership by lexically applying a
+                // later `.` or `..`; a plain missing tail is safe to retain for
+                // stale links.
+                if pending
+                    .iter()
+                    .any(|part| part.as_bytes() == b"." || part.as_bytes() == b"..")
+                {
+                    return Err(ResolveError::MissingTraversal);
+                }
+                for part in pending {
+                    current.push(part);
+                    check_bound(&current, bound, &mut reached_bound)?;
+                }
+                return Ok(current);
+            }
+            Err(_) => return Err(ResolveError::Io),
         }
     }
-    let base = if existing.exists() {
-        existing
-            .canonicalize()
-            .unwrap_or_else(|_| normalize_lexical(&existing))
-    } else {
-        normalize_lexical(&existing)
+    Ok(current)
+}
+
+fn check_bound(
+    current: &Path,
+    bound: Option<&Path>,
+    reached_bound: &mut bool,
+) -> Result<(), ResolveError> {
+    let Some(bound) = bound else {
+        return Ok(());
     };
-    let mut full = base;
-    for component in tail.iter().rev() {
-        full.push(component);
+    if current.starts_with(bound) {
+        *reached_bound = true;
+        Ok(())
+    } else if !*reached_bound && bound.starts_with(current) {
+        // Processing an absolute symlink target on the way back to `bound`.
+        Ok(())
+    } else {
+        Err(ResolveError::EscapesRoot)
     }
-    normalize_lexical(&full)
+}
+
+fn path_components(path: &Path) -> VecDeque<OsString> {
+    // Preserve `.` entries: after a missing component, they are errors, not
+    // lexical no-ops.
+    let bytes = path.as_os_str().as_bytes();
+    let mut parts: VecDeque<_> = bytes
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+        .map(|part| OsString::from_vec(part.to_vec()))
+        .collect();
+    if bytes.ends_with(b"/") {
+        parts.push_back(OsString::from("."));
+    }
+    parts
+}
+
+fn absolute_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(path))
+    }
+}
+
+fn link_target_path(target: &Path, link: &Path) -> io::Result<PathBuf> {
+    if link.is_absolute() {
+        Ok(link.to_path_buf())
+    } else {
+        absolute_path(target.parent().unwrap_or(Path::new("."))).map(|parent| parent.join(link))
+    }
+}
+
+fn resolved_directory(path: &Path) -> Option<PathBuf> {
+    let resolved = resolve_path(path).ok()?;
+    std::fs::metadata(path)
+        .ok()
+        .filter(|meta| meta.is_dir())
+        .map(|_| resolved)
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
+fn is_direct_entry_path(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    !bytes.is_empty()
+        && !bytes.ends_with(b"/")
+        && !bytes.ends_with(b"/.")
+        && !path.components().any(|part| part == Component::ParentDir)
+        && matches!(path.components().next_back(), Some(Component::Normal(_)))
+}
+
+fn same_entry(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 /// Lexically normalize a path by collapsing `.` and `..` components without
-/// touching the filesystem. The result may still contain symlinks if the path
-/// does not exist — use `canonicalize` for existing paths.
+/// touching the filesystem. This remains useful for plan-file presentation;
+/// ownership decisions use [`resolve_path`] instead.
 pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
+            Component::CurDir => {}
+            Component::ParentDir => {
                 out.pop();
             }
             c => out.push(c),
@@ -316,18 +459,30 @@ pub fn remove_link(target: &Path, repo_root: &Path) -> Result<bool, LinkError> {
 /// a link repointed to another store (or a foreign target) between inspection
 /// and removal must remain untouched.
 ///
-/// Uses the exact-entry [`points_at_source`] check rather than the broad
-/// [`points_into_repo`], so a link pointing directly at a repo source entry
-/// that is itself a symlink resolving outside the repo is still recognized as
-/// stitch-owned and removed.
+/// A normal source needs both an exact `check_link` match and broad canonical
+/// ownership. The only exception is a terminal configured source symlink,
+/// which uses [`points_at_source`] to compare the immediate entry identity
+/// without following that terminal source symlink.
 pub fn remove_link_to(
     target: &Path,
     expected_source: &Path,
     repo_root: &Path,
 ) -> Result<bool, LinkError> {
-    if !points_at_source(target, expected_source, repo_root) {
+    let expected_is_symlink = std::fs::symlink_metadata(expected_source)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    let owned = if expected_is_symlink {
+        points_at_source(target, expected_source, repo_root)
+    } else {
+        points_into_repo(target, repo_root)
+            && check_link(target, expected_source) == LinkStatus::Linked
+    };
+    if !owned {
         return Ok(false);
     }
+    // This is intentionally the final operation: revalidate immediately
+    // before an ordinary unlink. Same-UID races after this check are outside
+    // this tool's threat model.
     std::fs::remove_file(target).map_err(|e| LinkError::Remove(e, target.to_path_buf()))?;
     Ok(true)
 }
@@ -336,6 +491,8 @@ pub fn remove_link_to(
 pub enum LinkError {
     #[error("source does not exist: {0}")]
     SourceMissing(PathBuf),
+    #[error("source {0} escapes configured root {1}")]
+    SourceOutsideRoot(PathBuf, PathBuf),
     #[error("could not create parent directory {1}: {0}")]
     Mkdir(std::io::Error, PathBuf),
     #[error("could not canonicalize source {1}: {0}")]
@@ -608,6 +765,15 @@ mod tests {
             !points_into_repo(&file, &repo),
             "a dangling link through a resolvable gateway is still foreign"
         );
+
+        // The gateway itself may be dangling too; readlink still gives us its
+        // external target, so that state must not fall back to lexical repo
+        // ownership.
+        let dangling_gateway = repo.join("dangling-gateway");
+        std::os::unix::fs::symlink(external.join("missing"), &dangling_gateway).unwrap();
+        let dangling_file = home.join("dangling-gateway-file");
+        std::os::unix::fs::symlink(dangling_gateway.join("victim"), &dangling_file).unwrap();
+        assert!(!points_into_repo(&dangling_file, &repo));
     }
 
     #[test]
@@ -660,6 +826,145 @@ mod tests {
             !points_at_source(&target, &source, &repo),
             "a foreign link is not at the expected repo source"
         );
+    }
+
+    #[test]
+    fn test_points_into_repo_applies_dotdot_after_gateway_expansion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+
+        // POSIX substitutes the gateway target before it applies the later
+        // `..`: this is /external/.., not /repo/gateway/.. (= /repo).
+        let gateway = repo.join("gateway");
+        std::os::unix::fs::symlink(&external, &gateway).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(gateway.join(".."), &link).unwrap();
+
+        assert!(!points_into_repo(&link, &repo));
+    }
+
+    #[test]
+    fn test_points_into_repo_follows_repeated_symlinks_and_honors_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let inside = repo.join("inside");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        // Repeatedly entering a real gateway and leaving it with `..` is a
+        // valid in-repo traversal; `..` is applied after each expansion.
+        let gateway = repo.join("gateway");
+        std::os::unix::fs::symlink(&inside, &gateway).unwrap();
+        let repeated = tmp.path().join("repeated");
+        std::os::unix::fs::symlink(
+            gateway
+                .join("..")
+                .join("gateway")
+                .join("..")
+                .join("inside")
+                .join("gone"),
+            &repeated,
+        )
+        .unwrap();
+        assert!(points_into_repo(&repeated, &repo));
+
+        // The Linux limit permits 40 expansions but rejects the 41st. The
+        // final entry is intentionally missing so this also exercises the
+        // safe dangling-tail result after a fully resolvable chain.
+        for i in 0..41 {
+            let next = if i == 40 {
+                repo.join("missing")
+            } else {
+                repo.join(format!("s{}", i + 1))
+            };
+            std::os::unix::fs::symlink(next, repo.join(format!("s{i}"))).unwrap();
+        }
+        let forty = tmp.path().join("forty");
+        let forty_one = tmp.path().join("forty-one");
+        std::os::unix::fs::symlink(repo.join("s1"), &forty).unwrap();
+        std::os::unix::fs::symlink(repo.join("s0"), &forty_one).unwrap();
+
+        assert!(points_into_repo(&forty, &repo));
+        assert!(
+            !points_into_repo(&forty_one, &repo),
+            "the 41st expansion must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_store_scope_rejects_gateway_into_sibling_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let alpha = repo.join("alpha");
+        let beta = repo.join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(beta.join("victim"), "beta").unwrap();
+        std::os::unix::fs::symlink(&beta, alpha.join("gateway")).unwrap();
+
+        let target = tmp.path().join("target");
+        std::os::unix::fs::symlink(alpha.join("gateway").join("victim"), &target).unwrap();
+
+        assert!(points_into_repo(&target, &repo));
+        assert!(!points_into(&target, &alpha));
+        assert!(points_into(&target, &beta));
+        assert!(
+            create_link_in(
+                &tmp.path().join("new"),
+                &alpha.join("gateway").join("victim"),
+                &alpha
+            )
+            .is_err(),
+            "creation must not canonicalize an alpha source through beta"
+        );
+        let replaced_root = repo.join("replaced-alpha");
+        std::os::unix::fs::symlink(&beta, &replaced_root).unwrap();
+        assert!(
+            create_link_in(
+                &tmp.path().join("new-root"),
+                &replaced_root.join("victim"),
+                &replaced_root
+            )
+            .is_err(),
+            "a configured store root must not be a sibling-store gateway"
+        );
+    }
+
+    #[test]
+    fn test_points_at_source_rejects_terminal_slash_dot_and_escaped_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let store = repo.join("store");
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        let source = store.join("alias");
+        std::os::unix::fs::symlink(&external, &source).unwrap();
+
+        let slash = tmp.path().join("slash");
+        let dot = tmp.path().join("dot");
+        let traversal = tmp.path().join("traversal");
+        std::fs::create_dir(store.join("child")).unwrap();
+        std::os::unix::fs::symlink(PathBuf::from(format!("{}/", source.display())), &slash)
+            .unwrap();
+        std::os::unix::fs::symlink(source.join("."), &dot).unwrap();
+        std::os::unix::fs::symlink(store.join("child").join("..").join("alias"), &traversal)
+            .unwrap();
+        assert!(!points_at_source(&slash, &source, &repo));
+        assert!(!points_at_source(&dot, &source, &repo));
+        assert!(!points_at_source(&traversal, &source, &repo));
+        // The expected entry itself exists below the repo spelling, but its
+        // parent gateway resolves outside the repo. It cannot use the narrow
+        // external-source exception.
+        let gateway = repo.join("gateway");
+        std::os::unix::fs::symlink(&external, &gateway).unwrap();
+        let escaped_source = gateway.join("escaped-alias");
+        std::os::unix::fs::symlink(&external, &escaped_source).unwrap();
+        let escaped_target = tmp.path().join("escaped-target");
+        std::os::unix::fs::symlink(&escaped_source, &escaped_target).unwrap();
+        assert!(!points_at_source(&escaped_target, &escaped_source, &repo));
     }
 
     #[test]
