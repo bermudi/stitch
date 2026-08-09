@@ -1077,6 +1077,30 @@ fn add_rejects_traversal_in_files() {
 }
 
 #[test]
+fn add_dry_run_rejects_invalid_glob_before_previewing() {
+    let repo = Repo::new();
+    let target = repo.path().join("home").join("shells");
+    let target_str = target.to_string_lossy().into_owned();
+
+    repo.cmd()
+        .args([
+            "add",
+            &target_str,
+            "--name",
+            "shells",
+            "--patterns",
+            "[",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid glob pattern"));
+    assert!(!repo.path().join("shells").exists());
+    assert!(!target.exists());
+}
+
+#[test]
 fn apply_only_filter_restricts_to_named_stores() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
@@ -3353,19 +3377,22 @@ when = { hostname = "laptop" }
 /// produces a byte-identical state.toml (BTreeMap keys + sorted files).
 #[test]
 fn state_toml_ordering_is_stable_across_operation_order() {
-    // Use relative target paths so state.toml content is independent of the
-    // tempdir path — only the store names and targets matter for ordering.
-    // Snapshot after adding A then B.
+    // Snapshot after adding A then B. `add` persists absolute targets; replace
+    // each scratch root before comparing so only ordering remains significant.
     let repo_a = Repo::new();
     repo_a.cmd().args(["add", "home/zebra"]).assert().success();
     repo_a.cmd().args(["add", "home/alpha"]).assert().success();
-    let snap_a = fs::read_to_string(repo_a.path().join(".stitch").join("state.toml")).unwrap();
+    let snap_a = fs::read_to_string(repo_a.path().join(".stitch").join("state.toml"))
+        .unwrap()
+        .replace(repo_a.path().to_string_lossy().as_ref(), "<repo>");
 
     // Snapshot after adding B then A.
     let repo_b = Repo::new();
     repo_b.cmd().args(["add", "home/alpha"]).assert().success();
     repo_b.cmd().args(["add", "home/zebra"]).assert().success();
-    let snap_b = fs::read_to_string(repo_b.path().join(".stitch").join("state.toml")).unwrap();
+    let snap_b = fs::read_to_string(repo_b.path().join(".stitch").join("state.toml"))
+        .unwrap()
+        .replace(repo_b.path().to_string_lossy().as_ref(), "<repo>");
 
     assert_eq!(snap_a, snap_b, "state.toml must be order-stable");
     // And keys appear sorted.
@@ -3381,7 +3408,10 @@ fn state_toml_ordering_is_stable_across_operation_order() {
 fn state_toml_emits_files_sorted() {
     let repo = Repo::new();
     repo.make_store("s", &["c", "a", "b"]);
-    repo.write_state("[stores.s]\ntarget = \"home/s\"\nfiles = [\"c\", \"a\", \"b\"]\n");
+    repo.write_state(&format!(
+        "[stores.s]\ntarget = \"{}\"\nfiles = [\"c\", \"a\", \"b\"]\n",
+        repo.path().join("home/s").display()
+    ));
 
     // Adding a different store triggers a state.toml rewrite, which
     // re-serializes all stores with sorted files.
@@ -5034,6 +5064,59 @@ target = "{}"
 }
 
 #[test]
+fn apply_plan_restores_whole_directory_after_last_template_is_removed() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("config"), "plain\n").unwrap();
+    fs::write(store.join("config.local.tmpl"), "local={{ os }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        "[stores.git]\ntarget = \"{}\"\n",
+        target.display()
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(
+        target.is_dir() && !target.is_symlink(),
+        "the initial template must promote this store to file mode"
+    );
+    fs::remove_file(store.join("config.local.tmpl")).unwrap();
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        plan["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op["op"] == "remove_link"),
+        "the plan must remove stale file-mode links"
+    );
+    assert!(
+        plan["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op["op"] == "replace_link"),
+        "the plan must replace the now-empty target directory"
+    );
+    let plan_path = repo.path().join("restore-whole-dir.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(fs::read_link(&target).unwrap(), store);
+}
+
+#[test]
 fn deleted_source_cleanup_preserves_foreign_replacement() {
     let repo = Repo::new();
     let store = repo.path().join("git");
@@ -6348,7 +6431,7 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("symlinked ancestor"));
+        .stderr(contains("link operation is not present"));
 
     assert!(
         !real_config.join(".bashrc").exists(),
@@ -6404,7 +6487,7 @@ files = [".config/.bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("symlink into the repository"));
+        .stderr(contains("link operation is not present"));
 
     // Direct `apply` must also reject the repo-pointing parent as a conflict.
     repo.cmd()
@@ -6465,7 +6548,7 @@ files = ["nested/file"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("symlink into the repository"));
+        .stderr(contains("link operation is not present"));
 
     // No write-through: nothing was created or renamed inside the victim directory.
     assert!(!victim.join("nested").join("file").exists());
@@ -6686,7 +6769,7 @@ files = ["gitconfig.tmpl"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("render hash mismatch"));
+        .stderr(contains("render operation is not present"));
 }
 
 #[test]
@@ -6768,7 +6851,7 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("preflight failed"));
+        .stderr(contains("link operation is not present"));
 
     // The foreign link must not have been touched.
     assert_eq!(
@@ -6814,7 +6897,7 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("replace_link may only replace an empty directory"));
+        .stderr(contains("link operation is not present"));
     assert_eq!(fs::read_to_string(target).unwrap(), "USER DATA");
 }
 
@@ -7011,7 +7094,7 @@ files = [".bashrc"]
 }
 
 #[test]
-fn apply_plan_rejects_hand_edited_backup_outside_target_dir() {
+fn apply_plan_rejects_injected_backup_operation() {
     let repo = Repo::new();
     repo.make_store("shells", &[".bashrc"]);
     let home = repo.path().join("home");
@@ -7044,7 +7127,7 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("not under the same directory"));
+        .stderr(contains("link operation is not present"));
 }
 
 #[test]
@@ -7329,6 +7412,50 @@ files = ["gitconfig.tmpl"]
         .stderr(contains("no pinned stage_render"));
 }
 
+#[test]
+fn apply_plan_rejects_unselected_injected_stage_render() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    fs::write(store_dir.join("active.tmpl"), "same\n").unwrap();
+    fs::write(store_dir.join("orphan.tmpl"), "same\n").unwrap();
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.git]\ntarget = \"{}\"\nfiles = [\"active.tmpl\"]\n",
+        home.display()
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut injected = plan["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|op| op["op"] == "stage_render")
+        .unwrap()
+        .clone();
+    injected["source_rel"] = "orphan.tmpl".into();
+    injected["staged"] = repo
+        .path()
+        .join(".stitch/render/git/orphan")
+        .to_string_lossy()
+        .into_owned()
+        .into();
+    plan["ops"].as_array_mut().unwrap().insert(0, injected);
+
+    let plan_path = repo.path().join("injected-plan.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains(
+            "render operation is not present in the freshly computed apply plan",
+        ));
+    assert!(!repo.path().join(".stitch/render/git/orphan").exists());
+}
+
 /// When a template is removed from state, `stitch plan` captures a `remove_staged`
 /// op to clean up the stale render before its link is removed.
 #[test]
@@ -7401,10 +7528,10 @@ ignore = ["gitconfig.tmpl"]
     assert!(!home.join("gitconfig").exists());
 }
 
-/// Malformed `requires.backup != "absent"` on a BackupAndLink op must fail at
-/// whole-plan preflight, not after earlier ops have mutated the filesystem.
+/// An injected backup operation must fail fresh-plan authorization before any
+/// earlier operation can mutate the filesystem.
 #[test]
-fn apply_plan_preflight_rejects_malformed_backup_requires_before_mutation() {
+fn apply_plan_rejects_injected_backup_before_mutation() {
     let repo = Repo::new();
     repo.make_store("shells", &[".bashrc", ".zshrc"]);
     let home = repo.path().join("home");
@@ -7419,17 +7546,14 @@ files = [".bashrc", ".zshrc"]
         home.to_string_lossy(),
     ));
 
-    // Capture a normal --force plan, then hand-edit it so the backup_and_link
-    // op requires its backup path to be a real entry instead of absent.
-    // With the backup path actually present as a real file, the old preflight
-    // would pass (backup state matches), execute the earlier create_link, and
-    // only fail at the per-op re-check. The new whole-plan preflight must
-    // reject backup != "absent" before any filesystem mutation.
+    // Capture a normal --force plan, then hand-edit its backup operation and
+    // place another valid create before it. Fresh-plan authorization must
+    // reject the injected operation before either one executes.
     let output = repo.cmd().args(["plan", "--force"]).output().unwrap();
     assert!(output.status.success());
     let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    // Reorder so create_link (for .zshrc) precedes the malformed backup_and_link.
+    // Reorder so create_link (for .zshrc) precedes the injected backup operation.
     let ops = plan["ops"].as_array_mut().unwrap();
     let mut create = None;
     let mut backup = None;
@@ -7446,7 +7570,7 @@ files = [".bashrc", ".zshrc"]
     ];
     *plan["ops"].as_array_mut().unwrap() = reordered;
 
-    // Set the malformed backup precondition and create the backup as a real file.
+    // Change the backup precondition and create the backup as a real file.
     plan["ops"][1]["requires"]["backup"] = "real_entry".into();
     let backup_path = Path::new(plan["ops"][1]["backup"].as_str().unwrap()).to_path_buf();
     fs::write(&backup_path, "backup").unwrap();
@@ -7459,8 +7583,7 @@ files = [".bashrc", ".zshrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("preflight failed for op"))
-        .stderr(contains("backup_and_link requires backup=absent"));
+        .stderr(contains("link operation is not present"));
 
     // The create_link must not have run; the real target and backup are untouched.
     assert!(
@@ -7471,11 +7594,10 @@ files = [".bashrc", ".zshrc"]
     assert!(backup_path.is_file());
 }
 
-/// Preflight must simulate the executor's store-grouped order, not the raw
-/// plan.ops order, so a plan whose raw order is internally consistent but whose
-/// grouped order is not is rejected before any filesystem mutation.
+/// A hand-edited replacement must be rejected by fresh-plan authorization
+/// before any filesystem mutation.
 #[test]
-fn apply_plan_preflight_simulates_store_grouped_execution_order() {
+fn apply_plan_rejects_injected_store_replacement_before_mutation() {
     let repo = Repo::new();
     repo.make_store("alpha", &["x"]);
     repo.make_store("beta", &["x", "y"]);
@@ -7497,13 +7619,10 @@ files = ["x", "y"]
     assert!(output.status.success());
     let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    // The captured plan wants to create home/x for both alpha and beta. Hand-edit
-    // it so the raw op order is: alpha create x, beta create y, beta replace x
-    // (replacing alpha's link with beta's). In that raw order the preflight
-    // passes. But the executor runs stores in the `stores` field order, which we
-    // set to ["beta", "alpha"]; the grouped exec order becomes beta create y,
-    // beta replace x, alpha create x. The replace op now sees home/x absent and
-    // must fail at whole-plan preflight before any fs mutation.
+    // The captured plan wants to create home/x for both alpha and beta. Inject
+    // a replacement that tries to claim alpha's link for beta. The current
+    // plan never authorizes that replacement, so validation must reject it
+    // before any filesystem mutation.
     let alpha_create = plan["ops"][0].clone();
     let beta_create_y = plan["ops"][2].clone();
     let beta_replace = serde_json::json!({
@@ -7526,15 +7645,11 @@ files = ["x", "y"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("preflight failed for op 2"))
-        .stderr(contains("does not match expected"));
+        .stderr(contains("link operation is not present"));
 
-    // If the preflight had used the raw plan.ops order, home/y would have been
-    // created before the replace failed. The grouped-order preflight must catch
-    // the problem first.
     assert!(
         !home.join("y").exists(),
-        "grouped-order preflight must not mutate"
+        "fresh-plan validation must not mutate"
     );
     assert!(!home.join("x").exists());
 }
@@ -7897,4 +8012,422 @@ pre = "touch {}"
     assert!(!home.join("old").exists());
     assert!(home.join("keep").is_symlink());
     assert!(home.join("new").is_symlink());
+}
+
+#[test]
+fn apply_promotion_validates_all_sources_before_removing_whole_dir_link() {
+    let repo = Repo::new();
+    let store = repo.make_store("app", &[]);
+    let external = tempfile::tempdir().unwrap();
+    fs::write(external.path().join("new"), "external").unwrap();
+    std::os::unix::fs::symlink(external.path(), store.join("gateway")).unwrap();
+    let target = repo.path().join("home/app");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store, &target).unwrap();
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"gateway/new\"]\n",
+        target.display()
+    ));
+
+    repo.cmd().arg("apply").assert().failure();
+    assert_eq!(fs::read_link(&target).unwrap(), store);
+}
+
+#[test]
+fn remove_cleans_broken_template_link_when_staging_is_missing() {
+    let repo = Repo::new();
+    repo.make_store("app", &["config.tmpl"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join("config");
+    let staged = repo.path().join(".stitch/render/app/config");
+    std::os::unix::fs::symlink(&staged, &target).unwrap();
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"config.tmpl\"]\n",
+        home.display()
+    ));
+
+    repo.cmd().args(["remove", "app"]).assert().success();
+    assert!(fs::symlink_metadata(&target).is_err());
+    let state = fs::read_to_string(repo.path().join(".stitch/state.toml")).unwrap();
+    assert!(!state.contains("stores.app"));
+}
+
+#[test]
+fn config_rejects_relative_target_paths() {
+    let repo = Repo::new();
+    repo.write_state("[stores.app]\ntarget = \"relative/home\"\n");
+    repo.cmd()
+        .arg("list")
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("targets must expand to absolute paths"));
+}
+
+#[test]
+fn template_apply_rejects_broad_gitignore_negation() {
+    let repo = Repo::new();
+    repo.make_store("app", &["secret.tmpl"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"secret.tmpl\"]\n",
+        home.display()
+    ));
+    // `!**` re-includes the staging tree even though it does not spell out
+    // `.stitch/render`; Git would track a rendered secret in this case.
+    fs::write(repo.path().join(".gitignore"), ".stitch/render/\n!**\n").unwrap();
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains(".gitignore"));
+    assert!(!home.join("secret").exists());
+}
+
+#[test]
+fn whole_dir_mode_does_not_expose_symlink_named_as_template() {
+    let repo = Repo::new();
+    let store = repo.make_store("app", &[]);
+    let external = tempfile::tempdir().unwrap();
+    let secret = external.path().join("secret");
+    fs::write(&secret, "external secret").unwrap();
+    std::os::unix::fs::symlink(&secret, store.join("secret.tmpl")).unwrap();
+    let target = repo.path().join("home/app");
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\n",
+        target.display()
+    ));
+
+    repo.cmd().arg("apply").assert().failure();
+    assert!(fs::symlink_metadata(&target).is_err());
+}
+
+#[test]
+fn whole_dir_mode_rejects_fifo_named_as_template_without_unlinking_target() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = Repo::new();
+    let store = repo.make_store("app", &[]);
+    let template = store.join("secret.tmpl");
+    let path = CString::new(template.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` is a NUL-terminated pathname owned by this test.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    let target = repo.path().join("home/app");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store, &target).unwrap();
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\n",
+        target.display()
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("template source"))
+        .stdout(contains("direct regular file"));
+    assert_eq!(fs::read_link(&target).unwrap(), store);
+}
+
+#[test]
+fn template_gateway_source_is_rejected_by_apply_render_and_edit() {
+    let repo = Repo::new();
+    let store = repo.make_store("app", &[]);
+    let external = tempfile::tempdir().unwrap();
+    fs::write(
+        external.path().join("secret.tmpl"),
+        "external={{ hostname }}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(external.path(), store.join("gateway")).unwrap();
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"gateway/secret.tmpl\"]\n",
+        home.display()
+    ));
+
+    repo.cmd().arg("apply").assert().failure();
+    assert!(!home.join("gateway/secret").exists());
+    assert!(
+        !repo
+            .path()
+            .join(".stitch/render/app/gateway/secret")
+            .exists()
+    );
+    repo.cmd()
+        .args(["render", "app/gateway/secret.tmpl"])
+        .assert()
+        .failure();
+    repo.cmd()
+        .args(["edit", home.join("gateway/secret").to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("unsafe edit source"));
+}
+
+#[test]
+fn template_hook_cannot_remove_gitignore_before_staging() {
+    let repo = Repo::new();
+    repo.make_store("app", &["secret.tmpl"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"secret.tmpl\"]\n",
+        home.display()
+    ));
+    let hooks = repo.path().join(".stitch/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(
+        hooks.join("pre-apply"),
+        "#!/bin/sh\nrm -f \"$STITCH_ROOT/.gitignore\"\n",
+    )
+    .unwrap();
+    make_executable(&hooks.join("pre-apply"));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("gitignore"));
+    assert!(!repo.path().join(".stitch/render/app/secret").exists());
+}
+
+#[test]
+fn apply_rejects_config_changed_by_store_hook_before_mutation() {
+    let repo = Repo::new();
+    repo.make_store("app", &["new"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"new\"]\n",
+        home.display()
+    ));
+    repo.write_authored(&format!(
+        "[stores.app]\nhooks = {{ pre = \"echo '# hook mutation' >> {}\" }}\n",
+        repo.path().join(".stitch/state.toml").display()
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("repository or config changed during pre-hook"));
+    assert!(
+        !home.join("new").exists(),
+        "a store hook that changes config must not reach target mutation"
+    );
+}
+
+#[test]
+fn init_rejects_gitignore_symlink_before_creating_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = tempfile::NamedTempFile::new().unwrap();
+    fs::write(external.path(), "keep\n").unwrap();
+    std::os::unix::fs::symlink(external.path(), dir.path().join(".gitignore")).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .failure();
+    assert_eq!(fs::read_to_string(external.path()).unwrap(), "keep\n");
+    assert!(!dir.path().join("stitch.toml").exists());
+    assert!(!dir.path().join(".stitch").exists());
+}
+
+#[test]
+fn migrate_rejects_invalid_authored_ignore_before_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch/config.toml"),
+        "[stores.app]\ntarget = \"~\"\nignore = [\"[unterminated\"]\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("invalid glob pattern"));
+    assert!(!dir.path().join("stitch.toml").exists());
+    assert!(!dir.path().join(".stitch/state.toml").exists());
+}
+
+#[test]
+fn plan_promotion_rechecks_all_sources_after_store_hook() {
+    let repo = Repo::new();
+    let store = repo.make_store("app", &["a"]);
+    let target = repo.path().join("home/app");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store, &target).unwrap();
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"a\"]\n",
+        target.display()
+    ));
+    repo.write_authored(&format!(
+        "[stores.app]\nhooks = {{ pre = \"rm -f {}\" }}\n",
+        store.join("a").display()
+    ));
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let plan = repo.path().join("plan.json");
+    fs::write(&plan, output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("post-hook preflight"));
+    assert_eq!(fs::read_link(&target).unwrap(), store);
+}
+
+#[test]
+fn plan_multi_file_promotion_executes_without_false_preflight_conflict() {
+    let repo = Repo::new();
+    let store = repo.make_store("app", &["a", "b"]);
+    let target = repo.path().join("home/app");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store, &target).unwrap();
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"a\", \"b\"]\n",
+        target.display()
+    ));
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let plan = repo.path().join("plan.json");
+    fs::write(&plan, output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(target.join("a").is_symlink());
+    assert!(target.join("b").is_symlink());
+}
+
+#[test]
+fn remove_rejects_symlinked_state_before_unlinking_targets() {
+    let repo = Repo::new();
+    let store = repo.make_store("app", &["file"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"file\"]\n",
+        home.display()
+    ));
+    repo.cmd().arg("apply").assert().success();
+    let target = home.join("file");
+    assert!(target.is_symlink());
+
+    let state = repo.path().join(".stitch/state.toml");
+    let external = repo.path().join("external-state.toml");
+    fs::rename(&state, &external).unwrap();
+    std::os::unix::fs::symlink(&external, &state).unwrap();
+    repo.cmd().args(["remove", "app"]).assert().failure();
+    assert!(target.is_symlink());
+    assert!(fs::read_to_string(external).unwrap().contains("stores.app"));
+    assert!(store.join("file").exists());
+}
+
+#[test]
+fn config_rejects_target_overlap_through_filesystem_alias() {
+    let repo = Repo::new();
+    repo.make_store("app", &["a", "b"]);
+    let external = tempfile::tempdir().unwrap();
+    let root = external.path().join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    let gateway = repo.path().join("gateway");
+    std::os::unix::fs::symlink(external.path(), &gateway).unwrap();
+    repo.write_state(&format!(
+        "[stores.app.targets.one]\ntarget = \"{}\"\nfiles = [\"a\"]\n\n[stores.app.targets.two]\ntarget = \"{}\"\nfiles = [\"b\"]\n",
+        root.display(),
+        gateway.join("root/sub").display()
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("overlapping target paths"));
+}
+
+#[test]
+fn migrate_rejects_symlinked_stitch_dir_before_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    fs::write(external.path().join("config.toml"), "[stores]\n").unwrap();
+    std::os::unix::fs::symlink(external.path(), dir.path().join(".stitch")).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .failure()
+        .stderr(contains("refusing migration before writing anything"));
+    assert!(!dir.path().join("stitch.toml").exists());
+    assert!(!external.path().join("state.toml").exists());
+}
+
+#[test]
+fn remove_dry_run_reports_foreign_broken_link_as_conflict() {
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join("file");
+    std::os::unix::fs::symlink("/tmp/foreign", &target).unwrap();
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"file\"]\n",
+        home.display()
+    ));
+
+    repo.cmd()
+        .args(["remove", "app", "--dry-run"])
+        .assert()
+        .failure()
+        .code(7);
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        PathBuf::from("/tmp/foreign")
+    );
+}
+
+#[test]
+fn plan_rejects_config_changed_by_global_hook_before_mutation() {
+    let repo = Repo::new();
+    repo.make_store("app", &["new"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.app]\ntarget = \"{}\"\nfiles = [\"new\"]\n",
+        home.display()
+    ));
+    let hooks = repo.path().join(".stitch/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(
+        hooks.join("pre-apply"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '[stores.app]' 'target = \"{}\"' 'files = [\"new\", \"old\"]' > \"$STITCH_ROOT/.stitch/state.toml\"\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&hooks.join("pre-apply"));
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let plan = repo.path().join("plan.json");
+    fs::write(&plan, output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("config changed during pre-apply hook"));
+    assert!(!home.join("new").exists());
 }

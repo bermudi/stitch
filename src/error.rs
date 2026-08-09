@@ -375,6 +375,12 @@ impl From<ConfigError> for StitchError {
             ConfigError::Write(e, path) => Self::Internal {
                 message: format!("could not write {}: {e}", path.display()),
             },
+            ConfigError::CommittedWrite(e, path) => Self::Internal {
+                message: format!(
+                    "wrote {} but could not sync its parent directory: {e}; the new state remains in place but may not survive power loss",
+                    path.display()
+                ),
+            },
             other => Self::Config(other),
         }
     }

@@ -53,6 +53,8 @@ movement, data exposure, or silent replacement.** New code must uphold:
 - **Validate path fragments.** Reject absolute and `..`-containing file entries; nothing
   escapes the store/target dirs.
 - **No destructive overwrite of existing repo content.** Collisions are rejected.
+- **Filesystem race boundary:** stitch rejects hostile state already present when an operation starts and revalidates after hooks immediately before mutation. A malicious same-UID process racing the final filesystem syscall is out of scope (it can already mutate the same files directly). Do not claim stronger guarantees in docs or tests.
+- **No hidden quarantine mechanism.** Successful operations must not leave `.quarantine.*` links/files or retain old rendered secrets. User-data replacement uses the explicit, visible `.bak` behavior; tool-owned staging uses exclusive temporary files and atomic rename.
 - **Authored config is read-only to the tool.** After `init`, stitch never rewrites `stitch.toml`. Mutations touch `.stitch/state.toml` only — never silently destroy the user's comments or formatting. (v0.3 split, shipped.)
 - **`prune` is list-only by default.** It walks `$HOME` for repo-pointing symlinks no store references; removal requires explicit `--yes`. Removal routes through the `points_into_repo`-guarded `remove_link`, so foreign symlinks are never touched and a link repointed between scan and unlink is skipped. (v0.3.1, shipped.)
 

@@ -281,6 +281,60 @@ pub fn points_at_source(target: &Path, expected_source: &Path, repo_root: &Path)
     entry_identity(&link_entry) == entry_identity(expected_source)
 }
 
+/// Resolve a missing path by canonicalizing its nearest existing ancestor and
+/// then restoring the absent normal-component suffix.
+pub fn resolve_path_with_missing(path: &Path) -> Option<PathBuf> {
+    let absolute = absolute_path(path).ok()?;
+    let mut ancestor = absolute.as_path();
+    let mut suffix = VecDeque::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = resolve_path(ancestor).ok()?;
+                for component in suffix {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let leaf = ancestor.file_name()?.to_os_string();
+                suffix.push_front(leaf);
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Whether `target` points exactly at an expected source path that is now
+/// missing. This narrowly supports cleanup of dangling template links after
+/// their staged render was deleted. Both paths resolve through their nearest
+/// existing ancestors, and the resulting expected path must remain inside the
+/// repository.
+fn points_at_missing_source(target: &Path, expected_source: &Path, repo_root: &Path) -> bool {
+    if std::fs::symlink_metadata(expected_source).is_ok() || !is_direct_entry_path(expected_source)
+    {
+        return false;
+    }
+    let Ok(link) = std::fs::read_link(target) else {
+        return false;
+    };
+    if !is_direct_entry_path(&link) {
+        return false;
+    }
+    let Ok(link_path) = link_target_path(target, &link) else {
+        return false;
+    };
+    let (Some(link_path), Some(expected), Some(repo)) = (
+        resolve_path_with_missing(&link_path),
+        resolve_path_with_missing(expected_source),
+        resolved_directory(repo_root),
+    ) else {
+        return false;
+    };
+    link_path == expected && expected.starts_with(repo)
+}
+
 #[derive(Debug)]
 enum ResolveError {
     Io,
@@ -483,6 +537,24 @@ pub fn remove_link(target: &Path, repo_root: &Path) -> Result<bool, LinkError> {
     Ok(true)
 }
 
+/// Whether `target` currently points exactly at `expected_source` under the
+/// same rules used by [`remove_link_to`].
+pub fn points_to_source(target: &Path, expected_source: &Path, repo_root: &Path) -> bool {
+    match std::fs::symlink_metadata(expected_source) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            points_at_source(target, expected_source, repo_root)
+        }
+        Ok(_) => {
+            points_into_repo(target, repo_root)
+                && check_link(target, expected_source) == LinkStatus::Linked
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            points_at_missing_source(target, expected_source, repo_root)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Remove `target` only when it still points exactly at `expected_source` in
 /// this repo. Used for whole-directory → file-mode promotion and store removal:
 /// a link repointed to another store (or a foreign target) between inspection
@@ -497,16 +569,7 @@ pub fn remove_link_to(
     expected_source: &Path,
     repo_root: &Path,
 ) -> Result<bool, LinkError> {
-    let expected_is_symlink = std::fs::symlink_metadata(expected_source)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false);
-    let owned = if expected_is_symlink {
-        points_at_source(target, expected_source, repo_root)
-    } else {
-        points_into_repo(target, repo_root)
-            && check_link(target, expected_source) == LinkStatus::Linked
-    };
-    if !owned {
+    if !points_to_source(target, expected_source, repo_root) {
         return Ok(false);
     }
     // This is intentionally the final operation: revalidate immediately
@@ -594,6 +657,34 @@ mod tests {
         assert!(target.is_symlink(), "wrong expected source must not unlink");
         assert!(remove_link_to(&target, &source_a, tmp.path()).unwrap());
         assert!(target.symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn test_remove_link_to_accepts_exact_missing_source_but_rejects_gateway() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(repo.join(".stitch")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+
+        let expected = repo.join(".stitch/render/app/file");
+        let target = home.join("file");
+        symlink(&expected, &target).unwrap();
+        assert!(remove_link_to(&target, &expected, &repo).unwrap());
+
+        let repo_alias = tmp.path().join("repo-alias");
+        symlink(&repo, &repo_alias).unwrap();
+        let aliased_expected = repo_alias.join(".stitch/render/app/other");
+        symlink(repo.join(".stitch/render/app/other"), &target).unwrap();
+        assert!(remove_link_to(&target, &aliased_expected, &repo_alias).unwrap());
+
+        symlink(&external, repo.join("gateway")).unwrap();
+        let escaped = repo.join("gateway/missing/file");
+        symlink(&escaped, &target).unwrap();
+        assert!(!remove_link_to(&target, &escaped, &repo).unwrap());
+        assert!(target.is_symlink());
     }
 
     #[test]

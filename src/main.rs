@@ -413,8 +413,29 @@ fn plan_error(plan: &plan::Plan) -> StitchError {
 
 fn cmd_init() -> Result<(), StitchError> {
     let cwd = std::env::current_dir()?;
+    let gitignore = cwd.join(".gitignore");
+    if std::fs::symlink_metadata(&gitignore)
+        .is_ok_and(|meta| meta.file_type().is_symlink() || !meta.file_type().is_file())
+    {
+        return Err(StitchError::internal(format!(
+            "refusing non-regular or symlinked {}",
+            gitignore.display()
+        )));
+    }
     let stitch_dir = cwd.join(".stitch");
-    std::fs::create_dir_all(&stitch_dir)?;
+    match std::fs::symlink_metadata(&stitch_dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(StitchError::internal(format!(
+                "refusing non-directory or symlinked {}",
+                stitch_dir.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&stitch_dir)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
 
     let authored_path = cwd.join("stitch.toml");
     if std::fs::symlink_metadata(&authored_path).is_ok() {
@@ -443,10 +464,19 @@ fn cmd_init() -> Result<(), StitchError> {
     // user's to edit. The tool never rewrites this file after init. Reuses the
     // same fsync+rename atomicity as state writes.
     let authored_content = format!("{}{}", config::AUTHORED_TEMPLATE, "\n[vars]\n");
-    config::atomic_write(&authored_path, &authored_content)?;
+    let mut durability_warnings = Vec::new();
+    match config::atomic_write(&authored_path, &authored_content) {
+        Ok(()) => {}
+        Err(error) if error.write_committed() => durability_warnings.push(error.to_string()),
+        Err(error) => return Err(error.into()),
+    }
 
     // Generated half: empty state. Reserialized by the tool on every mutation.
-    config::GeneratedState::default().save(&cwd)?;
+    match config::GeneratedState::default().save(&cwd) {
+        Ok(()) => {}
+        Err(error) if error.write_committed() => durability_warnings.push(error.to_string()),
+        Err(error) => return Err(error.into()),
+    }
 
     // Trust foundation (v0.6): staging dir must never enter version control.
     // Append `.stitch/render/` to .gitignore (create if needed). Idempotent.
@@ -455,6 +485,13 @@ fn cmd_init() -> Result<(), StitchError> {
     // Pre-create the staging root at 0700 so the permission contract holds
     // before the first templated apply.
     render::ensure_render_root(&cwd).map_err(StitchError::internal)?;
+
+    if !durability_warnings.is_empty() {
+        return Err(StitchError::internal(format!(
+            "initialization completed, but its config directory could not be synced: {}",
+            durability_warnings.join("; ")
+        )));
+    }
 
     println!("Initialized stitch config:");
     println!("  {}", authored_path.display());
@@ -501,6 +538,7 @@ fn cmd_apply(
     // Global pre-apply hook (skipped under dry-run — hooks have side effects).
     if !opts.dry_run {
         let root_identity = filesystem_identity(root)?;
+        let config_hash = plan_exec::compute_config_hash(root)?;
         let env = hooks::HookEnv {
             root,
             store: None,
@@ -514,6 +552,11 @@ fn cmd_apply(
             root_identity,
             "repository changed during pre-apply hook",
         )?;
+        if plan_exec::compute_config_hash(root)? != config_hash {
+            return Err(StitchError::plan_stale(
+                "config changed during pre-apply hook",
+            ));
+        }
     }
 
     let (plan, warnings) = store::apply_all(root, &filtered_config, &platform, opts);
@@ -524,8 +567,13 @@ fn cmd_apply(
 
     render_plan(&plan, opts.dry_run);
 
-    // Global post-apply hook (skipped under dry-run). Warns on failure — the
-    // apply already happened, so post-hook failure does not abort.
+    if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
+        return Err(plan_error(&plan));
+    }
+
+    // Global post-apply hook (skipped under dry-run). Per-store execution has
+    // revalidated the repository after every post-hook, so this pathname still
+    // identifies the repository whose apply just completed.
     if !opts.dry_run {
         let env = hooks::HookEnv {
             root,
@@ -537,12 +585,7 @@ fn cmd_apply(
             eprintln!("warning: post-apply hook: {e}");
         }
     }
-
-    if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
-        Err(plan_error(&plan))
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 fn cmd_plan(
@@ -724,6 +767,7 @@ fn apply_json(
 
     if !opts.dry_run {
         let root_identity = filesystem_identity(root)?;
+        let config_hash = plan_exec::compute_config_hash(root)?;
         let env = hooks::HookEnv {
             root,
             store: None,
@@ -737,12 +781,17 @@ fn apply_json(
             root_identity,
             "repository changed during pre-apply hook",
         )?;
+        if plan_exec::compute_config_hash(root)? != config_hash {
+            return Err(StitchError::plan_stale(
+                "config changed during pre-apply hook",
+            ));
+        }
     }
 
     let (plan, mut warnings) = store::apply_all(root, config, &platform, opts);
     warnings.extend(loaded_warnings);
 
-    if !opts.dry_run {
+    if !opts.dry_run && plan.summary.errors == 0 && plan.summary.conflicts == 0 {
         let env = hooks::HookEnv {
             root,
             store: None,
@@ -958,27 +1007,60 @@ fn rollback_adopt_move(
     }
 }
 
-/// Undo a partial `add` (create-empty path): remove any links `apply_store`
-/// managed to create, then remove the (empty) store directory. Unlike
-/// `rollback_adopt_move`, this path relocates no user data, so there is
-/// nothing to rename back — only links we created and an empty dir we made
-/// are torn down. Errors are ignored: best-effort cleanup on an already-
-/// failing path.
-fn discard_uncommitted_add(
-    results: Option<&store::ApplyResult>,
-    store_dir: &std::path::Path,
+/// Remove links and staged renders created by an `add` attempt using their
+/// exact desired sources. A link repointed meanwhile remains untouched.
+///
+/// Cleanup is best effort only in the sense that every independent step is
+/// attempted. Its failures are returned to the user: a failed `add` must not
+/// quietly leave an unrecorded link or rendered output behind.
+fn cleanup_uncommitted_add(
     repo_root: &std::path::Path,
-) {
-    if let Some(results) = results {
-        for action in &results.actions {
-            if let store::ApplyAction::Created(p) | store::ApplyAction::Replaced { target: p, .. } =
-                action
-            {
-                let _ = linker::remove_link(p, repo_root);
-            }
+    store_name: &str,
+    new_store: &config::Store,
+    platform: &Platform,
+) -> Vec<String> {
+    let mut config = Config {
+        vars: std::collections::BTreeMap::new(),
+        stores: std::collections::BTreeMap::new(),
+    };
+    config
+        .stores
+        .insert(store_name.to_string(), new_store.clone());
+    let mut errors = Vec::new();
+    for entry in store::status_all(repo_root, &config, platform) {
+        if let Err(error) = linker::remove_link_to(&entry.target, &entry.link_source, repo_root) {
+            errors.push(format!(
+                "could not remove uncommitted link {}: {error}",
+                entry.target.display()
+            ));
         }
     }
-    let _ = std::fs::remove_dir(store_dir);
+    if let Err(error) = render::remove_store_staging(repo_root, store_name) {
+        errors.push(error);
+    }
+    errors
+}
+
+fn discard_uncommitted_add(store_dir: &std::path::Path) -> Option<String> {
+    match std::fs::remove_dir(store_dir) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(format!(
+            "could not remove uncommitted store directory {}: {error}",
+            store_dir.display()
+        )),
+    }
+}
+
+fn add_cleanup_error(primary: StitchError, errors: Vec<String>) -> StitchError {
+    if errors.is_empty() {
+        primary
+    } else {
+        StitchError::internal(format!(
+            "add failed ({primary}); cleanup also failed: {}. Inspect the listed paths before retrying.",
+            errors.join("; ")
+        ))
+    }
 }
 
 fn cmd_add(
@@ -1006,7 +1088,12 @@ fn cmd_add(
         )));
     }
 
-    let source = expand_home(path);
+    let expanded_source = expand_home(path);
+    let source = if expanded_source.is_absolute() {
+        expanded_source
+    } else {
+        std::env::current_dir()?.join(expanded_source)
+    };
 
     // A symlink at the target is always an error — we never silently clobber
     // or repoint a foreign symlink.
@@ -1050,7 +1137,11 @@ fn cmd_add(
     // Validate user-supplied fragments before touching the filesystem: a
     // `--file ../x` would otherwise escape the store/target dirs during apply
     // (and leave an orphaned store dir on failure).
-    config::validate_fragments(files, patterns, &format!("store '{store_name}'"))?;
+    let validation_context = format!("store '{store_name}'");
+    config::validate_fragments(files, patterns, &validation_context)?;
+    // Match generated-state validation before the dry-run branch so a preview
+    // never accepts a pattern that a real add would refuse to persist.
+    config::validate_globs(patterns, &[], &validation_context)?;
 
     let source_exists = source.exists();
 
@@ -1100,7 +1191,7 @@ fn cmd_add(
         } else {
             let data = AddData {
                 store: store_name.clone(),
-                target: path.to_string(),
+                target: collapse_home(&source),
                 mode: "create".into(),
                 source: None,
                 files: files.to_vec(),
@@ -1182,23 +1273,22 @@ fn cmd_add(
                 store::ApplyAction::Conflict { .. } | store::ApplyAction::Error(_)
             )
         }) {
-            for action in &results.actions {
-                if let store::ApplyAction::Created(p)
-                | store::ApplyAction::Replaced { target: p, .. } = action
-                {
-                    let _ = linker::remove_link(p, root);
-                }
-            }
-            rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|e| {
-                StitchError::internal(format!(
-                    "ADD FAILED and rollback also failed: {} is stranded in {} ({})",
+            let primary = apply_error_from_actions(&results.actions)
+                .unwrap_or_else(|| StitchError::internal("apply reported conflicts or errors"));
+            let cleanup_errors = cleanup_uncommitted_add(root, &store_name, &new_store, &platform);
+            if let Err(error) = rollback_adopt_move(&source, &store_dir, &raw_name, is_dir) {
+                let cleanup = if cleanup_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Cleanup also failed: {}.", cleanup_errors.join("; "))
+                };
+                return Err(StitchError::internal(format!(
+                    "ADD FAILED ({primary}) and rollback also failed: {} is stranded in {} ({error}).{cleanup}",
                     source.display(),
                     store_dir.display(),
-                    e
-                ))
-            })?;
-            return Err(apply_error_from_actions(&results.actions)
-                .unwrap_or_else(|| StitchError::internal("apply reported conflicts or errors")));
+                )));
+            }
+            return Err(add_cleanup_error(primary, cleanup_errors));
         }
 
         // Record: persist state.toml (generated half only). stitch.toml is
@@ -1212,22 +1302,29 @@ fn cmd_add(
                 targets: std::collections::BTreeMap::new(),
             },
         );
-        if let Err(e) = loaded.generated.save(root) {
-            for action in &results.actions {
-                if let store::ApplyAction::Created(p)
-                | store::ApplyAction::Replaced { target: p, .. } = action
-                {
-                    let _ = linker::remove_link(p, root);
-                }
+        if let Err(error) = loaded.generated.save(root) {
+            // A directory fsync can fail after rename. The state is then
+            // already committed, so rolling back its links/store would make
+            // that state point at missing data.
+            if error.write_committed() {
+                return Err(error.into());
             }
-            rollback_adopt_move(&source, &store_dir, &raw_name, is_dir).map_err(|re| {
-                StitchError::internal(format!(
-                    "state save failed ({e}) and rollback also failed: {} is stranded in {} ({re})",
+            let primary = StitchError::from(error);
+            let cleanup_errors = cleanup_uncommitted_add(root, &store_name, &new_store, &platform);
+            if let Err(rollback_error) = rollback_adopt_move(&source, &store_dir, &raw_name, is_dir)
+            {
+                let cleanup = if cleanup_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Cleanup also failed: {}.", cleanup_errors.join("; "))
+                };
+                return Err(StitchError::internal(format!(
+                    "state save failed ({primary}) and rollback also failed: {} is stranded in {} ({rollback_error}).{cleanup}",
                     source.display(),
                     store_dir.display(),
-                ))
-            })?;
-            return Err(StitchError::from(e));
+                )));
+            }
+            return Err(add_cleanup_error(primary, cleanup_errors));
         }
 
         println!(
@@ -1244,7 +1341,7 @@ fn cmd_add(
         }
     } else {
         // --- Create-empty path: fresh store, link to target. ---
-        let target_str = path.to_string();
+        let target_str = collapse_home(&source);
 
         let new_store = config::Store {
             target: Some(target_str.clone()),
@@ -1293,9 +1390,14 @@ fn cmd_add(
         });
 
         if failed {
-            discard_uncommitted_add(Some(&results), &store_dir, root);
-            return Err(apply_error_from_actions(&results.actions)
-                .unwrap_or_else(|| StitchError::internal("apply reported conflicts or errors")));
+            let primary = apply_error_from_actions(&results.actions)
+                .unwrap_or_else(|| StitchError::internal("apply reported conflicts or errors"));
+            let mut cleanup_errors =
+                cleanup_uncommitted_add(root, &store_name, &new_store, &platform);
+            if let Some(error) = discard_uncommitted_add(&store_dir) {
+                cleanup_errors.push(error);
+            }
+            return Err(add_cleanup_error(primary, cleanup_errors));
         }
 
         // Persist state.toml (generated half only). If save fails after apply
@@ -1310,9 +1412,20 @@ fn cmd_add(
                 targets: std::collections::BTreeMap::new(),
             },
         );
-        if let Err(e) = loaded.generated.save(root) {
-            discard_uncommitted_add(Some(&results), &store_dir, root);
-            return Err(StitchError::from(e));
+        if let Err(error) = loaded.generated.save(root) {
+            // See the adopt path above: rename succeeded, so leave the
+            // matching links and store in place when only directory fsync
+            // failed.
+            if error.write_committed() {
+                return Err(error.into());
+            }
+            let primary = StitchError::from(error);
+            let mut cleanup_errors =
+                cleanup_uncommitted_add(root, &store_name, &new_store, &platform);
+            if let Some(error) = discard_uncommitted_add(&store_dir) {
+                cleanup_errors.push(error);
+            }
+            return Err(add_cleanup_error(primary, cleanup_errors));
         }
 
         println!("Added store '{}'", store_name);
@@ -1352,17 +1465,39 @@ fn cmd_remove(
         .map(str::to_owned);
 
     let statuses = store::status_all(root, &loaded.config, &platform);
-    let linked: Vec<_> = statuses
+    let store_statuses: Vec<_> = statuses
         .iter()
         .filter(|e| e.store_name == *name && !e.skipped_platform)
-        .filter(|e| e.status == linker::LinkStatus::Linked)
         .collect();
+    let linked: Vec<_> = store_statuses
+        .iter()
+        .copied()
+        // A template link can outlive a missing staged render and therefore
+        // report Broken. Include it only when the same exact-source predicate
+        // used by real removal recognizes it; dry-run must not promise to
+        // remove a foreign broken link.
+        .filter(|e| linker::points_to_source(&e.target, &e.link_source, root))
+        .collect();
+    if let Some(entry) = store_statuses.iter().copied().find(|e| {
+        matches!(e.status, linker::LinkStatus::Broken(_))
+            && std::fs::symlink_metadata(&e.target).is_ok_and(|meta| meta.file_type().is_symlink())
+            && !linker::points_to_source(&e.target, &e.link_source, root)
+    }) {
+        return Err(StitchError::conflict_foreign(
+            &entry.target,
+            std::fs::read_link(&entry.target).ok(),
+        ));
+    }
     let linked_paths: Vec<String> = linked
         .iter()
         .map(|e| e.target.to_string_lossy().into_owned())
         .collect();
     let staging = render::store_render_dir(root, name);
     let staging_str = staging.to_string_lossy().into_owned();
+    let state_path = root.join(".stitch/state.toml");
+    if !dry_run {
+        config::validate_atomic_write_target(&state_path)?;
+    }
 
     if dry_run {
         let data = RemoveData {
@@ -1389,8 +1524,13 @@ fn cmd_remove(
         return Ok(());
     }
 
-    // Global pre-remove hook.
+    // Global pre-remove hook. Pin both the repository and its state directory:
+    // replacing either with another real directory must not redirect cleanup
+    // or the later state write.
     {
+        let root_identity = filesystem_identity(root)?;
+        let stitch_dir = root.join(".stitch");
+        let stitch_identity = filesystem_identity(&stitch_dir)?;
         let env = hooks::HookEnv {
             root,
             store: Some(name),
@@ -1399,6 +1539,17 @@ fn cmd_remove(
         };
         hooks::run_global_hook(root, "pre-remove", &env, &platform)
             .map_err(|e| StitchError::hook("pre-remove", e))?;
+        ensure_filesystem_identity(
+            root,
+            root_identity,
+            "repository changed during pre-remove hook",
+        )?;
+        ensure_filesystem_identity(
+            &stitch_dir,
+            stitch_identity,
+            "state directory changed during pre-remove hook",
+        )?;
+        config::validate_atomic_write_target(&state_path)?;
     }
 
     // Remove links before deleting state. If a link that was repo-owned when
@@ -1837,7 +1988,17 @@ fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
 }
 
 fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), StitchError> {
-    let legacy_path = root.join(".stitch").join("config.toml");
+    let stitch_dir = root.join(".stitch");
+    let stitch_meta = std::fs::symlink_metadata(&stitch_dir).map_err(|e| {
+        StitchError::internal(format!("could not inspect {}: {e}", stitch_dir.display()))
+    })?;
+    if stitch_meta.file_type().is_symlink() || !stitch_meta.is_dir() {
+        return Err(StitchError::internal(format!(
+            "{} is symlinked or not a directory — refusing migration before writing anything",
+            stitch_dir.display()
+        )));
+    }
+    let legacy_path = stitch_dir.join("config.toml");
     let authored_path = root.join("stitch.toml");
     let state_path = root.join(".stitch").join("state.toml");
 
@@ -1894,6 +2055,7 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
     // v0.2 accepted entries the new validator rejects (e.g. `./bashrc`); we
     // must fail fast so migration does not create state that cannot load.
     generated.validate()?;
+    config::validate_merged(&authored, &generated)?;
 
     // Render both halves once: authored (with the read-only header prepended)
     // and generated (sorted + header-stamped). The state string is reused for
@@ -1940,8 +2102,21 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
     // Write both new files first; only after both succeed do we move the legacy
     // file aside. A crash during writes leaves the original intact. The .bak
     // target was pre-checked above, so this rename can't clobber.
-    config::atomic_write(&authored_path, &authored_str)?;
-    config::atomic_write(&state_path, &state_str)?;
+    //
+    // Parent-directory fsync can fail after a successful rename. Continue a
+    // completed migration in that case: retrying after returning early would
+    // refuse the visible authored/state files and strand the legacy config.
+    let mut durability_warnings = Vec::new();
+    match config::atomic_write(&authored_path, &authored_str) {
+        Ok(()) => {}
+        Err(error) if error.write_committed() => durability_warnings.push(error.to_string()),
+        Err(error) => return Err(error.into()),
+    }
+    match config::atomic_write(&state_path, &state_str) {
+        Ok(()) => {}
+        Err(error) if error.write_committed() => durability_warnings.push(error.to_string()),
+        Err(error) => return Err(error.into()),
+    }
 
     // Preserve the original as a .bak rather than delete — the user's comments
     // and formatting are the recovery path (migrate is comment-lossy by design).
@@ -1961,6 +2136,12 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
          Re-add any comments you want to keep.",
         backup_path.display()
     );
+    if !durability_warnings.is_empty() {
+        return Err(StitchError::internal(format!(
+            "migration completed, but its config directory could not be synced: {}",
+            durability_warnings.join("; ")
+        )));
+    }
     Ok(())
 }
 

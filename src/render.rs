@@ -92,14 +92,41 @@ pub fn check_name_collisions(source_names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// True if any file under `store_dir` has a `.tmpl` suffix (full-tree walk).
+/// True if any non-directory entry under `store_dir` has a `.tmpl` suffix.
+///
+/// A terminal symlink named `*.tmpl` counts deliberately: forcing file mode
+/// lets the renderer reject it as a non-regular template source instead of
+/// exposing the literal symlink through a whole-directory link.
 pub fn store_has_templates(store_dir: &Path) -> bool {
     walkdir::WalkDir::new(store_dir)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| !e.file_type().is_dir())
         .any(|e| e.file_name().to_str().map(is_template).unwrap_or(false))
+}
+
+/// Return the first non-regular `*.tmpl` source found without following links.
+///
+/// Auto-detection must see these entries so a whole-directory link cannot
+/// expose a literal template symlink. Resolution then rejects them before a
+/// mode promotion can remove the live whole-directory link.
+pub fn unsupported_template_source(store_dir: &Path) -> Result<Option<PathBuf>, String> {
+    for entry in walkdir::WalkDir::new(store_dir).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect template sources under {}: {error}",
+                store_dir.display()
+            )
+        })?;
+        if !entry.file_type().is_dir()
+            && !entry.file_type().is_file()
+            && entry.file_name().to_str().map(is_template).unwrap_or(false)
+        {
+            return Ok(Some(entry.into_path()));
+        }
+    }
+    Ok(None)
 }
 
 /// Absolute path of the staged render for `store_name` / `link_rel`.
@@ -121,23 +148,52 @@ pub fn store_render_dir(repo_root: &Path, store_name: &str) -> PathBuf {
 // .gitignore enforcement
 // ---------------------------------------------------------------------------
 
-/// Whether `.gitignore` text already ignores the render staging dir.
+/// Whether `.gitignore` text safely ignores the render staging dir.
+///
+/// This is intentionally conservative rather than a complete gitignore
+/// interpreter. Recognized positive rules establish coverage; any later
+/// negation revokes it. A broad negation such as `!**` can re-include the
+/// staging tree without naming it. Returning false can only produce a warning
+/// or append a redundant rule, while a false positive could expose rendered
+/// secrets.
 pub fn gitignore_has_render_entry(contents: &str) -> bool {
-    contents.lines().any(|line| {
-        let t = line.trim();
-        // Exact entry, or broader ignores that already cover it.
-        t == RENDER_GITIGNORE_ENTRY
-            || t == ".stitch/render"
-            || t == ".stitch/"
-            || t == ".stitch"
-            || t == "**/.stitch/render/"
-            || t == "**/.stitch/render"
-    })
+    let mut covered = false;
+    for line in contents.lines() {
+        // Leading whitespace is literal in gitignore syntax, so do not trim
+        // it into a rule that Git itself would not recognize.
+        let rule = line.trim_end_matches('\r');
+        if rule.is_empty() || rule.starts_with('#') {
+            continue;
+        }
+        if rule.starts_with('!') {
+            // Correctly evaluating whether an arbitrary negation reaches this
+            // path needs Git's complete ignore matcher. Treat every negation
+            // as revoking coverage instead: a later positive render rule can
+            // establish it again.
+            covered = false;
+            continue;
+        }
+        if rule == RENDER_GITIGNORE_ENTRY
+            || rule == ".stitch/render"
+            || rule == ".stitch/"
+            || rule == ".stitch"
+            || rule == "**/.stitch/render/"
+            || rule == "**/.stitch/render"
+        {
+            covered = true;
+        }
+    }
+    covered
 }
 
 /// Read the repo `.gitignore` (if any) and report whether the render entry is present.
 pub fn repo_gitignore_covers_render(repo_root: &Path) -> bool {
     let path = repo_root.join(".gitignore");
+    if !std::fs::symlink_metadata(&path)
+        .is_ok_and(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
+    {
+        return false;
+    }
     match std::fs::read_to_string(path) {
         Ok(contents) => gitignore_has_render_entry(&contents),
         // No .gitignore at all → not covered.
@@ -159,20 +215,38 @@ pub fn has_staged_output(repo_root: &Path) -> bool {
 /// Append `.stitch/render/` to the repo `.gitignore`, creating the file if needed.
 /// Idempotent: a no-op when the entry is already present.
 pub fn ensure_render_gitignore(repo_root: &Path) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
     let path = repo_root.join(".gitignore");
-    if path.exists() {
-        let contents = std::fs::read_to_string(&path)?;
-        if gitignore_has_render_entry(&contents) {
-            return Ok(());
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
+            return Err(std::io::Error::other(format!(
+                "refusing non-regular or symlinked {}",
+                path.display()
+            )));
         }
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-        use std::io::Write;
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            writeln!(file)?;
+        Ok(_) => {
+            let contents = std::fs::read_to_string(&path)?;
+            if gitignore_has_render_entry(&contents) {
+                return Ok(());
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                writeln!(file)?;
+            }
+            writeln!(file, "{RENDER_GITIGNORE_ENTRY}")?;
         }
-        writeln!(file, "{RENDER_GITIGNORE_ENTRY}")?;
-    } else {
-        std::fs::write(&path, format!("{RENDER_GITIGNORE_ENTRY}\n"))?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            writeln!(file, "{RENDER_GITIGNORE_ENTRY}")?;
+        }
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -273,6 +347,23 @@ pub fn render_file(
     platform: &Platform,
     vars: &BTreeMap<String, String>,
 ) -> Result<String, String> {
+    let mut source_root = source_path.to_path_buf();
+    for _ in Path::new(template_name).components() {
+        if !source_root.pop() {
+            return Err(format!(
+                "template source {} has no store root",
+                source_path.display()
+            ));
+        }
+    }
+    if source_root.join(template_name) != source_path {
+        return Err(format!(
+            "template source {} does not match relative name '{template_name}'",
+            source_path.display()
+        ));
+    }
+    linker::validate_source_in(source_path, &source_root)
+        .map_err(|e| format!("unsafe template source: {e}"))?;
     let meta = std::fs::symlink_metadata(source_path)
         .map_err(|e| format!("could not inspect template {}: {e}", source_path.display()))?;
     if !meta.file_type().is_file() || meta.file_type().is_symlink() {
@@ -633,6 +724,14 @@ pub fn stage_template(
             "internal: stage_template called on non-template '{source_rel}'"
         ));
     }
+    // Enforce the ignore boundary at the write itself. Hooks and `add` can
+    // bypass command-level prechecks, but no rendered plaintext may reach disk
+    // after the rule disappears or through a symlinked `.gitignore`.
+    if !repo_gitignore_covers_render(repo_root) {
+        return Err(format!(
+            "repo .gitignore does not safely cover `{RENDER_GITIGNORE_ENTRY}`"
+        ));
+    }
     let rendered = render_file(source_path, source_rel, platform, vars)?;
     let paths = staged_paths(repo_root, store_name, &entry.link_rel)?;
 
@@ -961,26 +1060,12 @@ pub fn resolve_edit_source(
     // 2. Target path → owning store + file.
     let expanded = config::expand_home(entry);
 
-    // If the path is a symlink, keep its own path for target-prefix matching.
-    // Resolving through a repo-owned symlink (e.g. an already-linked dotfile)
-    // would break the prefix match against the configured target path and land
-    // us in the repo or the staging tree. For foreign symlinks we must not
-    // silently resolve to a repo source.
-    //
-    // Uses the narrow immediate-hop `points_into` (not the broad canonical
-    // `points_into_repo`): `edit` is read-only source resolution, not a
-    // destructive broad operation, and a link pointing directly at a repo
-    // source entry that is itself a symlink resolving outside the repo is
-    // still stitch-addressable.
+    // Keep a symlink's own path for configured target-prefix matching. Its
+    // ownership is checked against the exact configured source after that
+    // match; broad canonical ownership would reject the supported case where
+    // the configured source entry itself is a symlink resolving externally.
     let expanded = match std::fs::symlink_metadata(&expanded) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            if !linker::points_into(&expanded, repo_root) {
-                return Err(format!(
-                    "'{entry}' is a foreign symlink and does not point into this repo"
-                ));
-            }
-            expanded
-        }
+        Ok(meta) if meta.file_type().is_symlink() => expanded,
         _ if expanded.exists() => expanded.canonicalize().unwrap_or(expanded),
         _ => expanded,
     };
@@ -992,12 +1077,14 @@ pub fn resolve_edit_source(
                 if let Some(path) =
                     match_target_to_source(&store_dir, &config::expand_home(&te.target), &expanded)
                 {
+                    verify_edit_target(repo_root, name, &expanded, &store_dir, &path)?;
                     return Ok(path);
                 }
             }
         } else if let Some(ref target_str) = store.target {
             let target_path = config::expand_home(target_str);
             if let Some(path) = match_target_to_source(&store_dir, &target_path, &expanded) {
+                verify_edit_target(repo_root, name, &expanded, &store_dir, &path)?;
                 return Ok(path);
             }
         }
@@ -1007,6 +1094,53 @@ pub fn resolve_edit_source(
         "could not resolve '{entry}' to a store or configured target — \
          pass a store name or a target path (e.g. ~/.gitconfig)"
     ))
+}
+
+fn verify_edit_target(
+    repo_root: &Path,
+    store_name: &str,
+    target_entry: &Path,
+    store_dir: &Path,
+    source: &Path,
+) -> Result<(), String> {
+    linker::validate_source_in(source, store_dir)
+        .map_err(|error| format!("unsafe edit source: {error}"))?;
+    let is_template_source = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_template);
+    if is_template_source {
+        let meta = std::fs::symlink_metadata(source)
+            .map_err(|error| format!("could not inspect edit template source: {error}"))?;
+        if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+            return Err(format!(
+                "unsafe edit source: template {} must be a direct regular file",
+                source.display()
+            ));
+        }
+    }
+    if !target_entry.is_symlink() {
+        return Ok(());
+    }
+    let rel = source
+        .strip_prefix(store_dir)
+        .map_err(|_| "resolved edit source escapes store".to_string())?;
+    let rel = rel
+        .to_str()
+        .ok_or_else(|| "resolved edit source is not valid UTF-8".to_string())?;
+    let expected = if rel.ends_with(TMPL_SUFFIX) {
+        staging_path(repo_root, store_name, &resolve_entry(rel).link_rel)
+    } else {
+        source.to_path_buf()
+    };
+    if linker::points_to_source(target_entry, &expected, repo_root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is a foreign symlink and does not point at its configured source",
+            target_entry.display()
+        ))
+    }
 }
 
 /// If `expanded` is `target` or a path under it, return the corresponding repo
@@ -1171,17 +1305,34 @@ mod tests {
     }
 
     #[test]
+    fn symlink_named_template_forces_safe_file_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("external");
+        std::fs::write(&external, "secret").unwrap();
+        std::os::unix::fs::symlink(&external, tmp.path().join("secret.tmpl")).unwrap();
+        assert!(store_has_templates(tmp.path()));
+    }
+
+    #[test]
     fn gitignore_detection() {
         assert!(gitignore_has_render_entry(".stitch/render/\n"));
         assert!(gitignore_has_render_entry("# comment\n.stitch/\n"));
         assert!(gitignore_has_render_entry(".stitch\n"));
         assert!(!gitignore_has_render_entry("target/\n*.bak\n"));
+        // A broad negation can re-include staging without naming it. Treat
+        // every negation as unsafe unless a later positive rule restores it.
+        assert!(!gitignore_has_render_entry(".stitch/render/\n!**\n"));
+        assert!(!gitignore_has_render_entry(".stitch/\n!.stitch/render/\n"));
+        assert!(gitignore_has_render_entry(
+            ".stitch/\n!.stitch/render/\n.stitch/render/\n"
+        ));
     }
 
     #[test]
     fn stage_is_hash_gated_and_secure() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
         let store = repo.join("git");
         std::fs::create_dir_all(&store).unwrap();
         let src = store.join("gitconfig.tmpl");
@@ -1231,6 +1382,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
         let store = repo.join("git");
         std::fs::create_dir_all(&store).unwrap();
         let source = store.join("gitconfig.tmpl");
@@ -1305,6 +1457,7 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("not a regular file"), "got: {err}");
 
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
         let err = stage_template(
             repo,
             "git",
@@ -1322,6 +1475,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
         let source = repo.join("gitconfig.tmpl");
         std::fs::write(&source, "same\n").unwrap();
         let staged = staging_path(repo, "git", "gitconfig");
@@ -1420,6 +1574,39 @@ mod tests {
 
         let resolved = resolve_edit_source(repo, &config, &link.to_string_lossy()).unwrap();
         assert_eq!(resolved, store.join("gitconfig"));
+    }
+
+    #[test]
+    fn resolve_edit_source_rejects_symlinked_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let store = repo.join("git");
+        std::fs::create_dir_all(&store).unwrap();
+        let external = repo.join("external-template");
+        std::fs::write(&external, "secret\n").unwrap();
+        std::os::unix::fs::symlink(&external, store.join("gitconfig.tmpl")).unwrap();
+
+        let target = repo.join("home");
+        std::fs::create_dir_all(&target).unwrap();
+        let config = config::Config {
+            vars: BTreeMap::new(),
+            stores: BTreeMap::from([(
+                "git".into(),
+                config::Store {
+                    target: Some(target.to_string_lossy().into_owned()),
+                    files: vec!["gitconfig.tmpl".into()],
+                    patterns: vec![],
+                    ignore: vec![],
+                    when: config::WhenClause::default(),
+                    hooks: config::Hooks::default(),
+                    targets: BTreeMap::new(),
+                },
+            )]),
+        };
+
+        let err = resolve_edit_source(repo, &config, &target.join("gitconfig").to_string_lossy())
+            .unwrap_err();
+        assert!(err.contains("direct regular file"), "got: {err}");
     }
 
     #[test]

@@ -63,9 +63,9 @@ pub struct PlanFile {
     pub config_sha256: String,
     pub platform: PlatformFingerprint,
     pub ops: Vec<PlanFileOp>,
-    /// Selected store names (the `stitch plan --only` scope, or all stores).
-    /// Used to schedule per-store hooks even when a selected store has no
-    /// filesystem ops.
+    /// Stores owning executable operations. Plan execution runs hooks only for
+    /// these stores; an editable plan cannot authorize an otherwise unrelated
+    /// configured hook.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<String>,
     pub conflicts: Vec<PlanConflict>,
@@ -884,7 +884,10 @@ impl<'a> PreflightState<'a> {
         for ancestor in path.ancestors().skip(1) {
             // A verified earlier remove can intentionally clear a whole-dir
             // target before child links are created during mode promotion.
-            if self.overrides.get(ancestor) == Some(&TargetState::Absent) {
+            if self.overrides.get(ancestor) == Some(&TargetState::Absent)
+                || (self.overrides.get(ancestor) == Some(&TargetState::RealEntry)
+                    && self.simulated_dirs.contains(ancestor))
+            {
                 continue;
             }
             // Otherwise the simulator must never hide a symlink that exists
@@ -1329,8 +1332,25 @@ pub fn execute_plan(
         sync_ops_remaining(&mut report, plan, &remaining);
         return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
     }
+    let post_hook_hash =
+        compute_config_hash(repo_root).map_err(|e| PlanExecError::new(report.clone(), e))?;
+    if post_hook_hash != plan.config_sha256 {
+        sync_ops_remaining(&mut report, plan, &remaining);
+        return Err(PlanExecError::new(
+            report,
+            StitchError::plan_stale("config changed during pre-apply hook"),
+        ));
+    }
 
     for store_name in &selected_stores {
+        if let Err(e) = require_directory_identity(
+            repo_root,
+            repo_identity,
+            "repository changed before store execution",
+        ) {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
+        }
         let store = &loaded.config.stores[store_name];
         if !platform.matches_when(&store.when) {
             continue;
@@ -1367,6 +1387,43 @@ pub fn execute_plan(
         ) {
             sync_ops_remaining(&mut report, plan, &remaining);
             return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
+        }
+        if let Err(e) = require_directory_identity(
+            repo_root,
+            repo_identity,
+            "repository changed during store pre-hook",
+        ) {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
+        }
+        let hook_hash =
+            compute_config_hash(repo_root).map_err(|e| PlanExecError::new(report.clone(), e))?;
+        if hook_hash != plan.config_sha256 {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(format!(
+                    "config changed during pre-hook for store '{store_name}'"
+                )),
+            ));
+        }
+
+        // Re-simulate this store's complete remaining sequence after its hook.
+        // Dependent operations such as whole-dir promotion must fail before
+        // the root unlink if the hook invalidated a later child source.
+        if let Some(indices) = ops_by_store.get(store_name) {
+            let mut hook_state = PreflightState::new(repo_root, &platform);
+            for &idx in indices {
+                if let Err(error) = hook_state.apply_op(loaded, &plan.ops[idx]) {
+                    sync_ops_remaining(&mut report, plan, &remaining);
+                    return Err(PlanExecError::new(
+                        report,
+                        StitchError::plan_stale(format!(
+                            "post-hook preflight failed for op {idx}: {error}"
+                        )),
+                    ));
+                }
+            }
         }
 
         if let Some(indices) = ops_by_store.get(store_name) {
@@ -1408,6 +1465,25 @@ pub fn execute_plan(
         if let Some(warning) = run_store_post_hook(repo_root, store_name, &loaded.config, &platform)
         {
             report.warnings.push(warning);
+        }
+        if let Err(error) = require_directory_identity(
+            repo_root,
+            repo_identity,
+            "repository changed during store post-hook",
+        ) {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(report, StitchError::plan_stale(error)));
+        }
+        let hook_hash =
+            compute_config_hash(repo_root).map_err(|e| PlanExecError::new(report.clone(), e))?;
+        if hook_hash != plan.config_sha256 {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(format!(
+                    "config changed during post-hook for store '{store_name}'"
+                )),
+            ));
         }
     }
 
@@ -2020,6 +2096,9 @@ impl<'a> ValidationContext<'a> {
 struct CurrentRemovals {
     links: BTreeSet<(String, String, Option<String>)>,
     staged: BTreeSet<(String, String)>,
+    stage_writes: BTreeSet<String>,
+    link_writes: BTreeSet<String>,
+    sensitive_mutations: BTreeSet<String>,
 }
 
 /// Resolve the cleanup operations the current config and filesystem actually
@@ -2063,11 +2142,34 @@ fn current_removals(
             PlanFileOp::RemoveStaged { store, rel } => {
                 removals.staged.insert((store.clone(), rel.clone()));
             }
-            PlanFileOp::StageRender { .. }
-            | PlanFileOp::CreateLink { .. }
-            | PlanFileOp::ReplaceLink { .. }
-            | PlanFileOp::BackupAndLink { .. }
-            | PlanFileOp::RemoveLink { .. } => {}
+            PlanFileOp::StageRender { .. } => {
+                removals.stage_writes.insert(
+                    serde_json::to_string(op)
+                        .map_err(|e| StitchError::internal(format!("could not encode op: {e}")))?,
+                );
+            }
+            PlanFileOp::ReplaceLink { requires, .. } if requires.target == "real_entry" => {
+                let encoded = serde_json::to_string(op)
+                    .map_err(|e| StitchError::internal(format!("could not encode op: {e}")))?;
+                // Restoring whole-directory mode replaces the empty directory
+                // left by verified stale-link removal. It is both a normal
+                // fresh-plan link write and a sensitive real-entry mutation.
+                removals.link_writes.insert(encoded.clone());
+                removals.sensitive_mutations.insert(encoded);
+            }
+            PlanFileOp::BackupAndLink { .. } => {
+                let encoded = serde_json::to_string(op)
+                    .map_err(|e| StitchError::internal(format!("could not encode op: {e}")))?;
+                removals.link_writes.insert(encoded.clone());
+                removals.sensitive_mutations.insert(encoded);
+            }
+            PlanFileOp::CreateLink { .. } | PlanFileOp::ReplaceLink { .. } => {
+                removals.link_writes.insert(
+                    serde_json::to_string(op)
+                        .map_err(|e| StitchError::internal(format!("could not encode op: {e}")))?,
+                );
+            }
+            PlanFileOp::RemoveLink { .. } => {}
         }
     }
     Ok(removals)
@@ -2090,6 +2192,22 @@ fn is_under_any_target(config: &Config, store: &str, target: &Path) -> bool {
             .iter()
             .any(|p| target == p || target.starts_with(p))
     })
+}
+
+fn validate_fresh_link_write(
+    current: &CurrentRemovals,
+    idx: usize,
+    op: &PlanFileOp,
+) -> Result<(), String> {
+    let encoded = serde_json::to_string(op)
+        .map_err(|e| format!("op {idx}: could not encode operation: {e}"))?;
+    if current.link_writes.contains(&encoded) {
+        Ok(())
+    } else {
+        Err(format!(
+            "op {idx}: link operation is not present in the freshly computed apply plan"
+        ))
+    }
 }
 
 fn validate_op(
@@ -2136,6 +2254,13 @@ fn validate_op(
                     expected_staged.display()
                 ));
             }
+            let encoded = serde_json::to_string(op)
+                .map_err(|e| format!("op {idx}: could not encode operation: {e}"))?;
+            if !current_removals.stage_writes.contains(&encoded) {
+                return Err(format!(
+                    "op {idx}: render operation is not present in the freshly computed apply plan"
+                ));
+            }
             let link_rel = render::resolve_entry(source_rel).link_rel;
             rendered.insert(
                 (store.clone(), link_rel),
@@ -2146,8 +2271,16 @@ fn validate_op(
             );
             Ok(())
         }
-        PlanFileOp::CreateLink { target, source, .. } => {
+        PlanFileOp::CreateLink {
+            target,
+            source,
+            requires,
+        } => {
             validate_link_op(ctx, idx, target, source, rendered)?;
+            validate_fresh_link_write(current_removals, idx, op)?;
+            if requires.target != "absent" || requires.value.is_some() {
+                return Err(format!("op {idx}: create_link requires target=absent"));
+            }
             Ok(())
         }
         PlanFileOp::ReplaceLink {
@@ -2156,10 +2289,15 @@ fn validate_op(
             requires,
         } => {
             validate_link_op(ctx, idx, target, source, rendered)?;
-            if requires.target == "real_entry" && !Path::new(target).is_dir() {
-                return Err(format!(
-                    "op {idx}: replace_link may only replace an empty directory; use backup_and_link with explicit --force for files"
-                ));
+            validate_fresh_link_write(current_removals, idx, op)?;
+            if requires.target == "real_entry" {
+                let encoded = serde_json::to_string(op)
+                    .map_err(|e| format!("op {idx}: could not encode operation: {e}"))?;
+                if !current_removals.sensitive_mutations.contains(&encoded) {
+                    return Err(format!(
+                        "op {idx}: real-entry replacement is not present in the freshly computed apply plan"
+                    ));
+                }
             }
             Ok(())
         }
@@ -2170,7 +2308,15 @@ fn validate_op(
             ..
         } => {
             validate_link_op(ctx, idx, target, source, rendered)?;
+            validate_fresh_link_write(current_removals, idx, op)?;
             validate_backup_path(idx, target, backup)?;
+            let encoded = serde_json::to_string(op)
+                .map_err(|e| format!("op {idx}: could not encode operation: {e}"))?;
+            if !current_removals.sensitive_mutations.contains(&encoded) {
+                return Err(format!(
+                    "op {idx}: backup operation is not present in the freshly computed force plan"
+                ));
+            }
             Ok(())
         }
         PlanFileOp::RemoveLink {
@@ -2415,6 +2561,14 @@ fn validate_backup_path(idx: usize, target: &str, backup: &str) -> Result<(), St
             "op {idx}: backup path '{backup}' is not under the same directory as target '{target}'"
         ));
     }
+    let mut expected = target_path.as_os_str().to_os_string();
+    expected.push(".bak");
+    if backup_path.as_os_str() != expected {
+        return Err(format!(
+            "op {idx}: backup path must be exactly '{}.bak'",
+            target
+        ));
+    }
     Ok(())
 }
 
@@ -2437,6 +2591,14 @@ mod tests {
         let empty = compute_config_hash(tmp.path()).unwrap();
 
         assert_ne!(missing, empty);
+    }
+
+    #[test]
+    fn backup_path_must_be_exact_target_suffix() {
+        assert!(validate_backup_path(0, "/home/user/.bashrc", "/home/user/.bashrc.bak").is_ok());
+        let error =
+            validate_backup_path(0, "/home/user/.bashrc", "/home/user/other.bak").unwrap_err();
+        assert!(error.contains("must be exactly"), "got: {error}");
     }
 
     #[test]
