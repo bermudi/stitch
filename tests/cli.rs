@@ -6170,7 +6170,7 @@ files = [".bashrc"]
     assert!(output.status.success());
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
     let plan: Value = serde_json::from_str(stdout).expect("plan is valid JSON");
-    assert_eq!(plan["schema"], 1);
+    assert_eq!(plan["schema"], 2);
     assert_eq!(plan["kind"], "stitch/plan");
     assert_eq!(
         plan["repo"].as_str().unwrap(),
@@ -6285,24 +6285,18 @@ files = [".bashrc"]
 }
 
 #[test]
-fn apply_plan_succeeds_when_parent_dir_is_symlink() {
-    // Regression for review item #5: `~/.config` is a symlink to a real
-    // directory *outside* the repository. `apply --plan` must resolve the
-    // symlinked parent, verify it points at a real directory, and still link
-    // through it. The symlink is introduced after the plan is captured so the
-    // plan-build phase does not see a foreign parent symlink as a conflict.
+fn apply_plan_rejects_live_symlinked_parent() {
+    // A symlink introduced after capture is rejected during the whole-plan
+    // preflight, before any hook or mutation can traverse it. The destination
+    // is intentionally external: all target symlink ancestors are unsafe.
     let repo = Repo::new();
     repo.make_store("shells", &[".bashrc"]);
 
     let home = repo.path().join("home");
     fs::create_dir_all(&home).unwrap();
-
-    // The resolved config directory lives outside the repo.
     let external = tempfile::tempdir().unwrap();
     let real_config = external.path().join("real_config");
     fs::create_dir_all(&real_config).unwrap();
-
-    // Capture the plan while the parent is a real directory.
     let config_link = home.join(".config");
     fs::create_dir_all(&config_link).unwrap();
 
@@ -6317,30 +6311,22 @@ files = [".bashrc"]
 
     let plan_path = repo.path().join("plan.json");
     let output = repo.cmd().arg("plan").output().unwrap();
-    assert!(
-        output.status.success(),
-        "plan failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success());
     fs::write(&plan_path, &output.stdout).unwrap();
 
-    // Replace the real parent with a foreign symlink before applying.
     fs::remove_dir(&config_link).unwrap();
     std::os::unix::fs::symlink(&real_config, &config_link).unwrap();
 
     repo.cmd()
         .args(["apply", "--plan", plan_path.to_str().unwrap()])
         .assert()
-        .success()
-        .stdout(contains("Executed 1/1 ops"));
+        .failure()
+        .code(12)
+        .stderr(contains("symlinked ancestor"));
 
-    // The link should be visible through the symlinked parent and physically
-    // live in the resolved directory.
-    assert!(config_link.join(".bashrc").is_symlink());
-    assert!(real_config.join(".bashrc").is_symlink());
-    assert_eq!(
-        fs::read_link(config_link.join(".bashrc")).unwrap(),
-        repo.path().join("shells/.bashrc")
+    assert!(
+        !real_config.join(".bashrc").exists(),
+        "must not write through an external symlink"
     );
 }
 
@@ -7030,7 +7016,7 @@ files = [".bashrc"]
 }
 
 #[test]
-fn apply_plan_executes_remove_link_with_null_source() {
+fn apply_plan_rejects_hand_edited_removal_of_desired_link() {
     let repo = Repo::new();
     repo.make_store("shells", &[".bashrc"]);
     let home = repo.path().join("home");
@@ -7054,6 +7040,7 @@ files = [".bashrc"]
         .expect("plan is valid JSON");
     plan["ops"] = serde_json::json!([{
         "op": "remove_link",
+        "store": "shells",
         "target": home.join(".bashrc").to_string_lossy(),
         "source": null,
         "requires": { "target": "symlink_into_repo" }
@@ -7063,10 +7050,11 @@ files = [".bashrc"]
     repo.cmd()
         .args(["apply", "--plan", plan_path.to_str().unwrap()])
         .assert()
-        .success()
-        .stdout(contains("Executed 1/1 ops"));
+        .failure()
+        .code(12)
+        .stderr(contains("still desired"));
 
-    assert!(!home.join(".bashrc").exists());
+    assert!(home.join(".bashrc").is_symlink());
 }
 
 #[test]
@@ -7205,6 +7193,7 @@ files = ["x"]
     // Hand-edit the plan: target is beta/x, but source claims repo/alpha/x.
     plan["ops"] = serde_json::json!([{
         "op": "remove_link",
+        "store": "alpha",
         "target": home.join(".beta").join("x").to_string_lossy(),
         "source": repo.path().join("alpha").join("x").to_string_lossy(),
         "requires": { "target": "symlink_to", "value": repo.path().join("alpha").join("x").to_string_lossy() }
@@ -7605,4 +7594,240 @@ when = { os = "definitely-not-this-os" }
         fs::read_to_string(&link).is_ok(),
         "inactive target link must remain readable"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plan schema 2 safety regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_plan_rejects_schema_one_as_stale() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.display()
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    plan["schema"] = serde_json::json!(1);
+    let plan_path = repo.path().join("schema-one.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("unsupported plan schema: 1 (expected 2)"));
+    assert!(!home.join(".bashrc").exists());
+}
+
+#[test]
+fn plan_omits_link_below_existing_external_symlink_ancestor() {
+    // The store target itself is a symlink, so the older nested-only guard
+    // would miss it. Plan generation must make the plan non-executable.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    let config = home.join(".config");
+    let external = tempfile::tempdir().unwrap();
+    // `config` itself is absent, so file-mode promotion and the existing
+    // nested-parent guard cannot classify it. Only the plan builder sees the
+    // higher external `home` symlink ancestor.
+    std::os::unix::fs::symlink(external.path(), &home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        config.display()
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(!output.status.success());
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !plan["ops"].as_array().unwrap().iter().any(|op| {
+            op["op"] == "create_link"
+                && op["target"] == config.join(".bashrc").to_string_lossy().as_ref()
+        }),
+        "a link below a symlinked target root must be omitted"
+    );
+    assert!(
+        plan["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|conflict| {
+                conflict["kind"] == "symlink_ancestor"
+                    && conflict["target"] == home.to_string_lossy().as_ref()
+            }),
+        "unexpected plan: {plan}"
+    );
+    assert!(!external.path().join(".bashrc").exists());
+}
+
+#[test]
+fn apply_plan_rejects_whole_directory_then_child_link() {
+    // Neither target has a live symlink when captured. The preflight simulator
+    // must still reject beta's child because alpha creates its parent as a
+    // symlink earlier in the store-grouped execution order.
+    let repo = Repo::new();
+    repo.make_store("alpha", &["profile"]);
+    repo.make_store("beta", &["init.lua"]);
+    let config = repo.path().join("home").join(".config");
+    repo.write_state(&format!(
+        r#"
+[stores.alpha]
+target = "{}"
+
+[stores.beta]
+target = "{}/nvim"
+files = ["init.lua"]
+"#,
+        config.display(),
+        config.display(),
+    ));
+
+    let plan_path = repo.path().join("overlap.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("symlinked ancestor"));
+    assert!(
+        !config.is_symlink(),
+        "whole-directory link must not run before child preflight fails"
+    );
+    assert!(!config.join("nvim").join("init.lua").exists());
+}
+
+#[test]
+fn apply_plan_rejects_hand_edited_removal_of_desired_staged_render() {
+    let repo = Repo::new();
+    let store = repo.make_store("git", &[]);
+    fs::write(store.join("gitconfig.tmpl"), "name = stitch\n").unwrap();
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        home.display()
+    ));
+    repo.cmd().arg("apply").assert().success();
+    let staged = repo.path().join(".stitch/render/git/gitconfig");
+    assert!(staged.is_file());
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    plan["ops"] = serde_json::json!([{
+        "op": "remove_staged",
+        "store": "git",
+        "rel": "gitconfig"
+    }]);
+    let plan_path = repo.path().join("remove-desired-render.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("still desired"));
+    assert!(staged.is_file(), "desired staged render must remain");
+}
+
+#[test]
+fn source_less_stale_removal_keeps_its_explicit_shared_target_store() {
+    // `alpha` sorts before `zeta`, but the stale link belongs to `zeta`.
+    // Restricting execution to zeta proves source-less cleanup is no longer
+    // attributed by an ambiguous shared target path.
+    let repo = Repo::new();
+    repo.make_store("alpha", &["keep"]);
+    repo.make_store("zeta", &["old", "new"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.alpha]
+target = "{0}"
+files = ["keep"]
+
+[stores.zeta]
+target = "{0}"
+files = ["old", "new"]
+"#,
+        home.display()
+    ));
+    repo.cmd().arg("apply").assert().success();
+    assert!(home.join("old").is_symlink());
+
+    let marker = repo.path().join("zeta-pre-hook-ran");
+    repo.write_split(
+        &format!(
+            r#"
+[stores.alpha]
+target = "{0}"
+files = ["keep"]
+
+[stores.zeta]
+target = "{0}"
+files = ["new"]
+"#,
+            home.display()
+        ),
+        &format!(
+            r#"
+[stores.zeta.hooks]
+pre = "touch {}"
+"#,
+            marker.display()
+        ),
+    );
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let removal = plan["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|op| {
+            op["op"] == "remove_link" && op["target"] == home.join("old").to_string_lossy().as_ref()
+        })
+        .expect("zeta's stale link is captured");
+    assert_eq!(removal["store"], "zeta");
+    assert!(
+        removal.get("source").is_none(),
+        "stale cleanup is source-less"
+    );
+    plan["stores"] = serde_json::json!(["zeta"]);
+
+    let plan_path = repo.path().join("shared-target-removal.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert!(marker.exists(), "zeta's hook must own the removal group");
+    assert!(!home.join("old").exists());
+    assert!(home.join("keep").is_symlink());
+    assert!(home.join("new").is_symlink());
 }

@@ -100,6 +100,10 @@ pub enum PlanOp {
     },
 
     RemoveLink {
+        /// Store that discovered this stale link. This remains explicit even
+        /// when `source` is unavailable, because multiple stores can share a
+        /// target directory.
+        store: String,
         target: String,
         source: Option<String>,
         requires: LinkRequires,

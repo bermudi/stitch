@@ -18,33 +18,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
-pub const PLAN_SCHEMA: u32 = 1;
+pub const PLAN_SCHEMA: u32 = 2;
 pub const PLAN_KIND: &str = "stitch/plan";
 
 /// True if `p` contains any `..` path component.
 fn has_parent_dir(p: &Path) -> bool {
     p.components().any(|c| c == Component::ParentDir)
-}
-
-/// Whether a resolved symlink target (the destination path, not a path that
-/// is itself a symlink) lies inside `repo_root`. Existing paths are canonicalized;
-/// dangling or not-yet-created paths are compared after lexical normalization.
-fn resolved_target_points_into_repo(resolved: &Path, repo_root: &Path) -> bool {
-    let normalized_root = if repo_root.exists() {
-        repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| linker::normalize_lexical(repo_root))
-    } else {
-        linker::normalize_lexical(repo_root)
-    };
-    let normalized = if resolved.exists() {
-        resolved
-            .canonicalize()
-            .unwrap_or_else(|_| linker::normalize_lexical(resolved))
-    } else {
-        linker::normalize_lexical(resolved)
-    };
-    normalized.starts_with(&normalized_root)
 }
 
 /// The on-disk plan file format. Kept intentionally close to the §2 spec so
@@ -148,6 +127,9 @@ pub enum PlanFileOp {
     },
 
     RemoveLink {
+        /// Store that owns this stale-link cleanup. Required even when the
+        /// vanished source cannot be reconstructed from current config.
+        store: String,
         target: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
@@ -161,19 +143,13 @@ pub enum PlanFileOp {
 }
 
 impl PlanFileOp {
-    pub fn op_store(&self, repo_root: &Path, config: &Config) -> Option<String> {
+    pub fn op_store(&self, repo_root: &Path) -> Option<String> {
         match self {
             PlanFileOp::StageRender { store, .. } => Some(store.clone()),
             PlanFileOp::CreateLink { source, .. }
             | PlanFileOp::ReplaceLink { source, .. }
             | PlanFileOp::BackupAndLink { source, .. } => source_store(source, repo_root),
-            PlanFileOp::RemoveLink { target, source, .. } => {
-                if let Some(s) = source {
-                    source_store(s, repo_root)
-                } else {
-                    find_store_for_target(repo_root, config, Path::new(target))
-                }
-            }
+            PlanFileOp::RemoveLink { store, .. } => Some(store.clone()),
             PlanFileOp::RemoveStaged { store, .. } => Some(store.clone()),
         }
     }
@@ -254,7 +230,27 @@ pub fn build_plan_file(
             platform,
         )?;
         ops.extend(renders);
-        ops.append(&mut link_ops);
+        for op in link_ops.drain(..) {
+            let Some(target) = link_target(&op) else {
+                ops.push(op);
+                continue;
+            };
+            match symlinked_ancestor(Path::new(target)) {
+                Ok(Some(ancestor)) => conflicts.push(PlanConflict {
+                    target: path_to_string(&ancestor),
+                    kind: "symlink_ancestor".into(),
+                    resolves_to: std::fs::read_link(&ancestor)
+                        .ok()
+                        .map(|p| path_to_string(&p)),
+                }),
+                Ok(None) => ops.push(op),
+                Err(message) => errors.push(PlanError {
+                    target: Some(target.into()),
+                    message,
+                    class: FailureClass::Internal.id().into(),
+                }),
+            }
+        }
 
         for op in &store.ops {
             if let PlanOp::Conflict {
@@ -288,6 +284,36 @@ pub fn build_plan_file(
         conflicts,
         errors,
     })
+}
+
+/// Link operations can never traverse a symlinked target ancestor. Keeping
+/// this check at plan capture makes the serialized plan safe to inspect and
+/// prevents an external target gateway from becoming executable later.
+fn symlinked_ancestor(target: &Path) -> Result<Option<PathBuf>, String> {
+    for ancestor in target.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(Some(ancestor.to_path_buf())),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "could not inspect target ancestor {}: {e}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn link_target(op: &PlanFileOp) -> Option<&str> {
+    match op {
+        PlanFileOp::CreateLink { target, .. }
+        | PlanFileOp::ReplaceLink { target, .. }
+        | PlanFileOp::BackupAndLink { target, .. }
+        | PlanFileOp::RemoveLink { target, .. } => Some(target),
+        PlanFileOp::StageRender { .. } | PlanFileOp::RemoveStaged { .. } => None,
+    }
 }
 
 fn conflict_kind(resolves_to: &Option<String>) -> String {
@@ -395,11 +421,13 @@ fn convert_store_ops(
                 });
             }
             PlanOp::RemoveLink {
+                store,
                 target,
                 source,
                 requires,
             } => {
                 links.push(PlanFileOp::RemoveLink {
+                    store: store.clone(),
                     target: target.clone(),
                     source: source.clone(),
                     requires: requires.clone().into(),
@@ -698,9 +726,12 @@ fn check_source_exists_for_preflight(repo_root: &Path, source: &str) -> Result<(
 /// ops are preflighted against the *simulated* result of earlier ones.
 struct PreflightState<'a> {
     repo_root: &'a Path,
-    config: &'a Config,
     platform: &'a Platform,
     overrides: BTreeMap<PathBuf, TargetState>,
+    /// Missing ancestors that an earlier simulated create would make into
+    /// directories. `TargetState::RealEntry` alone is not enough: it can also
+    /// mean a file moved to a backup path.
+    simulated_dirs: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -710,12 +741,12 @@ struct RenderPin {
 }
 
 impl<'a> PreflightState<'a> {
-    fn new(repo_root: &'a Path, config: &'a Config, platform: &'a Platform) -> Self {
+    fn new(repo_root: &'a Path, platform: &'a Platform) -> Self {
         Self {
             repo_root,
-            config,
             platform,
             overrides: BTreeMap::new(),
+            simulated_dirs: BTreeSet::new(),
         }
     }
 
@@ -746,67 +777,26 @@ impl<'a> PreflightState<'a> {
     }
 
     fn parent_is_writable_dir(&self, path: &Path) -> Result<(), String> {
-        // `create_dir_all` follows symlinks for any missing ancestor, so every
-        // ancestor of the target (not just the immediate parent) must be safe.
+        // `create_dir_all` follows any symlink in this chain. A captured plan
+        // must not authorize that traversal, including through a link another
+        // operation in the same plan would create.
         for ancestor in path.ancestors().skip(1) {
-            match self.get_effective_state(ancestor) {
-                TargetState::Absent => continue,
-                TargetState::RealEntry => {
-                    // If the plan created this ancestor, it will be a real directory.
-                    if self
-                        .overrides
-                        .get(ancestor)
-                        .is_some_and(|s| matches!(s, TargetState::RealEntry))
-                        || ancestor.is_dir()
-                    {
-                        continue;
-                    } else {
-                        return Err(format!("parent {} is not a directory", ancestor.display()));
-                    }
-                }
-                TargetState::SymlinkTo(value) => {
-                    // A symlinked ancestor is only safe when it resolves to a directory
-                    // *outside* the repository. A repo-pointing ancestor would cause the
-                    // operation to write through the symlink into the repo.
-                    let resolved = if self.overrides.contains_key(ancestor) {
-                        let target = Path::new(&value);
-                        if target.is_absolute() {
-                            target.to_path_buf()
-                        } else {
-                            ancestor.parent().unwrap_or(Path::new(".")).join(target)
-                        }
-                    } else {
-                        ancestor.canonicalize().map_err(|e| {
-                            format!(
-                                "parent {} is a symlink that cannot be resolved: {e}",
-                                ancestor.display()
-                            )
-                        })?
-                    };
-                    let points_into_repo = if self.overrides.contains_key(ancestor) {
-                        resolved_target_points_into_repo(&resolved, self.repo_root)
-                    } else {
-                        linker::points_into_repo(ancestor, self.repo_root)
-                    };
-                    if points_into_repo {
+            // The plan simulator models earlier operations, but it must never
+            // hide a symlink that exists on disk before hooks run.
+            check_physical_ancestor(self.repo_root, ancestor)?;
+            if let Some(state) = self.overrides.get(ancestor) {
+                match state {
+                    TargetState::Absent => continue,
+                    TargetState::RealEntry if self.simulated_dirs.contains(ancestor) => continue,
+                    TargetState::RealEntry => {
                         return Err(format!(
-                            "parent {} is a symlink into the repository; refusing to write through it",
+                            "parent {} is not a simulated directory",
                             ancestor.display()
                         ));
-                    } else if resolved.is_dir() {
-                        continue;
-                    } else {
-                        return Err(format!(
-                            "parent {} resolves to {} which is not a directory",
-                            ancestor.display(),
-                            resolved.display()
-                        ));
                     }
-                }
-                TargetState::SymlinkIntoRepo => {
-                    // The symlink target cannot be read, so we cannot verify that the
-                    // parent resolves to a directory. Keep the conservative error.
-                    return Err(format!("parent {} is a symlink", ancestor.display()));
+                    TargetState::SymlinkTo(_) | TargetState::SymlinkIntoRepo => {
+                        return Err(symlink_ancestor_error(self.repo_root, ancestor));
+                    }
                 }
             }
         }
@@ -859,6 +849,7 @@ impl<'a> PreflightState<'a> {
             if self.get_effective_state(parent) == TargetState::Absent {
                 self.overrides
                     .insert(parent.to_path_buf(), TargetState::RealEntry);
+                self.simulated_dirs.insert(parent.to_path_buf());
             }
         }
     }
@@ -879,6 +870,11 @@ impl<'a> PreflightState<'a> {
                     source_rel,
                     staged,
                     sha256,
+                )?;
+                render::preflight_staged_path(
+                    self.repo_root,
+                    store,
+                    &render::resolve_entry(source_rel).link_rel,
                 )?;
                 Ok(())
             }
@@ -937,6 +933,7 @@ impl<'a> PreflightState<'a> {
                 Ok(())
             }
             PlanFileOp::RemoveLink {
+                store,
                 target,
                 source,
                 requires,
@@ -950,37 +947,18 @@ impl<'a> PreflightState<'a> {
                     &target_state,
                     &self.get_effective_state(target_path),
                 )?;
-
-                // For wildcard removals, require the link to point into the
-                // specific store's source or staging tree (not just the repo).
-                if source.is_none() {
-                    let store = find_store_for_target(self.repo_root, self.config, target_path)
-                        .ok_or_else(|| {
-                            format!("target {target} is not under any configured store target")
-                        })?;
-                    let store_dir = self.repo_root.join(&store);
-                    let staged_dir = render::store_render_dir(self.repo_root, &store);
-                    if !linker::points_into(target_path, &store_dir)
-                        && !linker::points_into(target_path, &staged_dir)
-                    {
-                        return Err(format!(
-                            "target {target} does not point into store '{store}'"
-                        ));
-                    }
-                }
+                // This is an ownership check, not merely path validation. Do
+                // it during whole-plan preflight so no hook runs for a plan
+                // that cannot safely remove its claimed link.
+                check_remove_link_ownership(self.repo_root, store, target_path, source.as_deref())?;
 
                 self.overrides
                     .insert(target_path.to_path_buf(), TargetState::Absent);
                 Ok(())
             }
             PlanFileOp::RemoveStaged { store, rel } => {
-                let staged_dir = render::store_render_dir(self.repo_root, store);
-                let staged_path = staged_dir.join(rel);
-                if !staged_path.starts_with(&staged_dir) {
-                    return Err("staged path escapes render tree".into());
-                }
                 // A stale render may already be gone; missing is not a failure.
-                Ok(())
+                render::preflight_staged_path(self.repo_root, store, rel)
             }
         }
     }
@@ -1063,11 +1041,25 @@ pub fn execute_plan(
     }
 
     // Untrusted-input validation: every op must be justified by the pinned
-    // config. This is the security boundary for hand-edited plan files.
+    // config. Recompute cleanup candidates as well: a hand-edited plan must
+    // never turn a still-desired link or render into a removal authorization.
     let validation_context = ValidationContext::new(repo_root, &loaded.config);
+    let current_removals = current_removals(repo_root, loaded, &platform).map_err(|e| {
+        PlanExecError::new(
+            base_report(plan),
+            StitchError::plan_stale(format!("could not resolve current plan: {e}")),
+        )
+    })?;
     let mut rendered: BTreeMap<(String, String), RenderPin> = BTreeMap::new();
     for (idx, op) in plan.ops.iter().enumerate() {
-        validate_op(&validation_context, idx, op, &mut rendered).map_err(|e| {
+        validate_op(
+            &validation_context,
+            &current_removals,
+            idx,
+            op,
+            &mut rendered,
+        )
+        .map_err(|e| {
             PlanExecError::new(
                 base_report(plan),
                 StitchError::plan_stale(format!("plan validation failed: {e}")),
@@ -1086,7 +1078,7 @@ pub fn execute_plan(
     // the original operation indices for accurate remainder reporting.
     let mut ops_by_store: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, op) in plan.ops.iter().enumerate() {
-        let Some(op_store) = op.op_store(repo_root, &loaded.config) else {
+        let Some(op_store) = op.op_store(repo_root) else {
             sync_ops_remaining(&mut report, plan, &remaining);
             return Err(PlanExecError::new(
                 report,
@@ -1161,7 +1153,7 @@ pub fn execute_plan(
     }
 
     // Preflight the execution sequence against a simulated filesystem state.
-    let mut state = PreflightState::new(repo_root, &loaded.config, &platform);
+    let mut state = PreflightState::new(repo_root, &platform);
     for &idx in &exec_order {
         let op = &plan.ops[idx];
         state.apply_op(loaded, op).map_err(|e| {
@@ -1172,11 +1164,15 @@ pub fn execute_plan(
         })?;
     }
 
+    // A plan that captured conflicts or errors is not executable. Reject it
+    // after all structural preflight but before any hook can create side
+    // effects or a safe-looking prefix can mutate the filesystem.
+    if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
+        sync_ops_remaining(&mut report, plan, &remaining);
+        return Err(PlanExecError::new(report, plan_exec_error(plan)));
+    }
     if dry_run {
         sync_ops_remaining(&mut report, plan, &remaining);
-        if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
-            return Err(PlanExecError::new(report, plan_exec_error(plan)));
-        }
         return Ok(report);
     }
 
@@ -1383,17 +1379,46 @@ fn staged_store(path: &Path) -> Option<String> {
     None
 }
 
-/// Check that every ancestor of `target` is safe to create directories under.
-/// This is the per-operation re-check that runs after hooks, so a hook cannot
-/// swap in a repo-pointing symlink after the initial preflight has passed.
-fn check_ancestors_writable(
-    repo_root: &Path,
-    loaded: &Loaded,
-    platform: &Platform,
-    target: &Path,
-) -> Result<(), String> {
-    let state = PreflightState::new(repo_root, &loaded.config, platform);
-    state.parent_is_writable_dir(target)
+/// Explain a rejected ancestor without accepting an external symlink as safe.
+fn symlink_ancestor_error(repo_root: &Path, ancestor: &Path) -> String {
+    if linker::points_into_repo(ancestor, repo_root) {
+        format!(
+            "parent {} is a symlink into the repository; refusing to traverse it",
+            ancestor.display()
+        )
+    } else {
+        format!(
+            "parent {} is a symlinked ancestor; refusing to traverse it",
+            ancestor.display()
+        )
+    }
+}
+
+/// Inspect one actual ancestor without following it.
+fn check_physical_ancestor(repo_root: &Path, ancestor: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(ancestor) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(symlink_ancestor_error(repo_root, ancestor))
+        }
+        Ok(meta) if !meta.is_dir() => {
+            Err(format!("parent {} is not a directory", ancestor.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "could not inspect target ancestor {}: {e}",
+            ancestor.display()
+        )),
+    }
+}
+
+/// The live re-check deliberately reads the filesystem rather than inheriting
+/// simulated state: prior plan operations may themselves have made a symlink.
+fn check_ancestors_writable(repo_root: &Path, target: &Path) -> Result<(), String> {
+    for ancestor in target.ancestors().skip(1) {
+        check_physical_ancestor(repo_root, ancestor)?;
+    }
+    Ok(())
 }
 
 /// Check that a target state matches the filesystem reality.
@@ -1432,6 +1457,43 @@ fn check_target_state(path: &Path, expected: &TargetState) -> Result<(), String>
     Ok(())
 }
 
+/// Verify that a removal still belongs to the named store. Source-less stale
+/// removals are scoped to that store's source or render tree; they must not
+/// become an ambiguous "any repo link" deletion when targets overlap.
+fn check_remove_link_ownership(
+    repo_root: &Path,
+    store: &str,
+    target: &Path,
+    source: Option<&str>,
+) -> Result<(), String> {
+    let owned = if let Some(source) = source {
+        linker::points_into_repo(target, repo_root)
+            || linker::points_at_source(target, Path::new(source), repo_root)
+    } else {
+        let store_dir = repo_root.join(store);
+        let staged_dir = render::store_render_dir(repo_root, store);
+        linker::points_into_repo(target, repo_root)
+            && (linker::points_into(target, &store_dir) || linker::points_into(target, &staged_dir))
+    };
+    if owned {
+        Ok(())
+    } else if source.is_some() {
+        Err(format!("{} does not point into repo", target.display()))
+    } else {
+        Err(format!(
+            "target {} does not point into store '{store}'",
+            target.display()
+        ))
+    }
+}
+
+/// Final source-less removal scope check. The threat model deliberately does
+/// not attempt to defeat a same-UID swap after this immediate check.
+fn remove_link_for_store(repo_root: &Path, store: &str, target: &Path) -> Result<bool, String> {
+    check_remove_link_ownership(repo_root, store, target, None)?;
+    linker::remove_link(target, repo_root).map_err(link_error)
+}
+
 fn preflight_op(
     repo_root: &Path,
     loaded: &Loaded,
@@ -1448,14 +1510,18 @@ fn preflight_op(
             let _ = verify_stage_render(
                 repo_root, loaded, platform, store, source_rel, staged, sha256,
             )?;
-            Ok(())
+            render::preflight_staged_path(
+                repo_root,
+                store,
+                &render::resolve_entry(source_rel).link_rel,
+            )
         }
         PlanFileOp::CreateLink {
             target,
             source,
             requires,
         } => {
-            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
+            check_ancestors_writable(repo_root, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             check_source_exists_for_preflight(repo_root, source)?;
@@ -1467,7 +1533,7 @@ fn preflight_op(
             source,
             requires,
         } => {
-            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
+            check_ancestors_writable(repo_root, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             check_source_exists_for_preflight(repo_root, source)?;
@@ -1480,7 +1546,7 @@ fn preflight_op(
             source,
             requires,
         } => {
-            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
+            check_ancestors_writable(repo_root, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             if !matches!(target_state, TargetState::RealEntry) {
@@ -1502,64 +1568,23 @@ fn preflight_op(
             Ok(())
         }
         PlanFileOp::RemoveLink {
+            store,
             target,
             source,
             requires,
         } => {
-            check_ancestors_writable(repo_root, loaded, platform, Path::new(target))?;
+            check_ancestors_writable(repo_root, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
             let target_path = Path::new(target);
-            match target_state {
-                TargetState::SymlinkTo(expected) => {
-                    if !target_path.is_symlink() {
-                        return Err(format!("{} is not a symlink", target_path.display()));
-                    }
-                    let resolved = std::fs::read_link(target_path).map_err(|e| format!("{e}"))?;
-                    if resolved != Path::new(&expected) {
-                        return Err(format!(
-                            "{} points to {} (expected {})",
-                            target_path.display(),
-                            resolved.display(),
-                            expected
-                        ));
-                    }
-                    // The link points exactly at `expected` (checked above).
-                    // Accept it as repo-owned if either the broad canonical
-                    // check resolves the link into the repo, or the exact-entry
-                    // check recognizes `expected` as a configured repo source.
-                    // The OR is needed because `expected` may be the canonical
-                    // readlink (whole-dir link, repo root reached through a
-                    // symlink — only the broad check matches) or a configured
-                    // source path that is itself a symlink resolving outside
-                    // the repo (source-symlink entry — only the exact-entry
-                    // check matches). This mirrors the remove_link_to /
-                    // remove_link checks used at execution time.
-                    if !(linker::points_into_repo(target_path, repo_root)
-                        || linker::points_at_source(target_path, Path::new(&expected), repo_root))
-                    {
-                        return Err(format!(
-                            "{} does not point into repo",
-                            target_path.display()
-                        ));
-                    }
-                }
-                TargetState::SymlinkIntoRepo => {
-                    if !target_path.is_symlink() {
-                        return Err(format!("{} is not a symlink", target_path.display()));
-                    }
-                    if !linker::points_into_repo(target_path, repo_root) {
-                        return Err(format!(
-                            "{} does not point into repo",
-                            target_path.display()
-                        ));
-                    }
-                }
-                _ => return Err("remove_link requires symlink_to or symlink_into_repo".into()),
+            if !matches!(
+                target_state,
+                TargetState::SymlinkTo(_) | TargetState::SymlinkIntoRepo
+            ) {
+                return Err("remove_link requires symlink_to or symlink_into_repo".into());
             }
-            // If a `source` is recorded, the link must still point at it or into
-            // the repo — both checked above when relevant.
-            let _ = source;
+            check_target_state(target_path, &target_state)?;
+            check_remove_link_ownership(repo_root, store, target_path, source.as_deref())?;
             Ok(())
         }
         PlanFileOp::RemoveStaged { store, rel } => {
@@ -1570,14 +1595,9 @@ fn preflight_op(
             if rel_path.is_absolute() || has_parent_dir(rel_path) || !is_safe_fragment(rel) {
                 return Err(format!("invalid staged rel '{rel}'"));
             }
-            let staged_dir = render::store_render_dir(repo_root, store);
-            let staged_path = staged_dir.join(rel);
-            if !staged_path.starts_with(&staged_dir) {
-                return Err("staged path escapes render tree".into());
-            }
             // Stale renders may already have been cleaned up by hand; a missing
             // file is not a preflight failure.
-            Ok(())
+            render::preflight_staged_path(repo_root, store, rel)
         }
     }
 }
@@ -1794,13 +1814,18 @@ fn execute_op(
             }
             Ok(())
         }
-        PlanFileOp::RemoveLink { target, source, .. } => {
+        PlanFileOp::RemoveLink {
+            store,
+            target,
+            source,
+            ..
+        } => {
             let target_path = Path::new(target);
             let removed = if let Some(src) = source {
                 let expected = Path::new(src);
                 linker::remove_link_to(target_path, expected, repo_root).map_err(link_error)?
             } else {
-                linker::remove_link(target_path, repo_root).map_err(link_error)?
+                remove_link_for_store(repo_root, store, target_path)?
             };
             if !removed {
                 return Err(format!("{} was not repo-owned", target_path.display()));
@@ -1831,6 +1856,55 @@ impl<'a> ValidationContext<'a> {
     }
 }
 
+#[derive(Default)]
+struct CurrentRemovals {
+    links: BTreeSet<(String, String, Option<String>)>,
+    staged: BTreeSet<(String, String)>,
+}
+
+/// Resolve the cleanup operations the current config and filesystem actually
+/// call stale. This is intentionally a small, dry-run recomputation rather
+/// than a second authorization language for plan-file removals.
+fn current_removals(
+    repo_root: &Path,
+    loaded: &Loaded,
+    platform: &Platform,
+) -> Result<CurrentRemovals, StitchError> {
+    let computed = store::compute_plan(
+        repo_root,
+        &loaded.config,
+        platform,
+        crate::store::ApplyOpts {
+            dry_run: true,
+            force: false,
+        },
+    );
+    let mut removals = CurrentRemovals::default();
+    for plan_store in &computed.stores {
+        for op in &plan_store.ops {
+            if let PlanOp::RemoveLink {
+                store,
+                target,
+                source,
+                ..
+            } = op
+            {
+                removals
+                    .links
+                    .insert((store.clone(), target.clone(), source.clone()));
+            }
+        }
+    }
+
+    let current_file = build_plan_file(repo_root, loaded, &computed, platform)?;
+    for op in &current_file.ops {
+        if let PlanFileOp::RemoveStaged { store, rel } = op {
+            removals.staged.insert((store.clone(), rel.clone()));
+        }
+    }
+    Ok(removals)
+}
+
 fn target_paths_for_store(store: &Store) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(ref t) = store.target {
@@ -1840,24 +1914,6 @@ fn target_paths_for_store(store: &Store) -> Vec<PathBuf> {
         paths.push(config::expand_home(&te.target));
     }
     paths
-}
-
-fn find_store_for_target(_repo_root: &Path, config: &Config, target: &Path) -> Option<String> {
-    let mut best: Option<(usize, String)> = None;
-    for (name, store) in &config.stores {
-        for target_path in target_paths_for_store(store) {
-            if target == target_path || target.starts_with(&target_path) {
-                let depth = target_path.components().count();
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_depth, _)| depth > *best_depth)
-                {
-                    best = Some((depth, name.clone()));
-                }
-            }
-        }
-    }
-    best.map(|(_, name)| name)
 }
 
 fn is_under_any_target(config: &Config, store: &str, target: &Path) -> bool {
@@ -1870,6 +1926,7 @@ fn is_under_any_target(config: &Config, store: &str, target: &Path) -> bool {
 
 fn validate_op(
     ctx: &ValidationContext,
+    current_removals: &CurrentRemovals,
     idx: usize,
     op: &PlanFileOp,
     rendered: &mut BTreeMap<(String, String), RenderPin>,
@@ -1936,8 +1993,13 @@ fn validate_op(
             validate_backup_path(idx, target, backup)?;
             Ok(())
         }
-        PlanFileOp::RemoveLink { target, source, .. } => {
-            validate_remove_link_op(ctx, idx, target, source.as_deref())?;
+        PlanFileOp::RemoveLink {
+            store,
+            target,
+            source,
+            ..
+        } => {
+            validate_remove_link_op(ctx, current_removals, idx, store, target, source.as_deref())?;
             Ok(())
         }
         PlanFileOp::RemoveStaged { store, rel } => {
@@ -1952,6 +2014,14 @@ fn validate_op(
             let staged_path = staged_dir.join(rel);
             if !staged_path.starts_with(&staged_dir) {
                 return Err(format!("op {idx}: staged path escapes render tree"));
+            }
+            if !current_removals
+                .staged
+                .contains(&(store.clone(), rel.clone()))
+            {
+                return Err(format!(
+                    "op {idx}: staged render {store}/{rel} is still desired or not stale"
+                ));
             }
             Ok(())
         }
@@ -2090,7 +2160,9 @@ fn validate_link_op(
 
 fn validate_remove_link_op(
     ctx: &ValidationContext,
+    current_removals: &CurrentRemovals,
     idx: usize,
+    store: &str,
     target: &str,
     source: Option<&str>,
 ) -> Result<(), String> {
@@ -2098,74 +2170,42 @@ fn validate_remove_link_op(
     if has_parent_dir(target_path) {
         return Err(format!("op {idx}: target '{target}' contains '..'"));
     }
-
-    let store = if let Some(src) = source {
-        let src_path = Path::new(src);
-        if has_parent_dir(src_path) {
-            return Err(format!("op {idx}: source '{src}' contains '..'"));
-        }
-        source_store(src, ctx.repo_root)
-            .ok_or_else(|| format!("op {idx}: cannot derive store from source '{src}'"))?
-    } else {
-        find_store_for_target(ctx.repo_root, ctx.config, target_path).ok_or_else(|| {
-            format!("op {idx}: target {target} is not under any configured store target")
-        })?
-    };
-
-    if !ctx.config.stores.contains_key(&store) {
+    if !ctx.config.stores.contains_key(store) {
         return Err(format!("op {idx}: unknown store '{store}'"));
     }
-    if !is_under_any_target(ctx.config, &store, target_path) {
+    if !is_under_any_target(ctx.config, store, target_path) {
         return Err(format!(
             "op {idx}: target {target} is not under a configured target for store '{store}'"
         ));
     }
 
-    let store_dir = ctx.repo_root.join(&store);
-    let staged_dir = render::store_render_dir(ctx.repo_root, &store);
-
     if let Some(src) = source {
         let src_path = Path::new(src);
+        if has_parent_dir(src_path) {
+            return Err(format!("op {idx}: source '{src}' contains '..'"));
+        }
         if !src_path.starts_with(ctx.repo_root) {
             return Err(format!("op {idx}: source {src} is not under the repo"));
         }
-
-        // The source must be the exact source that the config resolves to for
-        // this target. This guards hand-edited plans that swap a stale link's
-        // source for an arbitrary repo path.
-        let store_config = ctx.config.stores.get(&store).unwrap();
-        let expected = store::resolve_link_source(
-            ctx.repo_root,
-            &store_dir,
-            Some(store_config),
-            &store,
-            target_path,
-        )
-        .ok_or_else(|| {
-            format!(
-                "op {idx}: target {target} does not resolve to a configured source in store '{store}'"
-            )
-        })?;
-        if expected != *src {
+        let source_store = source_store(src, ctx.repo_root)
+            .ok_or_else(|| format!("op {idx}: cannot derive store from source '{src}'"))?;
+        if source_store != store {
             return Err(format!(
-                "op {idx}: source '{src}' does not match expected source '{expected}'"
-            ));
-        }
-    } else {
-        // Wildcard removal: the actual symlink must resolve into this store's
-        // source or staging tree, not merely any repo-owned link.
-        if !target_path.is_symlink() {
-            return Err(format!("op {idx}: target {target} is not a symlink"));
-        }
-        if !linker::points_into(target_path, &store_dir)
-            && !linker::points_into(target_path, &staged_dir)
-        {
-            return Err(format!(
-                "op {idx}: target {target} does not point into store '{store}'"
+                "op {idx}: source belongs to store '{source_store}', not '{store}'"
             ));
         }
     }
 
+    let removal = (
+        store.to_owned(),
+        target.to_owned(),
+        source.map(str::to_owned),
+    );
+    if !current_removals.links.contains(&removal) {
+        return Err(format!(
+            "op {idx}: remove_link for {target} is still desired or not a current stale cleanup"
+        ));
+    }
     Ok(())
 }
 
@@ -2220,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_dir_removal_from_symlinked_repo_root_executes() {
+    fn whole_dir_promotion_with_a_symlinked_child_is_not_executable() {
         let tmp = tempfile::tempdir().unwrap();
         let real_root = tmp.path().join("repo");
         let stitch_dir = real_root.join(".stitch");
@@ -2259,9 +2299,13 @@ mod tests {
             matches!(op, PlanFileOp::RemoveLink { target: path, .. } if path == &target.display().to_string())
         }));
 
-        execute_plan(&repo_alias, &loaded, &plan, false).unwrap();
-
-        assert!(!target.is_symlink());
-        assert!(target.join("profile").is_symlink());
+        assert!(plan.conflicts.iter().any(|conflict| {
+            conflict.kind == "symlink_ancestor" && conflict.target == target.display().to_string()
+        }));
+        assert!(execute_plan(&repo_alias, &loaded, &plan, false).is_err());
+        assert!(
+            target.is_symlink(),
+            "conflicted plan must not remove the root link"
+        );
     }
 }

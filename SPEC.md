@@ -515,7 +515,7 @@ Plan ops are tagged by `action` (snake_case):
 - `create_link`: `{target, source, requires}`
 - `replace_link`: `{target, source, old_resolves_to, requires}`
 - `backup_and_link`: `{target, source, backup, requires}`
-- `remove_link`: `{target, source, requires}`
+- `remove_link`: `{store, target, source, requires}`
 - `already_linked`: `{target, source, requires}`
 - `content_changed`: `{target, source, requires}`
 - `conflict`: `{target, resolves_to}`
@@ -600,7 +600,7 @@ and a platform/config fingerprint. Plan files are versioned and self-describing:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "kind": "stitch/plan",
   "repo": "/home/daniel/dots",
   "config_sha256": "...",
@@ -630,8 +630,9 @@ and a platform/config fingerprint. Plan files are versioned and self-describing:
     pointing at the expected source or a real entry.
   - `backup_and_link`: `{target, backup, source, requires}` — target must be a
     real entry and the backup path must be absent.
-  - `remove_link`: `{target, source, requires}` — target must be a repo-owned
-    symlink. `source` is optional.
+  - `remove_link`: `{store, target, source, requires}` — target must be a
+    repo-owned symlink. `store` identifies the originating store (including
+    source-less stale cleanup); `source` is optional.
   - `remove_staged`: `{store, rel}` — remove a stale rendered template from
     `.stitch/render/<store>/<rel>`.
 - `requires` is the plan-file flat form:
@@ -652,7 +653,8 @@ Semantics:
   fall under a configured store target; path traversal (`..` or absolute) is
   rejected; backup paths must be in the same directory as the target; and
   `.stitch/render/` gitignore is checked before staging writes.
-- **Stale-plan detection.** `apply --plan` refuses if `schema`, `kind`,
+- **Stale-plan detection.** `apply --plan` accepts only plan schema `2`
+  (schema `1` is stale and must be replanned), and refuses if `kind`,
   `config_sha256`, or `platform` do not match, or if any `stage_render` hash
   does not match a fresh in-memory render. All of these exit 12.
 - **Preflight and per-op re-check.** Before any mutation, every op's

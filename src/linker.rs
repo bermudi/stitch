@@ -430,7 +430,8 @@ fn same_entry(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
 /// Lexically normalize a path by collapsing `.` and `..` components without
 /// touching the filesystem. This remains useful for plan-file presentation;
 /// ownership decisions use [`resolve_path`] instead.
-pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
+#[cfg(test)]
+fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

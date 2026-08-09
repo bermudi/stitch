@@ -373,6 +373,22 @@ fn staged_paths(repo_root: &Path, store_name: &str, link_rel: &str) -> Result<St
     })
 }
 
+/// Validate an existing staged path chain without creating or removing
+/// anything. Plan execution uses this before hooks and again before a render
+/// write or cleanup, so a symlink in `.stitch/render` cannot defer discovery
+/// until after hook side effects.
+pub fn preflight_staged_path(
+    repo_root: &Path,
+    store_name: &str,
+    link_rel: &str,
+) -> Result<(), String> {
+    let paths = staged_paths(repo_root, store_name, link_rel)?;
+    if checked_render_dirs(&paths.dirs, false)? {
+        let _ = staged_leaf_metadata(&paths.dest)?;
+    }
+    Ok(())
+}
+
 /// Inspect one staging directory without following it. `None` means it is
 /// absent and the caller chose not to create it.
 fn checked_render_dir(path: &Path, create: bool) -> Result<Option<std::fs::Metadata>, String> {
