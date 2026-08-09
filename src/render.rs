@@ -458,8 +458,24 @@ pub fn reconcile_store_links(
 ) -> Result<Vec<PathBuf>, String> {
     // This helper owns file-mode children, never the target root itself. Do
     // not follow a whole-directory link while a mode transition is pending.
-    if target_path.is_symlink() || !target_path.is_dir() {
-        return Ok(Vec::new());
+    // A missing target simply has no stale children; inspection failures must
+    // reach apply rather than being mistaken for an empty target.
+    match std::fs::symlink_metadata(target_path) {
+        Ok(meta) if meta.file_type().is_symlink() => return Ok(Vec::new()),
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!(
+                "could not reconcile target {}: it is not a directory",
+                target_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "could not inspect target {} for stale links: {e}",
+                target_path.display()
+            ));
+        }
     }
 
     let staging_dir = store_render_dir(repo_root, store_name);
@@ -532,16 +548,31 @@ pub fn reconcile_store_staging(
     keep_link_rels: &BTreeSet<String>,
 ) -> Result<(), String> {
     let dir = store_render_dir(repo_root, store_name);
-    if !dir.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "could not inspect staging directory {}: {e}",
+                dir.display()
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!(
+                "could not reconcile staging {}: it is not a directory",
+                dir.display()
+            ));
+        }
+        Ok(_) => {}
     }
 
     let mut to_remove: Vec<PathBuf> = Vec::new();
-    for entry in walkdir::WalkDir::new(&dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+    for entry in walkdir::WalkDir::new(&dir).follow_links(false) {
+        let entry = entry.map_err(|e| {
+            format!(
+                "could not scan staging directory {} for stale renders: {e}",
+                dir.display()
+            )
+        })?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -570,13 +601,17 @@ pub fn reconcile_store_staging(
         }
     }
 
-    // If the store dir is now empty, remove it too.
-    if dir
+    // If the store dir is now empty, remove it too. A concurrent removal is
+    // benign; any other inspection failure is not.
+    let mut entries = dir
         .read_dir()
-        .map(|mut d| d.next().is_none())
-        .unwrap_or(false)
-    {
-        let _ = std::fs::remove_dir(&dir);
+        .map_err(|e| format!("could not inspect staging directory {}: {e}", dir.display()))?;
+    if entries.next().is_none() {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("could not remove staging {}: {e}", dir.display())),
+        }
     }
 
     Ok(())
@@ -862,6 +897,36 @@ mod tests {
         let r3 = stage_template(repo, "git", "gitconfig.tmpl", &src, &p, &vars).unwrap();
         assert!(matches!(r3, StageOutcome::Written(_)));
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "host=testhost!\n");
+    }
+
+    #[test]
+    fn reconcile_reports_a_non_directory_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, "not a directory").unwrap();
+
+        let err = reconcile_store_links(
+            &target,
+            tmp.path(),
+            &tmp.path().join("store"),
+            "store",
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a directory"));
+    }
+
+    #[test]
+    fn reconcile_reports_an_invalid_staging_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let dir = store_render_dir(repo, "git");
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::write(&dir, "not a directory").unwrap();
+
+        let err = reconcile_store_staging(repo, "git", &BTreeSet::new()).unwrap_err();
+        assert!(err.contains("not a directory"));
     }
 
     #[test]
