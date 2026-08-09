@@ -667,8 +667,24 @@ pub fn reconcile_store_links(
 ) -> Result<Vec<PathBuf>, String> {
     // This helper owns file-mode children, never the target root itself. Do
     // not follow a whole-directory link while a mode transition is pending.
-    if target_path.is_symlink() || !target_path.is_dir() {
-        return Ok(Vec::new());
+    // A missing target has no stale children; all other inspection failures
+    // must reach apply so staging is not cleaned after an incomplete scan.
+    match std::fs::symlink_metadata(target_path) {
+        Ok(meta) if meta.file_type().is_symlink() => return Ok(Vec::new()),
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!(
+                "could not reconcile target {}: it is not a directory",
+                target_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "could not inspect target {} for stale links: {e}",
+                target_path.display()
+            ));
+        }
     }
 
     let staging_dir = store_render_dir(repo_root, store_name);
