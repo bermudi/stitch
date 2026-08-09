@@ -428,7 +428,7 @@ fn cmd_init() -> Result<(), StitchError> {
 
     // Pre-create the staging root at 0700 so the permission contract holds
     // before the first templated apply.
-    render::ensure_render_dir(&render::render_root(&cwd))?;
+    render::ensure_render_root(&cwd).map_err(StitchError::internal)?;
 
     println!("Initialized stitch config:");
     println!("  {}", authored_path.display());
@@ -1405,9 +1405,9 @@ fn cmd_remove(
     loaded.generated.stores.remove(name);
 
     // Staging is tool-owned: drop the store's render tree alongside its links.
-    if let Err(e) = render::remove_store_staging(root, name) {
-        eprintln!("warning: {e}");
-    }
+    // A staging safety failure leaves generated state intact so the user can
+    // retry rather than losing the inventory for still-present output.
+    render::remove_store_staging(root, name).map_err(StitchError::internal)?;
 
     loaded.generated.save(root)?;
 

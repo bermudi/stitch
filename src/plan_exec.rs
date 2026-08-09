@@ -1807,35 +1807,8 @@ fn execute_op(
             }
             Ok(())
         }
-        PlanFileOp::RemoveStaged { store, rel } => {
-            let staged_dir = render::store_render_dir(repo_root, store);
-            let staged_path = staged_dir.join(rel);
-            if !staged_path.starts_with(&staged_dir) {
-                return Err("staged path escapes render tree".into());
-            }
-            if staged_path.is_file()
-                && let Err(e) = std::fs::remove_file(&staged_path)
-            {
-                return Err(format!("could not remove {}: {e}", staged_path.display()));
-            }
-            // Prune empty parent directories up to (but not including) the
-            // store render directory.
-            let mut parent = staged_path.parent();
-            while let Some(p) = parent {
-                if p == staged_dir || !p.starts_with(&staged_dir) {
-                    break;
-                }
-                if is_dir_empty(p) {
-                    if let Err(e) = std::fs::remove_dir(p) {
-                        return Err(format!("could not remove {}: {e}", p.display()));
-                    }
-                    parent = p.parent();
-                } else {
-                    break;
-                }
-            }
-            Ok(())
-        }
+        PlanFileOp::RemoveStaged { store, rel } => render::remove_staged(repo_root, store, rel)
+            .map_err(|e| format!("could not remove staged render {store}/{rel}: {e}")),
     }
 }
 

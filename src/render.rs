@@ -11,8 +11,8 @@ use crate::platform::Platform;
 use minijinja::{AutoEscape, Environment, Error as MjError, ErrorKind as MjErrorKind};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 
 /// Template source suffix. Sole detection signal — deterministic from the
 /// directory entry alone.
@@ -181,38 +181,6 @@ pub fn ensure_render_gitignore(repo_root: &Path) -> Result<(), std::io::Error> {
 // Permissions
 // ---------------------------------------------------------------------------
 
-/// Ensure `dir` exists with mode `0700`. Creates parents as needed; chmods an
-/// existing directory if its mode is wider than required.
-pub fn ensure_render_dir(dir: &Path) -> Result<(), std::io::Error> {
-    if !dir.exists() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(RENDER_DIR_MODE)
-            .create(dir)?;
-    }
-    // Always enforce mode — an existing dir may have been created with a
-    // looser umask by a hand-mkdir or older stitch.
-    let meta = std::fs::metadata(dir)?;
-    let mut perms = meta.permissions();
-    if perms.mode() & 0o777 != RENDER_DIR_MODE {
-        perms.set_mode(RENDER_DIR_MODE);
-        std::fs::set_permissions(dir, perms)?;
-    }
-    // Also lock down the top-level `.stitch/render` when we created a nested path.
-    if let Some(parent) = dir.parent() {
-        let root_name = parent.file_name().and_then(|n| n.to_str());
-        if root_name == Some("render") {
-            let meta = std::fs::metadata(parent)?;
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o777 != RENDER_DIR_MODE {
-                perms.set_mode(RENDER_DIR_MODE);
-                std::fs::set_permissions(parent, perms)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Mode bits (low 9) of a path, if it exists.
 pub fn path_mode(path: &Path) -> Option<u32> {
     std::fs::metadata(path)
@@ -314,53 +282,300 @@ pub fn render_file(
 // Staging writes + reconciliation
 // ---------------------------------------------------------------------------
 
-/// Atomically write `contents` to `path` at mode `0600` (tempfile + fsync + rename).
+/// Validated paths below `.stitch/render/<store>`.
 ///
-/// Unlike [`config::atomic_write`], the resulting file is always `0600` regardless
-/// of umask — staged renders may hold secrets pulled via `env()` even in v0.6.
-fn atomic_write_secure(path: &Path, contents: &str) -> Result<(), String> {
-    let dir = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    ensure_render_dir(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+/// `dirs` holds every directory from `.stitch` through the leaf's parent. It
+/// lets each operation reject a pre-existing symlink or non-directory before
+/// it reads or mutates a staged file.
+struct StagedPaths {
+    store_dir: PathBuf,
+    dest: PathBuf,
+    dirs: Vec<PathBuf>,
+}
 
-    let prefix = path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "stitch".into());
-    let tmp_path = dir.join(format!(".{prefix}.{}.tmp", std::process::id()));
+struct StoreStagingPaths {
+    store_dir: PathBuf,
+    dirs: Vec<PathBuf>,
+}
 
-    let result = (|| -> Result<(), String> {
+fn check_staging_fragment(fragment: &str, kind: &str) -> Result<(), String> {
+    if config::is_safe_fragment(fragment) {
+        Ok(())
+    } else {
+        Err(format!("invalid staged {kind} '{fragment}'"))
+    }
+}
+
+/// Append a checked relative fragment to a directory chain. Fragments have
+/// already passed `is_safe_fragment`; matching components again keeps this
+/// helper safe when it is reused outside config loading.
+fn append_staging_dirs(
+    current: &mut PathBuf,
+    dirs: &mut Vec<PathBuf>,
+    fragment: &str,
+) -> Result<(), String> {
+    for component in Path::new(fragment).components() {
+        match component {
+            Component::Normal(part) => {
+                current.push(part);
+                dirs.push(current.clone());
+            }
+            Component::CurDir => {}
+            _ => return Err(format!("invalid staged path fragment '{fragment}'")),
+        }
+    }
+    Ok(())
+}
+
+fn store_staging_paths(repo_root: &Path, store_name: &str) -> Result<StoreStagingPaths, String> {
+    check_staging_fragment(store_name, "store name")?;
+
+    let root = render_root(repo_root);
+    let mut dirs = vec![repo_root.join(".stitch"), root.clone()];
+    let mut store_dir = root;
+    append_staging_dirs(&mut store_dir, &mut dirs, store_name)?;
+
+    Ok(StoreStagingPaths { store_dir, dirs })
+}
+
+fn staged_paths(repo_root: &Path, store_name: &str, link_rel: &str) -> Result<StagedPaths, String> {
+    check_staging_fragment(link_rel, "path")?;
+    let store = store_staging_paths(repo_root, store_name)?;
+    let mut dirs = store.dirs;
+    let mut parent = store.store_dir.clone();
+    let mut parts: Vec<_> = Path::new(link_rel)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_os_string()),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect();
+    let leaf = parts
+        .pop()
+        .ok_or_else(|| format!("invalid staged path '{link_rel}'"))?;
+    for part in parts {
+        parent.push(part);
+        dirs.push(parent.clone());
+    }
+    let dest = parent.join(leaf);
+    if !dest.starts_with(&store.store_dir) {
+        return Err(format!(
+            "staged path escapes render tree: {}",
+            dest.display()
+        ));
+    }
+
+    Ok(StagedPaths {
+        store_dir: store.store_dir,
+        dest,
+        dirs,
+    })
+}
+
+/// Inspect one staging directory without following it. `None` means it is
+/// absent and the caller chose not to create it.
+fn checked_render_dir(path: &Path, create: bool) -> Result<Option<std::fs::Metadata>, String> {
+    loop {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked render ancestor {}",
+                    path.display()
+                ));
+            }
+            Ok(meta) if !meta.file_type().is_dir() => {
+                return Err(format!(
+                    "render ancestor {} is not a directory",
+                    path.display()
+                ));
+            }
+            Ok(meta) => return Ok(Some(meta)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(format!(
+                        "could not create render directory {}: {e}",
+                        path.display()
+                    ));
+                }
+            },
+            Err(e) => {
+                return Err(format!(
+                    "could not inspect render directory {}: {e}",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+/// Validate every existing render ancestor, optionally creating missing ones.
+/// Directories at and below `.stitch/render` are tightened to `0700`; `.stitch`
+/// itself belongs to the rest of stitch's state and is only type-checked here.
+fn checked_render_dirs(dirs: &[PathBuf], create: bool) -> Result<bool, String> {
+    for (index, dir) in dirs.iter().enumerate() {
+        let Some(meta) = checked_render_dir(dir, create)? else {
+            return Ok(false);
+        };
+        if create && index != 0 && meta.permissions().mode() & 0o777 != RENDER_DIR_MODE {
+            let mut perms = meta.permissions();
+            perms.set_mode(RENDER_DIR_MODE);
+            std::fs::set_permissions(dir, perms)
+                .map_err(|e| format!("could not chmod render directory {}: {e}", dir.display()))?;
+        }
+    }
+    Ok(true)
+}
+
+/// Pre-create the render root safely for `init`.
+pub fn ensure_render_root(repo_root: &Path) -> Result<(), String> {
+    let dirs = vec![repo_root.join(".stitch"), render_root(repo_root)];
+    let _ = checked_render_dirs(&dirs, true)?;
+    Ok(())
+}
+
+/// Return a staged leaf's metadata without following a symlink. A staged
+/// render is always a regular file; rejecting every other type ensures reads
+/// can never block on a FIFO or device.
+fn staged_leaf_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(format!("refusing symlinked staged file {}", path.display()))
+        }
+        Ok(meta) if !meta.file_type().is_file() => Err(format!(
+            "staged file {} is not a regular file",
+            path.display()
+        )),
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "could not inspect staged file {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Read a staged regular file after validating its confined directory chain.
+fn read_staged_file(paths: &StagedPaths) -> Result<Option<(String, std::fs::Metadata)>, String> {
+    if !checked_render_dirs(&paths.dirs, false)? {
+        return Ok(None);
+    }
+    let Some(meta) = staged_leaf_metadata(&paths.dest)? else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(&paths.dest)
+        .map_err(|e| format!("could not read staged file {}: {e}", paths.dest.display()))?;
+    Ok(Some((contents, meta)))
+}
+
+const TEMP_NAME_ATTEMPTS: usize = 16;
+
+/// A short, unpredictable file name generated from Linux's kernel RNG. The
+/// fixed prefix and 128-bit suffix keep names well under `NAME_MAX`.
+fn random_temp_name() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        // SAFETY: `bytes[filled..]` is a writable buffer of the exact length
+        // passed to the Linux `getrandom(2)` syscall.
+        let count = unsafe {
+            libc::getrandom(
+                bytes[filled..].as_mut_ptr().cast(),
+                bytes.len() - filled,
+                libc::GRND_NONBLOCK,
+            )
+        };
+        if count > 0 {
+            filled += count as usize;
+            continue;
+        }
+        if count == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        }
+        return Err(format!(
+            "could not obtain random name for staged render: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(format!(
+        ".stitch-render-{:032x}.tmp",
+        u128::from_le_bytes(bytes)
+    ))
+}
+
+fn create_secure_temp(dir: &Path) -> Result<(std::fs::File, PathBuf), String> {
+    for _ in 0..TEMP_NAME_ATTEMPTS {
+        let path = dir.join(random_temp_name()?);
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true)
-            .create(true)
-            .truncate(true)
+            // `create_new` is O_CREAT | O_EXCL. O_NOFOLLOW rejects a pre-existing
+            // symlink even on platforms where an implementation changes first.
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .mode(RENDER_FILE_MODE);
-        let mut f = opts
-            .open(&tmp_path)
-            .map_err(|e| format!("could not create {}: {e}", tmp_path.display()))?;
-        use std::io::Write;
-        f.write_all(contents.as_bytes())
-            .map_err(|e| format!("could not write {}: {e}", tmp_path.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("could not fsync {}: {e}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, path)
-            .map_err(|e| format!("could not rename into {}: {e}", path.display()))?;
-        // rename(2) preserves the temp file's mode; re-chmod in case the
-        // destination existed with different bits and the fs did something odd.
-        let mut perms = std::fs::metadata(path)
-            .map_err(|e| format!("could not stat {}: {e}", path.display()))?
-            .permissions();
-        if perms.mode() & 0o777 != RENDER_FILE_MODE {
-            perms.set_mode(RENDER_FILE_MODE);
-            std::fs::set_permissions(path, perms)
-                .map_err(|e| format!("could not chmod {}: {e}", path.display()))?;
+        match opts.open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not create {}: {e}", path.display())),
         }
+    }
+    Err(format!(
+        "could not create a unique staged-render temporary file in {}",
+        dir.display()
+    ))
+}
+
+/// Atomically write `contents` at mode `0600` after validating all staging
+/// ancestors and the existing leaf. The temporary is fsynced before rename.
+fn atomic_write_secure(paths: &StagedPaths, contents: &str) -> Result<(), String> {
+    if !checked_render_dirs(&paths.dirs, true)? {
+        return Err(format!(
+            "render directory disappeared before writing {}",
+            paths.dest.display()
+        ));
+    }
+    // Do not replace a symlink, FIFO, or other unexpected leaf. A newly
+    // missing leaf is the only non-regular state a stage write accepts.
+    let _ = staged_leaf_metadata(&paths.dest)?;
+
+    let dir = paths
+        .dest
+        .parent()
+        .ok_or_else(|| format!("staged path has no parent: {}", paths.dest.display()))?;
+    let (mut file, tmp_path) = create_secure_temp(dir)?;
+    let result = (|| -> Result<(), String> {
+        // `mode` on open is filtered by umask, so set the exact private mode
+        // on our just-created descriptor rather than chmodding the destination.
+        file.set_permissions(std::fs::Permissions::from_mode(RENDER_FILE_MODE))
+            .map_err(|e| format!("could not chmod {}: {e}", tmp_path.display()))?;
+        use std::io::Write;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("could not write {}: {e}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("could not fsync {}: {e}", tmp_path.display()))?;
+
+        // Revalidate immediately before the ordinary path rename. The declared
+        // threat model deliberately excludes a same-UID replacement after this
+        // check and before rename(2).
+        if !checked_render_dirs(&paths.dirs, false)? {
+            return Err(format!(
+                "render directory disappeared before renaming into {}",
+                paths.dest.display()
+            ));
+        }
+        let _ = staged_leaf_metadata(&paths.dest)?;
+        std::fs::rename(&tmp_path, &paths.dest)
+            .map_err(|e| format!("could not rename into {}: {e}", paths.dest.display()))?;
         Ok(())
     })();
 
     if result.is_err() {
+        // The temp name was random and created exclusively by us. Cleanup is
+        // intentionally best-effort so the original error is preserved.
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
@@ -395,27 +610,21 @@ pub fn stage_template(
         ));
     }
     let rendered = render_file(source_path, source_rel, platform, vars)?;
-    let dest = staging_path(repo_root, store_name, &entry.link_rel);
+    let paths = staged_paths(repo_root, store_name, &entry.link_rel)?;
 
-    if let Ok(existing) = std::fs::read_to_string(&dest)
+    if let Some((existing, meta)) = read_staged_file(&paths)?
         && existing == rendered
+        && meta.nlink() == 1
+        && meta.permissions().mode() & 0o777 == RENDER_FILE_MODE
     {
-        // Still enforce mode in case a hand-edit loosened it.
-        if let Some(mode) = path_mode(&dest)
-            && mode != RENDER_FILE_MODE
-        {
-            let mut perms = std::fs::metadata(&dest)
-                .map_err(|e| format!("could not stat {}: {e}", dest.display()))?
-                .permissions();
-            perms.set_mode(RENDER_FILE_MODE);
-            std::fs::set_permissions(&dest, perms)
-                .map_err(|e| format!("could not chmod {}: {e}", dest.display()))?;
-        }
-        return Ok(StageOutcome::Unchanged(dest));
+        // Do not chmod an equal file in place: it could be hard-linked to an
+        // external inode. Any mode or link-count drift is repaired by replacing
+        // the leaf atomically below.
+        return Ok(StageOutcome::Unchanged(paths.dest));
     }
 
-    atomic_write_secure(&dest, &rendered)?;
-    Ok(StageOutcome::Written(dest))
+    atomic_write_secure(&paths, &rendered)?;
+    Ok(StageOutcome::Written(paths.dest))
 }
 
 /// Fresh in-memory render compared against the staged file.
@@ -432,10 +641,10 @@ pub fn staged_differs(
 ) -> Result<bool, String> {
     let entry = resolve_entry(source_rel);
     let rendered = render_file(source_path, source_rel, platform, vars)?;
-    let dest = staging_path(repo_root, store_name, &entry.link_rel);
-    match std::fs::read_to_string(&dest) {
-        Ok(existing) => Ok(existing != rendered),
-        Err(_) => Ok(true),
+    let paths = staged_paths(repo_root, store_name, &entry.link_rel)?;
+    match read_staged_file(&paths)? {
+        Some((existing, _)) => Ok(existing != rendered),
+        None => Ok(true),
     }
 }
 
@@ -458,24 +667,8 @@ pub fn reconcile_store_links(
 ) -> Result<Vec<PathBuf>, String> {
     // This helper owns file-mode children, never the target root itself. Do
     // not follow a whole-directory link while a mode transition is pending.
-    // A missing target simply has no stale children; inspection failures must
-    // reach apply rather than being mistaken for an empty target.
-    match std::fs::symlink_metadata(target_path) {
-        Ok(meta) if meta.file_type().is_symlink() => return Ok(Vec::new()),
-        Ok(meta) if !meta.is_dir() => {
-            return Err(format!(
-                "could not reconcile target {}: it is not a directory",
-                target_path.display()
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(format!(
-                "could not inspect target {} for stale links: {e}",
-                target_path.display()
-            ));
-        }
+    if target_path.is_symlink() || !target_path.is_dir() {
+        return Ok(Vec::new());
     }
 
     let staging_dir = store_render_dir(repo_root, store_name);
@@ -537,6 +730,94 @@ pub fn reconcile_store_links(
     Ok(removed)
 }
 
+/// Remove empty parents from `parent` up to, but not including, `stop`.
+/// `DirectoryNotEmpty` is never hidden: we only attempt an unlink after a
+/// successful empty read, so a non-NotFound failure means the cleanup did not
+/// complete as expected.
+fn remove_empty_staging_parents(mut parent: Option<PathBuf>, stop: &Path) -> Result<(), String> {
+    while let Some(dir) = parent {
+        if dir == stop {
+            break;
+        }
+        let mut entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(format!(
+                    "could not read render directory {}: {e}",
+                    dir.display()
+                ));
+            }
+        };
+        if entries.next().is_some() {
+            break;
+        }
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => parent = dir.parent().map(Path::to_path_buf),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(format!(
+                    "could not remove render directory {}: {e}",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_store_staging_dir(dir: &Path) -> Result<(), String> {
+    let mut entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "could not read render directory {}: {e}",
+                dir.display()
+            ));
+        }
+    };
+    if entries.next().is_none() {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "could not remove render directory {}: {e}",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove one stale staged render. Missing files are harmless, but every
+/// other inspection or removal error is reported to the caller. This retains
+/// ordinary path deletion after the immediate validation described above; the
+/// threat model excludes a hostile same-UID replacement after that validation.
+pub fn remove_staged(repo_root: &Path, store_name: &str, link_rel: &str) -> Result<(), String> {
+    let paths = staged_paths(repo_root, store_name, link_rel)?;
+    if !checked_render_dirs(&paths.dirs, false)? {
+        return Ok(());
+    }
+    if staged_leaf_metadata(&paths.dest)?.is_none() {
+        return Ok(());
+    }
+
+    match std::fs::remove_file(&paths.dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "could not remove stale render {}: {e}",
+                paths.dest.display()
+            ));
+        }
+    }
+    remove_empty_staging_parents(paths.dest.parent().map(Path::to_path_buf), &paths.store_dir)
+}
+
 /// Remove staged renders under `store_name` whose link names are not in
 /// `keep_link_rels`. Also drops empty parent directories left behind.
 ///
@@ -547,84 +828,72 @@ pub fn reconcile_store_staging(
     store_name: &str,
     keep_link_rels: &BTreeSet<String>,
 ) -> Result<(), String> {
-    let dir = store_render_dir(repo_root, store_name);
-    match std::fs::symlink_metadata(&dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(format!(
-                "could not inspect staging directory {}: {e}",
-                dir.display()
-            ));
-        }
-        Ok(meta) if !meta.is_dir() => {
-            return Err(format!(
-                "could not reconcile staging {}: it is not a directory",
-                dir.display()
-            ));
-        }
-        Ok(_) => {}
+    let store = store_staging_paths(repo_root, store_name)?;
+    if !checked_render_dirs(&store.dirs, false)? {
+        return Ok(());
     }
 
-    let mut to_remove: Vec<PathBuf> = Vec::new();
-    for entry in walkdir::WalkDir::new(&dir).follow_links(false) {
+    let mut to_remove = Vec::new();
+    for entry in walkdir::WalkDir::new(&store.store_dir)
+        .follow_links(false)
+        .into_iter()
+    {
         let entry = entry.map_err(|e| {
             format!(
-                "could not scan staging directory {} for stale renders: {e}",
-                dir.display()
+                "could not scan staging directory {}: {e}",
+                store.store_dir.display()
             )
         })?;
+        if entry.depth() == 0 || entry.file_type().is_dir() {
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "refusing symlink in staging tree {}",
+                entry.path().display()
+            ));
+        }
         if !entry.file_type().is_file() {
-            continue;
+            return Err(format!(
+                "staged file {} is not a regular file",
+                entry.path().display()
+            ));
         }
-        let Ok(rel) = entry.path().strip_prefix(&dir) else {
-            continue;
-        };
-        let rel_str = rel.to_string_lossy();
-        if !keep_link_rels.contains(rel_str.as_ref()) {
-            to_remove.push(entry.path().to_path_buf());
-        }
-    }
-
-    for path in to_remove {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("could not remove stale render {}: {e}", path.display()))?;
-        // Best-effort: prune empty parents up to the store render dir.
-        let mut parent = path.parent().map(|p| p.to_path_buf());
-        while let Some(p) = parent {
-            if p == dir {
-                break;
-            }
-            match std::fs::remove_dir(&p) {
-                Ok(()) => parent = p.parent().map(|x| x.to_path_buf()),
-                Err(_) => break,
-            }
+        let rel = entry.path().strip_prefix(&store.store_dir).map_err(|_| {
+            format!(
+                "staged path escapes render tree: {}",
+                entry.path().display()
+            )
+        })?;
+        let rel = rel
+            .to_str()
+            .ok_or_else(|| format!("staged path is not valid UTF-8: {}", entry.path().display()))?;
+        if !keep_link_rels.contains(rel) {
+            to_remove.push(rel.to_string());
         }
     }
 
-    // If the store dir is now empty, remove it too. A concurrent removal is
-    // benign; any other inspection failure is not.
-    let mut entries = dir
-        .read_dir()
-        .map_err(|e| format!("could not inspect staging directory {}: {e}", dir.display()))?;
-    if entries.next().is_none() {
-        match std::fs::remove_dir(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("could not remove staging {}: {e}", dir.display())),
-        }
+    for rel in to_remove {
+        remove_staged(repo_root, store_name, &rel)?;
     }
-
-    Ok(())
+    remove_empty_store_staging_dir(&store.store_dir)
 }
 
-/// Delete the entire staging tree for a store (used by `remove`).
+/// Delete the entire staging tree for a store (used by `remove`). Missing
+/// staging stays a no-op and never causes directories to be created.
 pub fn remove_store_staging(repo_root: &Path, store_name: &str) -> Result<(), String> {
-    let dir = store_render_dir(repo_root, store_name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("could not remove staging {}: {e}", dir.display()))?;
+    let store = store_staging_paths(repo_root, store_name)?;
+    if !checked_render_dirs(&store.dirs, false)? {
+        return Ok(());
     }
-    Ok(())
+    match std::fs::remove_dir_all(&store.store_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "could not remove staging {}: {e}",
+            store.store_dir.display()
+        )),
+    }
 }
 
 /// Resolve the repo source path for `edit <entry>`: never the staged render.
@@ -900,42 +1169,12 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_reports_a_non_directory_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("target");
-        std::fs::write(&target, "not a directory").unwrap();
-
-        let err = reconcile_store_links(
-            &target,
-            tmp.path(),
-            &tmp.path().join("store"),
-            "store",
-            &BTreeSet::new(),
-            false,
-        )
-        .unwrap_err();
-        assert!(err.contains("not a directory"));
-    }
-
-    #[test]
-    fn reconcile_reports_an_invalid_staging_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let dir = store_render_dir(repo, "git");
-        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-        std::fs::write(&dir, "not a directory").unwrap();
-
-        let err = reconcile_store_staging(repo, "git", &BTreeSet::new()).unwrap_err();
-        assert!(err.contains("not a directory"));
-    }
-
-    #[test]
     fn reconcile_removes_orphans() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         let keep = staging_path(repo, "git", "keep");
         let drop = staging_path(repo, "git", "drop");
-        ensure_render_dir(keep.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(keep.parent().unwrap()).unwrap();
         std::fs::write(&keep, "k").unwrap();
         std::fs::write(&drop, "d").unwrap();
 
@@ -945,6 +1184,151 @@ mod tests {
 
         assert!(keep.exists());
         assert!(!drop.exists());
+    }
+
+    #[test]
+    fn stage_rejects_symlinked_render_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let store = repo.join("git");
+        std::fs::create_dir_all(&store).unwrap();
+        let source = store.join("gitconfig.tmpl");
+        std::fs::write(&source, "safe\n").unwrap();
+        std::fs::create_dir_all(repo.join(".stitch")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), render_root(repo)).unwrap();
+
+        let err = stage_template(
+            repo,
+            "git",
+            "gitconfig.tmpl",
+            &source,
+            &test_platform(),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("symlinked render ancestor"), "got: {err}");
+        assert!(
+            !outside.path().join("git").exists(),
+            "staging must not write through the render-root symlink"
+        );
+    }
+
+    #[test]
+    fn staged_differs_rejects_symlinked_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let source = repo.join("gitconfig.tmpl");
+        std::fs::write(&source, "safe\n").unwrap();
+        let staged = staging_path(repo, "git", "gitconfig");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        let foreign = outside.path().join("rendered");
+        std::fs::write(&foreign, "safe\n").unwrap();
+        std::os::unix::fs::symlink(&foreign, &staged).unwrap();
+
+        let err = staged_differs(
+            repo,
+            "git",
+            "gitconfig.tmpl",
+            &source,
+            &test_platform(),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("symlinked staged file"), "got: {err}");
+    }
+
+    #[test]
+    fn fifo_staged_leaf_is_rejected_without_reading() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let source = repo.join("gitconfig.tmpl");
+        std::fs::write(&source, "safe\n").unwrap();
+        let staged = staging_path(repo, "git", "gitconfig");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        let path = CString::new(staged.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated pathname owned by this test.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let err = staged_differs(
+            repo,
+            "git",
+            "gitconfig.tmpl",
+            &source,
+            &test_platform(),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+
+        let err = stage_template(
+            repo,
+            "git",
+            "gitconfig.tmpl",
+            &source,
+            &test_platform(),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+    }
+
+    #[test]
+    fn equal_hardlinked_staging_is_replaced_not_chmodded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let source = repo.join("gitconfig.tmpl");
+        std::fs::write(&source, "same\n").unwrap();
+        let staged = staging_path(repo, "git", "gitconfig");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        let external = outside.path().join("external");
+        std::fs::write(&external, "same\n").unwrap();
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&external, &staged).unwrap();
+
+        let outcome = stage_template(
+            repo,
+            "git",
+            "gitconfig.tmpl",
+            &source,
+            &test_platform(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, StageOutcome::Written(_)));
+        assert_eq!(path_mode(&staged), Some(RENDER_FILE_MODE));
+        assert_eq!(path_mode(&external), Some(0o644));
+        assert_eq!(std::fs::metadata(&staged).unwrap().nlink(), 1);
+        assert_eq!(std::fs::metadata(&external).unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn cleanup_rejects_symlinked_store_root_and_missing_remove_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        remove_store_staging(repo, "missing").unwrap();
+        assert!(
+            !repo.join(".stitch").exists(),
+            "removing missing staging must not create .stitch"
+        );
+
+        std::fs::create_dir_all(render_root(repo)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), store_render_dir(repo, "git")).unwrap();
+        let err = reconcile_store_staging(repo, "git", &BTreeSet::new()).unwrap_err();
+        assert!(err.contains("symlinked render ancestor"), "got: {err}");
+        let err = remove_store_staging(repo, "git").unwrap_err();
+        assert!(err.contains("symlinked render ancestor"), "got: {err}");
+        assert!(
+            outside.path().exists(),
+            "cleanup must not follow the symlink"
+        );
     }
 
     #[test]
