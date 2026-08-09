@@ -18,6 +18,35 @@ use plan_exec::{PlanExecError, PlanFile, PlanFileOp};
 use platform::Platform;
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::os::unix::fs::MetadataExt;
+
+fn filesystem_identity(path: &std::path::Path) -> Result<(u64, u64), StitchError> {
+    // Repository aliases are supported, so follow the root entry and pin the
+    // directory it resolves to. Repointing the alias changes this identity.
+    let meta = std::fs::metadata(path)?;
+    if !meta.file_type().is_dir() {
+        return Err(StitchError::internal(format!(
+            "repository root {} does not resolve to a directory",
+            path.display()
+        )));
+    }
+    Ok((meta.dev(), meta.ino()))
+}
+
+fn ensure_filesystem_identity(
+    path: &std::path::Path,
+    expected: (u64, u64),
+    context: &str,
+) -> Result<(), StitchError> {
+    let actual = filesystem_identity(path)?;
+    if actual != expected {
+        return Err(StitchError::internal(format!(
+            "{context}: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 struct AddData {
@@ -136,10 +165,7 @@ fn run(cli: cli::Cli) -> Result<(), StitchError> {
                 if !only.is_empty() {
                     return Err(StitchError::usage("--plan is not compatible with --only"));
                 }
-                if force {
-                    return Err(StitchError::usage("--plan is not compatible with --force"));
-                }
-                cmd_apply_plan(&root, &plan_file, dry_run, json)
+                cmd_apply_plan(&root, &plan_file, dry_run, force, json)
             } else {
                 cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
             }
@@ -474,6 +500,7 @@ fn cmd_apply(
 
     // Global pre-apply hook (skipped under dry-run — hooks have side effects).
     if !opts.dry_run {
+        let root_identity = filesystem_identity(root)?;
         let env = hooks::HookEnv {
             root,
             store: None,
@@ -482,6 +509,11 @@ fn cmd_apply(
         };
         hooks::run_global_hook(root, "pre-apply", &env, &platform)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
+        ensure_filesystem_identity(
+            root,
+            root_identity,
+            "repository changed during pre-apply hook",
+        )?;
     }
 
     let (plan, warnings) = store::apply_all(root, &filtered_config, &platform, opts);
@@ -571,6 +603,7 @@ fn cmd_apply_plan(
     root: &std::path::Path,
     plan_path: &str,
     dry_run: bool,
+    force: bool,
     json: bool,
 ) -> Result<(), StitchError> {
     let loaded = Config::load(root)?;
@@ -597,7 +630,7 @@ fn cmd_apply_plan(
         )));
     }
 
-    let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run);
+    let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run, force);
 
     if json {
         match result {
@@ -690,6 +723,7 @@ fn apply_json(
     }
 
     if !opts.dry_run {
+        let root_identity = filesystem_identity(root)?;
         let env = hooks::HookEnv {
             root,
             store: None,
@@ -698,6 +732,11 @@ fn apply_json(
         };
         hooks::run_global_hook(root, "pre-apply", &env, &platform)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
+        ensure_filesystem_identity(
+            root,
+            root_identity,
+            "repository changed during pre-apply hook",
+        )?;
     }
 
     let (plan, mut warnings) = store::apply_all(root, config, &platform, opts);

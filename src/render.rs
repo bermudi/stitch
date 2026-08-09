@@ -273,6 +273,14 @@ pub fn render_file(
     platform: &Platform,
     vars: &BTreeMap<String, String>,
 ) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(source_path)
+        .map_err(|e| format!("could not inspect template {}: {e}", source_path.display()))?;
+    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+        return Err(format!(
+            "template source {} must be a direct regular file",
+            source_path.display()
+        ));
+    }
     let source = std::fs::read_to_string(source_path)
         .map_err(|e| format!("could not read template {}: {e}", source_path.display()))?;
     render_string(template_name, &source, platform, vars)

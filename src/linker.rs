@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 
 /// Linux's pathname symlink-expansion budget.
@@ -38,8 +38,8 @@ pub fn check_link(target: &Path, source: &Path) -> LinkStatus {
                         && is_direct_entry_path(&resolved)
                         && link_target_path(target, &resolved)
                             .ok()
-                            .and_then(|path| std::fs::symlink_metadata(path).ok())
-                            .is_some_and(|meta| same_entry(&meta, source_meta.as_ref().unwrap()))
+                            .and_then(|path| entry_identity(&path))
+                            == entry_identity(source)
                 } else {
                     let source = source.canonicalize().ok();
                     let resolved = link_target_path(target, &resolved)
@@ -109,10 +109,34 @@ pub fn create_link_to_entry(target: &Path, source: &Path) -> Result<(), LinkErro
     Ok(())
 }
 
+/// Validate a configured source immediately before a link mutation. A terminal
+/// source symlink is preserved as an entry; every other source must fully
+/// resolve within `source_root`.
+pub fn validate_source_in(source: &Path, source_root: &Path) -> Result<(), LinkError> {
+    let source_is_symlink = std::fs::symlink_metadata(source)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    let valid = is_real_directory(source_root)
+        && if source_is_symlink {
+            source_ancestors_within(source, source_root)
+        } else {
+            source_resolves_within(source, source_root)
+        };
+    if valid {
+        Ok(())
+    } else {
+        Err(LinkError::SourceOutsideRoot(
+            source.to_path_buf(),
+            source_root.to_path_buf(),
+        ))
+    }
+}
+
 /// Create a normal link only when its resolved source remains in its
 /// configured root.
 pub fn create_link_in(target: &Path, source: &Path, source_root: &Path) -> Result<(), LinkError> {
-    if !is_real_directory(source_root) || !source_resolves_within(source, source_root) {
+    validate_source_in(source, source_root)?;
+    if std::fs::symlink_metadata(source).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(LinkError::SourceOutsideRoot(
             source.to_path_buf(),
             source_root.to_path_buf(),
@@ -130,7 +154,8 @@ pub fn create_link_to_entry_in(
     source: &Path,
     source_root: &Path,
 ) -> Result<(), LinkError> {
-    if !is_real_directory(source_root) || !source_ancestors_within(source, source_root) {
+    validate_source_in(source, source_root)?;
+    if !std::fs::symlink_metadata(source).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(LinkError::SourceOutsideRoot(
             source.to_path_buf(),
             source_root.to_path_buf(),
@@ -253,9 +278,7 @@ pub fn points_at_source(target: &Path, expected_source: &Path, repo_root: &Path)
     if !source_ancestors_within(&link_entry, repo_root) {
         return false;
     }
-    std::fs::symlink_metadata(link_entry)
-        .map(|meta| same_entry(&meta, &source_meta))
-        .unwrap_or(false)
+    entry_identity(&link_entry) == entry_identity(expected_source)
 }
 
 #[derive(Debug)]
@@ -423,8 +446,13 @@ fn is_direct_entry_path(path: &Path) -> bool {
         && matches!(path.components().next_back(), Some(Component::Normal(_)))
 }
 
-fn same_entry(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    left.dev() == right.dev() && left.ino() == right.ino()
+/// Resolve only a path's parent and preserve its final directory-entry name.
+/// Exact-source ownership is path-entry identity, not inode identity: hard
+/// links to the same symlink inode remain distinct entries.
+fn entry_identity(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let leaf = path.file_name()?;
+    resolve_path(parent).ok().map(|parent| parent.join(leaf))
 }
 
 /// Lexically normalize a path by collapsing `.` and `..` components without
@@ -802,6 +830,27 @@ mod tests {
         std::fs::create_dir_all(other.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(gateway_victim(&repo), &other).unwrap();
         assert!(!points_at_source(&other, &source, &repo));
+    }
+
+    #[test]
+    fn test_points_at_source_rejects_hard_link_alias_of_source_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let store = repo.join("store");
+        let other = repo.join("other");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let source = store.join("alias");
+        std::os::unix::fs::symlink(tmp.path().join("external"), &source).unwrap();
+        let alias = other.join("alias");
+        std::fs::hard_link(&source, &alias).unwrap();
+        let target = tmp.path().join("target");
+        std::os::unix::fs::symlink(&alias, &target).unwrap();
+
+        assert!(!points_at_source(&target, &source, &repo));
+        assert!(!remove_link_to(&target, &source, &repo).unwrap());
+        assert!(target.is_symlink());
     }
 
     #[test]
