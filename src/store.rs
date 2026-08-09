@@ -1034,6 +1034,7 @@ fn action_to_plan_op(
             let source = resolve_remove_source(repo_root, store_dir, store, store_name, target);
             let requires = remove_requires(repo_root, store_dir, store, target, &source);
             PlanOp::RemoveLink {
+                store: store_name.into(),
                 target: target_str,
                 source,
                 requires,
@@ -1246,15 +1247,17 @@ fn resolve_link_source_for_target(
     patterns: &[String],
     ignore: &[String],
 ) -> Option<String> {
-    // Whole-directory link: target is the store target itself.
+    let resolved = resolve_target_names(store_dir, files, patterns, ignore);
+
+    // A target root is desired only in whole-directory mode. File mode may
+    // still need to remove a former whole-directory link at this path.
     if target == target_path {
-        return Some(path_to_string(store_dir));
+        return matches!(resolved, LinkTargets::WholeDir).then(|| path_to_string(store_dir));
     }
 
     let rel = target.strip_prefix(target_path).ok()?;
     let link_rel = rel.to_string_lossy().into_owned();
-    let LinkTargets::Files(source_names) = resolve_target_names(store_dir, files, patterns, ignore)
-    else {
+    let LinkTargets::Files(source_names) = resolved else {
         return None;
     };
     for source_name in source_names {
