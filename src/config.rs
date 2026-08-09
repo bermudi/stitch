@@ -307,6 +307,7 @@ impl Config {
                 )?;
             }
         }
+        validate_non_overlapping_targets(&self.stores)?;
         Ok(())
     }
 
@@ -407,13 +408,33 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<(), ConfigError> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e, dir.clone()))?;
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(ConfigError::Write(
+            std::io::Error::other("refusing to replace symlinked state file"),
+            path.to_path_buf(),
+        ));
+    }
     let prefix = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| "stitch".into());
-    let tmp_path = dir.join(format!(".{prefix}.{}.tmp", std::process::id()));
+    let mut random = [0_u8; 16];
+    let read = unsafe { libc::getrandom(random.as_mut_ptr().cast(), random.len(), 0) };
+    if read != random.len() as isize {
+        return Err(ConfigError::Write(
+            std::io::Error::last_os_error(),
+            path.to_path_buf(),
+        ));
+    }
+    let tmp_path = dir.join(format!(
+        ".{prefix}.{:032x}.tmp",
+        u128::from_le_bytes(random)
+    ));
     let result = (|| {
-        let mut f = std::fs::File::create(&tmp_path)
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
             .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
         f.write_all(contents.as_bytes())
             .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
@@ -759,11 +780,48 @@ pub fn is_safe_fragment(fragment: &str) -> bool {
 /// Whether `name` is exactly one normal path component. Store names become
 /// repo directory names, so unlike file fragments they may not be nested.
 pub fn is_store_name(name: &str) -> bool {
-    if name.is_empty() || name.contains('/') {
+    if name.is_empty() || name.contains('/') || matches!(name, ".stitch" | ".git") {
         return false;
     }
     let mut components = Path::new(name).components();
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<(), ConfigError> {
+    let mut targets: Vec<(String, String, PathBuf)> = Vec::new();
+    for (store_name, store) in stores {
+        if store.is_multi_target() {
+            targets.extend(store.targets.iter().map(|(target_name, target)| {
+                (
+                    store_name.clone(),
+                    format!("store '{store_name}' target '{target_name}'"),
+                    expand_home(&target.target),
+                )
+            }));
+        } else if let Some(target) = &store.target {
+            targets.push((
+                store_name.clone(),
+                format!("store '{store_name}'"),
+                expand_home(target),
+            ));
+        }
+    }
+
+    for (index, (left_store, left_name, left)) in targets.iter().enumerate() {
+        for (right_store, right_name, right) in targets.iter().skip(index + 1) {
+            if left_store == right_store
+                && left != right
+                && (left.starts_with(right) || right.starts_with(left))
+            {
+                return Err(ConfigError::InvalidPath(format!(
+                    "overlapping target paths are unsafe: {left_name} targets '{}' while {right_name} targets '{}'",
+                    left.display(),
+                    right.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_store_names<'a>(
@@ -1341,7 +1399,16 @@ mod tests {
     fn test_is_store_name() {
         assert!(is_store_name("shells"));
         assert!(is_store_name(".hidden"));
-        for invalid in ["", ".", "..", "nested/name", "nested/", "/absolute"] {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            ".git",
+            ".stitch",
+            "nested/name",
+            "nested/",
+            "/absolute",
+        ] {
             assert!(!is_store_name(invalid), "{invalid:?} must be rejected");
         }
     }

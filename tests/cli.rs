@@ -794,6 +794,32 @@ files = ["file"]
 // ---------------------------------------------------------------------------
 
 #[test]
+fn apply_validates_escaped_source_before_removing_old_link() {
+    let repo = Repo::new();
+    let store = repo.make_store("s", &["old"]);
+    let external = tempfile::tempdir().unwrap();
+    fs::write(external.path().join("new"), "external").unwrap();
+    std::os::unix::fs::symlink(external.path(), store.join("gateway")).unwrap();
+
+    let home = repo.path().join("home");
+    let target = home.join("gateway/new");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(store.join("old"), &target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.s]
+target = "{}"
+files = ["gateway/new"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().failure();
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(target).unwrap(), store.join("old"));
+}
+
+#[test]
 fn apply_force_backs_up_real_file_and_links() {
     // A real file at the target + --force: the file is renamed to
     // {target}.bak, the symlink takes its place, and the original content is
@@ -6597,17 +6623,19 @@ files = [".bashrc"]
 }
 
 #[test]
-fn apply_plan_rejects_force_and_only_as_usage_error() {
+fn apply_plan_accepts_force_but_rejects_only_as_usage_error() {
     let repo = Repo::new();
     let plan_path = repo.path().join("plan.json");
     fs::write(&plan_path, "{}").unwrap();
 
+    // --force is execution-time authority for a captured backup_and_link plan,
+    // so it reaches plan parsing rather than being rejected as usage.
     repo.cmd()
         .args(["apply", "--plan", plan_path.to_str().unwrap(), "--force"])
         .assert()
         .failure()
-        .code(2)
-        .stderr(contains("--plan is not compatible with --force"));
+        .code(12)
+        .stderr(contains("invalid plan file"));
 
     repo.cmd()
         .args([
@@ -6752,6 +6780,45 @@ files = [".bashrc"]
 }
 
 #[test]
+fn apply_plan_cannot_edit_create_into_unforced_real_file_replacement() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(output.status.success());
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    plan["ops"][0]["op"] = "replace_link".into();
+    plan["ops"][0]["requires"]["target"] = "real_entry".into();
+    plan["ops"][0]["requires"]
+        .as_object_mut()
+        .unwrap()
+        .remove("value");
+
+    let target = home.join(".bashrc");
+    fs::write(&target, "USER DATA").unwrap();
+    let plan_path = repo.path().join("edited-plan.json");
+    fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("replace_link may only replace an empty directory"));
+    assert_eq!(fs::read_to_string(target).unwrap(), "USER DATA");
+}
+
+#[test]
 fn plan_force_captures_backup_and_link() {
     let repo = Repo::new();
     repo.make_store("shells", &[".bashrc"]);
@@ -6803,7 +6870,7 @@ files = [".bashrc"]
     fs::write(&plan_path, &output.stdout).unwrap();
 
     repo.cmd()
-        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .args(["apply", "--plan", plan_path.to_str().unwrap(), "--force"])
         .assert()
         .success();
 
@@ -6973,7 +7040,7 @@ files = [".bashrc"]
     fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
 
     repo.cmd()
-        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .args(["apply", "--plan", plan_path.to_str().unwrap(), "--force"])
         .assert()
         .failure()
         .code(12)
@@ -7388,7 +7455,7 @@ files = [".bashrc", ".zshrc"]
     fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
 
     repo.cmd()
-        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .args(["apply", "--plan", plan_path.to_str().unwrap(), "--force"])
         .assert()
         .failure()
         .code(12)

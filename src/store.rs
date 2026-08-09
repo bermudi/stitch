@@ -8,6 +8,7 @@ use crate::render;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -146,8 +147,14 @@ fn target_has_template_source(
     };
     names.into_iter().any(|source_name| {
         let entry = render::resolve_entry(&source_name);
-        entry.is_template && store_dir.join(entry.source_rel).is_file()
+        entry.is_template && is_regular_template_source(&store_dir.join(entry.source_rel))
     })
+}
+
+fn is_regular_template_source(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// Apply a single store.
@@ -168,16 +175,24 @@ pub fn apply_store(
     }
 
     let store_dir = repo_root.join(name);
-    if !store_dir.exists() {
+    let store_is_real_dir = || {
+        std::fs::symlink_metadata(&store_dir)
+            .map(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    if !store_is_real_dir() {
         return ApplyResult {
             store_name: name.to_string(),
             actions: vec![internal_error(format!(
-                "store directory '{}' does not exist",
+                "store directory '{}' is missing, symlinked, or not a directory",
                 name
             ))],
         };
     }
 
+    let store_identity = std::fs::symlink_metadata(&store_dir)
+        .map(|meta| (meta.dev(), meta.ino()))
+        .ok();
     let mut actions = Vec::new();
 
     // Per-store pre-hook: aborts the store on failure (SPEC). Skipped under
@@ -198,6 +213,21 @@ pub fn apply_store(
                 actions,
             };
         }
+        // Hooks may mutate the filesystem. Never let a replaced store root
+        // drive source resolution or stale-link reconciliation.
+        let current_identity = std::fs::symlink_metadata(&store_dir)
+            .map(|meta| (meta.dev(), meta.ino()))
+            .ok();
+        if !store_is_real_dir() || current_identity != store_identity {
+            actions.push(internal_error(format!(
+                "store directory '{}' changed during its pre-hook",
+                name
+            )));
+            return ApplyResult {
+                store_name: name.to_string(),
+                actions,
+            };
+        }
     }
 
     // Reconciliation is derived from desired sources, not successful entry
@@ -209,6 +239,7 @@ pub fn apply_store(
     // and two target entries may even share a target path, so union their
     // configured link names before scanning that path.
     let mut target_keep_links: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    let mut link_reconciliation_failed = false;
 
     let empty_link_rels = BTreeSet::new();
     if store.is_multi_target() {
@@ -230,6 +261,7 @@ pub fn apply_store(
             // reaches back into the repo through an ancestor symlink.
             if target_is_confined(&target_path, repo_root).is_err() {
                 target_keep_links.remove(&target_path);
+                link_reconciliation_failed = true;
             }
         }
         for target_entry in store.targets.values() {
@@ -258,6 +290,7 @@ pub fn apply_store(
                 }
                 Err(action) => {
                     target_keep_links.remove(&target_path);
+                    link_reconciliation_failed = true;
                     actions.push(action);
                 }
             }
@@ -275,6 +308,7 @@ pub fn apply_store(
         );
         if target_is_confined(&target_path, repo_root).is_err() {
             target_keep_links.remove(&target_path);
+            link_reconciliation_failed = true;
         }
         match target_is_confined(&target_path, repo_root) {
             Ok(()) => {
@@ -297,6 +331,7 @@ pub fn apply_store(
             }
             Err(action) => {
                 target_keep_links.remove(&target_path);
+                link_reconciliation_failed = true;
                 actions.push(action);
             }
         }
@@ -307,7 +342,6 @@ pub fn apply_store(
     // Reconcile file-mode links before staging: a deleted source must not leave
     // a target symlink pointing at a render that is about to disappear. The
     // helper is dry-run aware so `diff` previews removals without mutating.
-    let mut link_reconciliation_failed = false;
     for (target_path, link_rels) in target_keep_links {
         match render::reconcile_store_links(
             &target_path,
@@ -788,6 +822,12 @@ fn apply_file_entry(
     if !entry.is_template {
         return apply_single_link(&source_path, &target, repo_root, store_dir, opts);
     }
+    if !is_regular_template_source(&source_path) {
+        return ApplyAction::Error(StitchError::render(
+            &source_path,
+            "template source must be a direct regular file",
+        ));
+    }
 
     let staged = render::staging_path(repo_root, store_name, &entry.link_rel);
 
@@ -857,6 +897,17 @@ fn apply_single_link(
     source_root: &Path,
     opts: ApplyOpts,
 ) -> ApplyAction {
+    // Validate both boundaries immediately before classification/mutation. In
+    // particular, never remove an old managed link and only then discover that
+    // its replacement source escapes through a gateway.
+    let staged_dry_run = opts.dry_run && source.starts_with(render::render_root(repo_root));
+    if !staged_dry_run && let Err(e) = linker::validate_source_in(source, source_root) {
+        return internal_error(e.to_string());
+    }
+    if let Err(action) = target_is_confined(target, repo_root) {
+        return action;
+    }
+
     let status = linker::check_link(target, source);
 
     match status {
