@@ -39,14 +39,14 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Execute a previously captured plan file verbatim
+        /// Validate and execute operations from a previously captured plan
         #[arg(long, value_name = "FILE")]
         plan: Option<String>,
     },
 
     /// Capture an executable plan of what apply would do
     Plan {
-        /// Only plan these stores (repeatable)
+        /// Limit captured operations to these stores (repeatable)
         #[arg(short, long = "only")]
         only: Vec<String>,
 

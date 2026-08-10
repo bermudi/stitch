@@ -523,10 +523,9 @@ fn cmd_apply(
 
     let platform = Platform::detect();
 
-    // Upgraded plain repos need no migration, but a real template apply must
-    // not create sensitive staged output before Git is told to ignore it.
-    if !opts.dry_run
-        && store::has_active_template_sources(root, &filtered_config, &platform)
+    // Upgraded plain repos need no migration, but template apply and its
+    // dry-run must agree that staging is blocked until Git ignores it.
+    if store::has_active_template_sources(root, &filtered_config, &platform)
         && !render::repo_gitignore_covers_render(root)
     {
         return Err(StitchError::internal(format!(
@@ -755,8 +754,7 @@ fn apply_json(
 ) -> Result<(), StitchError> {
     let platform = Platform::detect();
 
-    if !opts.dry_run
-        && store::has_active_template_sources(root, config, &platform)
+    if store::has_active_template_sources(root, config, &platform)
         && !render::repo_gitignore_covers_render(root)
     {
         return Err(StitchError::internal(format!(

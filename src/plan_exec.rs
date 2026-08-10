@@ -63,9 +63,9 @@ pub struct PlanFile {
     pub config_sha256: String,
     pub platform: PlatformFingerprint,
     pub ops: Vec<PlanFileOp>,
-    /// Stores owning executable operations. Plan execution runs hooks only for
-    /// these stores; an editable plan cannot authorize an otherwise unrelated
-    /// configured hook.
+    /// Stores owning executable operations. This list must exactly match the
+    /// operations and controls which per-store hooks run; it does not preserve
+    /// or authenticate the `plan --only` capture filter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<String>,
     pub conflicts: Vec<PlanConflict>,
