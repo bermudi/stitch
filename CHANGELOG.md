@@ -6,7 +6,9 @@
 
 - Plan schema 2 rejects schema-1 plans, attributes stale removals to their
   originating store, revalidates target ancestors after hooks, and requires
-  execution-time `--force` for backup operations.
+  execution-time `--force` for backup operations. `plan --only` limits capture
+  but is not authenticated in editable JSON; execution validates every listed
+  operation against a fresh normal apply plan.
 - Symlink ownership now resolves gateway chains with POSIX-correct `..`
   semantics. Broad repo/store ownership remains canonical, while the narrow
   external source-symlink exception matches only the exact configured entry.
@@ -14,7 +16,8 @@
   target mutations reject ancestors resolving into the repository.
 - Render staging uses private, unpredictable exclusive temporary files,
   refuses symlink/non-directory ancestors and non-regular leaves, and never
-  chmods a hard-linked staged inode.
+  chmods a hard-linked staged inode. Direct dry-runs enforce the same
+  `.gitignore` staging prerequisite as real apply.
 - Store names, file fragments, glob patterns, and ignore patterns are validated
   and normalized in memory without rewriting authored configuration.
 - Hidden quarantine artifacts were deliberately rejected: successful removal

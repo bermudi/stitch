@@ -654,10 +654,12 @@ Semantics:
 - **No plaintext.** `stage_render` carries only the hash, so
   `stitch plan > /tmp/p.json` does not leak rendered content.
 - **Untrusted input.** `stitch apply --plan` validates every op against the
-  pinned config before acting: sources must live under the repo; targets must
-  fall under a configured store target; path traversal (`..` or absolute) is
-  rejected; backup paths must be in the same directory as the target; and
-  `.stitch/render/` gitignore is checked before staging writes.
+  pinned config and a freshly computed apply plan before acting: sources must
+  live under the repo; targets must fall under a configured store target; path
+  traversal (`..` or absolute) is rejected; backup paths must be exactly
+  `{target}.bak`; and `.stitch/render/` gitignore is checked before staging
+  writes. "Untrusted" means edited JSON remains confined to current desired
+  operations; it does not mean the original capture scope is authenticated.
 - **Stale-plan detection.** `apply --plan` accepts only plan schema `2`
   (schema `1` is stale and must be replanned), and refuses if `kind`,
   `config_sha256`, or `platform` do not match, or if any `stage_render` hash
@@ -672,8 +674,13 @@ Semantics:
   for stores owning executable plan operations; a converged store omitted from
   `ops` does not run hooks. This prevents an edited `stores` list from becoming
   authority to invoke an otherwise unrelated hook.
-- **Execution authority.** `apply --plan` rejects `--only`; the executable
-  stores are derived from the plan operations. A plan containing
+- **Execution authority.** `plan --only` is a capture-time convenience, not a
+  signed execution boundary. `apply --plan` rejects `--only` and executes the
+  reviewed operation list; an edited plan may add operations for other stores
+  only when those exact operations are also present in a freshly computed
+  normal apply plan. The `stores` field must exactly match the operation-owning
+  stores and controls their hooks. Operators must therefore review the complete
+  operation list, not rely on the earlier capture command. A plan containing
   `backup_and_link` additionally requires execution-time `--force`, so editable
   JSON alone cannot authorize moving user data. `--dry-run` runs the same
   validation without mutating anything.

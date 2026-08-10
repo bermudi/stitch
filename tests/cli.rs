@@ -4510,6 +4510,12 @@ files = ["gitconfig.tmpl"]
     ));
 
     repo.cmd()
+        .args(["apply", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains(".stitch/render/"));
+
+    repo.cmd()
         .arg("apply")
         .assert()
         .failure()
@@ -6732,6 +6738,53 @@ fn apply_plan_accepts_force_but_rejects_only_as_usage_error() {
         .failure()
         .code(2)
         .stderr(contains("--plan is not compatible with --only"));
+}
+
+#[test]
+fn apply_plan_operation_list_is_authority_not_only_capture_scope() {
+    let repo = Repo::new();
+    repo.make_store("alpha", &["file"]);
+    repo.make_store("beta", &["file"]);
+    let alpha_target = repo.path().join("home/alpha");
+    let beta_target = repo.path().join("home/beta");
+    repo.write_state(&format!(
+        r#"
+[stores.alpha]
+target = "{}"
+files = ["file"]
+
+[stores.beta]
+target = "{}"
+files = ["file"]
+"#,
+        alpha_target.display(),
+        beta_target.display()
+    ));
+
+    let scoped_output = repo
+        .cmd()
+        .args(["plan", "--only", "alpha"])
+        .output()
+        .unwrap();
+    assert!(scoped_output.status.success());
+    let full_output = repo.cmd().arg("plan").output().unwrap();
+    assert!(full_output.status.success());
+    let mut scoped: Value = serde_json::from_slice(&scoped_output.stdout).unwrap();
+    let full: Value = serde_json::from_slice(&full_output.stdout).unwrap();
+
+    // Plan files have no hidden signature. Execution authorizes the reviewed
+    // operations, provided every one exactly matches a fresh normal apply plan.
+    scoped["ops"] = full["ops"].clone();
+    scoped["stores"] = full["stores"].clone();
+    let plan_path = repo.path().join("broadened-plan.json");
+    fs::write(&plan_path, serde_json::to_vec(&scoped).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(alpha_target.join("file").is_symlink());
+    assert!(beta_target.join("file").is_symlink());
 }
 
 #[test]
