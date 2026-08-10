@@ -987,14 +987,32 @@ fn cmd_list(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
 
 /// Reverse the move step of adopt: restore the user's file/dir to its
 /// original path and clean up the store dir created for file mode.
-/// Propagates the io::Error only if restoring the original fails — a
-/// leftover empty store dir is non-critical and ignored.
+///
+/// The destination is revalidated immediately before rename. If the return
+/// link was repointed (or any other entry appeared), leave both that entry and
+/// the adopted data untouched rather than letting `rename` overwrite it.
+/// Propagates the io::Error only if restoring the original fails — a leftover
+/// empty store dir is non-critical and ignored.
 fn rollback_adopt_move(
     source: &std::path::Path,
     store_dir: &std::path::Path,
     raw_name: &str,
     is_dir: bool,
 ) -> Result<(), std::io::Error> {
+    match std::fs::symlink_metadata(source) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to restore over entry that appeared at {}",
+                    source.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+
     if is_dir {
         // Dir mode: store_dir is the moved directory itself.
         std::fs::rename(store_dir, source)
@@ -2389,6 +2407,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.exit_code(), 9);
         assert!(!repo.join("nested").exists());
+    }
+
+    #[test]
+    fn rollback_adopt_move_refuses_to_overwrite_repointed_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("original");
+        let store_dir = tmp.path().join("store");
+        let adopted = store_dir.join("original");
+        let foreign = tmp.path().join("foreign");
+        fs::create_dir(&store_dir).unwrap();
+        fs::write(&adopted, "adopted data").unwrap();
+        fs::write(&foreign, "foreign data").unwrap();
+        symlink(&foreign, &source).unwrap();
+
+        let error = rollback_adopt_move(&source, &store_dir, "original", false).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_link(&source).unwrap(), foreign);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "foreign data");
+        assert_eq!(fs::read_to_string(adopted).unwrap(), "adopted data");
     }
 
     #[test]
