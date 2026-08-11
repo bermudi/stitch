@@ -31,6 +31,9 @@ impl Repo {
         fs::write(dir.path().join("stitch.toml"), "").expect("write stitch.toml");
         // Generated half: empty (the header is optional on read; keep it minimal).
         fs::write(stitch.join("state.toml"), "").expect("write state.toml");
+        // The state lock file is normally created by the first mutating command;
+        // seed it here so tests that make .stitch/ read-only still lock first.
+        fs::write(stitch.join("lock"), "").expect("write lock");
         // Trust foundation: doctor requires `.stitch/render/` in .gitignore.
         // Real `init` writes this; tests that bypass init need it too.
         fs::write(dir.path().join(".gitignore"), ".stitch/render/\n").expect("write .gitignore");
@@ -73,6 +76,7 @@ impl Repo {
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("stitch").expect("stitch binary");
         c.current_dir(self.dir.path());
+        c.env("HOME", self.dir.path().as_os_str());
         c.env_remove("EDITOR"); // avoid any inherited editor
         c.env_remove("STITCH_REPO"); // tests drive --repo explicitly when needed
         c
@@ -91,6 +95,59 @@ fn is_root() -> bool {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim() == "0")
         .unwrap_or(false)
+}
+
+/// A scratch environment that simulates a symlinked `$HOME`:
+/// `home_link` is a symlink to `real_home`, and the repo lives under the same
+/// temp root. This is the setup for issue #3.
+struct SymlinkedHomeRepo {
+    tmp: tempfile::TempDir,
+}
+
+impl SymlinkedHomeRepo {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_home = tmp.path().join("real_home");
+        let home_link = tmp.path().join("home_link");
+        let repo = tmp.path().join("repo");
+
+        fs::create_dir_all(&real_home).expect("mkdir real_home");
+        fs::create_dir_all(&repo).expect("mkdir repo");
+        std::os::unix::fs::symlink(&real_home, &home_link).expect("symlink home");
+
+        // Initialize a stitch repo in the normal way so the trust foundations
+        // (.gitignore, .stitch/render/) are present.
+        Command::cargo_bin("stitch")
+            .expect("stitch binary")
+            .current_dir(&repo)
+            .env("HOME", &home_link)
+            .env_remove("STITCH_REPO")
+            .arg("init")
+            .assert()
+            .success();
+
+        Self { tmp }
+    }
+
+    fn repo(&self) -> PathBuf {
+        self.tmp.path().join("repo")
+    }
+
+    fn home_link(&self) -> PathBuf {
+        self.tmp.path().join("home_link")
+    }
+
+    fn real_home(&self) -> PathBuf {
+        self.tmp.path().join("real_home")
+    }
+
+    fn cmd(&self) -> Command {
+        let mut c = Command::cargo_bin("stitch").expect("stitch binary");
+        c.current_dir(self.repo());
+        c.env("HOME", self.home_link());
+        c.env_remove("STITCH_REPO");
+        c
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +531,125 @@ files = [".bashrc"]
 }
 
 // ---------------------------------------------------------------------------
+// $HOME validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_fails_when_home_unset() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    repo.cmd()
+        .env_remove("HOME")
+        .arg("status")
+        .assert()
+        .failure()
+        .stderr(contains("$HOME"))
+        .stderr(contains("not set"));
+}
+
+#[test]
+fn status_fails_when_home_empty() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    repo.cmd()
+        .env("HOME", "")
+        .arg("status")
+        .assert()
+        .failure()
+        .stderr(contains("$HOME"))
+        .stderr(contains("empty"));
+}
+
+#[test]
+fn apply_fails_when_home_does_not_exist() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    let home_parent = tempfile::tempdir().unwrap();
+    let bogus_home = home_parent.path().join("ghosthome");
+    let bogus = bogus_home.to_string_lossy();
+
+    repo.cmd()
+        .env("HOME", bogus.as_ref())
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("$HOME"))
+        .stderr(contains("does not exist"));
+
+    assert!(
+        !bogus_home.exists(),
+        "stitch must not create a bogus $HOME directory"
+    );
+}
+
+#[test]
+fn status_works_with_existing_home() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    let home = tempfile::tempdir().unwrap();
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("bashrc"));
+}
+
+#[test]
+fn apply_creates_subdir_under_existing_home() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    let home = tempfile::tempdir().unwrap();
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("created"));
+
+    assert!(home.path().join(".config").is_dir());
+    assert!(home.path().join(".config/nvim").is_symlink());
+}
+
+// ---------------------------------------------------------------------------
 // apply
 // ---------------------------------------------------------------------------
 
@@ -790,6 +966,127 @@ files = ["file"]
 }
 
 // ---------------------------------------------------------------------------
+// when clauses: unknown keys are rejected, valid keys still filter/apply
+// ---------------------------------------------------------------------------
+
+fn repo_with_bashrc_store() -> (Repo, std::path::PathBuf) {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{target}"
+files = [".bashrc"]
+"#,
+        target = target.to_string_lossy(),
+    ));
+    (repo, target)
+}
+
+#[test]
+fn apply_rejects_unknown_when_key() {
+    let (repo, _target) = repo_with_bashrc_store();
+    repo.write_authored(
+        r#"
+[stores.bashrc.when]
+bogus_key = "x"
+"#,
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("unknown field `bogus_key`"))
+        .stderr(contains(
+            "expected one of `os`, `arch`, `distro`, `hostname`, `shell`",
+        ));
+}
+
+#[test]
+fn status_rejects_unknown_when_key() {
+    let (repo, _target) = repo_with_bashrc_store();
+    repo.write_authored(
+        r#"
+[stores.bashrc.when]
+bogus_key = "x"
+"#,
+    );
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("unknown field `bogus_key`"));
+}
+
+#[test]
+fn list_rejects_unknown_when_key() {
+    let (repo, _target) = repo_with_bashrc_store();
+    repo.write_authored(
+        r#"
+[stores.bashrc.when]
+bogus_key = "x"
+"#,
+    );
+
+    repo.cmd()
+        .arg("list")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("unknown field `bogus_key`"));
+}
+
+#[test]
+fn apply_skips_on_nonmatching_hostname() {
+    let (repo, target) = repo_with_bashrc_store();
+    repo.write_authored(
+        r#"
+[stores.bashrc.when]
+hostname = "nonexistent-host"
+"#,
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("skipped: platform"));
+
+    assert!(
+        !target.join(".bashrc").exists(),
+        "non-matching hostname must skip linking"
+    );
+}
+
+#[test]
+fn apply_works_with_valid_when() {
+    let (repo, target) = repo_with_bashrc_store();
+    let current_os = std::env::consts::OS;
+    repo.write_authored(&format!(
+        r#"
+[stores.bashrc.when]
+os = "{current_os}"
+"#,
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("created"));
+
+    assert!(
+        target.join(".bashrc").is_symlink(),
+        "matching `when.os` must still allow linking"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // apply --force (.bak backups)
 // ---------------------------------------------------------------------------
 
@@ -946,6 +1243,95 @@ target = "{target_str}"
     assert!(target.is_symlink());
     assert_eq!(fs::read_link(&target).unwrap(), foreign);
     assert!(!Path::new(&format!("{}.bak", target.display())).exists());
+}
+
+#[test]
+fn apply_conflicts_on_foreign_symlink_at_target_root_file_mode() {
+    // File-mode store with the target root itself a foreign symlink. The
+    // symlink must be treated as a conflict, not silently followed, and no
+    // child link may be written into the foreign directory.
+    let repo = Repo::new();
+    repo.make_store("config", &["foo"]);
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+
+    // Foreign directory containing a real file at the same name.
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_dir = foreign.path().join("config");
+    fs::create_dir_all(&foreign_dir).unwrap();
+    let foreign_file = foreign_dir.join("foo");
+    fs::write(&foreign_file, "foreign foo").unwrap();
+
+    // ~/.config is a symlink into the foreign directory.
+    let config_link = home.path().join(".config");
+    std::os::unix::fs::symlink(&foreign_dir, &config_link).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.config]
+target = "~/.config"
+files = ["foo"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(7)
+        .stdout(contains("conflict"));
+
+    // The target-root symlink is untouched.
+    assert!(config_link.is_symlink());
+    assert_eq!(fs::read_link(&config_link).unwrap(), foreign_dir);
+
+    // No stitch link was created inside the foreign directory and the
+    // existing foreign file is unchanged.
+    assert!(!foreign_dir.join("foo").is_symlink());
+    assert_eq!(fs::read_to_string(&foreign_file).unwrap(), "foreign foo");
+    assert!(!foreign_dir.join("foo.bak").exists());
+}
+
+#[test]
+fn apply_force_does_not_clobber_foreign_symlink_at_target_root_file_mode() {
+    // Even with --force, a file-mode target root that is a foreign symlink
+    // must remain a hard conflict and must not displace foreign content.
+    let repo = Repo::new();
+    repo.make_store("config", &["foo"]);
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_dir = foreign.path().join("config");
+    fs::create_dir_all(&foreign_dir).unwrap();
+    let foreign_file = foreign_dir.join("foo");
+    fs::write(&foreign_file, "foreign foo").unwrap();
+
+    let config_link = home.path().join(".config");
+    std::os::unix::fs::symlink(&foreign_dir, &config_link).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.config]
+target = "~/.config"
+files = ["foo"]
+"#,
+    );
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(7)
+        .stdout(contains("conflict"));
+
+    assert!(config_link.is_symlink());
+    assert_eq!(fs::read_link(&config_link).unwrap(), foreign_dir);
+    assert!(!foreign_dir.join("foo").is_symlink());
+    assert_eq!(fs::read_to_string(&foreign_file).unwrap(), "foreign foo");
+    assert!(!foreign_dir.join("foo.bak").exists());
 }
 
 #[test]
@@ -1301,6 +1687,114 @@ target = "{}"
 }
 
 #[test]
+fn status_labels_live_foreign_symlink_as_foreign() {
+    // A symlink at the target that points to an *existing* file outside this
+    // repo is a live foreign link, not a broken one.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join(".bashrc");
+
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign_file = foreign_dir.path().join("bashrc");
+    fs::write(&foreign_file, "foreign").unwrap();
+    std::os::unix::fs::symlink(&foreign_file, &target).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("foreign"))
+        .stdout(contains("broken").not());
+
+    let output = repo.cmd().args(["status", "--json"]).assert().success();
+    let stdout = std::str::from_utf8(&output.get_output().stdout).unwrap();
+    let json: Value = serde_json::from_str(stdout).unwrap();
+    let row = json["data"].as_array().unwrap().first().unwrap();
+    assert_eq!(row["state"].as_str().unwrap(), "foreign");
+    assert!(row["resolves_to"].as_str().is_some());
+}
+
+#[test]
+fn status_labels_dangling_symlink_as_broken() {
+    // A dangling symlink (target does not exist) must keep the "broken" label,
+    // even when it points outside this repo.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join(".bashrc");
+
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let missing = foreign_dir.path().join("missing");
+    std::os::unix::fs::symlink(&missing, &target).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("broken"))
+        .stdout(contains("foreign").not());
+
+    let output = repo.cmd().args(["status", "--json"]).assert().success();
+    let stdout = std::str::from_utf8(&output.get_output().stdout).unwrap();
+    let json: Value = serde_json::from_str(stdout).unwrap();
+    let row = json["data"].as_array().unwrap().first().unwrap();
+    assert_eq!(row["state"].as_str().unwrap(), "broken");
+    assert!(row["resolves_to"].as_str().is_some());
+}
+
+#[test]
+fn status_and_apply_agree_on_foreign_symlink() {
+    // The same on-disk state (live foreign symlink) must be reported as
+    // "foreign" by status and as a "conflict" by apply (exit 7).
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join(".bashrc");
+
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign_file = foreign_dir.path().join("bashrc");
+    fs::write(&foreign_file, "foreign").unwrap();
+    std::os::unix::fs::symlink(&foreign_file, &target).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    let status = repo.cmd().arg("status").assert().success();
+    let status_stdout = std::str::from_utf8(&status.get_output().stdout).unwrap();
+    assert!(
+        status_stdout.contains("foreign"),
+        "status must label a live foreign symlink as foreign"
+    );
+
+    let apply = repo.cmd().arg("apply").assert().failure();
+    assert_eq!(apply.get_output().status.code().unwrap(), 7);
+    let apply_stdout = std::str::from_utf8(&apply.get_output().stdout).unwrap();
+    assert!(
+        apply_stdout.contains("conflict"),
+        "apply must report a foreign symlink as a conflict"
+    );
+}
+
+#[test]
 fn status_name_filter_shows_only_matching_store() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
@@ -1504,6 +1998,57 @@ target = "{target_str}"
 
     assert!(target.is_symlink());
     assert_eq!(fs::read_link(&target).unwrap(), Path::new("/etc/foreign"));
+}
+
+#[test]
+fn diff_no_differences_exits_zero() {
+    // After a successful apply, `diff` must exit 0 and clearly report that
+    // there is nothing to do. SPEC treats `diff` as a preview of `apply`:
+    // it exits non-zero only for conflicts/errors, not simply because
+    // differences exist, so an in-sync store is a success.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{}"
+files = [".bashrc"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .success()
+        .stdout(contains("no differences"));
+}
+
+#[test]
+fn diff_with_differences_reports_them() {
+    // `diff` is the dry-run mirror of `apply`. When the filesystem is not
+    // yet reconciled, it should report the pending operation and still exit
+    // 0 (per SPEC, `diff` only exits non-zero on conflicts/errors).
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{}"
+files = [".bashrc"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .success()
+        .stdout(contains("create:"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,6 +2328,85 @@ fn add_adopt_file_collapses_home_target() {
     let resolved = fs::read_link(&link).unwrap();
     assert!(resolved.starts_with(repo.path()));
     assert_eq!(fs::read_to_string(&link).unwrap(), "data");
+}
+
+#[test]
+fn add_adopt_file_with_symlinked_home() {
+    // Issue #3: when $HOME itself is a symlink, `stitch add ~/.bashrc` must
+    // treat the file at the canonical home as the source, not as a foreign
+    // whole-dir symlink.
+    let env = SymlinkedHomeRepo::new();
+    let real_bashrc = env.real_home().join(".bashrc");
+    fs::write(&real_bashrc, "my bashrc").unwrap();
+
+    env.cmd()
+        .args(["add", "~/.bashrc"])
+        .assert()
+        .success()
+        .stdout(contains("Added store"));
+
+    // The file is now in the repo.
+    let in_repo = env.repo().join("bashrc").join(".bashrc");
+    assert!(in_repo.exists());
+    assert_eq!(fs::read_to_string(&in_repo).unwrap(), "my bashrc");
+
+    // state.toml records the ~-collapsed target, not the literal symlink path.
+    let state = fs::read_to_string(env.repo().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains(r#"target = "~""#),
+        "state.toml must record ~-collapsed target:\n{state}"
+    );
+    assert!(
+        state.contains(r#"".bashrc""#),
+        "state.toml must record the adopted file:\n{state}"
+    );
+
+    // The original location is now a symlink back to the repo, reachable
+    // through the symlinked HOME.
+    let link = env.home_link().join(".bashrc");
+    assert!(link.is_symlink(), "home link must be a symlink");
+    let resolved = fs::read_link(&link).unwrap();
+    assert!(
+        resolved.starts_with(env.repo()),
+        "link must point into repo: {resolved:?}"
+    );
+
+    // Regression: status reports linked, and apply is a no-op.
+    env.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("linked"));
+
+    env.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("ok"));
+}
+
+#[test]
+fn apply_noop_with_symlinked_home_target_root() {
+    // Issue #3 regression: an already-correct file-mode link through a
+    // symlinked $HOME must report "ok" on apply, not "conflict".
+    let env = SymlinkedHomeRepo::new();
+    let real_bashrc = env.real_home().join(".bashrc");
+    fs::write(&real_bashrc, "my bashrc").unwrap();
+
+    env.cmd().args(["add", "~/.bashrc"]).assert().success();
+
+    // Re-apply should be a clean no-op.
+    env.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("ok"))
+        .stdout(contains("0 conflict"));
+
+    // The link is still correct.
+    let link = env.home_link().join(".bashrc");
+    assert!(link.is_symlink());
+    assert_eq!(fs::read_to_string(&link).unwrap(), "my bashrc");
 }
 
 #[test]
@@ -2105,6 +2729,125 @@ fn add_rejects_patterns_on_existing_path() {
 
     assert!(src.exists());
     assert!(!repo.path().join("myconfig").exists());
+}
+
+// ---------------------------------------------------------------------------
+// add dotdot normalization (issue #12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn add_normalizes_dotdot_in_path() {
+    // A `..` that stays inside $HOME must be normalized away before the
+    // target is stored in state.toml.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let home_str = home_path.to_str().unwrap();
+
+    repo.cmd()
+        .args(["add", "~/sub/../myconfig"])
+        .env("HOME", home_str)
+        .assert()
+        .success()
+        .stdout(contains("Added store 'myconfig'"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains(r#"target = "~/myconfig""#),
+        "state.toml must record the normalized target:\n{state}"
+    );
+    assert!(
+        !state.contains("sub/.."),
+        "state.toml must not contain un-normalized '..':\n{state}"
+    );
+    assert!(
+        !state.contains("sub"),
+        "state.toml must not contain the redundant 'sub' component:\n{state}"
+    );
+
+    let link = home_path.join("myconfig");
+    assert!(link.is_symlink(), "target link must be created");
+    let resolved = fs::read_link(&link).unwrap();
+    assert!(
+        resolved.starts_with(repo.path()),
+        "link must point into repo"
+    );
+}
+
+#[test]
+fn add_rejects_dotdot_escaping_home() {
+    // A `..` that escapes $HOME must still be rejected after normalization.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+
+    repo.cmd()
+        .args(["add", "~/../outside"])
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid target"))
+        .stderr(contains("inside $HOME"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state.contains("outside"),
+        "state must not record an escaped target"
+    );
+}
+
+#[test]
+fn add_dotdot_target_resolves_correctly() {
+    // Regression guard: an existing target path containing `..` is adopted,
+    // normalized, linked, and remains correct on re-apply.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let home_str = home_path.to_str().unwrap();
+
+    let real = home_path.join(".config").join("nvim");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("init.lua"), "vim config").unwrap();
+    let placeholder = home_path.join(".config").join("placeholder");
+    fs::create_dir_all(&placeholder).unwrap();
+
+    repo.cmd()
+        .args(["add", "~/.config/placeholder/../nvim"])
+        .env("HOME", home_str)
+        .assert()
+        .success()
+        .stdout(contains("Added store 'nvim'"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains(r#"target = "~/.config/nvim""#),
+        "state.toml must record the normalized target:\n{state}"
+    );
+    assert!(
+        !state.contains("placeholder/.."),
+        "state.toml must not contain un-normalized '..':\n{state}"
+    );
+
+    let link = home_path.join(".config").join("nvim");
+    assert!(link.is_symlink(), "target must be a symlink");
+    let resolved = fs::read_link(&link).unwrap();
+    assert!(
+        resolved.starts_with(repo.path()),
+        "link must point into repo"
+    );
+    assert_eq!(
+        fs::read_to_string(link.join("init.lua")).unwrap(),
+        "vim config"
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .success()
+        .stdout(contains("ok"))
+        .stdout(contains("0 conflict"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2581,6 +3324,244 @@ ignore = ["*.bak"]
         stdout.contains("orphaned") && stdout.contains("nvim"),
         "expected orphaned-behavior warning for nvim, got: {stdout}"
     );
+}
+
+#[test]
+fn doctor_reports_live_foreign_symlink() {
+    // A live symlink at the target that points outside this repo (another
+    // tool's file) must surface as a `foreign-link` finding, not be silent.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join(".bashrc");
+
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign_file = foreign_dir.path().join("bashrc");
+    fs::write(&foreign_file, "foreign").unwrap();
+    std::os::unix::fs::symlink(&foreign_file, &target).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "doctor must fail on a foreign symlink"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "doctor", false);
+    assert_error_shape(&value, "doctor", 13);
+
+    let findings = value["data"]["findings"].as_array().unwrap();
+    let foreign = findings
+        .iter()
+        .find(|f| f["id"] == "foreign-link")
+        .expect("doctor must report a foreign-link finding");
+    assert_eq!(foreign["severity"], "error");
+
+    let message = foreign["message"].as_str().unwrap();
+    assert!(
+        message.contains(target.to_string_lossy().as_ref()),
+        "finding must mention the target path, got: {message}"
+    );
+
+    let hint = foreign["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("foreign") || hint.contains("another tool") || hint.contains("conflict"),
+        "hint must describe a foreign/apply-conflict situation, got: {hint}"
+    );
+    assert!(
+        !hint.contains("remove or repoint"),
+        "hint must not give broken-link advice, got: {hint}"
+    );
+
+    let summary = value["data"]["summary"].as_object().unwrap();
+    assert_eq!(summary["errors"], 1);
+}
+
+#[test]
+fn doctor_reports_broken_link() {
+    // A dangling symlink at the target must still be reported as a broken link.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join(".bashrc");
+    std::os::unix::fs::symlink("/nonexistent", &target).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "doctor must fail on a broken link"
+    );
+    let value = json_output(&output);
+    let findings = value["data"]["findings"].as_array().unwrap();
+    let broken = findings
+        .iter()
+        .find(|f| f["id"] == "broken-link")
+        .expect("doctor must report a broken-link finding");
+    assert_eq!(broken["severity"], "error");
+    let hint = broken["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("remove or repoint"),
+        "broken-link hint unchanged, got: {hint}"
+    );
+}
+
+#[test]
+fn doctor_reports_missing_link() {
+    // A configured store whose target symlink does not exist yet must surface
+    // as a `missing-link` warning (apply would create it, so it is not an error).
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "doctor must succeed on missing link"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "doctor", true);
+
+    let findings = value["data"]["findings"].as_array().unwrap();
+    let missing = findings
+        .iter()
+        .find(|f| f["id"] == "missing-link")
+        .expect("doctor must report a missing-link finding");
+    assert_eq!(missing["severity"], "warning");
+    let message = missing["message"].as_str().unwrap();
+    assert!(
+        message.contains("bashrc") && message.contains("missing"),
+        "message must name the store and describe a missing link, got: {message}"
+    );
+    let hint = missing["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("apply"),
+        "hint must suggest running apply, got: {hint}"
+    );
+
+    let summary = value["data"]["summary"].as_object().unwrap();
+    assert_eq!(summary["errors"], 0);
+    assert_eq!(summary["warnings"], 1);
+    assert_eq!(summary["info"], 1); // store-count
+}
+
+#[test]
+fn doctor_reports_untracked_store_dir() {
+    // A directory in the repo root that is not a configured store should be
+    // flagged so the user can clean it up or add it to config.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    fs::create_dir(repo.path().join("ghost")).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.bashrc]
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "doctor must succeed on untracked store dir"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "doctor", true);
+
+    let findings = value["data"]["findings"].as_array().unwrap();
+    let untracked = findings
+        .iter()
+        .find(|f| f["id"] == "untracked-store-dir")
+        .expect("doctor must report an untracked-store-dir finding");
+    assert_eq!(untracked["severity"], "info");
+    let message = untracked["message"].as_str().unwrap();
+    assert!(
+        message.contains("ghost") && message.contains("untracked"),
+        "message must name the untracked dir, got: {message}"
+    );
+    let hint = untracked["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("remove") || hint.contains("config"),
+        "hint should suggest cleanup or adding to config, got: {hint}"
+    );
+
+    let summary = value["data"]["summary"].as_object().unwrap();
+    assert_eq!(summary["errors"], 0);
+    assert_eq!(summary["warnings"], 0);
+    assert_eq!(summary["info"], 2); // store-count + untracked
+}
+
+#[test]
+fn doctor_reports_unreadable_source() {
+    // A store source directory that is not readable is an error: apply would
+    // fail. Skipped under root because root bypasses file mode bits.
+    if is_root() {
+        eprintln!("note: doctor_reports_unreadable_source skipped under root");
+        return;
+    }
+
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let store_dir = repo.path().join("bashrc");
+    let mut perms = fs::metadata(&store_dir).unwrap().permissions();
+    perms.set_mode(0o000);
+    fs::set_permissions(&store_dir, perms).unwrap();
+
+    repo.write_state(
+        r#"
+[stores.bashrc]
+target = "~"
+files = [".bashrc"]
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "doctor must fail on unreadable source"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "doctor", false);
+    assert_error_shape(&value, "doctor", 13);
+
+    let findings = value["data"]["findings"].as_array().unwrap();
+    let unreadable = findings
+        .iter()
+        .find(|f| f["id"] == "unreadable-source")
+        .expect("doctor must report an unreadable-source finding");
+    assert_eq!(unreadable["severity"], "error");
+    let message = unreadable["message"].as_str().unwrap();
+    assert!(
+        message.contains("bashrc")
+            && (message.contains("unreadable") || message.contains("permission")),
+        "message must name the store and describe an unreadability, got: {message}"
+    );
+    let hint = unreadable["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("permission") || hint.contains("apply will fail"),
+        "hint must mention permissions or apply failing, got: {hint}"
+    );
+
+    let summary = value["data"]["summary"].as_object().unwrap();
+    assert_eq!(summary["errors"], 1);
+    assert_eq!(summary["info"], 1); // store-count
 }
 
 // --- Global ignores + whole-dir promotion (P1#8 D/E) ---
@@ -3653,6 +4634,7 @@ fn import_leaves_stitch_toml_byte_stable() {
         .arg("import")
         .arg("--scan-dir")
         .arg(home.path().join(".config"))
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("Imported 1"));
@@ -4114,6 +5096,26 @@ fn migrate_nothing_to_do() {
         .stderr(contains("nothing to migrate"));
 }
 
+/// migrate on an already-converted repo exits 0 with a non-error message.
+/// The message and exit code must agree: success must not be paired with
+/// "error:".
+#[test]
+fn migrate_message_and_exit_code_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(dir.path().join("stitch.toml"), "").unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .success()
+        .stdout(contains("nothing to migrate"))
+        .stdout(contains("stitch.toml"))
+        .stderr(contains("error:").not());
+}
+
 /// migrate rejects v0.2 entries that the new validator would refuse (e.g.
 /// `files = ["../escape"]`) and fails *before* writing or backing up.
 #[test]
@@ -4236,8 +5238,9 @@ fn prune_fixture() -> (Repo, PathBuf, PathBuf, tempfile::TempDir) {
     std::os::unix::fs::symlink(&store_dir, &covered).unwrap();
     std::os::unix::fs::symlink(&store_dir, &orphan).unwrap();
 
-    let covered_str = covered.to_string_lossy().into_owned();
-    repo.write_state(&format!("[stores.nvim]\ntarget = \"{covered_str}\"\n"));
+    // Use `~` so the covered target stays inside $HOME when tests set HOME to
+    // the fake home dir; the orphan output assertions still use absolute paths.
+    repo.write_state("[stores.nvim]\ntarget = \"~/.config/nvim\"\n");
 
     (repo, covered, orphan, home)
 }
@@ -4252,6 +5255,7 @@ fn prune_default_lists_without_removing() {
         .arg("prune")
         .arg("--scan-dir")
         .arg(home.path())
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("Found 1 orphaned link(s):"))
@@ -4273,6 +5277,7 @@ fn prune_yes_removes_only_orphan() {
         .arg("--yes")
         .arg("--scan-dir")
         .arg(home.path())
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("Removed 1 link(s)."))
@@ -4298,6 +5303,7 @@ fn prune_dry_run_lists_without_removing() {
         .arg("--dry-run")
         .arg("--scan-dir")
         .arg(home.path())
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("Found 1 orphaned link(s):"));
@@ -4317,6 +5323,7 @@ fn prune_yes_dry_run_still_lists() {
         .arg("--dry-run")
         .arg("--scan-dir")
         .arg(home.path())
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("Found 1 orphaned link(s):"));
@@ -4396,6 +5403,7 @@ fn prune_no_orphans() {
         .arg("prune")
         .arg("--scan-dir")
         .arg(home.path())
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("No orphaned links found."));
@@ -4410,6 +5418,7 @@ fn prune_gc_alias_works() {
         .arg("gc")
         .arg("--scan-dir")
         .arg(home.path())
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("Found 1 orphaned link(s):"))
@@ -4439,6 +5448,7 @@ fn prune_yes_exits_nonzero_on_removal_failure() {
         .arg("--yes")
         .arg("--scan-dir")
         .arg(home.path())
+        .env("HOME", home.path().as_os_str())
         .assert()
         .failure()
         .stderr(contains("could not remove"))
@@ -5352,6 +6362,54 @@ files = ["gitconfig"]
         .stderr(contains("foreign"));
 }
 
+/// `stitch edit` with neither $EDITOR nor $VISUAL set must fail with a clear
+/// message and a non-zero exit code (no silent success, no raw I/O error).
+/// PATH is constrained so the fallback to `vi` fails quickly instead of
+/// launching an interactive editor.
+#[test]
+fn edit_fails_nonzero_when_editor_unset() {
+    let repo = Repo::new();
+    repo.cmd()
+        .env_remove("EDITOR")
+        .env_remove("VISUAL")
+        .env("PATH", "/no-such-dir")
+        .arg("edit")
+        .assert()
+        .failure()
+        .stderr(contains("could not run editor 'vi'"));
+}
+
+/// `stitch edit` must use the `vi` fallback when neither $EDITOR nor $VISUAL
+/// is set, preserving the pre-round-1 behavior.
+#[test]
+fn edit_uses_vi_fallback_when_editor_unset() {
+    let repo = Repo::new();
+    let vi_dir = tempfile::tempdir().unwrap();
+    let vi = vi_dir.path().join("vi");
+    fs::write(&vi, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&vi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    repo.cmd()
+        .env_remove("EDITOR")
+        .env_remove("VISUAL")
+        .env("PATH", vi_dir.path().as_os_str())
+        .arg("edit")
+        .assert()
+        .success();
+}
+
+/// `stitch edit` must still work when $EDITOR is set to a valid no-op editor.
+#[test]
+fn edit_works_when_editor_set() {
+    let repo = Repo::new();
+    repo.cmd()
+        .env_remove("VISUAL")
+        .env("EDITOR", "/bin/true")
+        .arg("edit")
+        .assert()
+        .success();
+}
+
 #[test]
 fn import_registers_existing_links() {
     let repo = Repo::new();
@@ -5366,6 +6424,7 @@ fn import_registers_existing_links() {
         .arg("import")
         .arg("--scan-dir")
         .arg(home.path().join(".config"))
+        .env("HOME", home.path().as_os_str())
         .assert()
         .success()
         .stdout(contains("import 'nvim'"))
@@ -5982,6 +7041,7 @@ target = "{}"
 
     let output = repo
         .cmd()
+        .env("HOME", home.path().as_os_str())
         .args([
             "--json",
             "prune",
@@ -6225,6 +7285,137 @@ fn render_rejects_non_template() {
         .assert()
         .failure()
         .stderr(contains("only .tmpl files"));
+}
+
+#[test]
+fn render_undefined_var_errors() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    repo.write_state("[stores.git]\n");
+    fs::write(
+        store_dir.join("config.tmpl"),
+        "name = {{ vars.does_not_exist }}\n",
+    )
+    .unwrap();
+
+    repo.cmd()
+        .args(["render", "git/config.tmpl"])
+        .assert()
+        .failure()
+        .code(8)
+        .stderr(contains("does_not_exist"))
+        .stderr(contains("undefined"));
+}
+
+#[test]
+fn render_undefined_var_in_apply_errors() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    let home = repo.path().join("home");
+    let target = home.join(".config").join("git");
+    fs::write(
+        store_dir.join("config.tmpl"),
+        "name = {{ vars.does_not_exist }}\n",
+    )
+    .unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["config.tmpl"]
+"#,
+        target.to_string_lossy()
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(8)
+        .stdout(contains("does_not_exist"))
+        .stdout(contains("undefined"));
+
+    assert!(
+        !repo.path().join(".stitch/render/git/config").exists(),
+        "undefined var must not produce a staged render"
+    );
+    assert!(
+        !home.join(".config/git/config").exists(),
+        "undefined var must not create the target link"
+    );
+}
+
+#[test]
+fn render_defined_var_works() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    repo.write_authored("[vars]\nemail = \"you@example.com\"\n");
+    repo.write_state("[stores.git]\n");
+    fs::write(
+        store_dir.join("gitconfig.tmpl"),
+        "email = {{ vars.email }}\n",
+    )
+    .unwrap();
+
+    repo.cmd()
+        .args(["render", "git/gitconfig.tmpl"])
+        .assert()
+        .success()
+        .stdout("email = you@example.com\n");
+}
+
+#[test]
+fn render_builtin_hostname_works() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    repo.write_state("[stores.git]\n");
+    fs::write(store_dir.join("gitconfig.tmpl"), "host={{ hostname }}\n").unwrap();
+
+    let hostname = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    repo.cmd()
+        .args(["render", "git/gitconfig.tmpl"])
+        .assert()
+        .success()
+        .stdout(format!("host={hostname}\n"));
+}
+
+#[test]
+fn render_env_with_default_works() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    repo.write_state("[stores.git]\n");
+    fs::write(
+        store_dir.join("gitconfig.tmpl"),
+        "editor={{ env(\"EDITOR\", \"nvim\") }}\n",
+    )
+    .unwrap();
+
+    repo.cmd()
+        .args(["render", "git/gitconfig.tmpl"])
+        .env_remove("EDITOR")
+        .assert()
+        .success()
+        .stdout("editor=nvim\n");
+}
+
+#[test]
+fn render_expression_works() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("git", &[]);
+    repo.write_state("[stores.git]\n");
+    fs::write(store_dir.join("gitconfig.tmpl"), "answer={{ 7*6 }}\n").unwrap();
+
+    repo.cmd()
+        .args(["render", "git/gitconfig.tmpl"])
+        .assert()
+        .success()
+        .stdout("answer=42\n");
 }
 
 #[test]
@@ -7874,10 +9065,12 @@ fn plan_omits_link_below_existing_external_symlink_ancestor() {
     let home = repo.path().join("home");
     let config = home.join(".config");
     let external = tempfile::tempdir().unwrap();
-    // `config` itself is absent, so file-mode promotion and the existing
-    // nested-parent guard cannot classify it. Only the plan builder sees the
-    // higher external `home` symlink ancestor.
-    std::os::unix::fs::symlink(external.path(), &home).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    // The store target itself is a symlink to an external path. The plan
+    // builder must see the symlinked ancestor and refuse to create a link
+    // beneath it. The target is still inside $HOME, so config validation passes
+    // and the conflict is the plan's responsibility.
+    std::os::unix::fs::symlink(external.path(), &config).unwrap();
     repo.write_state(&format!(
         r#"
 [stores.shells]
@@ -7903,8 +9096,8 @@ files = [".bashrc"]
             .unwrap()
             .iter()
             .any(|conflict| {
-                conflict["kind"] == "symlink_ancestor"
-                    && conflict["target"] == home.to_string_lossy().as_ref()
+                (conflict["kind"] == "foreign_symlink" || conflict["kind"] == "symlink_ancestor")
+                    && conflict["target"] == config.to_string_lossy().as_ref()
             }),
         "unexpected plan: {plan}"
     );
@@ -8391,15 +9584,18 @@ fn remove_rejects_symlinked_state_before_unlinking_targets() {
 fn config_rejects_target_overlap_through_filesystem_alias() {
     let repo = Repo::new();
     repo.make_store("app", &["a", "b"]);
-    let external = tempfile::tempdir().unwrap();
-    let root = external.path().join("root");
-    fs::create_dir_all(root.join("sub")).unwrap();
-    let gateway = repo.path().join("gateway");
-    std::os::unix::fs::symlink(external.path(), &gateway).unwrap();
+    // Create two in-$HOME paths, one a strict ancestor of the other, where the
+    // child path resolves through a gateway symlink. The overlap check must
+    // still catch this filesystem alias even though strict validation now
+    // requires targets to be under $HOME.
+    let real = repo.path().join("home").join("real");
+    fs::create_dir_all(real.join("sub")).unwrap();
+    let gateway = repo.path().join("home").join("gateway");
+    std::os::unix::fs::symlink(&real, &gateway).unwrap();
     repo.write_state(&format!(
         "[stores.app.targets.one]\ntarget = \"{}\"\nfiles = [\"a\"]\n\n[stores.app.targets.two]\ntarget = \"{}\"\nfiles = [\"b\"]\n",
-        root.display(),
-        gateway.join("root/sub").display()
+        real.display(),
+        gateway.join("sub").display()
     ));
 
     repo.cmd()
@@ -8483,4 +9679,767 @@ fn plan_rejects_config_changed_by_global_hook_before_mutation() {
         .failure()
         .stderr(contains("config changed during pre-apply hook"));
     assert!(!home.join("new").exists());
+}
+
+// ---------------------------------------------------------------------------
+// target path validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_rejects_absolute_target_outside_home() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    repo.make_store("evil", &["authorized_keys"]);
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("abs_target");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.evil]
+target = "{target_str}"
+files = ["authorized_keys"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid target"))
+        .stderr(contains(format!("'{target_str}'")));
+
+    assert!(!target.exists());
+    assert!(!target.join("authorized_keys").exists());
+}
+
+#[test]
+fn status_rejects_absolute_target_outside_home() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    repo.make_store("evil", &["a"]);
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("abs_status_target");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.evil]
+target = "{target_str}"
+files = ["a"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("status")
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid target"))
+        .stderr(contains(format!("'{target_str}'")));
+
+    assert!(!target.exists());
+}
+
+#[test]
+fn apply_rejects_dotdot_target_escaping_home() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    repo.make_store("evil", &["authorized_keys"]);
+
+    let outside = tempfile::tempdir().unwrap();
+    let evil = outside.path().join("evil_target");
+    let target = format!("~/../../../{}", evil.display());
+    repo.write_state(&format!(
+        r#"
+[stores.evil]
+target = "{target}"
+files = ["authorized_keys"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid target"))
+        .stderr(contains("'~/../../../"));
+
+    assert!(!evil.exists());
+}
+
+#[test]
+fn apply_force_rejects_target_outside_home_and_preserves_victim_file() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    repo.make_store("evil", &["authorized_keys"]);
+
+    // A real file outside $HOME that must not be touched.
+    let victim = tempfile::tempdir().unwrap();
+    let victim_dir = victim.path().join("victim");
+    fs::create_dir_all(&victim_dir).unwrap();
+    let victim_file = victim_dir.join("authorized_keys");
+    let original = "victim's real authorized_keys\n";
+    fs::write(&victim_file, original).unwrap();
+
+    let target_str = victim_dir.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.evil]
+target = "{target_str}"
+files = ["authorized_keys"]
+"#
+    ));
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid target"));
+
+    assert!(!victim_dir.join("authorized_keys.bak").exists());
+    assert!(!victim_file.is_symlink());
+    assert_eq!(fs::read_to_string(&victim_file).unwrap(), original);
+}
+
+#[test]
+fn apply_accepts_tilde_bashrc_target_inside_home() {
+    // Regression guard: a `~` target that stays inside $HOME must still work.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    repo.make_store("bash", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bash]
+target = "~/.bashrc"
+"#,
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .success();
+
+    let link = home.path().join(".bashrc");
+    assert!(link.is_symlink());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        repo.path().join("bash").canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn apply_rejects_multi_target_outside_home() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    repo.make_store("evil", &["a"]);
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("x");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.evil.targets.foo]
+target = "{target_str}"
+files = ["a"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid target"))
+        .stderr(contains(format!("'{target_str}'")));
+
+    assert!(!target.exists());
+    assert!(!target.join("a").exists());
+}
+
+#[test]
+fn add_rejects_target_outside_home() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    let src = outside.path().join("myconfig");
+    fs::create_dir_all(&src).unwrap();
+    let src_str = src.to_string_lossy().into_owned();
+
+    repo.cmd()
+        .args(["add", &src_str])
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("invalid target"));
+
+    assert!(!repo.path().join("myconfig").exists());
+}
+
+// ---------------------------------------------------------------------------
+// target validation (issue #7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_rejects_store_with_files_but_no_target() {
+    let repo = Repo::new();
+    repo.write_state(
+        r#"
+[stores.a]
+files = ["f"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("store 'a'"))
+        .stderr(contains("must have a target"))
+        .stderr(contains("internal error").not());
+}
+
+#[test]
+fn apply_rejects_store_with_files_but_no_target() {
+    let repo = Repo::new();
+    repo.write_state(
+        r#"
+[stores.a]
+files = ["f"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("store 'a'"))
+        .stderr(contains("must have a target"))
+        .stderr(contains("internal error: store directory").not());
+}
+
+#[test]
+fn list_rejects_store_with_files_but_no_target() {
+    let repo = Repo::new();
+    repo.write_state(
+        r#"
+[stores.a]
+files = ["f"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("list")
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("store 'a'"))
+        .stderr(contains("must have a target"));
+}
+
+#[test]
+fn status_works_for_valid_store_with_target() {
+    let repo = Repo::new();
+    repo.make_store("bash", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.bash]
+target = "~/.bashrc"
+files = [".bashrc"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("bash"));
+}
+
+/// Guard that restores a path's permissions on drop so a tempdir can be
+/// cleaned up even when a test assertion panics.
+struct RestoreMode<'a> {
+    path: &'a Path,
+    mode: u32,
+}
+
+impl<'a> Drop for RestoreMode<'a> {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.path, fs::Permissions::from_mode(self.mode));
+    }
+}
+
+#[test]
+fn apply_io_error_includes_path_context() {
+    // Force an I/O error while apply is computing the config hash by making
+    // .stitch/ unreadable. Config::load sees the missing state (it cannot read
+    // the directory), but compute_config_hash tries to read it and surfaces a
+    // raw I/O error. The message must name the file/operation.
+    if is_root() {
+        eprintln!("note: apply_io_error_includes_path_context skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let stitch_dir = repo.path().join(".stitch");
+    fs::set_permissions(&stitch_dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = RestoreMode {
+        path: &stitch_dir,
+        mode: 0o755,
+    };
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("state.toml"))
+        .stderr(contains("Permission denied"))
+        .stderr(contains("I/O error").not());
+}
+
+#[test]
+fn config_load_io_error_includes_path() {
+    // A directly unreadable stitch.toml must be reported with its file name,
+    // not a generic I/O error string.
+    if is_root() {
+        eprintln!("note: config_load_io_error_includes_path skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let authored = repo.path().join("stitch.toml");
+    fs::set_permissions(&authored, fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = RestoreMode {
+        path: &authored,
+        mode: 0o644,
+    };
+
+    repo.cmd()
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(contains("stitch.toml"))
+        .stderr(contains("reading"))
+        .stderr(contains("I/O error").not());
+}
+
+#[test]
+fn add_io_error_includes_path() {
+    // Make the repo root unwritable. The adopt path's create_dir_all for the
+    // store directory should fail with context naming the store path.
+    if is_root() {
+        eprintln!("note: add_io_error_includes_path skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let source = repo.path().join("home").join(".myrc");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "data").unwrap();
+
+    fs::set_permissions(repo.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = RestoreMode {
+        path: repo.path(),
+        mode: 0o755,
+    };
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("myrc"))
+        .stderr(contains("Permission denied"))
+        .stderr(contains("I/O error").not());
+}
+
+#[test]
+fn init_io_error_includes_path() {
+    // An unwritable cwd should not produce a bare "I/O error" when init tries
+    // to create .stitch/.
+    if is_root() {
+        eprintln!("note: init_io_error_includes_path skipped under root");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = RestoreMode {
+        path: dir.path(),
+        mode: 0o755,
+    };
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(contains(".stitch"))
+        .stderr(contains("Permission denied"))
+        .stderr(contains("I/O error").not());
+}
+
+#[test]
+fn list_allows_targetless_store_with_no_files() {
+    // Per SPEC, a store with no inventory is legal authored/dead behavior.
+    let repo = Repo::new();
+    repo.write_state("[stores.behavior]\n");
+
+    repo.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("behavior"))
+        .stdout(contains("(no target)"));
+}
+
+// ---------------------------------------------------------------------------
+// state lock hardening
+// ---------------------------------------------------------------------------
+
+#[test]
+fn state_lock_never_chmods_hard_linked_file() {
+    // A pre-existing .stitch/state.lock may share its inode with an unrelated
+    // file via a hard link. Opening it for locking must not re-permission the
+    // shared inode — only a freshly created lock file may get 0600.
+    let repo = Repo::new();
+    let lock = repo.path().join(".stitch").join("state.lock");
+    fs::write(&lock, "").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    let victim = repo.path().join("victim");
+    // Hard-link first (the destination must not exist yet), then write
+    // through either name — both share the inode.
+    fs::hard_link(&lock, &victim).unwrap();
+    fs::write(&victim, "precious").unwrap();
+
+    // `add` acquires the lock first, so this exercises the open path. The
+    // source must sit inside a real subdir of $HOME (a target equal to the
+    // future store dir would be a conflict).
+    let cfg_dir = repo.path().join(".config");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    fs::write(cfg_dir.join("nested-file"), "ignored").unwrap();
+    repo.cmd()
+        .args(["add", "~/.config/nested-file"])
+        .assert()
+        .success();
+
+    use std::os::unix::fs::MetadataExt;
+    let mode = fs::metadata(&victim).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o644, "hard-linked victim must keep its permissions");
+    // Same inode: if the lock had been chmodded, the victim would show it.
+    assert_eq!(
+        fs::metadata(&lock).unwrap().mode() & 0o777,
+        mode,
+        "lock and victim share an inode; modes must match"
+    );
+}
+
+#[test]
+fn remove_hooks_can_invoke_mutating_stitch_commands() {
+    // Regression: remove used to hold the state flock while running its
+    // pre/post hooks; a hook that invoked a mutating stitch command blocked
+    // forever on the lock held by its own parent. Hooks now run outside the
+    // lock (pre-hook before it, post-hook after the state save).
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    );
+    let bin = assert_cmd::cargo::cargo_bin("stitch");
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let pre = hooks_dir.join("pre-remove");
+    fs::write(
+        &pre,
+        format!(
+            "#!/bin/sh\n\"{}\" --repo \"$STITCH_ROOT\" add \"$HOME/.config/pre\" --name pre\n",
+            bin.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&pre, fs::Permissions::from_mode(0o755)).unwrap();
+    let post = hooks_dir.join("post-remove");
+    fs::write(
+        &post,
+        format!(
+            "#!/bin/sh\n\"{}\" --repo \"$STITCH_ROOT\" add \"$HOME/.config/post\" --name post\n",
+            bin.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&post, fs::Permissions::from_mode(0o755)).unwrap();
+
+    repo.cmd()
+        .args(["remove", "app"])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success();
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state.contains("stores.app"),
+        "removed store must be gone from state:\n{state}"
+    );
+    assert!(
+        state.contains("[stores.pre]") && state.contains("[stores.post]"),
+        "hook-invoked adds must have persisted:\n{state}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// symlinked .stitch rejection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_rejects_symlinked_stitch_dir() {
+    // A symlinked .stitch could point state reads (and template staging)
+    // anywhere. Load must refuse it before any command acts on its contents.
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    let external = repo.path().join("external_stitch");
+    fs::create_dir_all(&external).unwrap();
+    // The external "state" tries to create a $HOME link if it were followed.
+    fs::write(
+        external.join("state.toml"),
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    )
+    .unwrap();
+    let stitch = repo.path().join(".stitch");
+    fs::remove_dir_all(&stitch).unwrap();
+    std::os::unix::fs::symlink(&external, &stitch).unwrap();
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("state directory"));
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("state directory"));
+
+    // Nothing was created from the external state.
+    assert!(
+        !repo.path().join(".config").join("app").exists(),
+        "apply must not act on state read through a symlinked .stitch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// add: terminal symlink behind `..`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn add_rejects_terminal_symlink_behind_dotdot() {
+    // `add ~/sub/../link` where `link` is a terminal symlink must reject the
+    // link, never adopt its referent (which would then be moved into the repo
+    // and the original link repointed during reconciliation).
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    let real = home.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("data"), "inside").unwrap();
+    let link = home.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    repo.cmd()
+        .args(["add", "~/sub/../link"])
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .stderr(contains("already a symlink"));
+
+    assert!(link.is_symlink(), "original link must be untouched");
+    assert_eq!(fs::read_link(&link).unwrap(), real);
+    assert!(real.join("data").exists(), "referent must be untouched");
+    assert!(
+        !repo.path().join("link").exists(),
+        "no store may be created from the referent"
+    );
+    assert!(
+        !repo.path().join("real").exists(),
+        "referent must not be adopted into the repo"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// file-mode root consistency: status / doctor / diff / apply / remove
+// ---------------------------------------------------------------------------
+
+#[test]
+fn file_mode_root_linked_to_other_repo_dir_reports_consistently() {
+    // The root symlink points INTO the repo but at a directory that is not
+    // this store's source. status/doctor must not report the per-file entries
+    // as missing; apply must conflict; remove must refuse to drop state while
+    // apply conflicts (the symlink belongs to something else).
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    let other = repo.path().join("other_dir");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("g"), "g").unwrap();
+    let root_dir = repo.path().join(".config").join("app");
+    fs::create_dir_all(root_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&other, &root_dir).unwrap();
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("foreign"));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("conflict"));
+
+    repo.cmd()
+        .args(["remove", "app"])
+        .assert()
+        .failure()
+        .stderr(contains("foreign"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("stores.app"),
+        "remove must keep state while the root is a conflict:\n{state}"
+    );
+    assert!(root_dir.is_symlink(), "root symlink must be untouched");
+}
+
+#[test]
+fn apply_real_file_root_conflicts_even_with_force() {
+    // A regular file at the file-mode target root blocks the whole store.
+    // status/doctor report a conflict; diff must not preview child creation;
+    // apply (with or without --force) must report the conflict instead of
+    // failing internally.
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    let root = repo.path().join(".config").join("app");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    fs::write(&root, "i am a file, not a directory").unwrap();
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    );
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .stderr(contains("conflict"));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(6)
+        .stderr(contains("conflict"));
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .assert()
+        .failure()
+        .code(6)
+        .stderr(contains("conflict"));
+
+    // The blocking file must still be there, un-renamed, un-deleted.
+    assert_eq!(
+        fs::read_to_string(&root).unwrap(),
+        "i am a file, not a directory"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// pre-apply hook must not redirect writes outside $HOME
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pre_apply_hook_ancestor_symlink_does_not_escape_home() {
+    // A pre-apply hook replaces a valid target ancestor with a symlink to an
+    // external directory. Apply must revalidate target confinement after the
+    // hook and conflict instead of writing through the escape.
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    let cfg = home.path().join(".config").join("app_dir");
+    fs::create_dir_all(&cfg).unwrap();
+    // The external directory the hook will redirect the ancestor to.
+    let external = home.path().parent().unwrap().join("external_escape");
+    fs::create_dir_all(&external).unwrap();
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app_dir/nested"
+files = ["f"]
+"#,
+    );
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nset -e\nrm -rf \"$HOME/.config/app_dir\"\nln -s \"{}\" \"$HOME/.config/app_dir\"\n",
+            external.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_str)
+        .assert()
+        .failure()
+        .stderr(contains("conflict"));
+
+    // Nothing was created through the escape.
+    assert!(
+        !external.join("nested").exists(),
+        "apply must not write through a hook-introduced external ancestor"
+    );
+    assert!(
+        home.path().join(".config").join("app_dir").is_symlink(),
+        "the hook's symlink must remain untouched"
+    );
 }

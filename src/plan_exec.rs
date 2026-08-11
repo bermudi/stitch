@@ -5,7 +5,7 @@
 //! for staged renders and the config+platform fingerprint so that `apply --plan`
 //! can refuse to execute anything that shifted between capture and execution.
 
-use crate::config::{self, Config, Loaded, Store, is_safe_fragment};
+use crate::config::{self, Config, ConfigError, Loaded, Store, is_safe_fragment};
 use crate::error::{FailureClass, StitchError};
 use crate::hooks::{self, HookEnv};
 use crate::linker::{self, LinkError};
@@ -398,9 +398,10 @@ fn convert_store_ops(
     if let Some(store) = store_config {
         if store.is_multi_target() {
             for target in store.targets.values() {
+                let target_path = config::expand_home(&target.target).map_err(StitchError::from)?;
                 store::collect_reconciliation_keeps(
                     store_dir,
-                    &config::expand_home(&target.target),
+                    &target_path,
                     &target.files,
                     &target.patterns,
                     &target.ignore,
@@ -409,9 +410,10 @@ fn convert_store_ops(
                 );
             }
         } else if let Some(target) = &store.target {
+            let target_path = config::expand_home(target).map_err(StitchError::from)?;
             store::collect_reconciliation_keeps(
                 store_dir,
-                &config::expand_home(target),
+                &target_path,
                 &store.files,
                 &store.patterns,
                 &store.ignore,
@@ -721,7 +723,12 @@ pub fn compute_config_hash(repo_root: &Path) -> Result<String, StitchError> {
                 hasher.update([0]);
                 hasher.update(0u64.to_be_bytes());
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(StitchError::io_context(
+                    format!("computing config hash: reading {}", path.display()),
+                    e,
+                ));
+            }
         }
     }
 
@@ -1426,6 +1433,34 @@ pub fn execute_plan(
             }
         }
 
+        // Serialize this store's mutations with other mutating commands: the
+        // plan's pinned config hash was verified above, but a concurrent
+        // add/remove/migrate could still interleave between that check and the
+        // op loop. Hold the state lock from here through op execution and
+        // re-verify the hash under it; release before the post-hook, which may
+        // itself invoke a mutating stitch command.
+        let _state_lock = match config::StateLock::exclusive_if_present(repo_root) {
+            Ok(lock) => lock,
+            Err(e) => {
+                sync_ops_remaining(&mut report, plan, &remaining);
+                return Err(PlanExecError::new(
+                    report,
+                    StitchError::plan_stale(format!("could not lock state: {e}")),
+                ));
+            }
+        };
+        let locked_hash =
+            compute_config_hash(repo_root).map_err(|e| PlanExecError::new(report.clone(), e))?;
+        if locked_hash != plan.config_sha256 {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(format!(
+                    "config changed before executing store '{store_name}'"
+                )),
+            ));
+        }
+
         if let Some(indices) = ops_by_store.get(store_name) {
             for &idx in indices {
                 let op = &plan.ops[idx];
@@ -1461,6 +1496,7 @@ pub fn execute_plan(
                 }
             }
         }
+        drop(_state_lock);
 
         if let Some(warning) = run_store_post_hook(repo_root, store_name, &loaded.config, &platform)
         {
@@ -1681,7 +1717,8 @@ fn check_target_state(path: &Path, expected: &TargetState) -> Result<(), String>
             if !path.is_symlink() {
                 return Err(format!("{} is not a symlink", path.display()));
             }
-            let resolved = std::fs::read_link(path).map_err(|e| format!("{e}"))?;
+            let resolved = std::fs::read_link(path)
+                .map_err(|e| format!("could not read link {}: {e}", path.display()))?;
             if resolved != Path::new(expected_target) {
                 return Err(format!(
                     "{} points to {} (expected {})",
@@ -2042,7 +2079,13 @@ fn execute_op(
                 ));
             }
 
-            std::fs::rename(target_path, backup_path).map_err(|e| format!("{e}"))?;
+            std::fs::rename(target_path, backup_path).map_err(|e| {
+                format!(
+                    "could not back up {} to {}: {e}",
+                    target_path.display(),
+                    backup_path.display()
+                )
+            })?;
             if let Err(e) = create_link_for_plan(repo_root, target_path, source_path) {
                 // Restore the original on failure.
                 let _ = std::fs::rename(backup_path, target_path);
@@ -2175,23 +2218,25 @@ fn current_removals(
     Ok(removals)
 }
 
-fn target_paths_for_store(store: &Store) -> Vec<PathBuf> {
+fn target_paths_for_store(store: &Store) -> Result<Vec<PathBuf>, ConfigError> {
     let mut paths = Vec::new();
     if let Some(ref t) = store.target {
-        paths.push(config::expand_home(t));
+        paths.push(config::expand_home(t)?);
     }
     for te in store.targets.values() {
-        paths.push(config::expand_home(&te.target));
+        paths.push(config::expand_home(&te.target)?);
     }
-    paths
+    Ok(paths)
 }
 
-fn is_under_any_target(config: &Config, store: &str, target: &Path) -> bool {
-    config.stores.get(store).is_some_and(|store| {
-        target_paths_for_store(store)
-            .iter()
-            .any(|p| target == p || target.starts_with(p))
-    })
+fn is_under_any_target(config: &Config, store: &str, target: &Path) -> Result<bool, String> {
+    match config.stores.get(store) {
+        Some(store) => {
+            let paths = target_paths_for_store(store).map_err(|e| e.to_string())?;
+            Ok(paths.iter().any(|p| target == p || target.starts_with(p)))
+        }
+        None => Ok(false),
+    }
 }
 
 fn validate_fresh_link_write(
@@ -2456,7 +2501,7 @@ fn validate_link_op(
     if has_parent_dir(target_path) {
         return Err(format!("op {idx}: target '{target}' contains '..'"));
     }
-    if !is_under_any_target(ctx.config, &source_store, target_path) {
+    if !is_under_any_target(ctx.config, &source_store, target_path)? {
         return Err(format!(
             "op {idx}: target {target} is not under a configured target for store '{source_store}'"
         ));
@@ -2499,7 +2544,7 @@ fn validate_remove_link_op(
     if !ctx.config.stores.contains_key(store) {
         return Err(format!("op {idx}: unknown store '{store}'"));
     }
-    if !is_under_any_target(ctx.config, store, target_path) {
+    if !is_under_any_target(ctx.config, store, target_path)? {
         return Err(format!(
             "op {idx}: target {target} is not under a configured target for store '{store}'"
         ));
@@ -2604,6 +2649,7 @@ mod tests {
     #[test]
     fn whole_dir_promotion_removes_root_before_creating_children() {
         let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = config::test_home_guard(tmp.path().to_path_buf());
         let real_root = tmp.path().join("repo");
         let stitch_dir = real_root.join(".stitch");
         let store_dir = real_root.join("shells");

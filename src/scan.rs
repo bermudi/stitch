@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, ConfigError};
 use crate::linker;
 use crate::platform::Platform;
 
@@ -55,21 +55,21 @@ impl From<PathBuf> for ScanRoot {
 /// Default scan roots used when `prune` is invoked with no `--scan-dir`:
 /// `~` (shallow — top-level dotfiles only), then `~/.config` and
 /// `~/.local/share` (full depth). See [`ScanRoot`] for the speed rationale.
-pub fn default_scan_dirs() -> Vec<ScanRoot> {
-    vec![
+pub fn default_scan_dirs() -> Result<Vec<ScanRoot>, ConfigError> {
+    Ok(vec![
         ScanRoot {
-            path: config::expand_home("~"),
+            path: config::expand_home("~")?,
             max_depth: Some(1),
         },
         ScanRoot {
-            path: config::expand_home("~/.config"),
+            path: config::expand_home("~/.config")?,
             max_depth: None,
         },
         ScanRoot {
-            path: config::expand_home("~/.local/share"),
+            path: config::expand_home("~/.local/share")?,
             max_depth: None,
         },
-    ]
+    ])
 }
 
 /// Walk `roots` and return every symlink whose target points into

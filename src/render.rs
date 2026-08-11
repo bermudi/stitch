@@ -8,11 +8,15 @@
 use crate::config;
 use crate::linker;
 use crate::platform::Platform;
-use minijinja::{AutoEscape, Environment, Error as MjError, ErrorKind as MjErrorKind};
+use minijinja::value::{Enumerator, Object};
+use minijinja::{
+    AutoEscape, Environment, Error as MjError, ErrorKind as MjErrorKind, UndefinedBehavior, Value,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Template source suffix. Sole detection signal — deterministic from the
 /// directory entry alone.
@@ -273,7 +277,7 @@ struct RenderCtx<'a> {
     distro: Option<&'a str>,
     hostname: &'a str,
     shell: &'a str,
-    vars: &'a BTreeMap<String, String>,
+    vars: Value,
 }
 
 /// `{{ env("VAR") }}` / `{{ env("VAR", "default") }}`.
@@ -293,6 +297,42 @@ fn env_fn(name: String, default: Option<String>) -> Result<String, MjError> {
     }
 }
 
+/// Wrapper around the user-defined `vars` map that fails loudly on missing keys.
+///
+/// MiniJinja's default map serialization returns `UNDEFINED` for missing keys,
+/// which renders as an empty string. This object returns an invalid `Value`
+/// carrying an `UndefinedError`; the engine validates values during attribute
+/// lookup, so `{{ vars.does_not_exist }}` becomes a render error with the
+/// variable name and template location instead of silent emptiness.
+#[derive(Debug)]
+struct StrictVars(BTreeMap<String, String>);
+
+impl Object for StrictVars {
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        let k = key.as_str()?;
+        match self.0.get(k) {
+            Some(v) => Some(Value::from(v.clone())),
+            None => Some(Value::from(MjError::new(
+                MjErrorKind::UndefinedError,
+                format!("undefined template variable '{k}'"),
+            ))),
+        }
+    }
+
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        self.get_value(&Value::from(key))
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        let pairs: Vec<_> = self
+            .0
+            .iter()
+            .map(|(k, v)| (Value::from(k.clone()), Value::from(v.clone())))
+            .collect();
+        Enumerator::KeyValueIter(Box::new(pairs.into_iter()))
+    }
+}
+
 fn make_env() -> Environment<'static> {
     let mut env = Environment::new();
     // Dotfiles are plaintext; never HTML-escape `&` → `&amp;`.
@@ -301,6 +341,11 @@ fn make_env() -> Environment<'static> {
     // Dotfiles almost always end in `\n`; stripping it rewrites the user's
     // file on every render. Keep it.
     env.set_keep_trailing_newline(true);
+    // Undefined top-level variable references (e.g. `{{ does_not_exist }}`)
+    // must fail instead of rendering as an empty string. Missing `vars` keys
+    // are handled by `StrictVars::get_value_by_str` so the error names the
+    // specific key.
+    env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.add_function("env", env_fn);
     env
 }
@@ -321,21 +366,33 @@ pub fn render_string(
     let tmpl = env
         .get_template(name)
         .map_err(|e| format_mj_error(name, &e))?;
+    let vars_value = Value::from_object(StrictVars(vars.clone()));
     let ctx = RenderCtx {
         os: &platform.os,
         arch: &platform.arch,
         distro: platform.distro.as_deref(),
         hostname: &platform.hostname,
         shell: &platform.shell,
-        vars,
+        vars: vars_value,
     };
     tmpl.render(&ctx).map_err(|e| format_mj_error(name, &e))
 }
 
 fn format_mj_error(name: &str, err: &MjError) -> String {
-    // Prefer the primary error's line; fall back to the whole Display.
     match err.line() {
-        Some(line) => format!("template {name}:{line}: {err}"),
+        Some(line) => {
+            // `UndefinedError` and `InvalidOperation` carry a user-facing detail
+            // that already names the missing key/variable (e.g. undefined `vars`
+            // key or unset `env` variable). Use it directly to avoid the
+            // duplicated `(in {name}:{line})` from `err`'s Display.
+            if let Some(detail) = err.detail()
+                && (err.kind() == MjErrorKind::UndefinedError
+                    || err.kind() == MjErrorKind::InvalidOperation)
+            {
+                return format!("template {name}:{line}: {detail}");
+            }
+            format!("template {name}:{line}: {err}")
+        }
         None => format!("template {name}: {err}"),
     }
 }
@@ -794,12 +851,11 @@ pub fn reconcile_store_links(
     // must reach apply so staging is not cleaned after an incomplete scan.
     match std::fs::symlink_metadata(target_path) {
         Ok(meta) if meta.file_type().is_symlink() => return Ok(Vec::new()),
-        Ok(meta) if !meta.is_dir() => {
-            return Err(format!(
-                "could not reconcile target {}: it is not a directory",
-                target_path.display()
-            ));
-        }
+        // A non-directory root is not a dir of links to reconcile: it can
+        // hold no children. Reporting it as an internal error would turn the
+        // file-mode root conflict reported by `prepare_file_mode_target`
+        // into an apply failure on top of the conflict.
+        Ok(meta) if !meta.is_dir() => return Ok(Vec::new()),
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
@@ -1058,7 +1114,7 @@ pub fn resolve_edit_source(
     }
 
     // 2. Target path → owning store + file.
-    let expanded = config::expand_home(entry);
+    let expanded = config::expand_home(entry).map_err(|e| e.to_string())?;
 
     // Keep a symlink's own path for configured target-prefix matching. Its
     // ownership is checked against the exact configured source after that
@@ -1074,15 +1130,17 @@ pub fn resolve_edit_source(
         let store_dir = repo_root.join(name);
         if store.is_multi_target() {
             for te in store.targets.values() {
-                if let Some(path) =
-                    match_target_to_source(&store_dir, &config::expand_home(&te.target), &expanded)
-                {
+                if let Some(path) = match_target_to_source(
+                    &store_dir,
+                    &config::expand_home(&te.target).map_err(|e| e.to_string())?,
+                    &expanded,
+                ) {
                     verify_edit_target(repo_root, name, &expanded, &store_dir, &path)?;
                     return Ok(path);
                 }
             }
         } else if let Some(ref target_str) = store.target {
-            let target_path = config::expand_home(target_str);
+            let target_path = config::expand_home(target_str).map_err(|e| e.to_string())?;
             if let Some(path) = match_target_to_source(&store_dir, &target_path, &expanded) {
                 verify_edit_target(repo_root, name, &expanded, &store_dir, &path)?;
                 return Ok(path);

@@ -141,6 +141,12 @@ pub enum StitchError {
     #[error("I/O error: {source}")]
     Io { source: std::io::Error },
 
+    #[error("{message}: {source}")]
+    IoContext {
+        message: String,
+        source: std::io::Error,
+    },
+
     #[error("usage: {message}")]
     Usage { message: String },
 
@@ -203,6 +209,13 @@ impl StitchError {
 
     pub fn io(source: std::io::Error) -> Self {
         Self::Io { source }
+    }
+
+    pub fn io_context(message: impl Into<String>, source: std::io::Error) -> Self {
+        Self::IoContext {
+            message: message.into(),
+            source,
+        }
     }
 
     pub fn usage(message: impl Into<String>) -> Self {
@@ -284,7 +297,9 @@ impl StitchError {
 
     pub fn class(&self) -> FailureClass {
         match self {
-            Self::Internal { .. } | Self::Io { .. } => FailureClass::Internal,
+            Self::Internal { .. } | Self::Io { .. } | Self::IoContext { .. } => {
+                FailureClass::Internal
+            }
             Self::Usage { .. } => FailureClass::Usage,
             Self::Config(_) => FailureClass::Config,
             Self::RepoResolution { .. } => FailureClass::RepoResolution,
@@ -313,11 +328,12 @@ impl StitchError {
     /// generic class hint where possible.
     pub fn hint(&self) -> Option<String> {
         match self {
-            Self::Internal { .. } | Self::Io { .. } => None,
+            Self::Internal { .. } | Self::Io { .. } | Self::IoContext { .. } => None,
             Self::Usage { .. } => FailureClass::Usage.hint(),
             Self::Config(source) => match source {
                 ConfigError::LegacyV02(_) => Some("run `stitch migrate`".into()),
                 ConfigError::Parse(_, _) => Some("fix the TOML syntax and reload".into()),
+                ConfigError::Home(_) => Some("set $HOME to an existing directory".into()),
                 ConfigError::InvalidPath(_) => FailureClass::PathValidation.hint(),
                 _ => FailureClass::Config.hint(),
             },
