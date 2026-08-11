@@ -1,52 +1,107 @@
 # stitch
 
-A dotfile manager for Linux. Keep your config files in one repo; `stitch` reads a
-TOML config and symlinks them into place.
+Keep your Linux config files in one place — and keep them in sync.
 
-Symlinks point from the target (`~/.bashrc`, `~/.config/nvim`) back to the repo.
-Edits hit the repo file directly — no source/target split, no drift, no re-add
-step. Agents, scripts, whatever — if it writes to a symlink, it writes to the
-repo.
+`stitch` takes the scattered files in your home directory (`~/.bashrc`, `~/.config/nvim`, `~/.gitconfig`…) and links them back to a single folder you control (like `~/dots`). Edit the file in your home dir, and you're really editing the file in your repo. No copying, no re-adding, no drift.
 
-**Linux only.** Built on POSIX symlinks. Not tested on macOS, does not compile on
-Windows.
+If you've ever wanted to back up your dotfiles, move them to a new machine, or just stop losing them — this is the tool.
 
-## Install
+> **New here?** Dotfiles are just hidden config files — the ones starting with `.` in your home folder. Stitch puts them in a Git repo so you can track and restore them.
+
+**Linux only.** Built on standard Linux links. Not tested on macOS, doesn't run on Windows.
+
+---
+
+## Get it
+
+### Option 1 — Grab a ready-made binary (easiest)
+
+No Rust needed. Go to the **[Releases page](https://github.com/bermudi/stitch/releases)** and download the file for your computer.
+
+- Intel/AMD PC or laptop → `stitch-v0.8.0-x86_64-unknown-linux-gnu.tar.gz`
+- Raspberry Pi / ARM server → `stitch-v0.8.0-aarch64-unknown-linux-gnu.tar.gz`
+
+> Tip: Not sure which you need? Run `uname -m` — it prints `x86_64` for most desktops, `aarch64` for ARM.
+
+Then install it:
+
+```sh
+# example for x86_64 — swap the filename if you grabbed the ARM one
+# (check the Releases page for the latest version number)
+curl -LO https://github.com/bermudi/stitch/releases/download/v0.8.0/stitch-v0.8.0-x86_64-unknown-linux-gnu.tar.gz
+tar xzf stitch-v0.8.0-x86_64-unknown-linux-gnu.tar.gz
+sudo mv stitch /usr/local/bin/
+stitch --help
+```
+
+Each download has a `.sha256` file next to it if you want to verify it. You can always find the newest version at **https://github.com/bermudi/stitch/releases/latest**.
+
+### Option 2 — Build from source
+
+Need Rust first (2024 edition). Then:
 
 ```sh
 cargo install --path .
-```
-
-Or from a checkout:
-
-```sh
+# or, to try it without installing:
 cargo build --release
 ./target/release/stitch --help
 ```
 
-Requires Rust 2024 edition.
+---
 
-## Quick start
+## Your first 5 minutes
 
 ```sh
+# 1. Make a folder for your dotfiles
 mkdir ~/dots && cd ~/dots
-stitch init                                # create stitch.toml + .stitch/state.toml
-$EDITOR stitch.toml                        # add behavior (when, hooks, ignore)
-stitch add ~/.config/nvim                   # move existing content into the repo and link back (or create empty store if target doesn't exist)
-stitch apply                               # link them into place
-stitch status                              # verify
+
+# 2. Set it up — creates two small config files (see "How it works" below)
+stitch init
+
+# 3. Add something you already have — say your Neovim config
+#    This moves ~/.config/nvim INTO ~/dots and leaves a link behind
+stitch add ~/.config/nvim
+
+# 4. Or create a new empty store for a file that doesn't exist yet
+stitch add ~/.bashrc
+
+# 5. Put the links in place (and re-run this any time you change config)
+stitch apply
+
+# 6. Check that everything looks good
+stitch status
 ```
 
-Config is split across two files by authorship:
+What just happened?
 
-- **`stitch.toml`** (repo root) — yours. `vars`, `when`, `hooks`, `ignore`.
-  Written once at `init`; the tool never rewrites it, so your comments survive.
-- **`.stitch/state.toml`** (hidden) — the tool's. `target`, `files`,
-  `patterns`. `add`/`remove` are the only writers.
+```
+Before:  ~/.config/nvim  (real folder on disk)
+After:   ~/.config/nvim  →  ~/dots/nvim  (a link pointing back to your repo)
+```
 
-## Example config
+You edit `~/.config/nvim/init.lua` like normal — your editor follows the link and saves straight into `~/dots/nvim/init.lua`. Commit and push `~/dots` and your setup is backed up.
 
-`stitch.toml` (authored — behavior):
+To undo one thing: `stitch remove nvim` removes the links and the bookkeeping, but leaves the files in your repo alone.
+
+---
+
+## How it works (the 30-second version)
+
+- **Store** = a folder in your repo, like `~/dots/nvim` or `~/dots/shells`. One unit of stuff to manage.
+- **Target** = where it should appear in your home, like `~/.config/nvim` or `~`.
+- **Link** = stitch makes the target point back at the store. Edits at the target land in the repo — no second step.
+
+Stitch keeps two config files so your comments never get wiped out:
+
+- **`stitch.toml`** (in your repo root) — **yours.** You write it, you keep the comments. Things like `when` (only on certain machines) and `hooks`. Stitch creates it once at `init` and then never touches it again.
+- **`.stitch/state.toml`** (hidden folder) — **stitch's.** The list of *what* goes *where* (`target`, `files`). `add` and `remove` update this one.
+
+That's it. Change the config, run `stitch apply` — stitch makes the filesystem match.
+
+<details>
+<summary>Example of the two files</summary>
+
+`stitch.toml` — your choices:
 
 ```toml
 [vars]
@@ -59,7 +114,7 @@ os = "linux"
 hooks = { post = "git config --global core.editor nvim" }
 ```
 
-`.stitch/state.toml` (generated — link inventory):
+`.stitch/state.toml` — stitch's inventory:
 
 ```toml
 [stores.nvim]
@@ -73,34 +128,42 @@ files = [".bashrc", ".zshrc"]
 target = "~/.config/git"
 ```
 
-## Commands
+</details>
 
-| Command | Purpose |
+---
+
+## Common commands
+
+**Everyday:**
+
+| Command | What it does |
 |---|---|
-| `stitch init` | Create `stitch.toml` + `.stitch/state.toml` + `.gitignore` entry for staging |
-| `stitch migrate` | Split a v0.2 `.stitch/config.toml` into the two-file layout |
-| `stitch apply` | Reconcile filesystem to match config (the update loop) |
-| `stitch status [name]` | Show symlink state per store |
-| `stitch diff` | Preview what `apply` would do (incl. template content drift) |
-| `stitch list` | Print all configured stores and targets |
-| `stitch plan` | Capture `apply`'s exact op list as JSON |
-| `stitch render <store>/<file>` | Render a `.tmpl` to stdout (read-only) |
-| `stitch add <path>` | Move existing content into the repo and link back, or create an empty store if the path doesn't exist |
-| `stitch remove <name>` | Remove symlinks, staging, and the inventory entry |
-| `stitch edit [entry]` | Open `stitch.toml`, or an entry's repo source, in `$EDITOR` |
-| `stitch import` | Scan for existing repo-pointing symlinks and register them in state |
-| `stitch prune` | List (or `--yes` remove) orphaned repo-pointing symlinks |
-| `stitch doctor` | Health check (orphaned behavior, broken links, staging trust) |
+| `stitch add <path>` | Bring a file/folder into the repo and link it back. Creates it empty if the path doesn't exist yet. |
+| `stitch apply` | Make your home match the config. Creates/fixes links, reports anything in the way. |
+| `stitch status` | Is everything linked? Shows `linked`, `missing`, `conflict`, or `broken`. |
+| `stitch diff` | Preview what `apply` would do, without changing anything. |
 
-`apply` and `diff` support `--only <name>` (repeatable); `apply`, `diff`, `add`,
-and `remove` support `--dry-run`; `--force` is available where applicable.
-`apply` also accepts `--plan <file>` to execute a captured plan verbatim. A
-global `--json` flag gives machine-readable output for `status`, `list`, `diff`,
-`apply`, `plan`, `doctor`, `prune`, and `render`.
+**Occasionally:**
 
-## Templates
+| Command | What it does |
+|---|---|
+| `stitch list` | Show every store and where it points. |
+| `stitch remove <name>` | Unlink and forget a store (your files stay in the repo). |
+| `stitch edit` | Open `stitch.toml` in your editor. `stitch edit nvim` opens that store's file. |
+| `stitch doctor` | Health check — missing folders, broken links, leftover settings. |
+| `stitch prune` | List links pointing into your repo that nothing uses anymore. Add `--yes` to actually remove them. |
+| `stitch import` | Found old hand-made links pointing into your repo? Register them. |
+| `stitch plan` | Save exactly what `apply` would do to a file, so you can review and run `apply --plan <file>` later. |
 
-Rename a store file to end in `.tmpl` and put Jinja expressions in it:
+All of `apply`, `diff`, `add`, and `remove` support `--dry-run` (just pretend). `apply` and `diff` take `--only <name>` to act on one store, and `apply` takes `--force` to back up a real file to `*.bak` before replacing it. Add `--json` to `status`, `list`, `diff`, `apply`, `plan`, `doctor`, `prune`, or `render` for machine-readable output.
+
+> Want the full details? See **[SPEC.md](SPEC.md)** — every flag, edge case, and design choice is there.
+
+---
+
+## Templates (optional)
+
+Need a config that changes per machine? Rename a file to end in `.tmpl` and use `{{ }}` inside:
 
 ```
 # git/gitconfig.tmpl
@@ -111,60 +174,37 @@ Rename a store file to end in `.tmpl` and put Jinja expressions in it:
     editor = {{ env("EDITOR", "nvim") }}
 ```
 
-`apply` renders to `.stitch/render/<store>/...` (mode `0600`, dir `0700`) and
-symlinks the target at the name *without* `.tmpl`. Whole-dir stores that contain
-any `.tmpl` promote to per-file links automatically. Edit the source with
-`stitch edit ~/.gitconfig` — never the staged file. New repos get the required
-`.stitch/render/` `.gitignore` entry from `init`; upgraded repos must add it
-before their first template apply (plain repos need no migration).
+On `apply`, stitch renders it to `.stitch/render/` (locked down, not tracked by Git) and links the target without the `.tmpl` ending. Edit the `.tmpl` source, not the rendered file.
 
-## Concepts
+Available inside templates: `{{ env("VAR") }}`, `{{ vars.key }}`, `{{ hostname }}`, `{{ os }}`, `{{ arch }}`, `{{ distro }}`, `{{ shell }}`.
 
-- **Store** — a top-level directory in the repo. One unit of config.
-- **Target** — where the symlink(s) land on disk. Declared explicitly.
-- **Whole-directory mode** — no `files`/`patterns` → the entire store dir is one
-  symlink (promoted to file mode if any entry is ignored or any `.tmpl` exists).
-- **File mode** — `files` and/or `patterns` → individual files are symlinked into
-  the target dir. List template sources by their on-disk name (`gitconfig.tmpl`).
-- **`when`** — platform filter (`os`, `arch`, `distro`, `hostname`, `shell`).
-  All specified fields must match. `distro` is the detected Linux distro ID;
-  if unavailable it cannot match and `{{ distro }}` renders as `none` in templates.
-- **Hooks** — per-store `pre`/`post` shell commands, plus global
-  `.stitch/hooks/pre-apply` / `post-apply` / `pre-remove` / `post-remove`
-  executables.
-- **Authored vs generated** — `stitch.toml` is yours and hand-editable;
-  `.stitch/state.toml` is the tool's. The tool never rewrites the authored
-  file after `init`, so comments and formatting survive every mutation.
-- **Config is truth** — `apply` reconciles the filesystem to match the merged
-  config. Change config, re-apply. That's the loop.
+See SPEC.md §Templates for the full list.
 
-## Safety
+---
 
-`stitch` mutates `$HOME`. The contract: **never surprise the user with data
-movement, exposure, or silent replacement.**
+## Safety — how stitch treats your home
 
-- No external upload by default. Backups stay local.
-- Foreign symlinks (stow, chezmoi, Nix, Home-Manager) are always conflicts —
-  never silently replaced, even under `--force`.
-- `apply --force` renames a conflicting real file/dir to `{target}.bak` before
-  linking. Refuses if `.bak` already exists.
-- `add` moves a file *into* the repo to manage it; `--force` leaves the
-  backup in the target dir.
-- Path traversal is rejected: absolute and `..`-containing `files`/`patterns`
-  entries are rejected at config load.
+Stitch changes files in `$HOME`, so it's careful:
 
-## Documentation
+- **Never uploads anything.** Backups stay on your disk.
+- **Never quietly replaces a link it didn't make.** If a link points at stow, chezmoi, Nix, etc., stitch calls it a conflict and stops — even with `--force`.
+- **`--force` backs up, not deletes.** A real file in the way gets renamed to `file.bak` next to the original. If `.bak` already exists, it stops rather than pile up.
+- **Won't follow trick paths.** Entries with `/` at the start or `..` inside are rejected — nothing escapes your store or target.
+- **`prune` only lists by default.** It shows orphaned links; it only deletes with `--yes`.
 
-- **[SPEC.md](SPEC.md)** — full command/feature contract, config reference,
-  hooks, ignore patterns, conflict handling, roadmap.
-- **[CHANGELOG.md](CHANGELOG.md)** — release notes (trust review resolutions,
-  per-version changes).
-- **[AGENTS.md](AGENTS.md)** — contributor notes (architecture, red lines,
-  quality bar).
-- **[docs/reviews/2026-06-15-trust-review.md](docs/reviews/2026-06-15-trust-review.md)**
-  — the trust review that established the safety contract.
+---
 
-## Development
+## Keep learning
+
+- **[SPEC.md](SPEC.md)** — the full contract: every command, config field, hook, and conflict rule.
+- **[CHANGELOG.md](CHANGELOG.md)** — what's new in each release (including the trust-review fixes).
+- **[Releases](https://github.com/bermudi/stitch/releases)** — download binaries and read release notes.
+- **[AGENTS.md](AGENTS.md)** — contributor notes (architecture, safety rules).
+- **[docs/reviews/2026-06-15-trust-review.md](docs/reviews/2026-06-15-trust-review.md)** — the deep safety review this project was built around.
+
+---
+
+## Building & testing (for contributors)
 
 ```sh
 cargo build
@@ -173,8 +213,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Zero warnings, `cargo fmt` and `cargo clippy -D warnings` clean — required for
-a change to count as done.
+A change only counts as done when `cargo fmt` and `cargo clippy -D warnings` are clean.
 
 ## License
 
