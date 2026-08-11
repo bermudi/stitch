@@ -19,11 +19,13 @@ use platform::Platform;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
+use std::path::Component;
 
 fn filesystem_identity(path: &std::path::Path, label: &str) -> Result<(u64, u64), StitchError> {
     // Repository aliases are supported, so follow the root entry and pin the
     // directory it resolves to. Repointing the alias changes this identity.
-    let meta = std::fs::metadata(path)?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| StitchError::io_context(format!("{label} {}: metadata", path.display()), e))?;
     if !meta.file_type().is_dir() {
         return Err(StitchError::internal(format!(
             "{label} {} does not resolve to a directory",
@@ -325,7 +327,8 @@ fn resolve_root(override_path: Option<&str>) -> Result<std::path::PathBuf, Stitc
     {
         return resolve_override(&p, "STITCH_REPO");
     }
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| StitchError::io_context("getting current working directory", e))?;
     find_root(&cwd).ok_or_else(|| StitchError::repo_resolution("cwd", cwd))
 }
 
@@ -334,7 +337,7 @@ fn resolve_root(override_path: Option<&str>) -> Result<std::path::PathBuf, Stitc
 /// the wrong directory, and canonicalize when possible. `label` prefixes the
 /// error so the user knows which override was bad.
 fn resolve_override(path: &str, label: &str) -> Result<std::path::PathBuf, StitchError> {
-    let root = expand_home(path);
+    let root = expand_home(path).map_err(StitchError::from)?;
     if !root.join(".stitch").is_dir() {
         return Err(StitchError::repo_resolution(label, root));
     }
@@ -413,7 +416,8 @@ fn plan_error(plan: &plan::Plan) -> StitchError {
 }
 
 fn cmd_init() -> Result<(), StitchError> {
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| StitchError::io_context("getting current working directory", e))?;
     let gitignore = cwd.join(".gitignore");
     if std::fs::symlink_metadata(&gitignore)
         .is_ok_and(|meta| meta.file_type().is_symlink() || !meta.file_type().is_file())
@@ -433,9 +437,19 @@ fn cmd_init() -> Result<(), StitchError> {
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&stitch_dir)?;
+            std::fs::create_dir(&stitch_dir).map_err(|e| {
+                StitchError::io_context(
+                    format!("creating config directory {}", stitch_dir.display()),
+                    e,
+                )
+            })?;
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(StitchError::io_context(
+                format!("inspecting config directory {}", stitch_dir.display()),
+                error,
+            ));
+        }
     }
 
     let authored_path = cwd.join("stitch.toml");
@@ -481,7 +495,9 @@ fn cmd_init() -> Result<(), StitchError> {
 
     // Trust foundation (v0.6): staging dir must never enter version control.
     // Append `.stitch/render/` to .gitignore (create if needed). Idempotent.
-    render::ensure_render_gitignore(&cwd)?;
+    render::ensure_render_gitignore(&cwd).map_err(|e| {
+        StitchError::io_context(format!("updating .gitignore in {}", cwd.display()), e)
+    })?;
 
     // Pre-create the staging root at 0700 so the permission contract holds
     // before the first templated apply.
@@ -872,6 +888,9 @@ fn cmd_status(
             linker::LinkStatus::Broken(p) => {
                 format!("⚠ broken → {}", p.display())
             }
+            linker::LinkStatus::Foreign(p) => {
+                format!("◆ foreign → {}", p.display())
+            }
         };
 
         let source_name = entry
@@ -948,6 +967,22 @@ fn cmd_diff(
             force,
         },
     );
+
+    // When the plan contains no actionable changes, `diff` is a no-op.
+    // Report that clearly instead of rendering the full dry-run summary.
+    let clean = plan.summary.created == 0
+        && plan.summary.replaced == 0
+        && plan.summary.backed_up == 0
+        && plan.summary.removed == 0
+        && plan.summary.content_changed == 0
+        && plan.summary.conflicts == 0
+        && plan.summary.errors == 0
+        && plan.summary.skipped == 0;
+    if clean {
+        println!("no differences");
+        return Ok(());
+    }
+
     render_plan(&plan, true);
 
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
@@ -1091,6 +1126,13 @@ fn cmd_add(
     dry_run: bool,
     json: bool,
 ) -> Result<(), StitchError> {
+    // Serialize state mutations: load must see latest state and save must not
+    // race. Hold the exclusive lock for the entire non-dry-run operation.
+    let _state_lock = if dry_run {
+        None
+    } else {
+        Some(config::StateLock::exclusive(root).map_err(StitchError::from)?)
+    };
     let mut loaded = Config::load(root)?;
     print_warnings(&loaded);
 
@@ -1107,11 +1149,37 @@ fn cmd_add(
         )));
     }
 
-    let expanded_source = expand_home(path);
-    let source = if expanded_source.is_absolute() {
+    let expanded_source = expand_home(path)?;
+    let raw_source = if expanded_source.is_absolute() {
         expanded_source
     } else {
-        std::env::current_dir()?.join(expanded_source)
+        std::env::current_dir()
+            .map_err(|e| StitchError::io_context("getting current working directory", e))?
+            .join(expanded_source)
+    };
+    // Symlink-aware normalization: gateway/../victim must resolve through
+    // the gateway symlink (POSIX: symlink target spliced before ..), not
+    // collapse lexically to ~/victim. Ancestors resolve fully, but the
+    // terminal component is never followed — a terminal symlink must be
+    // rejected below, not silently adopted (its referent would be moved and
+    // the original link repointed during reconciliation). Only apply
+    // canonical resolution when the path contains ".." — otherwise preserve
+    // lexical HOME spelling so a symlinked $HOME (home_link -> real_home)
+    // doesn't canonicalize ~/.bashrc to /real_home/.bashrc and break
+    // collapse_home. Resolution failure is a hard error: falling back to
+    // lexical normalization could silently pick a different file.
+    let source = if raw_source
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        crate::linker::resolve_ancestors_with_missing(&raw_source).ok_or_else(|| {
+            StitchError::internal(format!(
+                "could not resolve {} through symlinks — refusing to guess at the path",
+                raw_source.display()
+            ))
+        })?
+    } else {
+        lexically_normalize(&raw_source)
     };
 
     // A symlink at the target is always an error — we never silently clobber
@@ -1181,19 +1249,24 @@ fn cmd_add(
         if source_exists {
             let is_dir = source.is_dir();
             let (target_str, adopt_files) = if is_dir {
-                (collapse_home(&source), Vec::new())
+                (collapse_home(&source)?, Vec::new())
             } else {
                 let parent = source
                     .parent()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "~".into());
-                (collapse_home(&expand_home(&parent)), vec![raw_name.clone()])
+                (
+                    collapse_home(&expand_home(&parent)?)?,
+                    vec![raw_name.clone()],
+                )
             };
+            config::validate_target(&target_str, &format!("store '{store_name}'"))?;
+
             let data = AddData {
                 store: store_name.clone(),
                 target: target_str,
                 mode: "adopt".into(),
-                source: Some(collapse_home(&source)),
+                source: Some(collapse_home(&source)?),
                 files: adopt_files,
                 patterns: Vec::new(),
             };
@@ -1203,14 +1276,15 @@ fn cmd_add(
             }
             println!("Would add (adopt existing):");
             println!("  {} → {}/", source.display(), store_dir.display());
-            println!(
-                "  then symlink back to {}",
-                expand_home(&data.target).display()
-            );
+            let target = expand_home(&data.target)?;
+            println!("  then symlink back to {}", target.display());
         } else {
+            let target_str = collapse_home(&source)?;
+            config::validate_target(&target_str, &format!("store '{store_name}'"))?;
+
             let data = AddData {
                 store: store_name.clone(),
-                target: collapse_home(&source),
+                target: target_str,
                 mode: "create".into(),
                 source: None,
                 files: files.to_vec(),
@@ -1237,13 +1311,14 @@ fn cmd_add(
         // the store layout (whole-dir for dirs, single-file for files).
         let is_dir = source.is_dir();
         let target_str = if is_dir {
-            collapse_home(&source)
+            collapse_home(&source)?
         } else {
-            source
-                .parent()
-                .map(collapse_home)
-                .unwrap_or_else(|| "~".into())
+            match source.parent() {
+                Some(p) => collapse_home(p)?,
+                None => "~".into(),
+            }
         };
+        config::validate_target(&target_str, &format!("store '{store_name}'"))?;
 
         let adopt_files = if is_dir {
             vec![]
@@ -1263,10 +1338,33 @@ fn cmd_add(
 
         // Move: relocate the file/dir into the repo.
         if is_dir {
-            std::fs::rename(&source, &store_dir)?;
+            std::fs::rename(&source, &store_dir).map_err(|e| {
+                StitchError::io_context(
+                    format!(
+                        "moving {} into store {}",
+                        source.display(),
+                        store_dir.display()
+                    ),
+                    e,
+                )
+            })?;
         } else {
-            std::fs::create_dir_all(&store_dir)?;
-            std::fs::rename(&source, store_dir.join(&raw_name))?;
+            std::fs::create_dir_all(&store_dir).map_err(|e| {
+                StitchError::io_context(
+                    format!("creating store directory {}", store_dir.display()),
+                    e,
+                )
+            })?;
+            std::fs::rename(&source, store_dir.join(&raw_name)).map_err(|e| {
+                StitchError::io_context(
+                    format!(
+                        "moving {} into store {}",
+                        source.display(),
+                        store_dir.join(&raw_name).display()
+                    ),
+                    e,
+                )
+            })?;
         }
 
         // Link: create the return symlink using the in-memory store.
@@ -1360,7 +1458,8 @@ fn cmd_add(
         }
     } else {
         // --- Create-empty path: fresh store, link to target. ---
-        let target_str = collapse_home(&source);
+        let target_str = collapse_home(&source)?;
+        config::validate_target(&target_str, &format!("store '{store_name}'"))?;
 
         let new_store = config::Store {
             target: Some(target_str.clone()),
@@ -1372,7 +1471,12 @@ fn cmd_add(
             targets: std::collections::BTreeMap::new(),
         };
 
-        std::fs::create_dir_all(&store_dir)?;
+        std::fs::create_dir_all(&store_dir).map_err(|e| {
+            StitchError::io_context(
+                format!("creating store directory {}", store_dir.display()),
+                e,
+            )
+        })?;
 
         let platform = Platform::detect();
         let mut _warnings = Vec::new();
@@ -1459,7 +1563,10 @@ fn cmd_remove(
     dry_run: bool,
     json: bool,
 ) -> Result<(), StitchError> {
-    let mut loaded = Config::load(root)?;
+    // No lock yet: the pre-remove hook runs first and may itself invoke a
+    // mutating stitch command (which takes the lock). The lock is acquired
+    // after the hook, and the state is reloaded under it.
+    let loaded = Config::load(root)?;
     print_warnings(&loaded);
     let platform = Platform::detect();
 
@@ -1483,40 +1590,50 @@ fn cmd_remove(
         .as_deref()
         .map(str::to_owned);
 
-    let statuses = store::status_all(root, &loaded.config, &platform);
-    let store_statuses: Vec<_> = statuses
-        .iter()
-        .filter(|e| e.store_name == *name && !e.skipped_platform)
-        .collect();
-    let linked: Vec<_> = store_statuses
-        .iter()
-        .copied()
-        // A template link can outlive a missing staged render and therefore
-        // report Broken. Include it only when the same exact-source predicate
-        // used by real removal recognizes it; dry-run must not promise to
-        // remove a foreign broken link.
-        .filter(|e| linker::points_to_source(&e.target, &e.link_source, root))
-        .collect();
-    if let Some(entry) = store_statuses.iter().copied().find(|e| {
-        matches!(e.status, linker::LinkStatus::Broken(_))
-            && std::fs::symlink_metadata(&e.target).is_ok_and(|meta| meta.file_type().is_symlink())
-            && !linker::points_to_source(&e.target, &e.link_source, root)
-    }) {
-        return Err(StitchError::conflict_foreign(
-            &entry.target,
-            std::fs::read_link(&entry.target).ok(),
-        ));
-    }
-    let linked_paths: Vec<String> = linked
-        .iter()
-        .map(|e| e.target.to_string_lossy().into_owned())
-        .collect();
+    // Classify this store's links from the current filesystem state. Shared by
+    // dry-run (no lock needed — nothing mutates) and the real removal path
+    // (recomputed after the pre-remove hook, under the lock). Returns the
+    // linked entries (owned) and their paths.
+    let classify =
+        |loaded: &config::Loaded| -> Result<(Vec<store::StatusEntry>, Vec<String>), StitchError> {
+            let statuses = store::status_all(root, &loaded.config, &platform);
+            let store_statuses: Vec<_> = statuses
+                .iter()
+                .filter(|e| e.store_name == *name && !e.skipped_platform)
+                .collect();
+            let linked: Vec<store::StatusEntry> = store_statuses
+                .iter()
+                .copied()
+                // A template link can outlive a missing staged render and therefore
+                // report Broken. Include it only when the same exact-source predicate
+                // used by real removal recognizes it; dry-run must not promise to
+                // remove a foreign broken link.
+                .filter(|e| linker::points_to_source(&e.target, &e.link_source, root))
+                .cloned()
+                .collect();
+            if let Some(entry) = store_statuses.iter().copied().find(|e| {
+                (matches!(e.status, linker::LinkStatus::Broken(_))
+                    || matches!(e.status, linker::LinkStatus::Foreign(_)))
+                    && std::fs::symlink_metadata(&e.target)
+                        .is_ok_and(|meta| meta.file_type().is_symlink())
+                    && !linker::points_to_source(&e.target, &e.link_source, root)
+            }) {
+                return Err(StitchError::conflict_foreign(
+                    &entry.target,
+                    std::fs::read_link(&entry.target).ok(),
+                ));
+            }
+            let linked_paths: Vec<String> = linked
+                .iter()
+                .map(|e| e.target.to_string_lossy().into_owned())
+                .collect();
+            Ok((linked, linked_paths))
+        };
+
+    let (_, linked_paths) = classify(&loaded)?;
     let staging = render::store_render_dir(root, name);
     let staging_str = staging.to_string_lossy().into_owned();
     let state_path = root.join(".stitch/state.toml");
-    if !dry_run {
-        config::validate_atomic_write_target(&state_path)?;
-    }
 
     if dry_run {
         let data = RemoveData {
@@ -1543,9 +1660,10 @@ fn cmd_remove(
         return Ok(());
     }
 
-    // Global pre-remove hook. Pin both the repository and its state directory:
-    // replacing either with another real directory must not redirect cleanup
-    // or the later state write.
+    // Global pre-remove hook — runs WITHOUT the state lock; a hook that
+    // invokes a mutating stitch command acquires the lock itself. Pin both the
+    // repository and its state directory: replacing either with another real
+    // directory must not redirect cleanup or the later state write.
     {
         let root_identity = filesystem_identity(root, "repository root")?;
         let stitch_dir = root.join(".stitch");
@@ -1572,6 +1690,17 @@ fn cmd_remove(
         )?;
         config::validate_atomic_write_target(&state_path)?;
     }
+
+    // Serialize with other mutating commands from here to the state save.
+    let _state_lock = config::StateLock::exclusive(root).map_err(StitchError::from)?;
+    // Reload: the pre-remove hook may have changed state (or even removed the
+    // store itself). Removal must act on the state it serializes with.
+    let mut loaded = Config::load(root)?;
+    if !loaded.config.stores.contains_key(name) {
+        println!("Store '{name}' was already removed (e.g. by the pre-remove hook).");
+        return Ok(());
+    }
+    let (linked, _) = classify(&loaded)?;
 
     // Remove links before deleting state. If a link that was repo-owned when
     // status_all ran can no longer be removed (e.g. it was repointed to a
@@ -1622,6 +1751,10 @@ fn cmd_remove(
 
     loaded.generated.save(root)?;
 
+    // The state write is committed; release the lock before the post-remove
+    // hook so a hook may invoke a mutating stitch command.
+    drop(_state_lock);
+
     // Global post-remove hook.
     {
         let env = hooks::HookEnv {
@@ -1658,13 +1791,28 @@ fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), StitchErr
         }
     };
 
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    let status = std::process::Command::new(&editor).arg(&path).status()?;
+    let editor = resolve_editor()?;
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .map_err(|e| StitchError::internal(format!("could not run editor '{editor}': {e}")))?;
 
     if !status.success() {
-        return Err(StitchError::internal("editor exited with error"));
+        let code = status.code().unwrap_or(-1);
+        return Err(StitchError::internal(format!(
+            "editor '{editor}' exited with status {code}"
+        )));
     }
     Ok(())
+}
+
+fn resolve_editor() -> Result<String, StitchError> {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Some(value) = std::env::var(var).ok().filter(|v| !v.is_empty()) {
+            return Ok(value);
+        }
+    }
+    Ok("vi".into())
 }
 
 /// Import existing repo-pointing symlinks into `.stitch/state.toml`.
@@ -1679,20 +1827,18 @@ fn cmd_import(
     dry_run: bool,
     json: bool,
 ) -> Result<(), StitchError> {
+    let _state_lock = if dry_run {
+        None
+    } else {
+        Some(config::StateLock::exclusive(root).map_err(StitchError::from)?)
+    };
     let mut loaded = Config::load(root)?;
     if !json {
         print_warnings(&loaded);
     }
     let platform = Platform::detect();
 
-    let roots: Vec<scan::ScanRoot> = if scan_dirs.is_empty() {
-        scan::default_scan_dirs()
-    } else {
-        scan_dirs
-            .iter()
-            .map(|s| scan::ScanRoot::from(expand_home(s)))
-            .collect()
-    };
+    let roots = prune_roots(scan_dirs).map_err(StitchError::from)?;
 
     let found = scan::scan_for_repo_links(root, &roots);
     // Already-owned links are not re-imported.
@@ -1736,7 +1882,7 @@ fn cmd_import(
             continue;
         }
         let rest: std::path::PathBuf = comps.collect();
-        let target_str = collapse_home(&fl.link);
+        let target_str = collapse_home(&fl.link)?;
 
         let bucket = buckets.entry(store_name).or_default();
         if rest.as_os_str().is_empty() {
@@ -1752,7 +1898,7 @@ fn cmd_import(
             let Some(target_dir) = target_dir_for_file_link(&fl.link, &rest) else {
                 continue;
             };
-            let parent = collapse_home(&target_dir);
+            let parent = collapse_home(&target_dir)?;
             bucket.files.insert(source_rel, parent);
         }
     }
@@ -1935,17 +2081,38 @@ fn target_dir_for_file_link(
     Some(target)
 }
 
-/// Collapse `$HOME` prefix to `~` for state.toml target strings.
-fn collapse_home(path: &std::path::Path) -> String {
-    if let Some(home) = dirs::home_dir()
-        && let Ok(rel) = path.strip_prefix(&home)
-    {
-        if rel.as_os_str().is_empty() {
-            return "~".into();
+/// Resolve `.` and `..` components lexically, without touching the
+/// filesystem or following symlinks.
+fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(Component::Normal(_)) = normalized.components().next_back() {
+                    normalized.pop();
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                normalized = std::path::PathBuf::new();
+                normalized.push(component.as_os_str());
+            }
+            Component::Normal(_) => normalized.push(component.as_os_str()),
         }
-        return format!("~/{}", rel.display());
     }
-    path.display().to_string()
+    normalized
+}
+
+/// Collapse `$HOME` prefix to `~` for state.toml target strings.
+fn collapse_home(path: &std::path::Path) -> Result<String, ConfigError> {
+    let home = config::expand_home("~")?;
+    if let Ok(rel) = path.strip_prefix(&home) {
+        if rel.as_os_str().is_empty() {
+            return Ok("~".into());
+        }
+        return Ok(format!("~/{}", rel.display()));
+    }
+    Ok(path.display().to_string())
 }
 
 fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
@@ -2019,15 +2186,37 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
             stitch_dir.display()
         )));
     }
+    // Serialize state mutations.
+    let _state_lock = if dry_run {
+        None
+    } else {
+        Some(config::StateLock::exclusive(root).map_err(StitchError::from)?)
+    };
     let legacy_path = stitch_dir.join("config.toml");
     let authored_path = root.join("stitch.toml");
     let state_path = root.join(".stitch").join("state.toml");
 
     if !legacy_path.exists() {
         if authored_path.exists() {
-            return Err(StitchError::internal(
-                "already migrated: stitch.toml exists",
-            ));
+            let msg = format!(
+                "nothing to migrate: {} exists (already converted)",
+                authored_path.display()
+            );
+            if json {
+                report::write(
+                    "migrate",
+                    MigrateData {
+                        authored_path: None,
+                        authored: None,
+                        state_path: None,
+                        state: None,
+                    },
+                    vec![msg],
+                );
+            } else {
+                println!("{msg}");
+            }
+            return Ok(());
         }
         return Err(StitchError::internal(format!(
             "nothing to migrate: {} not found",
@@ -2065,7 +2254,12 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
 
     // Parse the v0.2 file into the frozen LegacyConfig shape (not the
     // post-split types, which no longer carry the v0.2 layout).
-    let contents = std::fs::read_to_string(&legacy_path)?;
+    let contents = std::fs::read_to_string(&legacy_path).map_err(|e| {
+        StitchError::io_context(
+            format!("reading legacy config {}", legacy_path.display()),
+            e,
+        )
+    })?;
     let legacy: config::LegacyConfig = toml::from_str(&contents)
         .map_err(|e| StitchError::config(ConfigError::Parse(e, legacy_path.clone())))?;
     legacy.validate()?;
@@ -2141,7 +2335,16 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
 
     // Preserve the original as a .bak rather than delete — the user's comments
     // and formatting are the recovery path (migrate is comment-lossy by design).
-    std::fs::rename(&legacy_path, &backup_path)?;
+    std::fs::rename(&legacy_path, &backup_path).map_err(|e| {
+        StitchError::io_context(
+            format!(
+                "moving legacy config {} to {}",
+                legacy_path.display(),
+                backup_path.display()
+            ),
+            e,
+        )
+    })?;
 
     println!("Migrated v0.2 config:");
     println!("  wrote {}", authored_path.display());
@@ -2179,7 +2382,8 @@ fn cmd_prune(
                 Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             let warnings = loaded.warnings;
             let platform = Platform::detect();
-            let roots = prune_roots(scan_dirs);
+            let roots = prune_roots(scan_dirs)
+                .map_err(|e| Box::new((StitchError::from(e), warnings.clone())))?;
             let found = scan::scan_for_repo_links(root, &roots);
             let orphan_refs = scan::orphan_links(root, &found, &loaded.config, &platform);
             let orphans: Vec<scan::FoundLink> = orphan_refs.iter().map(|&fl| fl.clone()).collect();
@@ -2188,6 +2392,18 @@ fn cmd_prune(
                 let data = report::prune(&orphans, 0, 0);
                 return Ok((data, warnings));
             }
+
+            // Removal mutates links: serialize with other mutating commands
+            // and re-scan under the lock, so a concurrent add/apply cannot
+            // have its state or links change between classification and
+            // removal.
+            let _state_lock = config::StateLock::exclusive_if_present(root)
+                .map_err(|e| Box::new((StitchError::from(e), warnings.clone())))?;
+            let loaded =
+                Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
+            let found = scan::scan_for_repo_links(root, &roots);
+            let orphan_refs = scan::orphan_links(root, &found, &loaded.config, &platform);
+            let orphans: Vec<scan::FoundLink> = orphan_refs.iter().map(|&fl| fl.clone()).collect();
 
             let mut removed = 0;
             let mut failed = 0;
@@ -2223,7 +2439,7 @@ fn cmd_prune(
     print_warnings(&loaded);
     let platform = Platform::detect();
 
-    let roots = prune_roots(scan_dirs);
+    let roots = prune_roots(scan_dirs)?;
 
     let found = scan::scan_for_repo_links(root, &roots);
     let orphans = scan::orphan_links(root, &found, &loaded.config, &platform);
@@ -2245,6 +2461,19 @@ fn cmd_prune(
     // never clobbered even if classification raced between scan and unlink.
     if !yes || dry_run {
         println!("\n  (to remove these, run: stitch prune --yes)");
+        return Ok(());
+    }
+
+    // Removal mutates links: serialize with other mutating commands and
+    // re-scan under the lock, so a concurrent add/apply cannot have its state
+    // or links change between classification and removal.
+    let _state_lock = config::StateLock::exclusive_if_present(root).map_err(StitchError::from)?;
+    let loaded = Config::load(root)?;
+    let found = scan::scan_for_repo_links(root, &roots);
+    let orphans = scan::orphan_links(root, &found, &loaded.config, &platform);
+
+    if orphans.is_empty() {
+        println!("No orphaned links found.");
         return Ok(());
     }
 
@@ -2285,13 +2514,13 @@ fn cmd_prune(
     Ok(())
 }
 
-fn prune_roots(scan_dirs: &[String]) -> Vec<scan::ScanRoot> {
+fn prune_roots(scan_dirs: &[String]) -> Result<Vec<scan::ScanRoot>, ConfigError> {
     if scan_dirs.is_empty() {
         scan::default_scan_dirs()
     } else {
         scan_dirs
             .iter()
-            .map(|s| scan::ScanRoot::from(expand_home(s)))
+            .map(|s| Ok(scan::ScanRoot::from(expand_home(s)?)))
             .collect()
     }
 }
@@ -2454,6 +2683,7 @@ mod tests {
     #[test]
     fn remove_store_with_external_source_symlink_cleans_link_and_state() {
         let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = config::test_home_guard(tmp.path().to_path_buf());
         let repo = tmp.path();
         let stitch = repo.join(".stitch");
         fs::create_dir_all(&stitch).unwrap();
@@ -2534,6 +2764,7 @@ files = ["regular", "alias"]
     #[test]
     fn remove_store_succeeds_when_pre_remove_hook_already_removed_link() {
         let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = config::test_home_guard(tmp.path().to_path_buf());
         let repo = tmp.path();
         let stitch = repo.join(".stitch");
         fs::create_dir_all(&stitch).unwrap();

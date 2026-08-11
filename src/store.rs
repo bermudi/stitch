@@ -83,6 +83,107 @@ pub fn apply_all(
     let sorted: BTreeMap<_, _> = config.stores.iter().collect();
     let mut results = Vec::new();
     for (name, store) in sorted {
+        let store_dir = repo_root.join(name);
+        let store_is_real_dir = || {
+            std::fs::symlink_metadata(&store_dir)
+                .map(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+                .unwrap_or(false)
+        };
+        if !store_is_real_dir() {
+            results.push(ApplyResult {
+                store_name: name.clone(),
+                actions: vec![internal_error(format!(
+                    "store directory '{}' is missing, symlinked, or not a directory",
+                    name
+                ))],
+            });
+            continue;
+        }
+
+        let store_identity = std::fs::symlink_metadata(&store_dir)
+            .map(|meta| (meta.dev(), meta.ino()))
+            .ok();
+
+        // Per-store pre-hook: aborts the store on failure (SPEC). Runs
+        // WITHOUT the state lock — a hook may itself invoke a mutating stitch
+        // command, and holding the lock across it would deadlock.
+        if !opts.dry_run
+            && let Some(pre) = &store.hooks.pre
+        {
+            // Pin both the repository identity and its loaded configuration
+            // across the hook. Checking only the store directory would let a
+            // hook change target/source rules and have this already-loaded
+            // config mutate them.
+            let hook_root_identity = std::fs::metadata(repo_root)
+                .ok()
+                .filter(|meta| meta.is_dir())
+                .map(|meta| (meta.dev(), meta.ino()));
+            let hook_config_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
+            let env = HookEnv {
+                root: repo_root,
+                store: Some(name),
+                target: store.target.as_deref(),
+                action: "apply",
+            };
+            if let Err(msg) = hooks::run_store_hook(pre, &env, platform) {
+                results.push(ApplyResult {
+                    store_name: name.clone(),
+                    actions: vec![ApplyAction::Error(StitchError::hook("pre", msg))],
+                });
+                continue;
+            }
+            // Hooks may mutate the filesystem. Never let a replaced store
+            // root drive source resolution or stale-link reconciliation.
+            let current_store_identity = std::fs::symlink_metadata(&store_dir)
+                .map(|meta| (meta.dev(), meta.ino()))
+                .ok();
+            if !store_is_real_dir() || current_store_identity != store_identity {
+                results.push(ApplyResult {
+                    store_name: name.clone(),
+                    actions: vec![internal_error(format!(
+                        "store directory '{}' changed during its pre-hook",
+                        name
+                    ))],
+                });
+                continue;
+            }
+            let current_root_identity = std::fs::metadata(repo_root)
+                .ok()
+                .filter(|meta| meta.is_dir())
+                .map(|meta| (meta.dev(), meta.ino()));
+            let current_config_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
+            if current_root_identity != hook_root_identity
+                || current_config_hash != hook_config_hash
+            {
+                results.push(ApplyResult {
+                    store_name: name.clone(),
+                    actions: vec![internal_error(format!(
+                        "repository or config changed during pre-hook for store '{name}'"
+                    ))],
+                });
+                continue;
+            }
+        }
+
+        // Lock around the mutation phase. The config-hash pin (which covers
+        // state.toml) is rechecked under the lock, so a concurrent add/remove/
+        // migrate can never interleave its state change with the links this
+        // run creates: the run either applies against the exact state it
+        // planned against, or fails honestly instead of orphaning links.
+        let _state_lock = if opts.dry_run {
+            None
+        } else {
+            match config::StateLock::exclusive_if_present(repo_root) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    results.push(ApplyResult {
+                        store_name: name.clone(),
+                        actions: vec![internal_error(e.to_string())],
+                    });
+                    continue;
+                }
+            }
+        };
         let current_identity = std::fs::metadata(repo_root)
             .ok()
             .filter(|meta| meta.is_dir())
@@ -96,7 +197,7 @@ pub fn apply_all(
             results.push(ApplyResult {
                 store_name: name.clone(),
                 actions: vec![internal_error(format!(
-                    "repository changed before applying store '{name}'"
+                    "repository or config changed before applying store '{name}'"
                 ))],
             });
             continue;
@@ -110,6 +211,25 @@ pub fn apply_all(
             opts,
             &mut warnings,
         );
+        drop(_state_lock);
+
+        // Per-store post-hook: warns on failure — the store is already
+        // applied, so post-hook failure does not abort (SPEC). Runs without
+        // the lock so the hook may invoke a mutating stitch command.
+        if !opts.dry_run
+            && let Some(post) = &store.hooks.post
+        {
+            let env = HookEnv {
+                root: repo_root,
+                store: Some(name),
+                target: store.target.as_deref(),
+                action: "apply",
+            };
+            if let Err(msg) = hooks::run_store_hook(post, &env, platform) {
+                warnings.push(format!("store '{name}' post-hook: {msg}"));
+            }
+        }
+
         let after_identity = std::fs::metadata(repo_root)
             .ok()
             .filter(|meta| meta.is_dir())
@@ -197,7 +317,7 @@ pub fn apply_store(
     platform: &Platform,
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> ApplyResult {
     if !platform.matches_when(&store.when) {
         return ApplyResult {
@@ -222,67 +342,11 @@ pub fn apply_store(
         };
     }
 
-    let store_identity = std::fs::symlink_metadata(&store_dir)
-        .map(|meta| (meta.dev(), meta.ino()))
-        .ok();
+    // Hooks are not run here: `apply_all` runs pre/post hooks outside the
+    // state lock (a hook may invoke a mutating stitch command) and calls this
+    // function for the mutation phase only. Direct callers (`add`, `import`)
+    // create stores with no hooks.
     let mut actions = Vec::new();
-
-    // Per-store pre-hook: aborts the store on failure (SPEC). Skipped under
-    // dry-run — running a shell command is a side effect, not a preview.
-    if !opts.dry_run
-        && let Some(pre) = &store.hooks.pre
-    {
-        // Pin both the repository identity and its loaded configuration across
-        // the hook. Checking only the store directory would let a hook change
-        // target/source rules and have this already-loaded config mutate them.
-        let root_identity = std::fs::metadata(repo_root)
-            .ok()
-            .filter(|meta| meta.is_dir())
-            .map(|meta| (meta.dev(), meta.ino()));
-        let config_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
-        let env = HookEnv {
-            root: repo_root,
-            store: Some(name),
-            target: store.target.as_deref(),
-            action: "apply",
-        };
-        if let Err(msg) = hooks::run_store_hook(pre, &env, platform) {
-            actions.push(ApplyAction::Error(StitchError::hook("pre", msg)));
-            return ApplyResult {
-                store_name: name.to_string(),
-                actions,
-            };
-        }
-        // Hooks may mutate the filesystem. Never let a replaced store root
-        // drive source resolution or stale-link reconciliation.
-        let current_identity = std::fs::symlink_metadata(&store_dir)
-            .map(|meta| (meta.dev(), meta.ino()))
-            .ok();
-        if !store_is_real_dir() || current_identity != store_identity {
-            actions.push(internal_error(format!(
-                "store directory '{}' changed during its pre-hook",
-                name
-            )));
-            return ApplyResult {
-                store_name: name.to_string(),
-                actions,
-            };
-        }
-        let current_root_identity = std::fs::metadata(repo_root)
-            .ok()
-            .filter(|meta| meta.is_dir())
-            .map(|meta| (meta.dev(), meta.ino()));
-        let current_config_hash = crate::plan_exec::compute_config_hash(repo_root).ok();
-        if current_root_identity != root_identity || current_config_hash != config_hash {
-            actions.push(internal_error(format!(
-                "repository or config changed during pre-hook for store '{name}'"
-            )));
-            return ApplyResult {
-                store_name: name.to_string(),
-                actions,
-            };
-        }
-    }
 
     // Reconciliation is derived from desired sources, not successful entry
     // application. A render/resolution failure and a target skipped by `when`
@@ -301,7 +365,8 @@ pub fn apply_store(
         // whole-dir target must see a skipped file-mode sibling that shares its
         // path; otherwise it could erase that sibling before its turn.
         for target_entry in store.targets.values() {
-            let target_path = config::expand_home(&target_entry.target);
+            let target_path = config::expand_home(&target_entry.target)
+                .expect("HOME was validated by Config::load");
             collect_reconciliation_keeps(
                 &store_dir,
                 &target_path,
@@ -322,7 +387,8 @@ pub fn apply_store(
             if !platform.matches_when(&target_entry.when) {
                 continue;
             }
-            let target_path = config::expand_home(&target_entry.target);
+            let target_path = config::expand_home(&target_entry.target)
+                .expect("HOME was validated by Config::load");
             match target_is_confined(&target_path, repo_root) {
                 Ok(()) => {
                     let target_link_rels = target_keep_links
@@ -350,7 +416,8 @@ pub fn apply_store(
             }
         }
     } else if let Some(ref target_str) = store.target {
-        let target_path = config::expand_home(target_str);
+        let target_path =
+            config::expand_home(target_str).expect("HOME was validated by Config::load");
         collect_reconciliation_keeps(
             &store_dir,
             &target_path,
@@ -421,22 +488,6 @@ pub fn apply_store(
         && let Err(e) = render::reconcile_store_staging(repo_root, name, &keep_links)
     {
         actions.push(internal_error(e));
-    }
-
-    // Per-store post-hook: warns on failure — the store is already applied,
-    // so post-hook failure does not abort (SPEC). Skipped under dry-run.
-    if !opts.dry_run
-        && let Some(post) = &store.hooks.post
-    {
-        let env = HookEnv {
-            root: repo_root,
-            store: Some(name),
-            target: store.target.as_deref(),
-            action: "apply",
-        };
-        if let Err(msg) = hooks::run_store_hook(post, &env, platform) {
-            warnings.push(format!("store '{name}' post-hook: {msg}"));
-        }
     }
 
     ApplyResult {
@@ -532,14 +583,40 @@ fn prepare_file_mode_target(
         }
     };
     if !metadata.file_type().is_symlink() {
+        // A real file (or anything else non-directory) at the file-mode root
+        // is a hard conflict — even under `--force`: the whole store's links
+        // live inside this directory, and silently renaming the user's file
+        // to `.bak` to make room is beyond per-entry force semantics. The
+        // conflict (not an internal error) also keeps `diff`/`status`/`apply`
+        // in agreement.
+        if !metadata.is_dir() {
+            return Err(ApplyAction::Conflict {
+                target: target_path.to_path_buf(),
+                resolves_to: None,
+            });
+        }
         return Ok((false, Vec::new()));
+    }
+
+    // A symlinked target root that does not resolve into this repo is either
+    // the special case of $HOME itself being a symlink (issue #3) or a
+    // foreign symlink that must be a conflict. Only bypass when the target
+    // is lexically $HOME itself — an alias like ~/.alias -> ~ resolves to
+    // HOME canonically but must still conflict.
+    if !linker::points_into_repo(target_path, repo_root) {
+        let is_home_itself = config::expand_home("~")
+            .ok()
+            .is_some_and(|home| home == target_path);
+        if is_home_itself {
+            return Ok((false, Vec::new()));
+        }
     }
 
     // Only this store's exact whole-dir link may be promoted. A foreign link,
     // or a link to another store in the same repo, remains a conflict.
-    match linker::check_link(target_path, store_dir) {
+    match linker::check_link(target_path, store_dir, repo_root) {
         LinkStatus::Linked => {}
-        LinkStatus::Broken(resolved) => {
+        LinkStatus::Broken(resolved) | LinkStatus::Foreign(resolved) => {
             return Err(ApplyAction::Conflict {
                 target: target_path.to_path_buf(),
                 resolves_to: Some(resolved),
@@ -795,20 +872,57 @@ fn remove_empty_target_dir(target_path: &Path) -> Result<bool, String> {
     }
 }
 
-/// Reject a target whose ancestors resolve back into the repo. External
-/// volume/gateway symlinks remain valid: only a canonical repo destination is
-/// confinement-breaking.
+/// Reject a target whose ancestors are unsafe, evaluated immediately before
+/// the mutation that depends on them (so a pre-apply hook that replaced an
+/// ancestor is caught, not written through):
+///
+/// - a symlink ancestor that resolves back into the repo is a conflict
+///   (writing through it could reach another store's sources);
+/// - a symlink ancestor that resolves OUTSIDE canonical `$HOME` is a conflict:
+///   config validation already rejects such targets at load, and a hook may
+///   have introduced one after that check — writing through it would escape
+///   `$HOME` entirely.
+/// - a symlink *at* the target itself is also rejected for file-mode roots:
+///   a file-mode target must be a real directory, not a symlink (even one
+///   that resolves to $HOME via an alias like ~/.alias -> ~). Whole-dir
+///   targets are allowed to be symlinks pointing at their store dir — that
+///   case is handled by the caller after this check.
 fn target_is_confined(target: &Path, repo_root: &Path) -> Result<(), ApplyAction> {
+    let canonical_home = match crate::config::canonical_home() {
+        Ok(home) => home,
+        Err(e) => {
+            return Err(internal_error(format!(
+                "could not resolve $HOME while checking target confinement: {e}"
+            )));
+        }
+    };
+    // Check ancestors first (existing behavior).
     let mut ancestor = target.parent();
     while let Some(path) = ancestor {
         match std::fs::symlink_metadata(path) {
-            Ok(meta)
-                if meta.file_type().is_symlink() && linker::points_into_repo(path, repo_root) =>
-            {
-                return Err(ApplyAction::Conflict {
-                    target: path.to_path_buf(),
-                    resolves_to: std::fs::read_link(path).ok(),
-                });
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // Repo-pointing ancestors are always conflicts: writing
+                // through them reaches other stores' sources.
+                if linker::points_into_repo(path, repo_root) {
+                    return Err(ApplyAction::Conflict {
+                        target: path.to_path_buf(),
+                        resolves_to: std::fs::read_link(path).ok(),
+                    });
+                }
+                // A non-repo symlink ancestor must still resolve inside
+                // canonical $HOME. External volume/gateway symlinks were
+                // rejected by config validation; enforce the same boundary
+                // here so a hook that introduced one cannot redirect writes
+                // outside $HOME after the load-time check.
+                match linker::resolve_path_with_missing(path) {
+                    Some(resolved) if resolved.starts_with(&canonical_home) => {}
+                    _ => {
+                        return Err(ApplyAction::Conflict {
+                            target: path.to_path_buf(),
+                            resolves_to: std::fs::read_link(path).ok(),
+                        });
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -820,6 +934,25 @@ fn target_is_confined(target: &Path, repo_root: &Path) -> Result<(), ApplyAction
             }
         }
         ancestor = path.parent();
+    }
+    // For file-mode roots, a symlink at the target itself is a foreign
+    // conflict (even if it resolves to $HOME via an alias like ~/.alias -> ~).
+    // The exception is $HOME itself being a symlink (home_link -> real_home)
+    // — that is the user's actual home and must be allowed for file-mode
+    // stores with target "~" (e.g. .bashrc).
+    if let Ok(meta) = std::fs::symlink_metadata(target)
+        && meta.file_type().is_symlink()
+    {
+        // $HOME itself may be a symlink; allow it.
+        let is_home_itself = crate::config::expand_home("~")
+            .ok()
+            .is_some_and(|home| home == target);
+        if !is_home_itself && !linker::points_into_repo(target, repo_root) {
+            return Err(ApplyAction::Conflict {
+                target: target.to_path_buf(),
+                resolves_to: std::fs::read_link(target).ok(),
+            });
+        }
     }
     Ok(())
 }
@@ -968,10 +1101,14 @@ fn apply_single_link(
         return action;
     }
 
-    let status = linker::check_link(target, source);
+    let status = linker::check_link(target, source, repo_root);
 
     match status {
         LinkStatus::Linked => ApplyAction::AlreadyLinked(target.to_path_buf()),
+        LinkStatus::Foreign(resolved) => ApplyAction::Conflict {
+            target: target.to_path_buf(),
+            resolves_to: Some(resolved),
+        },
         LinkStatus::Missing => {
             if opts.dry_run {
                 ApplyAction::Created(target.to_path_buf())
@@ -984,8 +1121,8 @@ fn apply_single_link(
         }
         // A real file or directory occupies the target. Without --force this
         // is a hard conflict; with --force the target is renamed to `.bak`
-        // and the link takes its place. (Foreign symlinks never reach here —
-        // they surface as `Broken` below and stay conflicts even under force.)
+        // and the link takes its place. (Foreign symlinks are handled by the
+        // dedicated `LinkStatus::Foreign` arm above; they never reach here.)
         LinkStatus::Conflict(_) => {
             if !opts.force {
                 ApplyAction::Conflict {
@@ -1016,7 +1153,10 @@ fn apply_single_link(
             }
             let old_resolves_to = resolved.clone();
             if let Err(e) = std::fs::remove_file(target) {
-                return internal_error(e.to_string());
+                return internal_error(format!(
+                    "could not remove stale symlink {}: {e}",
+                    target.display()
+                ));
             }
             match create_link_for(target, source, source_root) {
                 Ok(()) => ApplyAction::Replaced {
@@ -1318,7 +1458,7 @@ pub(crate) fn resolve_link_source(
             store_dir,
             store_name,
             target,
-            &config::expand_home(target_str),
+            &config::expand_home(target_str).ok()?,
             &store_config.files,
             &store_config.patterns,
             &store_config.ignore,
@@ -1336,7 +1476,7 @@ pub(crate) fn resolve_link_source(
             store_dir,
             store_name,
             target,
-            &config::expand_home(&target_entry.target),
+            &config::expand_home(&target_entry.target).ok()?,
             &target_entry.files,
             &target_entry.patterns,
             &target_entry.ignore,
@@ -1385,7 +1525,7 @@ fn resolve_link_source_for_target(
     None
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StatusEntry {
     pub store_name: String,
     /// Multi-target name, if this entry belongs to a named target. Single-
@@ -1434,7 +1574,8 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                 if !platform.matches_when(&target_entry.when) {
                     continue;
                 }
-                let target_path = config::expand_home(&target_entry.target);
+                let target_path = config::expand_home(&target_entry.target)
+                    .expect("HOME was validated by Config::load");
                 entries.extend(collect_statuses(
                     repo_root,
                     name,
@@ -1447,7 +1588,8 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                 ));
             }
         } else if let Some(ref target_str) = store.target {
-            let target_path = config::expand_home(target_str);
+            let target_path =
+                config::expand_home(target_str).expect("HOME was validated by Config::load");
             entries.extend(collect_statuses(
                 repo_root,
                 name,
@@ -1488,12 +1630,61 @@ fn collect_statuses(
                 source: store_dir.to_path_buf(),
                 link_source: store_dir.to_path_buf(),
                 target: target_path.to_path_buf(),
-                status: linker::check_link(target_path, store_dir),
+                status: linker::check_link(target_path, store_dir, repo_root),
                 skipped_platform: false,
                 is_template: false,
             });
         }
         Ok(LinkTargets::Files(names)) => {
+            // File-mode target root must be a real directory, not a symlink
+            // or real file. Surface a root conflict directly so status/doctor
+            // agree with apply's foreign/real-file handling.
+            if let Ok(meta) = std::fs::symlink_metadata(target_path) {
+                if meta.file_type().is_symlink() {
+                    // A symlink at the file-mode root is acceptable only if
+                    // it is $HOME itself (home_link -> real_home) or this
+                    // store's OWN whole-dir link awaiting promotion. Any
+                    // other symlink — foreign, or repo-owned but belonging to
+                    // a different store — is a root conflict: apply would
+                    // refuse to write through it, so status/doctor must not
+                    // report the per-file entries as merely missing.
+                    let is_home_itself = crate::config::expand_home("~")
+                        .ok()
+                        .is_some_and(|home| home == target_path);
+                    let owns_root = matches!(
+                        linker::check_link(target_path, store_dir, repo_root),
+                        linker::LinkStatus::Linked
+                    );
+                    if !is_home_itself && !owns_root {
+                        let resolves_to = std::fs::read_link(target_path)
+                            .unwrap_or_else(|_| PathBuf::from("(unreadable)"));
+                        entries.push(StatusEntry {
+                            store_name: name.to_string(),
+                            target_name: target_name.map(str::to_owned),
+                            source: store_dir.to_path_buf(),
+                            link_source: store_dir.to_path_buf(),
+                            target: target_path.to_path_buf(),
+                            status: linker::LinkStatus::Foreign(resolves_to),
+                            skipped_platform: false,
+                            is_template: false,
+                        });
+                        return entries;
+                    }
+                } else if !meta.is_dir() {
+                    // Real file blocks the directory target.
+                    entries.push(StatusEntry {
+                        store_name: name.to_string(),
+                        target_name: target_name.map(str::to_owned),
+                        source: store_dir.to_path_buf(),
+                        link_source: store_dir.to_path_buf(),
+                        target: target_path.to_path_buf(),
+                        status: linker::LinkStatus::Conflict(target_path.to_path_buf()),
+                        skipped_platform: false,
+                        is_template: false,
+                    });
+                    return entries;
+                }
+            }
             for source_name in &names {
                 let entry = render::resolve_entry(source_name);
                 let repo_source = store_dir.join(&entry.source_rel);
@@ -1504,7 +1695,7 @@ fn collect_statuses(
                 } else {
                     repo_source.clone()
                 };
-                let status = linker::check_link(&target, &link_source);
+                let status = linker::check_link(&target, &link_source, repo_root);
                 entries.push(StatusEntry {
                     store_name: name.to_string(),
                     target_name: target_name.map(str::to_owned),
@@ -1725,6 +1916,20 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
             continue;
         }
 
+        if matches!(
+            std::fs::read_dir(&store_dir),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+        ) {
+            findings.push(DoctorFinding {
+                id: "unreadable-source",
+                severity: Severity::Error,
+                message: format!("store '{}': directory is unreadable", name),
+                path: Some(store_dir.clone()),
+                hint: Some("check permissions on the store directory; apply will fail".into()),
+            });
+            continue;
+        }
+
         if store_dir
             .read_dir()
             .map_or(true, |mut d| d.next().is_none())
@@ -1744,7 +1949,8 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
         // same platform, i.e. their combined `when` constraints are jointly
         // satisfiable.
         if let Some(ref target_str) = store.target {
-            let target_path = config::expand_home(target_str);
+            let target_path =
+                config::expand_home(target_str).expect("HOME was validated by Config::load");
             let new_claim = make_claim(name, None, &store.when, None);
             if let Some(existing) = seen_targets
                 .get(&target_path)
@@ -1768,7 +1974,8 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
         }
 
         for (tname, tentry) in &store.targets {
-            let target_path = config::expand_home(&tentry.target);
+            let target_path =
+                config::expand_home(&tentry.target).expect("HOME was validated by Config::load");
             let new_claim = make_claim(name, Some(tname), &store.when, Some(&tentry.when));
             if let Some(existing) = seen_targets
                 .get(&target_path)
@@ -1824,6 +2031,56 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                 });
             }
 
+            if let LinkStatus::Foreign(ref resolved) = entry.status {
+                findings.push(DoctorFinding {
+                    id: "foreign-link",
+                    severity: Severity::Error,
+                    message: format!(
+                        "store '{}': foreign symlink at {} -> {}",
+                        name,
+                        entry.target.display(),
+                        resolved.display()
+                    ),
+                    path: Some(entry.target.clone()),
+                    hint: Some(format!(
+                        "foreign symlink at {} -> {}; owned by another tool, `apply` will conflict",
+                        entry.target.display(),
+                        resolved.display()
+                    )),
+                });
+            }
+
+            if let LinkStatus::Conflict(ref path) = entry.status {
+                findings.push(DoctorFinding {
+                    id: "conflict-real-file",
+                    severity: Severity::Error,
+                    message: format!(
+                        "store '{}': real file/dir blocks link at {}",
+                        name,
+                        path.display()
+                    ),
+                    path: Some(entry.target.clone()),
+                    hint: Some(format!(
+                        "remove or move `{}`, or run `stitch apply --force`",
+                        path.display()
+                    )),
+                });
+            }
+
+            if let LinkStatus::Missing = entry.status {
+                findings.push(DoctorFinding {
+                    id: "missing-link",
+                    severity: Severity::Warning,
+                    message: format!(
+                        "store '{}': missing link at {}",
+                        name,
+                        entry.target.display()
+                    ),
+                    path: Some(entry.target.clone()),
+                    hint: Some("run `stitch apply` to create the link".into()),
+                });
+            }
+
             // Staging drift: tool-owned render differs from a fresh render.
             // Hand-edits (or a vars/env change since last apply) surface here
             // so the next apply's overwrite is never silent.
@@ -1875,6 +2132,32 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                     }
                 }
             }
+        }
+    }
+
+    // Flag directories in the repo root that are not configured stores.
+    if let Ok(entries) = std::fs::read_dir(repo_root) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            if name == ".stitch" || name == ".git" {
+                continue;
+            }
+            if config.stores.contains_key(name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            findings.push(DoctorFinding {
+                id: "untracked-store-dir",
+                severity: Severity::Info,
+                message: format!(
+                    "untracked directory '{}' is not a configured store",
+                    entry.path().display()
+                ),
+                path: Some(entry.path()),
+                hint: Some("not a configured store; remove it or add it to config".into()),
+            });
         }
     }
 
@@ -2456,7 +2739,12 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_store_allows_external_target_ancestor() {
+    fn test_apply_store_blocks_external_target_ancestor() {
+        // An ancestor symlink that resolves OUTSIDE canonical $HOME is a
+        // conflict: config validation rejects such targets at load, and a
+        // pre-apply hook could otherwise introduce one after that check and
+        // redirect writes out of $HOME. Home itself being a symlink is the
+        // allowed exception (it IS the canonical home).
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repo");
         let store_dir = repo_root.join("nvim");
@@ -2464,6 +2752,7 @@ mod tests {
         std::fs::write(store_dir.join("init.lua"), "init").unwrap();
         let external = tmp.path().join("external");
         std::fs::create_dir_all(&external).unwrap();
+        std::fs::create_dir_all(external.join(".config")).unwrap();
         let home = tmp.path().join("home");
         std::os::unix::fs::symlink(&external, &home).unwrap();
 
@@ -2496,11 +2785,16 @@ mod tests {
             &mut Vec::new(),
         );
 
+        // The `home` symlink is the offending ancestor; nothing may be
+        // created through it.
         assert!(matches!(
             result.actions.as_slice(),
-            [ApplyAction::Created(_)]
+            [ApplyAction::Conflict { target, .. }] if target == &home
         ));
-        assert!(external.join(".config/init.lua").is_symlink());
+        assert!(
+            !external.join(".config/init.lua").exists(),
+            "must not write through the external symlink ancestor"
+        );
     }
 
     #[test]

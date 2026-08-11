@@ -18,10 +18,17 @@ pub enum LinkStatus {
     Conflict(PathBuf),
     /// Symlink exists but points to a missing or wrong target.
     Broken(PathBuf),
+    /// Symlink exists, does not resolve into this repo, but resolves to a live
+    /// file or directory managed by another tool.
+    Foreign(PathBuf),
 }
 
 /// Check the status of a symlink at `target` pointing to `source`.
-pub fn check_link(target: &Path, source: &Path) -> LinkStatus {
+///
+/// `repo_root` is used to decide whether a non-matching symlink is a stale
+/// repo-owned link (`Broken`) or a foreign link (`Foreign` vs `Broken` based
+/// on whether the resolved target exists).
+pub fn check_link(target: &Path, source: &Path, repo_root: &Path) -> LinkStatus {
     match std::fs::symlink_metadata(target) {
         Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(target) {
             Ok(resolved) => {
@@ -49,7 +56,16 @@ pub fn check_link(target: &Path, source: &Path) -> LinkStatus {
                 };
                 if linked {
                     LinkStatus::Linked
+                } else if points_into_repo(target, repo_root) {
+                    // Repo-owned but not the expected source: stale state that
+                    // apply can self-heal, so it stays "broken".
+                    LinkStatus::Broken(resolved)
+                } else if std::fs::metadata(target).is_ok() {
+                    // A live symlink not owned by this repo: another tool's
+                    // file, not a broken link.
+                    LinkStatus::Foreign(resolved)
                 } else {
+                    // A dangling symlink not owned by this repo.
                     LinkStatus::Broken(resolved)
                 }
             }
@@ -282,28 +298,74 @@ pub fn points_at_source(target: &Path, expected_source: &Path, repo_root: &Path)
 }
 
 /// Resolve a missing path by canonicalizing its nearest existing ancestor and
-/// then restoring the absent normal-component suffix.
+/// then restoring the absent suffix. Missing `.`/`..` components are folded
+/// lexically: every suffix component is genuinely absent, so no symlink can
+/// alter the reading (`sub/..` where `sub` does not exist collapses to
+/// nothing, exactly as it reads).
 pub fn resolve_path_with_missing(path: &Path) -> Option<PathBuf> {
     let absolute = absolute_path(path).ok()?;
     let mut ancestor = absolute.as_path();
-    let mut suffix = VecDeque::new();
+    // Missing components, collected from the leaf toward the existing prefix.
+    let mut suffix: Vec<OsString> = Vec::new();
     loop {
         match std::fs::symlink_metadata(ancestor) {
             Ok(_) => {
                 let mut resolved = resolve_path(ancestor).ok()?;
-                for component in suffix {
-                    resolved.push(component);
+                // Rebuild the missing tail in original order. `..` pops the
+                // previously queued normal component; `.` is a no-op. Both
+                // exist only as textual entries — the kernel could not have
+                // resolved them either, so collapsing them is the faithful
+                // reading (the alternative would be refusing the whole path).
+                let mut parts: Vec<OsString> = Vec::new();
+                for part in suffix.iter().rev() {
+                    match part.as_os_str().as_bytes() {
+                        b".." => {
+                            parts.pop();
+                        }
+                        b"." => {}
+                        _ => parts.push(part.clone()),
+                    }
+                }
+                for part in parts {
+                    resolved.push(part);
                 }
                 return Some(resolved);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let leaf = ancestor.file_name()?.to_os_string();
-                suffix.push_front(leaf);
+                // Extract the trailing component by hand: `Path::file_name`
+                // returns `None` for a `..`-terminated path, but the
+                // component matters for the fold above.
+                match ancestor.components().next_back() {
+                    Some(std::path::Component::ParentDir) => {
+                        suffix.push(OsString::from(".."));
+                    }
+                    Some(std::path::Component::CurDir) => {
+                        suffix.push(OsString::from("."));
+                    }
+                    Some(std::path::Component::Normal(name)) => {
+                        suffix.push(name.to_os_string());
+                    }
+                    Some(_) | None => return None,
+                }
                 ancestor = ancestor.parent()?;
             }
             Err(_) => return None,
         }
     }
+}
+
+/// Like [`resolve_path_with_missing`], but never follows a symlink at the
+/// final component: ancestors resolve fully (POSIX splice ordering), while the
+/// leaf is preserved as-is so callers can inspect it. `add` uses this so a
+/// terminal symlink in the user's path is rejected instead of silently
+/// adopting its referent (and later repointing/deleting the original link).
+pub fn resolve_ancestors_with_missing(path: &Path) -> Option<PathBuf> {
+    let absolute = absolute_path(path).ok()?;
+    let leaf = absolute.file_name()?.to_os_string();
+    let parent = absolute.parent()?;
+    let mut resolved = resolve_path_with_missing(parent)?;
+    resolved.push(leaf);
+    Some(resolved)
 }
 
 /// Whether `target` points exactly at an expected source path that is now
@@ -546,7 +608,7 @@ pub fn points_to_source(target: &Path, expected_source: &Path, repo_root: &Path)
         }
         Ok(_) => {
             points_into_repo(target, repo_root)
-                && check_link(target, expected_source) == LinkStatus::Linked
+                && check_link(target, expected_source, repo_root) == LinkStatus::Linked
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             points_at_missing_source(target, expected_source, repo_root)
@@ -612,13 +674,19 @@ mod tests {
         let target_file = target_dir.join("test.txt");
 
         // Missing before creation.
-        assert_eq!(check_link(&target_file, &source_file), LinkStatus::Missing);
+        assert_eq!(
+            check_link(&target_file, &source_file, tmp.path()),
+            LinkStatus::Missing
+        );
 
         // Create the link.
         create_link(&target_file, &source_file).unwrap();
 
         // Now linked.
-        assert_eq!(check_link(&target_file, &source_file), LinkStatus::Linked);
+        assert_eq!(
+            check_link(&target_file, &source_file, tmp.path()),
+            LinkStatus::Linked
+        );
 
         // Read through the link.
         let content = std::fs::read_to_string(&target_file).unwrap();
@@ -626,7 +694,10 @@ mod tests {
 
         // Remove the link.
         assert!(remove_link(&target_file, tmp.path()).unwrap());
-        assert_eq!(check_link(&target_file, &source_file), LinkStatus::Missing);
+        assert_eq!(
+            check_link(&target_file, &source_file, tmp.path()),
+            LinkStatus::Missing
+        );
     }
 
     #[test]
@@ -697,7 +768,7 @@ mod tests {
         std::fs::write(&target, "I am a real file").unwrap();
 
         assert!(matches!(
-            check_link(&target, &source),
+            check_link(&target, &source, tmp.path()),
             LinkStatus::Conflict(_)
         ));
     }

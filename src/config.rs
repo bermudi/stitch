@@ -11,8 +11,13 @@
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(test)]
+use std::cell::RefCell;
 
 // ===========================================================================
 // Authored — from stitch.toml. Read-only to the tool after `init`.
@@ -143,6 +148,7 @@ pub struct Loaded {
 // ===========================================================================
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WhenClause {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
@@ -238,6 +244,22 @@ impl Config {
         let legacy_path = repo_root.join(".stitch").join("config.toml");
         let mut warnings = Vec::new();
 
+        // A symlinked or non-directory `.stitch` is never followed: the state
+        // could be authored anywhere and its targets could point wherever the
+        // external file says. Reject at load, before any command mutates.
+        let stitch_dir = repo_root.join(".stitch");
+        match std::fs::symlink_metadata(&stitch_dir) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(ConfigError::Read(
+                    std::io::Error::other("refusing symlinked or non-directory state directory"),
+                    stitch_dir,
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ConfigError::Read(e, stitch_dir)),
+        }
+
         // Item 5: a v0.2-only repo (legacy present, new format absent) is a
         // hard, actionable error. Do not parse the old file.
         if !stitch_path.exists() && legacy_path.exists() {
@@ -253,30 +275,30 @@ impl Config {
             ));
         }
 
-        // Authored half: missing file = empty authored.
-        let authored = if stitch_path.exists() {
-            let contents = std::fs::read_to_string(&stitch_path)
-                .map_err(|e| ConfigError::Read(e, stitch_path.clone()))?;
-            toml::from_str::<AuthoredConfig>(&contents)
-                .map_err(|e| ConfigError::Parse(e, stitch_path))?
-        } else {
-            AuthoredConfig::default()
+        // Authored half: missing file = empty authored. Distinguish NotFound
+        // from other I/O errors (e.g. permission denied on .stitch dir).
+        let authored = match std::fs::read_to_string(&stitch_path) {
+            Ok(contents) => toml::from_str::<AuthoredConfig>(&contents)
+                .map_err(|e| ConfigError::Parse(e, stitch_path.clone()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AuthoredConfig::default(),
+            Err(e) => return Err(ConfigError::Read(e, stitch_path.clone())),
         };
         // Validate each half before merging: an authored-only store otherwise
         // has no generated entry to force a later validation pass.
         authored.validate()?;
 
-        // Generated half: missing file = empty state.
-        let generated = if state_path.exists() {
-            let raw = std::fs::read_to_string(&state_path)
-                .map_err(|e| ConfigError::Read(e, state_path.clone()))?;
-            // Strip the known tool-owned header before parsing (it is not part
-            // of the TOML data model). Absent/differing header → parse verbatim.
-            let contents = raw.strip_prefix(STATE_HEADER).unwrap_or(&raw);
-            toml::from_str::<GeneratedState>(contents)
-                .map_err(|e| ConfigError::Parse(e, state_path))?
-        } else {
-            GeneratedState::default()
+        // Generated half: missing file = empty state. Must not treat
+        // unreadable .stitch as absent (e.g. chmod 000).
+        let generated = match std::fs::read_to_string(&state_path) {
+            Ok(raw) => {
+                // Strip the known tool-owned header before parsing (it is not part
+                // of the TOML data model). Absent/differing header → parse verbatim.
+                let contents = raw.strip_prefix(STATE_HEADER).unwrap_or(&raw);
+                toml::from_str::<GeneratedState>(contents)
+                    .map_err(|e| ConfigError::Parse(e, state_path.clone()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => GeneratedState::default(),
+            Err(e) => return Err(ConfigError::Read(e, state_path.clone())),
         };
         generated.validate()?;
 
@@ -299,13 +321,30 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_store_names(self.stores.keys(), "merged config")?;
         for (name, store) in &self.stores {
+            // Mixed modes: store with top-level target/files plus named targets
+            // must error — otherwise top-level inventory silently disappears.
+            if !store.targets.is_empty()
+                && (store.target.is_some() || !store.files.is_empty() || !store.patterns.is_empty())
+            {
+                return Err(ConfigError::InvalidPath(format!(
+                    "invalid store '{name}' in merged config: cannot mix top-level target/files with named targets"
+                )));
+            }
+            validate_store_has_target(
+                name,
+                &store.files,
+                &store.patterns,
+                &store.target,
+                !store.targets.is_empty(),
+                "merged config",
+            )?;
             if let Some(target) = &store.target {
-                validate_target_absolute(target, &format!("store '{name}'"))?;
+                validate_target(target, &format!("store '{name}'"))?;
             }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
             validate_globs(&store.patterns, &store.ignore, &format!("store '{name}'"))?;
             for te in store.targets.values() {
-                validate_target_absolute(
+                validate_target(
                     &te.target,
                     &format!("store '{name}' (target '{}')", te.target),
                 )?;
@@ -407,13 +446,28 @@ impl GeneratedState {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_store_names(self.stores.keys(), "generated state")?;
         for (name, store) in &self.stores {
+            if !store.targets.is_empty()
+                && (store.target.is_some() || !store.files.is_empty() || !store.patterns.is_empty())
+            {
+                return Err(ConfigError::InvalidPath(format!(
+                    "invalid store '{name}' in generated state: cannot mix top-level target/files with named targets"
+                )));
+            }
+            validate_store_has_target(
+                name,
+                &store.files,
+                &store.patterns,
+                &store.target,
+                !store.targets.is_empty(),
+                "generated state",
+            )?;
             if let Some(target) = &store.target {
-                validate_target_absolute(target, &format!("store '{name}'"))?;
+                validate_target(target, &format!("store '{name}'"))?;
             }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
             validate_globs(&store.patterns, &[], &format!("store '{name}'"))?;
             for target in store.targets.values() {
-                validate_target_absolute(
+                validate_target(
                     &target.target,
                     &format!("store '{name}' (target '{}')", target.target),
                 )?;
@@ -521,6 +575,118 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<(), ConfigError> {
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Exclusive lock on `.stitch/state.lock` via `flock(2)`. Held for the
+/// duration of a mutating command (load → mutate → save) to serialize
+/// concurrent `stitch add` etc. The lock file is created if missing at
+/// `0600`; the lock is advisory and blocking (Linux `LOCK_EX`).
+///
+/// This prevents the orphan/prune data-loss path where two concurrent adds
+/// both read an empty state, each insert one store, and the last writer wins,
+/// leaving links without a covering state entry.
+#[derive(Debug)]
+pub struct StateLock {
+    _file: std::fs::File,
+}
+
+impl StateLock {
+    /// Acquire an exclusive lock for `repo_root`. Blocks until available.
+    /// Creates `.stitch` (and the lock file) if missing — used by state
+    /// writers (`add`, `remove`, `import`, `migrate`), which create state
+    /// anyway.
+    pub fn exclusive(repo_root: &Path) -> Result<Self, ConfigError> {
+        let stitch_dir = repo_root.join(".stitch");
+        // Validate or create .stitch as a real directory (not symlink).
+        match std::fs::symlink_metadata(&stitch_dir) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(ConfigError::Write(
+                    std::io::Error::other("refusing non-directory or symlinked state parent"),
+                    stitch_dir,
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&stitch_dir)
+                    .map_err(|e| ConfigError::Write(e, stitch_dir.clone()))?;
+            }
+            Err(e) => return Err(ConfigError::Write(e, stitch_dir)),
+        }
+        Self::acquire(repo_root)
+    }
+
+    /// Acquire the exclusive lock only when `.stitch` already exists — for
+    /// mutators that never write state (`apply`, `prune --yes`). A repo with
+    /// no state directory has nothing to serialize, so `Ok(None)`. A
+    /// symlinked `.stitch` is refused rather than followed.
+    pub fn exclusive_if_present(repo_root: &Path) -> Result<Option<Self>, ConfigError> {
+        let stitch_dir = repo_root.join(".stitch");
+        match std::fs::symlink_metadata(&stitch_dir) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(ConfigError::Write(
+                std::io::Error::other("refusing non-directory or symlinked state parent"),
+                stitch_dir,
+            )),
+            Ok(_) => Self::acquire(repo_root).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ConfigError::Write(e, stitch_dir)),
+        }
+    }
+
+    fn acquire(repo_root: &Path) -> Result<Self, ConfigError> {
+        let stitch_dir = repo_root.join(".stitch");
+        let lock_path = stitch_dir.join("state.lock");
+        // Open or create the lock file without following symlinks. The 0600
+        // mode applies only at creation (`O_CREAT|O_EXCL`); an existing file
+        // is opened as-is and its permissions are NEVER touched — chmodding
+        // the inode would also re-permission every hard link to it.
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| ConfigError::Write(e, lock_path.clone()))?,
+            Err(e) => return Err(ConfigError::Write(e, lock_path)),
+        };
+        // `create_new` never follows a symlink, but an existing entry must be
+        // checked explicitly (a re-created symlink in the gap would have been
+        // followed by the plain open above).
+        if std::fs::symlink_metadata(&lock_path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(ConfigError::Write(
+                std::io::Error::other("refusing symlinked state lock file"),
+                lock_path,
+            ));
+        }
+        // Blocking exclusive flock.
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if ret != 0 {
+            return Err(ConfigError::Write(
+                std::io::Error::last_os_error(),
+                lock_path,
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 /// Merge authored + generated halves into the read-only view, returning any
@@ -862,19 +1028,69 @@ pub fn is_store_name(name: &str) -> bool {
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
-fn validate_target_absolute(target: &str, context: &str) -> Result<(), ConfigError> {
-    if !expand_home(target).is_absolute() {
+pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
+    let expanded = expand_home(target)?;
+    if !expanded.is_absolute() {
         return Err(ConfigError::InvalidPath(format!(
             "invalid target '{target}' in {context}: targets must expand to absolute paths"
         )));
     }
-    Ok(())
+    if expanded
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(ConfigError::InvalidPath(format!(
+            "invalid target '{target}' in {context}: targets must resolve inside $HOME and contain no '..' or escape traversal"
+        )));
+    }
+
+    // A target is allowed to be exactly $HOME (or a spelling of it, such as
+    // `~` or `~/.`). Beyond that, every target must live beneath $HOME:
+    // resolve its parent and ensure the parent is inside $HOME. Resolving the
+    // parent follows symlinks of the path-to-the-target without following the
+    // target itself, which is important for the existing foreign-symlink
+    // conflict tests.
+    let home = expand_home("~")?;
+    let mut home_spelling = expanded.clone();
+    while home_spelling
+        .file_name()
+        .is_some_and(|n| n == OsStr::new("."))
+    {
+        home_spelling.pop();
+    }
+    if home_spelling == home {
+        return Ok(());
+    }
+
+    let Some(parent) = expanded.parent() else {
+        return Err(ConfigError::InvalidPath(format!(
+            "invalid target '{target}' in {context}: targets must resolve inside $HOME and contain no '..' or escape traversal"
+        )));
+    };
+
+    let home_canonical = normalized_target_path("~")?;
+    let parent_str = parent.to_string_lossy();
+    let normalized_parent = normalized_target_path(parent_str.as_ref())?;
+    if normalized_parent.starts_with(&home_canonical) {
+        return Ok(());
+    }
+
+    Err(ConfigError::InvalidPath(format!(
+        "invalid target '{target}' in {context}: targets must resolve inside $HOME and contain no '..' or escape traversal"
+    )))
 }
 
-fn normalized_target_path(target: &str) -> PathBuf {
-    let expanded = expand_home(target);
+/// Canonical (symlink-following) form of `$HOME`. Config-time target
+/// validation and apply-time confinement both use it: a target's ancestors
+/// must resolve inside this path even after a hook replaced them.
+pub(crate) fn canonical_home() -> Result<PathBuf, ConfigError> {
+    normalized_target_path("~")
+}
+
+pub(crate) fn normalized_target_path(target: &str) -> Result<PathBuf, ConfigError> {
+    let expanded = expand_home(target)?;
     if let Some(resolved) = crate::linker::resolve_path_with_missing(&expanded) {
-        return resolved;
+        return Ok(resolved);
     }
     let absolute = if expanded.is_absolute() {
         expanded
@@ -893,26 +1109,26 @@ fn normalized_target_path(target: &str) -> PathBuf {
             other => normalized.push(other.as_os_str()),
         }
     }
-    normalized
+    Ok(normalized)
 }
 
 fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<(), ConfigError> {
     let mut targets: Vec<(String, String, PathBuf, WhenClause)> = Vec::new();
     for (store_name, store) in stores {
         if store.is_multi_target() {
-            targets.extend(store.targets.iter().map(|(target_name, target)| {
-                (
+            for (target_name, target) in &store.targets {
+                targets.push((
                     store_name.clone(),
                     format!("store '{store_name}' target '{target_name}'"),
-                    normalized_target_path(&target.target),
+                    normalized_target_path(&target.target)?,
                     target.when.clone(),
-                )
-            }));
+                ));
+            }
         } else if let Some(target) = &store.target {
             targets.push((
                 store_name.clone(),
                 format!("store '{store_name}'"),
-                normalized_target_path(target),
+                normalized_target_path(target)?,
                 store.when.clone(),
             ));
         }
@@ -999,6 +1215,25 @@ pub fn validate_globs(
     Ok(())
 }
 
+/// Reject a store that declares `files`/`patterns` but has no target to
+/// link them into. Whole-directory stores and authored-only behavior are
+/// still allowed to have no target, but file/pattern mode requires one.
+fn validate_store_has_target(
+    name: &str,
+    files: &[String],
+    patterns: &[String],
+    target: &Option<String>,
+    has_targets: bool,
+    source: &str,
+) -> Result<(), ConfigError> {
+    if (!files.is_empty() || !patterns.is_empty()) && target.is_none() && !has_targets {
+        return Err(ConfigError::InvalidPath(format!(
+            "invalid store '{name}' in {source}: store with files/patterns must have a target"
+        )));
+    }
+    Ok(())
+}
+
 /// Walk upward from `start` to find a directory containing `.stitch/`.
 pub fn find_root(start: &Path) -> Option<PathBuf> {
     let mut current = if start.is_absolute() {
@@ -1017,14 +1252,74 @@ pub fn find_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Override `$HOME` for the current thread during unit tests. This avoids
+/// unsynchronized environment-variable mutation and lets tests that place
+/// targets outside the real home directory run safely in parallel.
+#[cfg(test)]
+pub fn set_test_home(home: Option<PathBuf>) {
+    TEST_HOME.with(|h| *h.borrow_mut() = home);
+}
+
+#[cfg(test)]
+pub struct TestHomeGuard;
+
+#[cfg(test)]
+impl Drop for TestHomeGuard {
+    fn drop(&mut self) {
+        set_test_home(None);
+    }
+}
+
+/// Set the test `$HOME` for the current thread and clear it when the guard
+/// is dropped.
+#[cfg(test)]
+pub fn test_home_guard(home: PathBuf) -> TestHomeGuard {
+    set_test_home(Some(home));
+    TestHomeGuard
+}
+
+fn home_dir() -> Result<PathBuf, ConfigError> {
+    #[cfg(test)]
+    {
+        if let Some(home) = TEST_HOME.with(|h| h.borrow().clone()) {
+            return Ok(home);
+        }
+    }
+    match std::env::var("HOME") {
+        Ok(value) if value.is_empty() => Err(ConfigError::Home(
+            "$HOME is set to an empty string; stitch needs $HOME to resolve targets.".into(),
+        )),
+        Ok(value) => {
+            let path = PathBuf::from(value);
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() => Ok(path),
+                Ok(_) => Err(ConfigError::Home(format!(
+                    "$HOME '{}' is not a directory; stitch needs $HOME to resolve targets.",
+                    path.display()
+                ))),
+                Err(_) => Err(ConfigError::Home(format!(
+                    "$HOME '{}' does not exist; stitch needs $HOME to resolve targets.",
+                    path.display()
+                ))),
+            }
+        }
+        Err(_) => Err(ConfigError::Home(
+            "$HOME is not set; stitch needs $HOME to resolve targets.".into(),
+        )),
+    }
+}
+
 /// Expand `~` at the start of a path.
-pub fn expand_home(path: &str) -> PathBuf {
+pub fn expand_home(path: &str) -> Result<PathBuf, ConfigError> {
     let raw = if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir()
-            .expect("could not determine home directory")
-            .join(rest)
+        home_dir()?.join(rest)
     } else if path == "~" {
-        dirs::home_dir().expect("could not determine home directory")
+        home_dir()?
     } else {
         PathBuf::from(path)
     };
@@ -1037,12 +1332,12 @@ pub fn expand_home(path: &str) -> PathBuf {
     while s.len() > 1 && s.ends_with('/') {
         s.pop();
     }
-    PathBuf::from(s)
+    Ok(PathBuf::from(s))
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("could not read config at {1}: {0}")]
+    #[error("reading {1}: {0}")]
     Read(std::io::Error, PathBuf),
     #[error("could not parse config at {1}: {0}")]
     Parse(toml::de::Error, PathBuf),
@@ -1056,6 +1351,8 @@ pub enum ConfigError {
     CommittedWrite(std::io::Error, PathBuf),
     #[error("{0}")]
     InvalidPath(String),
+    #[error("{0}")]
+    Home(String),
     /// A v0.2 single-file repo that has not been migrated. The message tells
     /// the user exactly how to upgrade.
     #[error(
@@ -1080,24 +1377,26 @@ mod tests {
 
     #[test]
     fn test_expand_home() {
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(expand_home("~"), home);
-        assert_eq!(expand_home("~/foo/bar"), home.join("foo/bar"));
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let _guard = test_home_guard(home.clone());
+        assert_eq!(expand_home("~").unwrap(), home);
+        assert_eq!(expand_home("~/foo/bar").unwrap(), home.join("foo/bar"));
         assert_eq!(
-            expand_home("/absolute/path"),
+            expand_home("/absolute/path").unwrap(),
             PathBuf::from("/absolute/path")
         );
         // Trailing slashes are stripped — symlink(2) fails on a linkpath
         // with a trailing slash, so `stitch add ~/.config/foo/` must not
         // carry the slash through to the linker.
-        assert_eq!(expand_home("~/foo/"), home.join("foo"));
-        assert_eq!(expand_home("~/foo///"), home.join("foo"));
+        assert_eq!(expand_home("~/foo/").unwrap(), home.join("foo"));
+        assert_eq!(expand_home("~/foo///").unwrap(), home.join("foo"));
         assert_eq!(
-            expand_home("/absolute/path/"),
+            expand_home("/absolute/path/").unwrap(),
             PathBuf::from("/absolute/path")
         );
         // Root stays root — the `len() > 1` guard prevents stripping "/" to "".
-        assert_eq!(expand_home("/"), PathBuf::from("/"));
+        assert_eq!(expand_home("/").unwrap(), PathBuf::from("/"));
     }
 
     #[test]
@@ -1159,6 +1458,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn test_when_clause_rejects_unknown_field() {
+        let err = toml::from_str::<WhenClause>("bogus_key = \"x\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field `bogus_key`"),
+            "unknown WhenClause key must be rejected, got: {msg}"
+        );
+        assert!(
+            msg.contains("expected one of `os`, `arch`, `distro`, `hostname`, `shell`"),
+            "error should list the valid WhenClause fields, got: {msg}"
+        );
     }
 
     #[test]
@@ -1599,11 +1912,14 @@ ignore = ["./cache//"]
 
 [stores.app.targets.work]
 ignore = ["./ignored*//"]
+
+[stores.flat]
+ignore = ["./cache2//"]
 "#;
         std::fs::write(tmp.path().join("stitch.toml"), authored).unwrap();
         std::fs::write(
             stitch.join("state.toml"),
-            r#"[stores.app]
+            r#"[stores.flat]
 target = "~"
 files = ["./dir//file/"]
 patterns = ["./foo*//"]
@@ -1617,9 +1933,12 @@ patterns = ["./work*//"]
         .unwrap();
 
         let loaded = Config::load(tmp.path()).unwrap();
+        let flat = &loaded.config.stores["flat"];
+        assert_eq!(flat.files, ["dir/file"]);
+        assert_eq!(flat.patterns, ["foo*/"]);
+        assert_eq!(flat.ignore, ["cache2/"]);
         let store = &loaded.config.stores["app"];
-        assert_eq!(store.files, ["dir/file"]);
-        assert_eq!(store.patterns, ["foo*/"]);
+        assert!(store.files.is_empty());
         assert_eq!(store.ignore, ["cache/"]);
         let target = &store.targets["work"];
         assert_eq!(target.files, ["work/file"]);
