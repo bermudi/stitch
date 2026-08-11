@@ -322,7 +322,8 @@ Per-store `pre` and `post` shell commands. `pre` failure aborts the store. `post
 Hooks are run via `sh -c` with the user's privileges (like git hooks). They are skipped under `--dry-run`/`diff`.
 
 Global hooks in `.stitch/hooks/` (must be executable — `chmod +x`):
-- `pre-apply` / `post-apply` — run before/after all stores
+- `pre-apply` / `post-apply` — run before/after all stores; the global
+  `post-apply` is skipped when the plan reports conflicts or errors
 - `pre-remove` / `post-remove` — run before/after removals
 
 Hooks receive env vars: `STITCH_ROOT`, `STITCH_STORE`, `STITCH_TARGET`, `STITCH_ACTION`, plus platform vars (`STITCH_OS`, `STITCH_ARCH`, `STITCH_DISTRO`, `STITCH_HOSTNAME`, `STITCH_SHELL`).

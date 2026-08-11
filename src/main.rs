@@ -20,13 +20,13 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 
-fn filesystem_identity(path: &std::path::Path) -> Result<(u64, u64), StitchError> {
+fn filesystem_identity(path: &std::path::Path, label: &str) -> Result<(u64, u64), StitchError> {
     // Repository aliases are supported, so follow the root entry and pin the
     // directory it resolves to. Repointing the alias changes this identity.
     let meta = std::fs::metadata(path)?;
     if !meta.file_type().is_dir() {
         return Err(StitchError::internal(format!(
-            "repository root {} does not resolve to a directory",
+            "{label} {} does not resolve to a directory",
             path.display()
         )));
     }
@@ -37,8 +37,9 @@ fn ensure_filesystem_identity(
     path: &std::path::Path,
     expected: (u64, u64),
     context: &str,
+    label: &str,
 ) -> Result<(), StitchError> {
-    let actual = filesystem_identity(path)?;
+    let actual = filesystem_identity(path, label)?;
     if actual != expected {
         return Err(StitchError::internal(format!(
             "{context}: {}",
@@ -536,7 +537,7 @@ fn cmd_apply(
 
     // Global pre-apply hook (skipped under dry-run — hooks have side effects).
     if !opts.dry_run {
-        let root_identity = filesystem_identity(root)?;
+        let root_identity = filesystem_identity(root, "repository root")?;
         let config_hash = plan_exec::compute_config_hash(root)?;
         let env = hooks::HookEnv {
             root,
@@ -550,6 +551,7 @@ fn cmd_apply(
             root,
             root_identity,
             "repository changed during pre-apply hook",
+            "repository root",
         )?;
         if plan_exec::compute_config_hash(root)? != config_hash {
             return Err(StitchError::plan_stale(
@@ -764,7 +766,7 @@ fn apply_json(
     }
 
     if !opts.dry_run {
-        let root_identity = filesystem_identity(root)?;
+        let root_identity = filesystem_identity(root, "repository root")?;
         let config_hash = plan_exec::compute_config_hash(root)?;
         let env = hooks::HookEnv {
             root,
@@ -778,6 +780,7 @@ fn apply_json(
             root,
             root_identity,
             "repository changed during pre-apply hook",
+            "repository root",
         )?;
         if plan_exec::compute_config_hash(root)? != config_hash {
             return Err(StitchError::plan_stale(
@@ -1544,9 +1547,9 @@ fn cmd_remove(
     // replacing either with another real directory must not redirect cleanup
     // or the later state write.
     {
-        let root_identity = filesystem_identity(root)?;
+        let root_identity = filesystem_identity(root, "repository root")?;
         let stitch_dir = root.join(".stitch");
-        let stitch_identity = filesystem_identity(&stitch_dir)?;
+        let stitch_identity = filesystem_identity(&stitch_dir, "state directory")?;
         let env = hooks::HookEnv {
             root,
             store: Some(name),
@@ -1559,11 +1562,13 @@ fn cmd_remove(
             root,
             root_identity,
             "repository changed during pre-remove hook",
+            "repository root",
         )?;
         ensure_filesystem_identity(
             &stitch_dir,
             stitch_identity,
             "state directory changed during pre-remove hook",
+            "state directory",
         )?;
         config::validate_atomic_write_target(&state_path)?;
     }

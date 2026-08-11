@@ -275,8 +275,9 @@ matched; the chain resolves outside it.
 **Fix — two-tier ownership (`src/linker.rs`):**
 - `points_into_repo` is now *canonical*: it follows the full symlink chain
   (resolvable targets are canonicalized; dangling targets are resolved as far
-  as the filesystem allows via `resolve_as_far_as_possible`, so a link through
-  a *resolvable* gateway to a non-existent victim is still foreign). This is
+  as the filesystem allows via `resolve_components`' missing-tail arm, so a
+  link through a *resolvable* gateway to a non-existent victim is still
+  foreign). This is
   the broad predicate used by `apply`'s Broken arm, `prune`/`scan`, and the
   wildcard `remove_link`.
 - A new exact-entry `points_at_source(target, expected_source, repo_root)`

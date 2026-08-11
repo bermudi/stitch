@@ -33,6 +33,10 @@
   independent reconciliation cannot safely determine ownership.
 - Template sources must be direct regular files, not symlinks, FIFOs, devices,
   or directories.
+- The global `post-apply` hook no longer runs when the plan reports conflicts
+  or errors. It previously ran first even after a partial apply; per-store
+  post hooks still run for every attempted store, so cleanup for partial
+  applies belongs there rather than in the global hook.
 
 ## 0.7.1 — 2026-08-07
 
