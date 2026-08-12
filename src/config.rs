@@ -10,10 +10,11 @@
 
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(test)]
@@ -144,6 +145,284 @@ pub struct Loaded {
 }
 
 // ===========================================================================
+// ConfigSnapshot — parsed config bound to the exact bytes it was hashed from.
+// ===========================================================================
+
+/// The parsed configuration bound to the SHA-256 hash of the exact bytes it
+/// was parsed from.
+///
+/// This eliminates the TOCTOU between `Config::load` (which parses bytes for
+/// hook selection) and `compute_config_hash` (which re-reads bytes for hash
+/// verification). A config that changes between those two calls could install
+/// a wrong hook that passes the hash check. With `ConfigSnapshot`, the hash is
+/// computed from the *same bytes* that were parsed, so the parsed config and
+/// the hash are always consistent.
+///
+/// Direct `apply` and `apply --json` use this as their single trusted config
+/// source: hook selection reads from `loaded.config`; every revalidation
+/// compares fresh disk bytes to `hash()`.
+#[derive(Debug)]
+pub struct ConfigSnapshot {
+    /// The parsed and merged configuration.
+    pub loaded: Loaded,
+    /// SHA-256 of the exact captured bytes (authored + state), computed by
+    /// [`hash_config_bytes`]. Missing and empty files are distinct.
+    hash: String,
+}
+
+impl ConfigSnapshot {
+    /// Load authored (`stitch.toml`) + generated (`.stitch/state.toml`),
+    /// capturing the exact bytes of both files once, parsing from those bytes,
+    /// and hashing those same bytes.
+    ///
+    /// Each file is opened once with `O_NOFOLLOW` and validated via `fstat` on
+    /// the file descriptor (not the path). This eliminates the race between
+    /// `validate_authored_file` (which lstats the path) and `fs::read` (which
+    /// reopens the path): a symlink or hard link installed between validation
+    /// and read cannot substitute bytes, because the read comes from the
+    /// already-opened, already-validated fd.
+    ///
+    /// **Scope:** this protects the config file's own inode — not a malicious
+    /// race that replaces its parent directory (e.g. swapping `.stitch/` or
+    /// the repo root) between path resolution and open. That remains within
+    /// the documented same-user race boundary (see AGENTS.md).
+    ///
+    /// This is the single trusted config source for direct `apply` / `apply
+    /// --json`. The returned `hash()` is the pin that every revalidation
+    /// compares against — not a re-read.
+    pub fn load(repo_root: &Path) -> Result<Self, ConfigError> {
+        let stitch_dir = repo_root.join(".stitch");
+        let state_path = stitch_dir.join("state.toml");
+        let authored_path = repo_root.join("stitch.toml");
+        let legacy_path = stitch_dir.join("config.toml");
+        let mut warnings = Vec::new();
+
+        validate_stitch_dir(&stitch_dir)?;
+
+        // v0.2-only repo check (mirrors Config::load). These are lstat-based
+        // existence checks that don't read file content — they only decide
+        // which error to produce, so a race here is not a content-substitution
+        // risk.
+        if !path_exists(&authored_path) && path_exists(&legacy_path) {
+            return Err(ConfigError::LegacyV02(legacy_path));
+        }
+        if path_exists(&authored_path) && path_exists(&legacy_path) {
+            warnings.push(format!(
+                "found stale v0.2 config at {} — stitch.toml is in use; \
+                 you can remove the old file",
+                legacy_path.display()
+            ));
+        }
+
+        // Open each file once with O_NOFOLLOW, fstat the fd, read from the fd.
+        // This binds validation and content-reading to the same file descriptor
+        // — a path replacement targeting the file between validate and read
+        // cannot substitute bytes. (Parent-directory replacement is out of
+        // scope; see the doc on `open_and_read_validated`.)
+        let authored_bytes = open_and_read_validated(&authored_path, "authored config")?;
+        let state_bytes = open_and_read_validated(&state_path, "state")?;
+
+        // Parse from the captured bytes (not a re-read).
+        let authored = match authored_bytes.as_deref() {
+            None => AuthoredConfig::default(),
+            Some(bytes) => parse_authored_bytes(bytes, &authored_path)?,
+        };
+        authored.validate()?;
+
+        let generated = match state_bytes.as_deref() {
+            None => GeneratedState::default(),
+            Some(bytes) => parse_state_bytes(bytes, &state_path)?,
+        };
+        generated.validate()?;
+
+        let (mut config, merge_warnings) = merge(&authored, &generated);
+        warnings.extend(merge_warnings);
+        config.validate()?;
+        config.normalize();
+
+        let hash = hash_config_bytes(authored_bytes.as_deref(), state_bytes.as_deref());
+
+        Ok(Self {
+            loaded: Loaded {
+                authored,
+                generated,
+                config,
+                warnings,
+            },
+            hash,
+        })
+    }
+
+    /// The SHA-256 hash of the captured bytes. This is the pin that hook
+    /// selection and post-hook verification must compare against — not a
+    /// re-read.
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+}
+
+/// Return `true` if a path exists (lstat, without following symlinks).
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Open a file with `O_NOFOLLOW`, validate it via `fstat` on the fd, and read
+/// its bytes from the same fd. Returns `None` for `NotFound` (missing file) and
+/// `Some(bytes)` for a present file (including an empty one). This distinction
+/// is what keeps missing and empty files separate in the hash.
+///
+/// `O_NOFOLLOW` rejects symlinks at open time. `fstat` on the fd then checks:
+/// - the file is a regular file (not a device, socket, etc.);
+/// - `nlink == 1` (not hard-linked to another path).
+///
+/// Because the read comes from the already-opened fd, a path replacement
+/// (symlink, hard link, rename) targeting the file itself after the open
+/// succeeds cannot substitute bytes — the read sees the original inode's
+/// content. This does NOT protect against a race that replaces the file's
+/// parent directory between path resolution and open; that remains within
+/// the documented same-user race boundary.
+fn open_and_read_validated(path: &Path, kind: &str) -> Result<Option<Vec<u8>>, ConfigError> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // O_NOFOLLOW on Linux returns ELOOP for a symlink; map it to the same
+        // error message as the path-based validate_regular_file for consistency.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(ConfigError::Read(
+                std::io::Error::other(format!("refusing symlinked or non-regular {kind} file")),
+                path.to_path_buf(),
+            ));
+        }
+        Err(e) => return Err(ConfigError::Read(e, path.to_path_buf())),
+    };
+
+    // fstat the fd — not the path. This validates the inode we actually opened.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::fstat(file.as_raw_fd(), &mut stat) };
+    if ret != 0 {
+        return Err(ConfigError::Read(
+            std::io::Error::last_os_error(),
+            path.to_path_buf(),
+        ));
+    }
+    let mode = stat.st_mode;
+    if mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(ConfigError::Read(
+            std::io::Error::other(format!("refusing symlinked or non-regular {kind} file")),
+            path.to_path_buf(),
+        ));
+    }
+    if stat.st_nlink > 1 {
+        return Err(ConfigError::Read(
+            std::io::Error::other(format!(
+                "refusing hard-linked {kind} file (multiple paths to the same inode)"
+            )),
+            path.to_path_buf(),
+        ));
+    }
+
+    // Read from the validated fd.
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(stat.st_size as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| ConfigError::Read(e, path.to_path_buf()))?;
+    Ok(Some(bytes))
+}
+
+fn parse_authored_bytes(bytes: &[u8], path: &Path) -> Result<AuthoredConfig, ConfigError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        ConfigError::Read(
+            std::io::Error::other(format!("invalid UTF-8: {e}")),
+            path.to_path_buf(),
+        )
+    })?;
+    toml::from_str::<AuthoredConfig>(text).map_err(|e| ConfigError::Parse(e, path.to_path_buf()))
+}
+
+fn parse_state_bytes(bytes: &[u8], path: &Path) -> Result<GeneratedState, ConfigError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        ConfigError::Read(
+            std::io::Error::other(format!("invalid UTF-8: {e}")),
+            path.to_path_buf(),
+        )
+    })?;
+    let contents = text.strip_prefix(STATE_HEADER).unwrap_or(text);
+    toml::from_str::<GeneratedState>(contents)
+        .map_err(|e| ConfigError::Parse(e, path.to_path_buf()))
+}
+
+/// Re-read fresh on-disk config bytes using the same no-follow, fd-validated
+/// reader as [`ConfigSnapshot::load`] (one `open_and_read_validated` per file),
+/// and hash them. This is the revalidation counterpart to
+/// [`ConfigSnapshot::hash`]: it does NOT parse — it only re-reads and
+/// re-hashes — so a path replacement (symlink, hard link, rename) targeting
+/// the file itself between open and read cannot substitute bytes. This does
+/// NOT protect against a parent-directory replacement race; that remains
+/// within the documented same-user race boundary.
+///
+/// Returns the hash on success, or the real [`ConfigError`] (with path and
+/// context) on failure. Callers in the direct-apply path use this instead of
+/// `plan_exec::compute_config_hash` so that revalidation shares the same
+/// trust boundary as snapshot capture and never silently swallows a read
+/// failure as "hash mismatch".
+pub(crate) fn revalidate_config_hash(repo_root: &Path) -> Result<String, ConfigError> {
+    let stitch_dir = repo_root.join(".stitch");
+    let state_path = stitch_dir.join("state.toml");
+    let authored_path = repo_root.join("stitch.toml");
+    // validate_stitch_dir is still checked: a replaced .stitch directory
+    // would change which state bytes we read. The v0.2 legacy checks are
+    // NOT re-run — revalidation compares bytes, not load semantics, and the
+    // snapshot already passed them.
+    validate_stitch_dir(&stitch_dir)?;
+    let authored_bytes = open_and_read_validated(&authored_path, "authored config")?;
+    let state_bytes = open_and_read_validated(&state_path, "state")?;
+    Ok(hash_config_bytes(
+        authored_bytes.as_deref(),
+        state_bytes.as_deref(),
+    ))
+}
+
+/// Compute the config identity hash from in-memory bytes.
+///
+/// `None` = file missing; `Some(b)` = file present (including `b` empty). The
+/// presence marker (`[1]` vs `[0]`) and length prefix keep missing and empty
+/// files distinct and prevent concatenation-boundary collisions. This is the
+/// single shared hash function — `plan_exec::compute_config_hash` delegates
+/// here after reading bytes from disk.
+pub(crate) fn hash_config_bytes(authored: Option<&[u8]>, state: Option<&[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"stitch/config-hash/v2\0");
+
+    let files: [(&str, Option<&[u8]>); 2] =
+        [("stitch.toml", authored), (".stitch/state.toml", state)];
+    for (label, bytes) in files {
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        match bytes {
+            Some(b) => {
+                hasher.update([1]);
+                hasher.update((b.len() as u64).to_be_bytes());
+                hasher.update(b);
+            }
+            None => {
+                hasher.update([0]);
+                hasher.update(0u64.to_be_bytes());
+            }
+        }
+    }
+
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ===========================================================================
 // Shared clause types
 // ===========================================================================
 
@@ -248,17 +527,7 @@ impl Config {
         // could be authored anywhere and its targets could point wherever the
         // external file says. Reject at load, before any command mutates.
         let stitch_dir = repo_root.join(".stitch");
-        match std::fs::symlink_metadata(&stitch_dir) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                return Err(ConfigError::Read(
-                    std::io::Error::other("refusing symlinked or non-directory state directory"),
-                    stitch_dir,
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ConfigError::Read(e, stitch_dir)),
-        }
+        validate_stitch_dir(&stitch_dir)?;
 
         // Item 5: a v0.2-only repo (legacy present, new format absent) is a
         // hard, actionable error. Do not parse the old file.
@@ -277,6 +546,7 @@ impl Config {
 
         // Authored half: missing file = empty authored. Distinguish NotFound
         // from other I/O errors (e.g. permission denied on .stitch dir).
+        validate_authored_file(&stitch_path)?;
         let authored = match std::fs::read_to_string(&stitch_path) {
             Ok(contents) => toml::from_str::<AuthoredConfig>(&contents)
                 .map_err(|e| ConfigError::Parse(e, stitch_path.clone()))?,
@@ -289,6 +559,7 @@ impl Config {
 
         // Generated half: missing file = empty state. Must not treat
         // unreadable .stitch as absent (e.g. chmod 000).
+        validate_state_file(&state_path)?;
         let generated = match std::fs::read_to_string(&state_path) {
             Ok(raw) => {
                 // Strip the known tool-owned header before parsing (it is not part
@@ -367,7 +638,7 @@ impl Config {
     /// Normalize safe path fragments in the merged, in-memory view. This
     /// keeps the on-disk files untouched: in particular, authored ignore rules
     /// retain their comments and formatting while apply sees canonical paths.
-    fn normalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         for store in self.stores.values_mut() {
             normalize_fragment_lists(&mut store.files, &mut store.patterns);
             normalize_ignores(&mut store.ignore);
@@ -392,7 +663,7 @@ pub fn validate_merged(
 }
 
 impl AuthoredConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         validate_store_names(self.stores.keys(), "authored config")
     }
 }
@@ -478,6 +749,60 @@ impl GeneratedState {
         }
         Ok(())
     }
+}
+
+/// Reject a `.stitch/` directory that exists but is a symlink or otherwise
+/// non-directory. Missing directories are legal (empty state).
+///
+/// This guards every reader of `.stitch/state.toml`: if the parent is a
+/// symlink, the state file resolves outside the repo and must not be trusted.
+pub(crate) fn validate_stitch_dir(path: &Path) -> Result<(), ConfigError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(ConfigError::Read(
+            std::io::Error::other("refusing symlinked or non-directory state directory"),
+            path.to_path_buf(),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ConfigError::Read(e, path.to_path_buf())),
+    }
+}
+
+fn validate_regular_file(path: &Path, kind: &str) -> Result<(), ConfigError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => Err(ConfigError::Read(
+            std::io::Error::other(format!("refusing symlinked or non-regular {kind} file")),
+            path.to_path_buf(),
+        )),
+        Ok(meta) if meta.nlink() > 1 => Err(ConfigError::Read(
+            std::io::Error::other(format!(
+                "refusing hard-linked {kind} file (multiple paths to the same inode)"
+            )),
+            path.to_path_buf(),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ConfigError::Read(e, path.to_path_buf())),
+    }
+}
+
+/// Reject a `state.toml` that exists but is a symlink or otherwise
+/// non-regular. Missing files are legal (empty state).
+///
+/// State is the tool's authoritative inventory; we must never read bytes from
+/// a path that could be authored outside the repo.
+pub(crate) fn validate_state_file(path: &Path) -> Result<(), ConfigError> {
+    validate_regular_file(path, "state")
+}
+
+/// Reject a `stitch.toml` that exists but is a symlink or otherwise
+/// non-regular, or hard-linked to another path. Missing files are legal (empty
+/// authored config).
+///
+/// Authored config is human-written; we must never read bytes from a path that
+/// could be authored outside the repo and influence hook or store behavior.
+pub(crate) fn validate_authored_file(path: &Path) -> Result<(), ConfigError> {
+    validate_regular_file(path, "authored config")
 }
 
 /// Validate an existing atomic-write destination without mutating it.
@@ -650,13 +975,14 @@ impl StateLock {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&lock_path)
                 .map_err(|e| ConfigError::Write(e, lock_path.clone()))?,
             Err(e) => return Err(ConfigError::Write(e, lock_path)),
         };
-        // `create_new` never follows a symlink, but an existing entry must be
-        // checked explicitly (a re-created symlink in the gap would have been
-        // followed by the plain open above).
+        // `create_new` never follows a symlink, and the existing-path open now
+        // refuses symlinks too (`O_NOFOLLOW`). The metadata check below is
+        // defense-in-depth for a symlink installed after the open wins a race.
         if std::fs::symlink_metadata(&lock_path)
             .map(|meta| meta.file_type().is_symlink())
             .unwrap_or(false)
@@ -691,7 +1017,10 @@ impl Drop for StateLock {
 
 /// Merge authored + generated halves into the read-only view, returning any
 /// non-fatal warnings (authored-only targets — behavior declared, no link).
-fn merge(authored: &AuthoredConfig, generated: &GeneratedState) -> (Config, Vec<String>) {
+pub(crate) fn merge(
+    authored: &AuthoredConfig,
+    generated: &GeneratedState,
+) -> (Config, Vec<String>) {
     let mut warnings = Vec::new();
     let mut stores = BTreeMap::new();
 
@@ -1372,6 +1701,7 @@ impl ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     // --- unchanged helpers ---
 
@@ -1705,6 +2035,117 @@ mod tests {
             loaded.warnings.iter().any(|w| w.contains("stale v0.2")),
             "expected stale-config warning, got {:?}",
             loaded.warnings
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_symlinked_state_file() {
+        // A symlinked state.toml would let an external file author the link
+        // inventory. Load must refuse it before any command acts on its contents.
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        std::fs::create_dir_all(&stitch_dir).unwrap();
+        std::fs::write(tmp.path().join("stitch.toml"), "").unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        let external_state = external.path().join("state.toml");
+        std::fs::write(
+            &external_state,
+            "[stores.app]\ntarget = \"~/.config/app\"\nfiles = [\"f\"]\n",
+        )
+        .unwrap();
+
+        let state = stitch_dir.join("state.toml");
+        std::os::unix::fs::symlink(&external_state, &state).unwrap();
+
+        let err = Config::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing symlinked or non-regular state file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_hard_linked_state_file() {
+        // A hard-linked state.toml also lets an external file author the link
+        // inventory (multiple paths to the same inode). Load must refuse it.
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        std::fs::create_dir_all(&stitch_dir).unwrap();
+        std::fs::write(tmp.path().join("stitch.toml"), "").unwrap();
+
+        let external_state = tmp.path().join("external-state.toml");
+        std::fs::write(
+            &external_state,
+            "[stores.app]\ntarget = \"~/.config/app\"\nfiles = [\"f\"]\n",
+        )
+        .unwrap();
+
+        let state = stitch_dir.join("state.toml");
+        std::fs::hard_link(&external_state, &state).unwrap();
+
+        let err = Config::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing hard-linked state file (multiple paths to the same inode)"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_symlinked_stitch_toml() {
+        // A symlinked stitch.toml would let an external file author hooks and
+        // store behavior. Load must refuse it before any command acts on it.
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        std::fs::create_dir_all(&stitch_dir).unwrap();
+        std::fs::write(stitch_dir.join("state.toml"), "").unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        let external_authored = external.path().join("stitch.toml");
+        std::fs::write(
+            &external_authored,
+            "[stores.app]\nhooks = { pre = 'touch /tmp/pwned' }\n",
+        )
+        .unwrap();
+
+        let authored = tmp.path().join("stitch.toml");
+        std::os::unix::fs::symlink(&external_authored, &authored).unwrap();
+
+        let err = Config::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing symlinked or non-regular authored config file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_hard_linked_stitch_toml() {
+        // A hard-linked stitch.toml also lets an external file author behavior
+        // (multiple paths to the same inode). Load must refuse it.
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        std::fs::create_dir_all(&stitch_dir).unwrap();
+        std::fs::write(stitch_dir.join("state.toml"), "").unwrap();
+
+        let external_authored = tmp.path().join("external-stitch.toml");
+        std::fs::write(
+            &external_authored,
+            "[stores.app]\nhooks = { pre = 'touch /tmp/pwned' }\n",
+        )
+        .unwrap();
+
+        let authored = tmp.path().join("stitch.toml");
+        std::fs::hard_link(&external_authored, &authored).unwrap();
+
+        let err = Config::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "refusing hard-linked authored config file (multiple paths to the same inode)"
+            ),
+            "got: {err}"
         );
     }
 
@@ -2102,5 +2543,85 @@ patterns = ["./work*//"]
             },
         );
         config
+    }
+
+    // --- ConfigSnapshot / hash_config_bytes tests ---
+
+    #[test]
+    fn hash_config_bytes_distinguishes_missing_from_empty() {
+        // Both missing.
+        let both_missing = hash_config_bytes(None, None);
+        // Authored empty, state missing.
+        let authored_empty = hash_config_bytes(Some(b""), None);
+        // Authored missing, state empty.
+        let state_empty = hash_config_bytes(None, Some(b""));
+        // Both empty.
+        let both_empty = hash_config_bytes(Some(b""), Some(b""));
+
+        assert_ne!(both_missing, authored_empty, "missing vs empty authored");
+        assert_ne!(both_missing, state_empty, "missing vs empty state");
+        assert_ne!(both_missing, both_empty, "both missing vs both empty");
+        assert_ne!(authored_empty, state_empty, "empty authored vs empty state");
+        assert_ne!(authored_empty, both_empty, "one empty vs both empty");
+        assert_ne!(state_empty, both_empty, "one empty vs both empty");
+    }
+
+    #[test]
+    fn hash_config_bytes_is_deterministic() {
+        let h1 = hash_config_bytes(Some(b"[stores.app]\n"), Some(b"[stores.app]\n"));
+        let h2 = hash_config_bytes(Some(b"[stores.app]\n"), Some(b"[stores.app]\n"));
+        assert_eq!(h1, h2, "same bytes must produce same hash");
+    }
+
+    #[test]
+    fn hash_config_bytes_distinguishes_content() {
+        let h1 = hash_config_bytes(Some(b"[stores.a]\n"), None);
+        let h2 = hash_config_bytes(Some(b"[stores.b]\n"), None);
+        assert_ne!(h1, h2, "different content must produce different hashes");
+    }
+
+    #[test]
+    fn config_snapshot_load_captures_and_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let stitch = root.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(root.join("stitch.toml"), "").unwrap();
+        fs::write(stitch.join("state.toml"), "").unwrap();
+        fs::write(root.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let snap = ConfigSnapshot::load(&root).expect("load");
+        let hash = snap.hash().to_string();
+
+        // A fresh load with the same bytes must produce the same hash.
+        let snap2 = ConfigSnapshot::load(&root).expect("load 2");
+        assert_eq!(snap2.hash(), hash, "same bytes must produce same hash");
+    }
+
+    #[test]
+    fn config_snapshot_hash_changes_when_state_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let stitch = root.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(root.join("stitch.toml"), "").unwrap();
+        fs::write(stitch.join("state.toml"), "").unwrap();
+        fs::write(root.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let snap = ConfigSnapshot::load(&root).expect("load");
+        let hash_before = snap.hash().to_string();
+
+        fs::write(
+            stitch.join("state.toml"),
+            "[stores.app]\ntarget = \"~/.app\"\n",
+        )
+        .unwrap();
+
+        let snap2 = ConfigSnapshot::load(&root).expect("load 2");
+        assert_ne!(
+            snap2.hash(),
+            hash_before,
+            "hash must change when state changes"
+        );
     }
 }

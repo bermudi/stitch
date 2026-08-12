@@ -47,6 +47,242 @@ fn require_directory_identity(
     Ok(())
 }
 
+// ===========================================================================
+// Target-ancestor identity pinning across pre-apply and pre-store hooks.
+// A hook must not be able to introduce or repoint a symlinked ancestor that
+// a link operation would traverse, or silently replace a real directory with
+// a different one (bind mount / rename / copy) before that operation runs.
+// ===========================================================================
+
+/// The pre-hook identity of one filesystem entry that a link operation would
+/// traverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetAncestorEntry {
+    RealDir { dev: u64, ino: u64 },
+    Symlink { dev: u64, ino: u64, target: PathBuf },
+    Other { dev: u64, ino: u64 },
+}
+
+fn target_ancestor_entry(path: &Path) -> Result<Option<TargetAncestorEntry>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(format!(
+                "could not inspect target ancestor {}: {e}",
+                path.display()
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|e| {
+            format!(
+                "could not read target ancestor symlink {}: {e}",
+                path.display()
+            )
+        })?;
+        return Ok(Some(TargetAncestorEntry::Symlink {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            target,
+        }));
+    }
+    if meta.is_dir() {
+        return Ok(Some(TargetAncestorEntry::RealDir {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }));
+    }
+    Ok(Some(TargetAncestorEntry::Other {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }))
+}
+
+/// A concrete redirect detected by [`TargetAncestorSnapshot::revalidate`].
+#[derive(Debug, Clone)]
+pub(crate) enum TargetAncestorRedirect {
+    /// The path is a symlink (pre-existing or created by the hook) and a link
+    /// operation would have to traverse it.
+    Symlinked {
+        path: PathBuf,
+        resolves_to: Option<PathBuf>,
+    },
+    /// The path was a real directory and is now a different real directory, or
+    /// a to-be-removed ancestor was replaced by something other than the same
+    /// entry or absence.
+    Redirected {
+        path: PathBuf,
+        resolves_to: Option<PathBuf>,
+    },
+    /// The path was a real directory and no longer exists.
+    Removed { path: PathBuf },
+}
+
+impl std::fmt::Display for TargetAncestorRedirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Symlinked { path, resolves_to } => {
+                write!(
+                    f,
+                    "target ancestor {} is a symlinked redirect",
+                    path.display()
+                )?;
+                if let Some(target) = resolves_to {
+                    write!(f, " -> {}", target.display())?;
+                }
+                Ok(())
+            }
+            Self::Redirected { path, resolves_to } => {
+                write!(f, "target ancestor {} was redirected", path.display())?;
+                if let Some(target) = resolves_to {
+                    write!(f, " -> {}", target.display())?;
+                }
+                Ok(())
+            }
+            Self::Removed { path } => {
+                write!(f, "target ancestor {} was removed", path.display())
+            }
+        }
+    }
+}
+
+/// Snapshot of the filesystem identity of target ancestor directories.
+///
+/// The capture is taken before a hook; [`TargetAncestorSnapshot::revalidate`]
+/// is called after the hook and before any link creation through those
+/// ancestors.
+#[derive(Debug, Clone)]
+pub(crate) struct TargetAncestorSnapshot {
+    removed: BTreeSet<PathBuf>,
+    identities: BTreeMap<PathBuf, Option<TargetAncestorEntry>>,
+}
+
+impl TargetAncestorSnapshot {
+    /// Capture the pre-hook identity of every target ancestor from the target's
+    /// parent up to and including `$HOME`. Ancestors above `$HOME` are not pinned.
+    pub fn capture<I: IntoIterator<Item = PathBuf>>(
+        _repo_root: &Path,
+        targets: I,
+        removed_ancestors: &BTreeSet<PathBuf>,
+        home: &Path,
+    ) -> Result<Self, TargetAncestorRedirect> {
+        let mut identities = BTreeMap::new();
+        for target in targets {
+            for ancestor in target.ancestors().skip(1) {
+                if !ancestor.starts_with(home) {
+                    break;
+                }
+                let path = ancestor.to_path_buf();
+                if identities.contains_key(&path) {
+                    continue;
+                }
+                match target_ancestor_entry(ancestor) {
+                    Ok(id) => {
+                        identities.insert(path, id);
+                    }
+                    Err(_) => {
+                        return Err(TargetAncestorRedirect::Redirected {
+                            path,
+                            resolves_to: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            removed: removed_ancestors.clone(),
+            identities,
+        })
+    }
+
+    /// Revalidate every captured ancestor after a hook.
+    ///
+    /// Allowed transitions:
+    /// - a real directory stays the same real directory;
+    /// - an absent ancestor stays absent or becomes a real directory
+    ///   (a hook may `mkdir -p` a missing parent);
+    /// - a removed ancestor (e.g., a whole-directory promotion root) stays the
+    ///   same symlink or becomes absent; anything else is a redirect.
+    pub fn revalidate(&self) -> Result<(), TargetAncestorRedirect> {
+        for (path, expected) in &self.identities {
+            let actual =
+                target_ancestor_entry(path).map_err(|_| TargetAncestorRedirect::Redirected {
+                    path: path.clone(),
+                    resolves_to: None,
+                })?;
+            match (expected, actual) {
+                (Some(expected_id), Some(actual_id)) if *expected_id == actual_id => {}
+                (None, None) => {}
+                (None, Some(TargetAncestorEntry::RealDir { .. })) => {
+                    // Previously absent: a hook may have `mkdir -p`d a real
+                    // directory. This is the benign case.
+                }
+                (Some(TargetAncestorEntry::Symlink { .. }), None)
+                    if self.removed.contains(path) =>
+                {
+                    // A removed ancestor (e.g., whole-dir promotion root) may
+                    // already be gone; the operation will create the
+                    // replacement itself.
+                }
+                (None, Some(TargetAncestorEntry::Symlink { target, .. })) => {
+                    return Err(TargetAncestorRedirect::Symlinked {
+                        path: path.clone(),
+                        resolves_to: Some(target),
+                    });
+                }
+                (None, Some(TargetAncestorEntry::Other { .. })) => {
+                    return Err(TargetAncestorRedirect::Redirected {
+                        path: path.clone(),
+                        resolves_to: None,
+                    });
+                }
+                (Some(_), None) => {
+                    return Err(TargetAncestorRedirect::Removed { path: path.clone() });
+                }
+                (Some(_), Some(TargetAncestorEntry::Symlink { target, .. })) => {
+                    return Err(TargetAncestorRedirect::Symlinked {
+                        path: path.clone(),
+                        resolves_to: Some(target),
+                    });
+                }
+                (Some(_), Some(TargetAncestorEntry::RealDir { .. }))
+                | (Some(_), Some(TargetAncestorEntry::Other { .. })) => {
+                    return Err(TargetAncestorRedirect::Redirected {
+                        path: path.clone(),
+                        resolves_to: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn redirect_to_plan_message(repo_root: &Path, redirect: &TargetAncestorRedirect) -> String {
+    match redirect {
+        TargetAncestorRedirect::Symlinked { path, .. } => symlink_ancestor_error(repo_root, path),
+        TargetAncestorRedirect::Redirected {
+            path,
+            resolves_to: Some(_),
+        } => symlink_ancestor_error(repo_root, path),
+        TargetAncestorRedirect::Removed { path } => {
+            format!("target ancestor {} was removed by the hook", path.display())
+        }
+        TargetAncestorRedirect::Redirected {
+            path,
+            resolves_to: None,
+        } => {
+            format!(
+                "target ancestor {} changed identity during the hook",
+                path.display()
+            )
+        }
+    }
+}
+
 /// True if `p` contains any `..` path component.
 fn has_parent_dir(p: &Path) -> bool {
     p.components().any(|c| c == Component::ParentDir)
@@ -362,6 +598,25 @@ fn link_target(op: &PlanFileOp) -> Option<&str> {
         | PlanFileOp::RemoveLink { target, .. } => Some(target),
         PlanFileOp::StageRender { .. } | PlanFileOp::RemoveStaged { .. } => None,
     }
+}
+
+/// Collect the link targets and the set of ancestor paths that will be
+/// explicitly removed before child links are created (whole-directory →
+/// file-mode promotion roots).
+fn plan_link_targets(ops: &[PlanFileOp]) -> (Vec<PathBuf>, BTreeSet<PathBuf>) {
+    let mut removed = BTreeSet::new();
+    for op in ops {
+        if let PlanFileOp::RemoveLink { target, .. } = op {
+            removed.insert(PathBuf::from(target));
+        }
+    }
+    let mut targets = Vec::new();
+    for op in ops {
+        if let Some(target) = link_target(op) {
+            targets.push(PathBuf::from(target));
+        }
+    }
+    (targets, removed)
 }
 
 fn conflict_kind(resolves_to: &Option<String>) -> String {
@@ -697,42 +952,33 @@ fn target_state_from(target: &str, value: &Option<String>) -> Result<TargetState
 }
 
 pub fn compute_config_hash(repo_root: &Path) -> Result<String, StitchError> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"stitch/config-hash/v2\0");
+    let stitch_dir = repo_root.join(".stitch");
+    let state_path = stitch_dir.join("state.toml");
+    let authored_path = repo_root.join("stitch.toml");
+    config::validate_stitch_dir(&stitch_dir)?;
+    config::validate_state_file(&state_path)?;
+    config::validate_authored_file(&authored_path)?;
 
-    let files = [
-        ("stitch.toml", repo_root.join("stitch.toml")),
-        (
-            ".stitch/state.toml",
-            repo_root.join(".stitch").join("state.toml"),
-        ),
-    ];
-    for (label, path) in files {
-        // The label and presence marker domain-separate the two config
-        // components and distinguish a missing file from an existing empty
-        // file. The length also prevents concatenation-boundary collisions.
-        hasher.update(label.as_bytes());
-        hasher.update([0]);
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                hasher.update([1]);
-                hasher.update((bytes.len() as u64).to_be_bytes());
-                hasher.update(bytes);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                hasher.update([0]);
-                hasher.update(0u64.to_be_bytes());
-            }
-            Err(e) => {
-                return Err(StitchError::io_context(
-                    format!("computing config hash: reading {}", path.display()),
-                    e,
-                ));
-            }
-        }
+    let authored = read_bytes_or_none(&authored_path)?;
+    let state = read_bytes_or_none(&state_path)?;
+    Ok(config::hash_config_bytes(
+        authored.as_deref(),
+        state.as_deref(),
+    ))
+}
+
+/// Read file bytes, returning `None` for `NotFound` and `Some(bytes)` for a
+/// present file (including an empty one). Mirrors [`config::hash_config_bytes`]
+/// semantics: missing and empty are distinct.
+fn read_bytes_or_none(path: &Path) -> Result<Option<Vec<u8>>, StitchError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StitchError::io_context(
+            format!("computing config hash: reading {}", path.display()),
+            e,
+        )),
     }
-
-    Ok(sha256_hex_bytes(&hasher.finalize()))
 }
 
 fn sha256_hex(content: &str) -> String {
@@ -1102,11 +1348,39 @@ impl<'a> PreflightState<'a> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PAUSE_AFTER_GLOBAL_HASH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only seam: deterministically simulate a config change between the
+/// global hash check and the per-store pre-hook. This is a thread-local
+/// callback so unit tests can reproduce the TOCTOU without a flaky race.
+#[cfg(test)]
+pub fn set_test_pause_after_global_hash(f: Option<Box<dyn FnOnce()>>) {
+    TEST_PAUSE_AFTER_GLOBAL_HASH.with(|p| *p.borrow_mut() = f);
+}
+
+#[cfg(test)]
+fn test_pause_after_global_hash() {
+    TEST_PAUSE_AFTER_GLOBAL_HASH.with(|p| {
+        if let Some(f) = p.borrow_mut().take() {
+            f();
+        }
+    });
+}
+
 /// Execute a plan file. With `dry_run: true` this is a preflight: every
 /// precondition and fingerprint is validated and no filesystem mutation occurs.
+///
+/// The config snapshot that drives every mutation is reloaded under the
+/// per-store state lock and bound to the pinned config hash. The `loaded`
+/// argument is kept for caller convenience but is not used for execution; it
+/// may be stale by the time the lock is acquired.
 pub fn execute_plan(
     repo_root: &Path,
-    loaded: &Loaded,
+    _loaded: &Loaded,
     plan: &PlanFile,
     dry_run: bool,
     force: bool,
@@ -1171,16 +1445,39 @@ pub fn execute_plan(
         ));
     }
 
-    // Untrusted-input validation: every op must be justified by the pinned
-    // config. Recompute cleanup candidates as well: a hand-edited plan must
-    // never turn a still-desired link or render into a removal authorization.
-    let validation_context = ValidationContext::new(repo_root, &loaded.config);
-    let current_removals = current_removals(repo_root, loaded, &platform, force).map_err(|e| {
-        PlanExecError::new(
-            base_report(plan),
-            StitchError::plan_stale(format!("could not resolve current plan: {e}")),
-        )
-    })?;
+    let mut report = base_report(plan);
+    let mut remaining: BTreeSet<usize> = (0..plan.ops.len()).collect();
+
+    // Load the authoritative snapshot under the state lock, verify its hash,
+    // and perform all untrusted-input validation against it. The snapshot
+    // authorizes link removals and staged-render cleanups, so validation must
+    // run before the plan is grouped or executed.
+    let initial_state_lock = match config::StateLock::exclusive_if_present(repo_root) {
+        Ok(lock) => lock,
+        Err(e) => {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(report, StitchError::from(e)));
+        }
+    };
+    let initial_loaded = Config::load(repo_root)
+        .map_err(|e| PlanExecError::new(report.clone(), StitchError::from(e)))?;
+    let initial_hash =
+        compute_config_hash(repo_root).map_err(|e| PlanExecError::new(report.clone(), e))?;
+    if initial_hash != plan.config_sha256 {
+        return Err(PlanExecError::new(
+            report,
+            StitchError::plan_stale("config hash mismatch — re-run `stitch plan`"),
+        ));
+    }
+
+    let validation_context = ValidationContext::new(repo_root, &initial_loaded.config);
+    let current_removals =
+        current_removals(repo_root, &initial_loaded, &platform, force).map_err(|e| {
+            PlanExecError::new(
+                report.clone(),
+                StitchError::plan_stale(format!("could not resolve current plan: {e}")),
+            )
+        })?;
     let mut rendered: BTreeMap<(String, String), RenderPin> = BTreeMap::new();
     for (idx, op) in plan.ops.iter().enumerate() {
         validate_op(
@@ -1192,21 +1489,16 @@ pub fn execute_plan(
         )
         .map_err(|e| {
             PlanExecError::new(
-                base_report(plan),
+                report.clone(),
                 StitchError::plan_stale(format!("plan validation failed: {e}")),
             )
         })?;
     }
 
-    // Build the store-grouped execution sequence first. The executor runs each
-    // selected store's ops in `selected_stores` order (see the loop below); the
-    // preflight must simulate that exact order so cross-store ordering and path
-    // interactions are checked before any filesystem mutation.
-    let mut report = base_report(plan);
-    let mut remaining: BTreeSet<usize> = (0..plan.ops.len()).collect();
-
     // Group ops by store, preserving each store's plan order while retaining
-    // the original operation indices for accurate remainder reporting.
+    // the original operation indices for accurate remainder reporting. By now
+    // every op has passed structural validation, so grouping only fails when
+    // a hand-edited store list is inconsistent.
     let mut ops_by_store: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, op) in plan.ops.iter().enumerate() {
         let Some(op_store) = op.op_store(repo_root) else {
@@ -1232,16 +1524,6 @@ pub fn execute_plan(
         ));
     }
 
-    for store_name in &selected_stores {
-        if !loaded.config.stores.contains_key(store_name) {
-            sync_ops_remaining(&mut report, plan, &remaining);
-            return Err(PlanExecError::new(
-                report,
-                StitchError::plan_stale(format!("selected store '{store_name}' not in config")),
-            ));
-        }
-    }
-
     // A captured plan must not silently drop an operation because its store
     // was omitted, or because the store is no longer active on this platform.
     // Keep those operations in `remaining` and reject the plan before hooks or
@@ -1257,9 +1539,14 @@ pub fn execute_plan(
             }));
         }
     }
+    // Defense-in-depth: `validate_op` already rejects any op for a
+    // platform-skipped store (`compute_plan` emits no such ops, so
+    // `current_removals` will not contain it). This scan is a second line of
+    // defense; if `validate_op` is ever relaxed, it preserves the "abort before
+    // side effects" guarantee for platform-skipped stores.
     for store_name in &selected_stores {
-        let store = &loaded.config.stores[store_name];
-        if !platform.matches_when(&store.when)
+        if let Some(store) = initial_loaded.config.stores.get(store_name)
+            && !platform.matches_when(&store.when)
             && let Some(indices) = ops_by_store.get(store_name)
         {
             skipped_ops.extend(indices.iter().map(|&idx| {
@@ -1289,21 +1576,23 @@ pub fn execute_plan(
         }
     }
 
-    // Preflight the execution sequence against a simulated filesystem state.
+    // Preflight the execution sequence against the same locked-and-verified
+    // snapshot so cross-store ordering and path interactions are checked before
+    // any filesystem mutation.
     let mut state = PreflightState::new(repo_root, &platform);
     for &idx in &exec_order {
         let op = &plan.ops[idx];
-        state.apply_op(loaded, op).map_err(|e| {
+        state.apply_op(&initial_loaded, op).map_err(|e| {
             PlanExecError::new(
-                base_report(plan),
+                report.clone(),
                 StitchError::plan_stale(format!("preflight failed for op {idx}: {e}")),
             )
         })?;
     }
 
     // A plan that captured conflicts or errors is not executable. Reject it
-    // after all structural preflight but before any hook can create side
-    // effects or a safe-looking prefix can mutate the filesystem.
+    // before any hook can create side effects or a safe-looking prefix can
+    // mutate the filesystem.
     if !plan.conflicts.is_empty() || !plan.errors.is_empty() {
         sync_ops_remaining(&mut report, plan, &remaining);
         return Err(PlanExecError::new(report, plan_exec_error(plan)));
@@ -1312,6 +1601,28 @@ pub fn execute_plan(
         sync_ops_remaining(&mut report, plan, &remaining);
         return Ok(report);
     }
+
+    drop(initial_state_lock);
+
+    // Pin every target ancestor's identity across the global pre-apply hook.
+    // A hook that replaces `~/.config` with a symlink (or a different real
+    // directory) must be caught before any store runs.
+    let home =
+        config::expand_home("~").map_err(|e| PlanExecError::new(report.clone(), e.into()))?;
+    let (global_targets, global_removed) = plan_link_targets(&plan.ops);
+    let global_ancestors =
+        TargetAncestorSnapshot::capture(repo_root, global_targets, &global_removed, &home)
+            .map_err(|e| {
+                PlanExecError::new(
+                    report.clone(),
+                    StitchError::plan_stale(redirect_to_plan_message(repo_root, &e)),
+                )
+            })?;
+
+    // Pin $HOME identity (including the resolved directory behind a symlinked
+    // $HOME) across the global pre-apply hook.
+    let home_identity = crate::safety::HomeIdentity::capture()
+        .map_err(|e| PlanExecError::new(report.clone(), StitchError::plan_stale(e.to_string())))?;
 
     // Global pre-apply hook (side effect, only on real execution). Pin the
     // repository identity across it so a hook cannot redirect every source by
@@ -1329,6 +1640,20 @@ pub fn execute_plan(
         return Err(PlanExecError::new(
             report,
             StitchError::hook("pre-apply", e),
+        ));
+    }
+    if let Err(e) = global_ancestors.revalidate() {
+        sync_ops_remaining(&mut report, plan, &remaining);
+        return Err(PlanExecError::new(
+            report,
+            StitchError::plan_stale(redirect_to_plan_message(repo_root, &e)),
+        ));
+    }
+    if let Err(e) = home_identity.revalidate() {
+        sync_ops_remaining(&mut report, plan, &remaining);
+        return Err(PlanExecError::new(
+            report,
+            StitchError::plan_stale(e.to_string()),
         ));
     }
     if let Err(e) = require_directory_identity(
@@ -1349,6 +1674,11 @@ pub fn execute_plan(
         ));
     }
 
+    // Test-only hook: simulate a concurrent same-UID config change in the
+    // window between the global hash check and the per-store Config::load.
+    #[cfg(test)]
+    test_pause_after_global_hash();
+
     for store_name in &selected_stores {
         if let Err(e) = require_directory_identity(
             repo_root,
@@ -1358,9 +1688,27 @@ pub fn execute_plan(
             sync_ops_remaining(&mut report, plan, &remaining);
             return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
         }
-        let store = &loaded.config.stores[store_name];
-        if !platform.matches_when(&store.when) {
-            continue;
+
+        // Load the snapshot as it exists immediately before the store's pre-hook.
+        // The pre-hook may mutate state, so this is advisory; the authoritative
+        // snapshot for execution is reloaded under the state lock below. Before
+        // using this snapshot to resolve the pre-hook, verify it matches the
+        // plan's pinned hash so a concurrent change cannot install a different
+        // hook between the global hash check and this store's pre-hook.
+        let pre_hook_loaded = Config::load(repo_root).map_err(|e| {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            PlanExecError::new(report.clone(), StitchError::from(e))
+        })?;
+        let pre_hook_hash =
+            compute_config_hash(repo_root).map_err(|e| PlanExecError::new(report.clone(), e))?;
+        if pre_hook_hash != plan.config_sha256 {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(format!(
+                    "config changed before pre-hook for store '{store_name}'"
+                )),
+            ));
         }
 
         let store_dir = repo_root.join(store_name);
@@ -1383,9 +1731,53 @@ pub fn execute_plan(
                 return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
             }
         };
-        if let Err(e) = run_store_pre_hook(repo_root, store_name, &loaded.config, &platform) {
+
+        // Pin the target ancestors for this store across its pre-hook, with
+        // the same identity semantics as the global pre-apply hook.
+        let store_ops: Vec<PlanFileOp> = ops_by_store
+            .get(store_name)
+            .iter()
+            .flat_map(|indices| indices.iter().map(|&i| plan.ops[i].clone()))
+            .collect();
+        let (store_targets, store_removed) = plan_link_targets(&store_ops);
+        let store_ancestors =
+            TargetAncestorSnapshot::capture(repo_root, store_targets, &store_removed, &home)
+                .map_err(|e| {
+                    PlanExecError::new(
+                        report.clone(),
+                        StitchError::plan_stale(redirect_to_plan_message(repo_root, &e)),
+                    )
+                })?;
+
+        // Revalidate $HOME identity across the per-store pre-hook, using the
+        // command-level identity captured before the store loop.
+        if let Err(e) = home_identity.revalidate() {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(e.to_string()),
+            ));
+        }
+
+        if let Err(e) =
+            run_store_pre_hook(repo_root, store_name, &pre_hook_loaded.config, &platform)
+        {
             sync_ops_remaining(&mut report, plan, &remaining);
             return Err(PlanExecError::new(report, e));
+        }
+        if let Err(e) = store_ancestors.revalidate() {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(redirect_to_plan_message(repo_root, &e)),
+            ));
+        }
+        if let Err(e) = home_identity.revalidate() {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(e.to_string()),
+            ));
         }
         if let Err(e) = require_directory_identity(
             &store_dir,
@@ -1415,24 +1807,6 @@ pub fn execute_plan(
             ));
         }
 
-        // Re-simulate this store's complete remaining sequence after its hook.
-        // Dependent operations such as whole-dir promotion must fail before
-        // the root unlink if the hook invalidated a later child source.
-        if let Some(indices) = ops_by_store.get(store_name) {
-            let mut hook_state = PreflightState::new(repo_root, &platform);
-            for &idx in indices {
-                if let Err(error) = hook_state.apply_op(loaded, &plan.ops[idx]) {
-                    sync_ops_remaining(&mut report, plan, &remaining);
-                    return Err(PlanExecError::new(
-                        report,
-                        StitchError::plan_stale(format!(
-                            "post-hook preflight failed for op {idx}: {error}"
-                        )),
-                    ));
-                }
-            }
-        }
-
         // Serialize this store's mutations with other mutating commands: the
         // plan's pinned config hash was verified above, but a concurrent
         // add/remove/migrate could still interleave between that check and the
@@ -1449,6 +1823,10 @@ pub fn execute_plan(
                 ));
             }
         };
+        let locked_loaded = Config::load(repo_root).map_err(|e| {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            PlanExecError::new(report.clone(), StitchError::from(e))
+        })?;
         let locked_hash =
             compute_config_hash(repo_root).map_err(|e| PlanExecError::new(report.clone(), e))?;
         if locked_hash != plan.config_sha256 {
@@ -1461,12 +1839,30 @@ pub fn execute_plan(
             ));
         }
 
+        // Re-simulate this store's complete remaining sequence after its hook.
+        // Dependent operations such as whole-dir promotion must fail before
+        // the root unlink if the hook invalidated a later child source. The
+        // simulation uses the locked-and-verified snapshot so a pre-hook or
+        // concurrent change cannot authorize a stale operation.
         if let Some(indices) = ops_by_store.get(store_name) {
+            let mut hook_state = PreflightState::new(repo_root, &platform);
+            for &idx in indices {
+                if let Err(error) = hook_state.apply_op(&locked_loaded, &plan.ops[idx]) {
+                    sync_ops_remaining(&mut report, plan, &remaining);
+                    return Err(PlanExecError::new(
+                        report,
+                        StitchError::plan_stale(format!(
+                            "post-hook preflight failed for op {idx}: {error}"
+                        )),
+                    ));
+                }
+            }
+
             for &idx in indices {
                 let op = &plan.ops[idx];
 
                 // Re-check the precondition immediately before acting.
-                if let Err(e) = preflight_op(repo_root, loaded, &platform, op) {
+                if let Err(e) = preflight_op(repo_root, &locked_loaded, &platform, op) {
                     sync_ops_remaining(&mut report, plan, &remaining);
                     return Err(PlanExecError::new(
                         report,
@@ -1477,7 +1873,7 @@ pub fn execute_plan(
                     ));
                 }
 
-                match execute_op(repo_root, loaded, &platform, op, idx, &mut report) {
+                match execute_op(repo_root, &locked_loaded, &platform, op, idx, &mut report) {
                     Ok(()) => {
                         report.ops_executed.push(op_description(op));
                         remaining.remove(&idx);
@@ -1498,9 +1894,20 @@ pub fn execute_plan(
         }
         drop(_state_lock);
 
-        if let Some(warning) = run_store_post_hook(repo_root, store_name, &loaded.config, &platform)
+        if let Some(warning) =
+            run_store_post_hook(repo_root, store_name, &locked_loaded.config, &platform)
         {
             report.warnings.push(warning);
+        }
+        // Revalidate $HOME identity after the post-hook, using the
+        // command-level identity. A post-hook that replaces the directory
+        // behind a symlinked $HOME must be caught before the next store.
+        if let Err(e) = home_identity.revalidate() {
+            sync_ops_remaining(&mut report, plan, &remaining);
+            return Err(PlanExecError::new(
+                report,
+                StitchError::plan_stale(e.to_string()),
+            ));
         }
         if let Err(error) = require_directory_identity(
             repo_root,
@@ -2621,6 +3028,7 @@ fn validate_backup_path(idx: usize, target: &str, backup: &str) -> Result<(), St
 mod tests {
     use super::*;
     use crate::store::ApplyOpts;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -2636,6 +3044,127 @@ mod tests {
         let empty = compute_config_hash(tmp.path()).unwrap();
 
         assert_ne!(missing, empty);
+    }
+
+    #[test]
+    fn config_hash_rejects_symlinked_state_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::write(tmp.path().join("stitch.toml"), "").unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        let external_state = external.path().join("state.toml");
+        fs::write(&external_state, "[stores.app]\ntarget = \"~\"\n").unwrap();
+
+        let state = stitch_dir.join("state.toml");
+        symlink(external_state, &state).unwrap();
+
+        let err = compute_config_hash(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing symlinked or non-regular state file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_hash_rejects_hard_linked_state_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::write(tmp.path().join("stitch.toml"), "").unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        let external_state = external.path().join("state.toml");
+        fs::write(&external_state, "[stores.app]\ntarget = \"~\"\n").unwrap();
+
+        let state = stitch_dir.join("state.toml");
+        fs::hard_link(&external_state, &state).unwrap();
+
+        let err = compute_config_hash(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing hard-linked state file (multiple paths to the same inode)"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_hash_rejects_symlinked_stitch_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::write(stitch_dir.join("state.toml"), "").unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        let external_authored = external.path().join("stitch.toml");
+        fs::write(
+            &external_authored,
+            "[stores.app]\nhooks = { pre = 'touch /tmp/pwned' }\n",
+        )
+        .unwrap();
+
+        let authored = tmp.path().join("stitch.toml");
+        symlink(external_authored, &authored).unwrap();
+
+        let err = compute_config_hash(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing symlinked or non-regular authored config file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_hash_rejects_hard_linked_stitch_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stitch_dir = tmp.path().join(".stitch");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::write(stitch_dir.join("state.toml"), "").unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        let external_authored = external.path().join("stitch.toml");
+        fs::write(
+            &external_authored,
+            "[stores.app]\nhooks = { pre = 'touch /tmp/pwned' }\n",
+        )
+        .unwrap();
+
+        let authored = tmp.path().join("stitch.toml");
+        fs::hard_link(&external_authored, &authored).unwrap();
+
+        let err = compute_config_hash(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "refusing hard-linked authored config file (multiple paths to the same inode)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_hash_rejects_symlinked_stitch_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("stitch.toml"), "").unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        fs::create_dir_all(external.path().join(".stitch")).unwrap();
+        fs::write(
+            external.path().join(".stitch").join("state.toml"),
+            "[stores.app]\ntarget = \"~\"\n",
+        )
+        .unwrap();
+
+        let stitch = tmp.path().join(".stitch");
+        symlink(external.path().join(".stitch"), &stitch).unwrap();
+
+        let err = compute_config_hash(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing symlinked or non-directory state directory"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2691,5 +3220,328 @@ mod tests {
         execute_plan(&repo_alias, &loaded, &plan, false, false).unwrap();
         assert!(target.is_dir());
         assert!(target.join("profile").is_symlink());
+    }
+
+    #[test]
+    fn execute_plan_rejects_stale_loaded_and_does_not_create_orphan() {
+        // Capture a loaded config snapshot, then simulate a concurrent `remove`
+        // that empties `.stitch/state.toml`. A stale `Loaded` passed to
+        // execute_plan must not be used to authorize creation: the executor
+        // reloads the authoritative empty state under the state lock and rejects
+        // the now-unauthorized create_link before the filesystem is touched.
+        let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = config::test_home_guard(tmp.path().to_path_buf());
+        let repo_root = tmp.path().join("repo");
+        let stitch_dir = repo_root.join(".stitch");
+        let store_dir = repo_root.join("shells");
+        let target_dir = tmp.path().join("home").join(".shells");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(repo_root.join("stitch.toml"), "").unwrap();
+        fs::write(store_dir.join("profile"), "profile\n").unwrap();
+        fs::write(
+            stitch_dir.join("state.toml"),
+            format!(
+                "[stores.shells]\ntarget = \"{}\"\nfiles = [\"profile\"]\n",
+                target_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let stale_loaded = Config::load(&repo_root).unwrap();
+
+        // Concurrent `remove` empties the authoritative state without changing
+        // the source file, leaving a `Loaded` that still believes the store is
+        // desired.
+        fs::write(stitch_dir.join("state.toml"), "").unwrap();
+
+        let platform = Platform::detect();
+        let fingerprint = PlatformFingerprint::from(&platform);
+        let target = target_dir.join("profile");
+        let source = store_dir.join("profile");
+        let plan = PlanFile {
+            schema: PLAN_SCHEMA,
+            kind: PLAN_KIND.into(),
+            repo: path_to_string(
+                &repo_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| repo_root.clone()),
+            ),
+            config_sha256: compute_config_hash(&repo_root).unwrap(),
+            platform: fingerprint,
+            stores: vec!["shells".into()],
+            ops: vec![PlanFileOp::CreateLink {
+                target: path_to_string(&target),
+                source: path_to_string(&source),
+                requires: PlanFileRequires {
+                    target: "absent".into(),
+                    value: None,
+                    backup: None,
+                    backup_value: None,
+                },
+            }],
+            conflicts: vec![],
+            errors: vec![],
+        };
+
+        let result = execute_plan(&repo_root, &stale_loaded, &plan, false, false);
+        assert!(
+            result.is_err(),
+            "stale loaded must not authorize a create_link for a removed store: {result:?}"
+        );
+        assert!(
+            !target.is_symlink(),
+            "no orphan link may be created for a store no longer in state"
+        );
+        assert!(
+            !target.exists(),
+            "target must not be created by a rejected plan"
+        );
+    }
+
+    #[test]
+    fn execute_plan_rejects_config_change_before_per_store_pre_hook() {
+        // Simulate the TOCTOU: a same-UID process rewrites stitch.toml to
+        // install a malicious pre-hook after the global hash check has passed
+        // but before the per-store Config::load. The new pre-hook hash check
+        // must detect the change before the (untrusted) hook resolves and runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = config::test_home_guard(tmp.path().to_path_buf());
+        let repo_root = tmp.path().join("repo");
+        let stitch_dir = repo_root.join(".stitch");
+        let store_dir = repo_root.join("s");
+        let target_dir = tmp.path().join("home").join("s");
+        fs::create_dir_all(&stitch_dir).unwrap();
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(repo_root.join("stitch.toml"), "").unwrap();
+        fs::write(store_dir.join("f"), "f\n").unwrap();
+        fs::write(
+            stitch_dir.join("state.toml"),
+            format!(
+                "[stores.s]\ntarget = \"{}\"\nfiles = [\"f\"]\n",
+                target_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let loaded = Config::load(&repo_root).unwrap();
+        let platform = Platform::detect();
+        let computed = store::compute_plan(
+            &repo_root,
+            &loaded.config,
+            &platform,
+            ApplyOpts {
+                dry_run: true,
+                force: false,
+            },
+        );
+        let plan = build_plan_file(&repo_root, &loaded, &computed, &platform).unwrap();
+
+        let marker = repo_root.join("marker");
+        let malicious = format!(
+            "[stores.s]\nhooks = {{ pre = \"touch {}\" }}\n",
+            marker.display()
+        );
+        let repo_arc = std::sync::Arc::new(repo_root.clone());
+        set_test_pause_after_global_hash(Some(Box::new(move || {
+            fs::write(repo_arc.join("stitch.toml"), malicious).unwrap();
+        })));
+
+        let result = execute_plan(&repo_root, &loaded, &plan, false, false);
+        set_test_pause_after_global_hash(None);
+
+        let err = result.expect_err("config change must abort before pre-hook");
+        let msg = err.error.to_string();
+        assert!(
+            msg.contains("config changed before pre-hook"),
+            "expected pre-hook hash-check failure, got: {msg}"
+        );
+        assert!(
+            !marker.exists(),
+            "malicious pre-hook must not run before the hash check"
+        );
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_includes_home_and_deduplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = home.join(".config");
+        fs::create_dir_all(&cfg).unwrap();
+
+        let targets = vec![cfg.join("a").join("f"), cfg.join("b").join("g")];
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), targets, &BTreeSet::new(), &home).unwrap();
+
+        assert!(snapshot.identities.contains_key(&cfg));
+        assert!(snapshot.identities.contains_key(&cfg.join("a")));
+        assert!(snapshot.identities.contains_key(&cfg.join("b")));
+        assert!(snapshot.identities.contains_key(&home));
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_allows_absent_to_real_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let target = home.join(".config").join("f");
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), vec![target], &BTreeSet::new(), &home)
+                .unwrap();
+
+        fs::create_dir_all(home.join(".config")).unwrap();
+        snapshot.revalidate().unwrap();
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_rejects_absent_to_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let target = home.join(".config").join("f");
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), vec![target], &BTreeSet::new(), &home)
+                .unwrap();
+
+        let other = home.join(".ssh");
+        fs::create_dir_all(&other).unwrap();
+        symlink(&other, home.join(".config")).unwrap();
+
+        let err = snapshot.revalidate().unwrap_err();
+        assert!(
+            matches!(err, TargetAncestorRedirect::Symlinked { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_rejects_real_dir_identity_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let config = home.join(".config");
+        fs::create_dir_all(&config).unwrap();
+
+        let target = config.join("f");
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), vec![target], &BTreeSet::new(), &home)
+                .unwrap();
+
+        // Replace the real directory with a different one (same as a bind
+        // mount / rename / copy attack).
+        fs::remove_dir(&config).unwrap();
+        fs::create_dir_all(&config).unwrap();
+
+        let err = snapshot.revalidate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TargetAncestorRedirect::Redirected {
+                    resolves_to: None,
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_rejects_real_dir_to_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let config = home.join(".config");
+        fs::create_dir_all(&config).unwrap();
+
+        let target = config.join("f");
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), vec![target], &BTreeSet::new(), &home)
+                .unwrap();
+
+        fs::remove_dir(&config).unwrap();
+        let other = home.join(".ssh");
+        fs::create_dir_all(&other).unwrap();
+        symlink(&other, &config).unwrap();
+
+        let err = snapshot.revalidate().unwrap_err();
+        assert!(
+            matches!(err, TargetAncestorRedirect::Symlinked { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_allows_symlink_identity_preservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let other = home.join(".ssh");
+        fs::create_dir_all(&other).unwrap();
+        let config = home.join(".config");
+        symlink(&other, &config).unwrap();
+
+        let target = config.join("f");
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), vec![target], &BTreeSet::new(), &home)
+                .unwrap();
+
+        // Revalidate sees the same symlink and is fine; the per-link
+        // confinement check, not the snapshot, decides whether this is
+        // traversable.
+        snapshot.revalidate().unwrap();
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_rejects_symlink_repointing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let other = home.join(".ssh");
+        fs::create_dir_all(&other).unwrap();
+        let config = home.join(".config");
+        symlink(&other, &config).unwrap();
+
+        let target = config.join("f");
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), vec![target], &BTreeSet::new(), &home)
+                .unwrap();
+
+        fs::remove_file(&config).unwrap();
+        let third = home.join(".third");
+        fs::create_dir_all(&third).unwrap();
+        symlink(&third, &config).unwrap();
+
+        let err = snapshot.revalidate().unwrap_err();
+        assert!(
+            matches!(err, TargetAncestorRedirect::Symlinked { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn target_ancestor_snapshot_rejects_existing_dir_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let config = home.join(".config");
+        fs::create_dir_all(&config).unwrap();
+
+        let target = config.join("f");
+        let snapshot =
+            TargetAncestorSnapshot::capture(tmp.path(), vec![target], &BTreeSet::new(), &home)
+                .unwrap();
+
+        fs::remove_dir(&config).unwrap();
+
+        let err = snapshot.revalidate().unwrap_err();
+        assert!(
+            matches!(err, TargetAncestorRedirect::Removed { .. }),
+            "got: {err:?}"
+        );
     }
 }

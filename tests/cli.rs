@@ -6,7 +6,7 @@
 //! (bypassing `init`) to keep the test bodies focused.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -1842,6 +1842,115 @@ target = "{}"
         .stderr(contains("unknown store"));
 }
 
+#[test]
+fn source_name_collision_is_reported_by_status_doctor_apply_diff_remove() {
+    // A store whose files resolve to the same link name must be flagged as a
+    // config error by every command; remove in particular must not silently
+    // drop state for a misconfigured store.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig", "gitconfig.tmpl"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig", "gitconfig.tmpl"]
+"#,
+    ));
+
+    // status prints an error line.
+    let status = repo.cmd().arg("status").assert().success();
+    let status_out = std::str::from_utf8(&status.get_output().stdout).unwrap();
+    assert!(
+        status_out.contains("name collision"),
+        "status must mention the collision, got: {status_out}"
+    );
+    assert!(
+        status_out.contains("error:"),
+        "status must render an error, got: {status_out}"
+    );
+
+    // doctor reports a source-name-collision finding.
+    let doctor = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        !doctor.status.success(),
+        "doctor must fail on a source-name collision"
+    );
+    let value: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let findings = value["data"]["findings"].as_array().unwrap();
+    let collision = findings
+        .iter()
+        .find(|f| f["id"] == "source-name-collision")
+        .expect("doctor must report a source-name-collision finding");
+    assert_eq!(collision["severity"], "error");
+    let message = collision["message"].as_str().unwrap();
+    assert!(
+        message.contains("name collision"),
+        "finding message must mention the collision, got: {message}"
+    );
+
+    // apply and diff both error.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("name collision"));
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .stdout(contains("name collision"));
+
+    // remove aborts and preserves state.
+    let state_before = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    repo.cmd()
+        .args(["remove", "git"])
+        .assert()
+        .failure()
+        .code(9)
+        .stderr(contains("configuration error"));
+    let state_after = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert_eq!(
+        state_before, state_after,
+        "remove must preserve state when it aborts"
+    );
+    assert!(
+        state_after.contains("[stores.git]"),
+        "remove must preserve the state.toml entry"
+    );
+}
+
+#[test]
+fn status_and_doctor_remain_healthy_without_source_name_collision() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+files = ["init.lua"]
+"#,
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("linked"))
+        .stdout(contains("name collision").not());
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(contains("0 errors"));
+}
+
 // ---------------------------------------------------------------------------
 // diff
 // ---------------------------------------------------------------------------
@@ -3028,6 +3137,276 @@ target = "{target_b_str}"
     );
 }
 
+/// P1 hardening: a store configured for file mode still has a whole-directory
+/// symlink at its target root (pending promotion). `remove` must unlink the
+/// root before dropping state, otherwise the state becomes empty while the
+/// target root still points into the repo.
+#[test]
+fn remove_cleans_pending_whole_dir_promotion_root() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("app", &["f"]);
+    let target = repo.path().join("home").join(".config").join("app");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+files = ["f"]
+"#
+    ));
+
+    // Simulate a whole-dir symlink left over before the file-mode config.
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&store_dir, &target).unwrap();
+    assert!(target.is_symlink());
+    assert_eq!(std::fs::read_link(&target).unwrap(), store_dir);
+
+    // Dry run must report the root link in the planned removal list.
+    repo.cmd()
+        .args(["remove", "--dry-run", "app"])
+        .assert()
+        .success()
+        .stdout(contains(&target_str));
+
+    repo.cmd()
+        .args(["remove", "app"])
+        .assert()
+        .success()
+        .stdout(contains("Removed store 'app'"));
+
+    // Root gone, store directory untouched, state entry removed.
+    assert!(
+        !target.exists(),
+        "pending-promotion root symlink must be removed"
+    );
+    assert!(store_dir.is_dir(), "store directory must be left untouched");
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state_text.contains("[stores.app]"),
+        "state entry must be removed"
+    );
+}
+
+/// A file-mode store whose target root is a foreign whole-directory symlink
+/// must still be rejected by `remove`, leaving both the link and the state
+/// untouched.
+#[test]
+fn remove_rejects_foreign_root_in_file_mode() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("app", &["f"]);
+    let target = repo.path().join("home").join(".config").join("app");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+files = ["f"]
+"#
+    ));
+
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_dir = foreign.path().join("foreign");
+    fs::create_dir_all(&foreign_dir).unwrap();
+    fs::write(foreign_dir.join("f"), "not ours").unwrap();
+
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&foreign_dir, &target).unwrap();
+    assert!(target.is_symlink());
+    assert_eq!(std::fs::read_link(&target).unwrap(), foreign_dir);
+
+    repo.cmd()
+        .args(["remove", "app"])
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    assert!(target.is_symlink(), "foreign root symlink must remain");
+    assert_eq!(
+        std::fs::read_link(&target).unwrap(),
+        foreign_dir,
+        "foreign root symlink must still point at the foreign target"
+    );
+
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state_text.contains("[stores.app]"),
+        "state entry must be preserved"
+    );
+    assert!(
+        state_text.contains(&target_str),
+        "state target must be preserved"
+    );
+    assert!(store_dir.is_dir(), "store directory must be left untouched");
+}
+
+/// P1 regression: a whole-directory store that is skipped on the current
+/// platform still has an owned symlink. `remove` must unlink it before
+/// dropping state, otherwise the link becomes an orphan with no inventory
+/// entry covering it.
+#[test]
+fn remove_whole_dir_when_skipped() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("app", &["f"]);
+    let target = repo.path().join("home").join(".app");
+    let target_str = target.to_string_lossy().into_owned();
+
+    // Apply as a whole-directory store.
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+"#
+    ));
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), store_dir);
+
+    // Skip the store on this platform.
+    repo.write_authored(
+        r#"
+[stores.app]
+when = { os = "nonexistent_os" }
+"#,
+    );
+
+    repo.cmd()
+        .args(["remove", "app"])
+        .assert()
+        .success()
+        .stdout(contains("Removed store 'app'"));
+
+    assert!(
+        !target.exists(),
+        "whole-dir symlink for skipped store must be removed"
+    );
+    assert!(store_dir.is_dir(), "store directory must be left untouched");
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state_text.contains("[stores.app]"),
+        "state entry must be removed"
+    );
+}
+
+/// P1 regression: a file-mode store that is skipped on the current platform
+/// still has a leftover whole-directory symlink (pending promotion). `remove`
+/// must unlink that root before dropping state.
+#[test]
+fn remove_file_mode_promotion_when_skipped() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("app", &["f"]);
+    let target = repo.path().join("home").join(".config").join("app");
+    let target_str = target.to_string_lossy().into_owned();
+
+    // Start as whole-directory and apply.
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+"#
+    ));
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), store_dir);
+
+    // Promote to file mode and skip on this platform.
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+files = ["f"]
+"#
+    ));
+    repo.write_authored(
+        r#"
+[stores.app]
+when = { os = "nonexistent_os" }
+"#,
+    );
+
+    repo.cmd()
+        .args(["remove", "app"])
+        .assert()
+        .success()
+        .stdout(contains("Removed store 'app'"));
+
+    assert!(
+        !target.exists(),
+        "pending-promotion root for skipped store must be removed"
+    );
+    assert!(store_dir.is_dir(), "store directory must be left untouched");
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state_text.contains("[stores.app]"),
+        "state entry must be removed"
+    );
+}
+
+/// A whole-directory store that is skipped on the current platform and has a
+/// foreign symlink at its target must be rejected by `remove`. The foreign
+/// link and the generated state must be preserved.
+#[test]
+fn remove_rejects_foreign_link_when_skipped() {
+    let repo = Repo::new();
+    let store_dir = repo.make_store("app", &["f"]);
+    let target = repo.path().join("home").join(".app");
+    let target_str = target.to_string_lossy().into_owned();
+
+    // Apply as a whole-directory store.
+    repo.write_state(&format!(
+        r#"
+[stores.app]
+target = "{target_str}"
+"#
+    ));
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), store_dir);
+
+    // Skip the store and replace the owned link with a foreign one.
+    repo.write_authored(
+        r#"
+[stores.app]
+when = { os = "nonexistent_os" }
+"#,
+    );
+
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_dir = foreign.path().join("foreign");
+    fs::create_dir_all(&foreign_dir).unwrap();
+    fs::write(foreign_dir.join("f"), "not ours").unwrap();
+
+    fs::remove_file(&target).unwrap();
+    std::os::unix::fs::symlink(&foreign_dir, &target).unwrap();
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), foreign_dir);
+
+    repo.cmd()
+        .args(["remove", "app"])
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    assert!(target.is_symlink(), "foreign symlink must remain");
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        foreign_dir,
+        "foreign symlink must still point at the foreign target"
+    );
+
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state_text.contains("[stores.app]"),
+        "state entry must be preserved"
+    );
+    assert!(
+        state_text.contains(&target_str),
+        "state target must be preserved"
+    );
+    assert!(store_dir.is_dir(), "store directory must be left untouched");
+}
+
 // ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------
@@ -3298,6 +3677,106 @@ target = "{target_str}"
         .stdout(contains("both target"))
         .stdout(contains("store 'a'"))
         .stdout(contains("store 'b'"));
+}
+
+#[test]
+fn doctor_reports_source_name_collision_in_multi_target_store() {
+    // A source-name collision in one named target must surface for that
+    // specific target, even when another target in the same store is healthy.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig", "gitconfig.tmpl", "other"]);
+    let active_target = repo.path().join("home").join(".config").join("git");
+    let other_target = repo.path().join("home2");
+    let active_str = active_target.to_string_lossy().into_owned();
+    let other_str = other_target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git.targets.active]
+target = "{active_str}"
+files = ["gitconfig", "gitconfig.tmpl"]
+
+[stores.git.targets.other]
+target = "{other_str}"
+files = ["other"]
+"#,
+    ));
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "doctor must fail on source-name collision"
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = value["data"]["findings"].as_array().unwrap();
+    let collision = findings
+        .iter()
+        .find(|f| f["id"] == "source-name-collision")
+        .expect("doctor must report source-name-collision for active target");
+    assert_eq!(collision["severity"], "error");
+    let message = collision["message"].as_str().unwrap();
+    assert!(
+        message.contains("name collision"),
+        "finding must mention the collision, got: {message}"
+    );
+    assert!(
+        message.contains("target 'active'"),
+        "finding must identify the named target, got: {message}"
+    );
+}
+
+#[test]
+fn doctor_reports_unsupported_template_source() {
+    // A non-regular `.tmpl` source (e.g. a symlink) must be reported as an
+    // `unsupported-template-source` finding, not mislabelled as a name
+    // collision.
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig"), "plain\n").unwrap();
+
+    // Create a symlink named `*.tmpl` — that is not a regular template source.
+    let real = store.join("real_gitconfig");
+    fs::write(&real, "real\n").unwrap();
+    std::os::unix::fs::symlink(&real, store.join("gitconfig.tmpl")).unwrap();
+
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+"#,
+    ));
+
+    let output = repo.cmd().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "doctor must fail on an unsupported template source"
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = value["data"]["findings"].as_array().unwrap();
+
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["id"] == "unsupported-template-source"),
+        "doctor must report an unsupported-template-source finding"
+    );
+    assert!(
+        !findings.iter().any(|f| f["id"] == "source-name-collision"),
+        "a non-regular template source must not be reported as a source-name-collision"
+    );
+
+    let finding = findings
+        .iter()
+        .find(|f| f["id"] == "unsupported-template-source")
+        .unwrap();
+    assert_eq!(finding["severity"], "error");
+    let hint = finding["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("regular file"),
+        "hint must tell the user to use a regular file, got: {hint}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4017,7 +4496,6 @@ target = "{}"
 
 /// Helper: chmod +x a path (for global hook scripts).
 fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).unwrap();
@@ -9145,6 +9623,88 @@ files = ["init.lua"]
 }
 
 #[test]
+fn apply_plan_rejects_platform_skipped_store_before_hooks_or_mutations() {
+    // A hand-edited plan that injects a platform-skipped store must abort
+    // before the global pre-apply hook and before any earlier store creates a
+    // link. This guards the broader "abort before side effects" property; the
+    // plan is rejected by `validate_op` before the platform-skip scan is reached.
+    let repo = Repo::new();
+    let _matched_store = repo.make_store("matched", &["profile"]);
+    let skipped_store = repo.make_store("skipped", &["profile"]);
+    let matched_target = repo.path().join("home").join("matched");
+    let skipped_target = repo.path().join("home").join("skipped");
+    fs::create_dir_all(&matched_target).unwrap();
+    fs::create_dir_all(&skipped_target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.matched]
+target = "{}"
+files = ["profile"]
+
+[stores.skipped]
+target = "{}"
+files = ["profile"]
+"#,
+        matched_target.display(),
+        skipped_target.display(),
+    ));
+    repo.write_authored("\n[stores.skipped]\nwhen = { os = \"macos\" }\n");
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Hand-edit the plan to select the platform-skipped store and add its op.
+    let skipped_source = skipped_store.join("profile").display().to_string();
+    let skipped_target_file = skipped_target.join("profile").display().to_string();
+    let mut ops = plan["ops"].as_array().unwrap().clone();
+    ops.push(serde_json::json!({
+        "op": "create_link",
+        "target": skipped_target_file,
+        "source": skipped_source,
+        "requires": { "target": "absent" }
+    }));
+    plan["ops"] = serde_json::Value::Array(ops);
+    plan["stores"] = serde_json::json!(["matched", "skipped"]);
+
+    // Install a global pre-apply hook that would mark the filesystem if it ran.
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let marker = repo.path().join("hook-ran");
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+    let mut perms = fs::metadata(&hook).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&hook, perms).unwrap();
+
+    fs::write(&plan_path, serde_json::to_string(&plan).unwrap()).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains(
+            "link operation is not present in the freshly computed apply plan",
+        ));
+
+    assert!(!marker.exists(), "global pre-apply hook must not run");
+    assert!(
+        !matched_target.join("profile").is_symlink(),
+        "earlier matched store must not create a link"
+    );
+    assert!(
+        !skipped_target.join("profile").exists(),
+        "skipped store must not create a link"
+    );
+}
+
+#[test]
 fn apply_plan_rejects_hand_edited_removal_of_desired_staged_render() {
     let repo = Repo::new();
     let store = repo.make_store("git", &[]);
@@ -9459,7 +10019,7 @@ fn apply_rejects_config_changed_by_store_hook_before_mutation() {
         .arg("apply")
         .assert()
         .failure()
-        .stdout(contains("repository or config changed during pre-hook"));
+        .stdout(contains("config hash mismatch after pre-hook"));
     assert!(
         !home.join("new").exists(),
         "a store hook that changes config must not reach target mutation"
@@ -9578,6 +10138,207 @@ fn remove_rejects_symlinked_state_before_unlinking_targets() {
     assert!(target.is_symlink());
     assert!(fs::read_to_string(external).unwrap().contains("stores.app"));
     assert!(store.join("file").exists());
+}
+
+#[test]
+fn apply_rejects_hard_linked_state_file_before_linking() {
+    // A hard link to an external state file must not be used to author the
+    // link inventory. The tool should reject state.toml with nlink > 1 and
+    // must not create any target symlink.
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    let home = tempfile::tempdir().unwrap();
+
+    let external = tempfile::tempdir().unwrap();
+    let external_state = external.path().join("state.toml");
+    fs::write(
+        &external_state,
+        "[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n",
+    )
+    .unwrap();
+
+    let state = repo.path().join(".stitch/state.toml");
+    fs::remove_file(&state).unwrap();
+    fs::hard_link(&external_state, &state).unwrap();
+
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("hard-linked"));
+
+    // The externally authored store must not have been applied.
+    assert!(!home.path().join(".app").exists());
+    assert!(!home.path().join(".app/file").exists());
+}
+
+#[test]
+fn status_rejects_hard_linked_state_file() {
+    // Same bypass through a hard link must be rejected by `status` too.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+
+    let external = tempfile::tempdir().unwrap();
+    let external_state = external.path().join("state.toml");
+    fs::write(
+        &external_state,
+        "[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n",
+    )
+    .unwrap();
+
+    let state = repo.path().join(".stitch/state.toml");
+    fs::remove_file(&state).unwrap();
+    fs::hard_link(&external_state, &state).unwrap();
+
+    repo.cmd()
+        .arg("status")
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("hard-linked"));
+}
+
+#[test]
+fn status_succeeds_with_regular_state_file() {
+    // A normal state.toml (nlink == 1) must still load and report status.
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    repo.write_state("[stores.app]\ntarget = \"~\"\nfiles = [\"file\"]\n");
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("app"));
+
+    // Sanity check: the state file we wrote has the expected link count.
+    let state = repo.path().join(".stitch/state.toml");
+    assert_eq!(fs::metadata(&state).unwrap().nlink(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// authored stitch.toml validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_rejects_symlinked_stitch_toml_before_hook() {
+    // A symlinked stitch.toml would let an external file author store behavior
+    // and hooks. Apply must refuse it before running the pre-hook or linking.
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    repo.write_state(
+        r#"[stores.app]
+target = "~/.config/app"
+"#,
+    );
+
+    let marker = repo.path().join("pwned");
+    let external = tempfile::tempdir().unwrap();
+    let external_authored = external.path().join("stitch.toml");
+    fs::write(
+        &external_authored,
+        format!(
+            "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let authored = repo.path().join("stitch.toml");
+    fs::remove_file(&authored).unwrap();
+    std::os::unix::fs::symlink(&external_authored, &authored).unwrap();
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("authored config"));
+
+    assert!(
+        !marker.exists(),
+        "pre-hook must not run on symlinked stitch.toml"
+    );
+    assert!(
+        !repo.path().join(".config").join("app").exists(),
+        "apply must not link through a symlinked stitch.toml"
+    );
+}
+
+#[test]
+fn apply_rejects_hard_linked_stitch_toml_before_hook() {
+    // A hard link to an external stitch.toml must not be used to author hooks.
+    // Apply must reject nlink > 1 before the pre-hook or linking.
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    repo.write_state(
+        r#"[stores.app]
+target = "~/.config/app"
+"#,
+    );
+
+    let marker = repo.path().join("pwned");
+    let external = tempfile::tempdir().unwrap();
+    let external_authored = external.path().join("stitch.toml");
+    fs::write(
+        &external_authored,
+        format!(
+            "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let authored = repo.path().join("stitch.toml");
+    fs::remove_file(&authored).unwrap();
+    fs::hard_link(&external_authored, &authored).unwrap();
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("hard-linked"));
+
+    assert!(
+        !marker.exists(),
+        "pre-hook must not run on hard-linked stitch.toml"
+    );
+    assert!(
+        !repo.path().join(".config").join("app").exists(),
+        "apply must not link through a hard-linked stitch.toml"
+    );
+}
+
+#[test]
+fn apply_succeeds_with_regular_stitch_toml() {
+    // A normal stitch.toml (nlink == 1, regular file) must still load, run
+    // hooks, and apply links.
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    repo.write_state(
+        r#"[stores.app]
+target = "~/.config/app"
+"#,
+    );
+
+    let marker = repo.path().join("pre-ran");
+    repo.write_authored(&format!(
+        "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+        marker.display()
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let target = repo.path().join(".config").join("app");
+    assert!(marker.exists(), "pre-hook should have run");
+    assert!(target.is_symlink(), "store should be applied");
+
+    let authored = repo.path().join("stitch.toml");
+    assert_eq!(fs::metadata(&authored).unwrap().nlink(), 1);
 }
 
 #[test]
@@ -10151,6 +10912,59 @@ fn state_lock_never_chmods_hard_linked_file() {
 }
 
 #[test]
+fn state_lock_existing_path_refuses_symlink() {
+    // The existing-lock open must not follow a symlinked .stitch/state.lock.
+    // Point the lock at an external, read-only file. A plain O_RDWR open would
+    // follow the symlink and fail with "Permission denied" on the read-only
+    // target; with O_NOFOLLOW, the open fails with ELOOP before it touches the
+    // target, so the error must mention symbolic links and the external file
+    // must remain unopened and unmodified.
+    let repo = Repo::new();
+    let external = tempfile::tempdir().unwrap();
+    let external_file = external.path().join("external");
+    fs::write(&external_file, "sensitive lock target").unwrap();
+
+    let mut perms = fs::metadata(&external_file).unwrap().permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&external_file, perms).unwrap();
+
+    let lock = repo.path().join(".stitch").join("state.lock");
+    std::os::unix::fs::symlink(&external_file, &lock).unwrap();
+
+    use std::os::unix::fs::MetadataExt;
+    let before = fs::metadata(&external_file).unwrap();
+    let before_mtime = (before.mtime(), before.mtime_nsec());
+
+    let output = repo
+        .cmd()
+        .args(["add", "~/.config/locked"])
+        .output()
+        .expect("stitch add should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected add to fail, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("symbolic"),
+        "expected ELOOP symlink refusal, got:\n{stderr}"
+    );
+
+    let after = fs::metadata(&external_file).unwrap();
+    let after_mtime = (after.mtime(), after.mtime_nsec());
+    assert_eq!(
+        after_mtime, before_mtime,
+        "external target must not be opened or modified"
+    );
+    assert_eq!(
+        fs::read_to_string(&external_file).unwrap(),
+        "sensitive lock target",
+        "external target content must be unchanged"
+    );
+}
+
+#[test]
 fn remove_hooks_can_invoke_mutating_stitch_commands() {
     // Regression: remove used to hold the state flock while running its
     // pre/post hooks; a hook that invoked a mutating stitch command blocked
@@ -10249,6 +11063,53 @@ files = ["f"]
     assert!(
         !repo.path().join(".config").join("app").exists(),
         "apply must not act on state read through a symlinked .stitch"
+    );
+}
+
+#[test]
+fn load_rejects_symlinked_state_file() {
+    // A symlinked state.toml would let an external file author the link
+    // inventory. Every command that reads state must refuse it before acting.
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    let external = repo.path().join("external_state");
+    fs::create_dir_all(&external).unwrap();
+    // The external "state" tries to create a $HOME link if it were followed.
+    fs::write(
+        external.join("state.toml"),
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    )
+    .unwrap();
+    let state = repo.path().join(".stitch").join("state.toml");
+    fs::remove_file(&state).unwrap();
+    std::os::unix::fs::symlink(external.join("state.toml"), &state).unwrap();
+
+    for (cmd, args) in [
+        ("status", vec![]),
+        ("apply", vec![]),
+        ("plan", vec![]),
+        ("diff", vec![]),
+        ("doctor", vec![]),
+        ("remove", vec!["app"]),
+        ("prune", vec!["--yes"]),
+    ] {
+        repo.cmd()
+            .arg(cmd)
+            .args(args)
+            .assert()
+            .failure()
+            .code(3)
+            .stderr(contains("refusing symlinked or non-regular state file"));
+    }
+
+    // Nothing was created from the external state.
+    assert!(
+        !repo.path().join(".config").join("app").exists(),
+        "apply must not act on state read through a symlinked state.toml"
     );
 }
 
@@ -10443,3 +11304,958 @@ files = ["f"]
         "the hook's symlink must remain untouched"
     );
 }
+
+/// A global pre-apply hook replaces `~/.config` with a symlink to `~/.ssh`.
+/// Apply must conflict before writing the new link through the redirected
+/// ancestor.
+#[test]
+fn global_pre_apply_hook_in_home_redirect_blocks_apply() {
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    fs::create_dir_all(repo.path().join(".config")).unwrap();
+    fs::create_dir_all(repo.path().join(".ssh")).unwrap();
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    );
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nset -e\nrm -rf \"$HOME/.config\"\nln -s \"$HOME/.ssh\" \"$HOME/.config\"\n",
+    )
+    .unwrap();
+    make_executable(&hook);
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("conflict"));
+
+    assert!(
+        !repo.path().join(".ssh").join("app").join("f").exists(),
+        "apply must not write through the redirected ancestor"
+    );
+    assert!(
+        repo.path().join(".config").is_symlink(),
+        "the hook-created symlink must remain untouched"
+    );
+}
+
+/// A per-store pre-hook can also redirect a target ancestor. The per-store
+/// ancestor snapshot must catch it independently of the global hook.
+#[test]
+fn per_store_pre_hook_redirects_target_ancestor() {
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    fs::create_dir_all(repo.path().join(".config")).unwrap();
+    fs::create_dir_all(repo.path().join(".ssh")).unwrap();
+    repo.write_split(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+        r#"
+[stores.app]
+hooks = { pre = "rm -rf $HOME/.config && ln -s $HOME/.ssh $HOME/.config" }
+"#,
+    );
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("conflict"));
+
+    assert!(
+        !repo.path().join(".ssh").join("app").join("f").exists(),
+        "apply must not write through the per-store hook redirect"
+    );
+    assert!(
+        repo.path().join(".config").is_symlink(),
+        "the per-store hook-created symlink must remain untouched"
+    );
+}
+
+/// A pre-apply hook may create a missing real target ancestor. Apply must
+/// continue and create the expected link.
+#[test]
+fn global_pre_apply_hook_creates_missing_real_ancestor() {
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    // Intentionally do NOT create ~/.config.
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    );
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(&hook, "#!/bin/sh\nset -e\nmkdir -p \"$HOME/.config/app\"\n").unwrap();
+    make_executable(&hook);
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(
+        repo.path()
+            .join(".config")
+            .join("app")
+            .join("f")
+            .is_symlink(),
+        "apply should create the link through the hook-created real ancestor"
+    );
+}
+
+/// `apply --plan` also pins target ancestors across the global pre-apply hook.
+/// A real-directory replacement (not only a symlink) must be rejected.
+#[test]
+fn apply_plan_rejects_global_hook_real_dir_ancestor_redirect() {
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    fs::create_dir_all(repo.path().join(".config")).unwrap();
+    fs::create_dir_all(repo.path().join(".ssh")).unwrap();
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    );
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nset -e\nrm -rf \"$HOME/.config\"\nmv \"$HOME/.ssh\" \"$HOME/.config\"\n",
+    )
+    .unwrap();
+    make_executable(&hook);
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("changed identity"));
+
+    assert!(
+        !repo.path().join(".config").join("app").join("f").exists(),
+        "apply --plan must not write through the redirected real directory"
+    );
+}
+
+/// `apply --plan` also pins target ancestors across a per-store pre-hook.
+#[test]
+fn apply_plan_rejects_store_hook_real_dir_ancestor_redirect() {
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    fs::create_dir_all(repo.path().join(".config")).unwrap();
+    fs::create_dir_all(repo.path().join(".ssh")).unwrap();
+    repo.write_split(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+        r#"
+[stores.app]
+hooks = { pre = "rm -rf $HOME/.config && mv $HOME/.ssh $HOME/.config" }
+"#,
+    );
+
+    let plan_path = repo.path().join("plan.json");
+    let output = repo.cmd().arg("plan").output().unwrap();
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    repo.cmd()
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("changed identity"));
+
+    assert!(
+        !repo.path().join(".config").join("app").join("f").exists(),
+        "apply --plan must not write through the per-store hook redirect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Symlinked store root (trust review item)
+// ---------------------------------------------------------------------------
+
+/// A repo store directory that is itself a symlink must not be treated as
+/// healthy by any command. `status`, `doctor`, `apply`, and `remove` must all
+/// agree that the store is invalid and `remove` must not drop the generated
+/// state or touch the target link.
+#[test]
+fn symlinked_store_root_is_unhealthy() {
+    let repo = Repo::new();
+    let external = tempfile::tempdir().unwrap();
+    let external_dir = external.path().join("shells");
+    fs::create_dir_all(&external_dir).unwrap();
+    fs::write(external_dir.join("rc"), "data").unwrap();
+
+    // Replace the real store directory with a symlink to an external directory.
+    let store_dir = repo.path().join("shells");
+    repo.make_store("shells", &[]);
+    fs::remove_dir(&store_dir).unwrap();
+    std::os::unix::fs::symlink(&external_dir, &store_dir).unwrap();
+
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".shells");
+    // Target link points at the repo symlink entry itself.
+    std::os::unix::fs::symlink(&store_dir, &target).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+"#,
+        target.to_string_lossy()
+    ));
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("error"))
+        .stdout(contains("store directory"));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("store directory"));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .code(13)
+        .stdout(contains("store directory"));
+
+    repo.cmd()
+        .args(["remove", "shells"])
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    // The target link is untouched and the state entry is preserved.
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), store_dir);
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state_text.contains("[stores.shells]"));
+}
+
+/// Same as `symlinked_store_root_is_unhealthy`, but the target link points
+/// directly at the external endpoint rather than the repo symlink entry.
+#[test]
+fn symlinked_store_root_with_foreign_target_is_unhealthy() {
+    let repo = Repo::new();
+    let external = tempfile::tempdir().unwrap();
+    let external_dir = external.path().join("shells");
+    fs::create_dir_all(&external_dir).unwrap();
+    fs::write(external_dir.join("rc"), "data").unwrap();
+
+    let store_dir = repo.path().join("shells");
+    repo.make_store("shells", &[]);
+    fs::remove_dir(&store_dir).unwrap();
+    std::os::unix::fs::symlink(&external_dir, &store_dir).unwrap();
+
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".shells");
+    std::os::unix::fs::symlink(&external_dir, &target).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+"#,
+        target.to_string_lossy()
+    ));
+
+    repo.cmd()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("error"))
+        .stdout(contains("store directory"));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("store directory"));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .code(13)
+        .stdout(contains("store directory"));
+
+    repo.cmd()
+        .args(["remove", "shells"])
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), external_dir);
+    let state_text = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state_text.contains("[stores.shells]"));
+}
+
+/// Regression guard for the `check_link` source-symlink branch: a source entry
+/// inside a real store directory that is itself a symlink must still report
+/// `linked` and remain removable.
+#[test]
+fn source_symlink_is_still_linked_and_removable() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let store_dir = repo.make_store("store", &["real"]);
+    let real = store_dir.join("real");
+    let alias = store_dir.join("alias");
+    std::os::unix::fs::symlink("real", &alias).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.store]
+target = "{}"
+files = ["alias"]
+"#,
+        home.path().to_string_lossy()
+    ));
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("ok"));
+
+    let link = home.path().join("alias");
+    assert!(link.is_symlink());
+    assert_eq!(fs::read_link(&link).unwrap(), alias);
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("linked"));
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["remove", "store"])
+        .assert()
+        .success()
+        .stdout(contains("Removed store 'store'"));
+
+    assert!(!link.exists());
+    assert!(real.exists());
+}
+
+// ---------------------------------------------------------------------------
+// P0 regression: $HOME itself must be pinned across pre-apply hooks.
+// ---------------------------------------------------------------------------
+
+/// P0: a pre-apply hook replaces the real `$HOME` directory with a symlink to
+/// an external directory. The target (`~/.app`) is directly under `$HOME`, the
+/// case where the previous "intermediate ancestors only" fix captured nothing.
+/// Apply must conflict before it can create `external/.app`.
+#[test]
+fn pre_apply_hook_replace_home_direct_target_is_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let external = tmp.path().join("external");
+    fs::create_dir_all(&external).unwrap();
+
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.app"
+"#,
+    );
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nset -e\n[ -n \"$HOME\" ] || exit 1\n[ -n \"$EXTERNAL_HOME\" ] || exit 1\nrm -rf \"$HOME\"\nln -s \"$EXTERNAL_HOME\" \"$HOME\"\n",
+    )
+    .unwrap();
+    make_executable(&hook);
+
+    repo.cmd()
+        .env("HOME", &home)
+        .env("EXTERNAL_HOME", &external)
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    assert!(home.is_symlink(), "the hook must have replaced $HOME");
+    assert!(
+        !external.join(".app").exists(),
+        "apply must not create a link in the external home"
+    );
+    assert!(
+        !home.join(".app").exists(),
+        "apply must not create a link through the redirected $HOME"
+    );
+}
+
+/// P0: a pre-apply hook replaces `$HOME` with a symlink to an external
+/// directory that already has the missing intermediate ancestor (`~/.config`).
+/// The previous fix treated `~/.config` going from absent to real as benign;
+/// with `$HOME` pinned the change at `$HOME` itself is caught first.
+#[test]
+fn pre_apply_hook_replace_home_with_existing_intermediate_is_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let external = tmp.path().join("external");
+    fs::create_dir_all(external.join(".config")).unwrap();
+
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.config/app"
+files = ["f"]
+"#,
+    );
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nset -e\n[ -n \"$HOME\" ] || exit 1\n[ -n \"$EXTERNAL_HOME\" ] || exit 1\nrm -rf \"$HOME\"\nln -s \"$EXTERNAL_HOME\" \"$HOME\"\n",
+    )
+    .unwrap();
+    make_executable(&hook);
+
+    repo.cmd()
+        .env("HOME", &home)
+        .env("EXTERNAL_HOME", &external)
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(7)
+        .stderr(contains("conflict: foreign symlink"));
+
+    assert!(home.is_symlink(), "the hook must have replaced $HOME");
+    assert!(
+        !external.join(".config").join("app").join("f").exists(),
+        "apply must not create a link in the external home"
+    );
+    assert!(
+        !home.join(".config").join("app").join("f").exists(),
+        "apply must not create a link through the redirected $HOME"
+    );
+}
+
+/// Regression guard: a real, unmodified `$HOME` still applies successfully.
+#[test]
+fn apply_with_real_home_direct_target_still_works() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    repo.write_state(
+        r#"
+[stores.app]
+target = "~/.app"
+"#,
+    );
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("created"));
+
+    assert!(home.path().join(".app").is_symlink());
+    assert_eq!(
+        fs::read_link(home.path().join(".app")).unwrap(),
+        repo.path().join("app").canonicalize().unwrap()
+    );
+}
+
+// ===========================================================================
+// Safety invariant matrix: invariant × command × variant.
+//
+// These tests define the target behavior for each combination. They are
+// written BEFORE migrating commands onto the safety module, so some will
+// fail — that is intentional. Each failing test is a cell in the matrix
+// that the current code does not cover. After migration, all must pass.
+//
+// Invariants:
+//   H = HomeIdentity (pin $HOME resolved dir, not just lstat)
+//   C = ConfigSnapshot (bind parsed bytes to hash, no re-read TOCTOU)
+//   I = InventoryCheck (validate all stores, including platform-skipped)
+//
+// Commands: apply, remove, edit
+// ===========================================================================
+
+/// Helper: create a symlinked-$HOME environment with a repo that has a store
+/// applied. Returns the temp dir, repo path, home symlink, and real home.
+struct MatrixHomeEnv {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    home_link: PathBuf,
+    real_home: PathBuf,
+}
+
+impl MatrixHomeEnv {
+    /// Set up: symlinked home → real_home, repo with store "app" (whole-dir),
+    /// store already applied so `~/.app -> repo/app` exists inside real_home.
+    fn new_applied() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_home = tmp.path().join("real_home");
+        let home_link = tmp.path().join("home_link");
+        let repo = tmp.path().join("repo");
+
+        fs::create_dir_all(&real_home).expect("mkdir real_home");
+        fs::create_dir_all(&repo).expect("mkdir repo");
+        std::os::unix::fs::symlink(&real_home, &home_link).expect("symlink home");
+
+        // Init repo.
+        Command::cargo_bin("stitch")
+            .expect("bin")
+            .current_dir(&repo)
+            .env("HOME", &home_link)
+            .env_remove("STITCH_REPO")
+            .arg("init")
+            .assert()
+            .success();
+
+        // Create store and state.
+        let store_dir = repo.join("app");
+        fs::create_dir_all(&store_dir).expect("mkdir store");
+        fs::write(store_dir.join("file"), "contents").expect("write file");
+        fs::write(
+            repo.join(".stitch").join("state.toml"),
+            "[stores.app]\ntarget = \"~/.app\"\n",
+        )
+        .expect("write state");
+
+        // Apply so the link exists inside real_home.
+        Command::cargo_bin("stitch")
+            .expect("bin")
+            .current_dir(&repo)
+            .env("HOME", &home_link)
+            .env_remove("STITCH_REPO")
+            .arg("apply")
+            .assert()
+            .success();
+
+        assert!(real_home.join(".app").is_symlink(), "link must exist");
+
+        Self {
+            _tmp: tmp,
+            repo,
+            home_link,
+            real_home,
+        }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut c = Command::cargo_bin("stitch").expect("bin");
+        c.current_dir(&self.repo);
+        c.env("HOME", &self.home_link);
+        c.env_remove("STITCH_REPO");
+        c.env_remove("EDITOR");
+        c.env_remove("VISUAL");
+        c
+    }
+}
+
+// --- H × apply × symlinked-home: hook replaces dir behind symlinked $HOME ---
+
+/// **P0 matrix cell.** A pre-apply hook replaces the *directory behind* the
+/// symlinked `$HOME` with a different directory. The symlink `$HOME` itself
+/// is unchanged. Apply must detect the resolved-directory identity change and
+/// refuse to write into the replacement.
+#[test]
+fn matrix_home_apply_hook_replaces_dir_behind_symlinked_home() {
+    let env = MatrixHomeEnv::new_applied();
+
+    // Create a hook that replaces real_home with a different directory.
+    let hooks_dir = env.repo.join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("mkdir hooks");
+    let hook = hooks_dir.join("pre-apply");
+    let real_home = env.real_home.clone();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nset -e\nrm -rf \"{real}\"\nmkdir \"{real}\"\n",
+            real = real_home.display()
+        ),
+    )
+    .expect("write hook");
+    make_executable(&hook);
+
+    // Add a new file to the store so apply would try to create a new link.
+    fs::write(env.repo.join("app").join("newfile"), "new").expect("write newfile");
+    fs::write(
+        env.repo.join(".stitch").join("state.toml"),
+        "[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\", \"newfile\"]\n",
+    )
+    .expect("write state");
+
+    env.cmd().arg("apply").assert().failure();
+
+    // The new link must NOT have been created in the replacement directory.
+    // (The old link was destroyed when real_home was rm -rf'd and recreated.)
+    assert!(
+        !env.real_home.join(".app").join("newfile").exists(),
+        "apply must not write through the replaced home directory"
+    );
+}
+
+/// **Positive counterpart.** A pre-apply hook that does NOT touch `$HOME`
+/// must succeed normally with a symlinked home.
+#[test]
+fn matrix_home_apply_succeeds_with_symlinked_home_no_attack() {
+    let env = MatrixHomeEnv::new_applied();
+
+    // Hook that just touches a marker, doesn't touch home.
+    let hooks_dir = env.repo.join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("mkdir hooks");
+    let hook = hooks_dir.join("pre-apply");
+    let marker = env.repo.join("hook_ran");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch \"{}\"\n", marker.display()),
+    )
+    .expect("write hook");
+    make_executable(&hook);
+
+    env.cmd().arg("apply").assert().success();
+    assert!(marker.exists(), "hook should have run");
+}
+
+// --- H × remove × symlinked-home: pre-remove hook redirects $HOME ---
+
+/// **P0 matrix cell.** A pre-remove hook replaces the directory behind the
+/// symlinked `$HOME`. Remove must detect the change and refuse to delete the
+/// external link or drop state.
+#[test]
+fn matrix_home_remove_hook_replaces_dir_behind_symlinked_home() {
+    let env = MatrixHomeEnv::new_applied();
+
+    // Capture the original link target for later verification.
+    let original_link = env.real_home.join(".app");
+    assert!(original_link.is_symlink(), "precondition: link exists");
+
+    // Create a pre-remove hook that replaces real_home.
+    let hooks_dir = env.repo.join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("mkdir hooks");
+    let hook = hooks_dir.join("pre-remove");
+    let real_home = env.real_home.clone();
+    let external = env._tmp.path().join("external");
+    fs::create_dir_all(&external).expect("mkdir external");
+    // The hook creates a new directory and puts a symlink in it, simulating
+    // an external replacement that remove might delete.
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nset -e\nrm -rf \"{real}\"\nmkdir \"{real}\"\nln -s \"{repo}/app\" \"{real}/.app\"\n",
+            real = real_home.display(),
+            repo = env.repo.display()
+        ),
+    )
+    .expect("write hook");
+    make_executable(&hook);
+
+    let result = env.cmd().arg("remove").arg("app").assert();
+
+    // Remove must fail (exit non-zero).
+    result.failure();
+
+    // State must be preserved (the store must still be in state.toml).
+    let state =
+        fs::read_to_string(env.repo.join(".stitch").join("state.toml")).expect("read state");
+    assert!(
+        state.contains("stores.app"),
+        "state must be preserved, got: {state}"
+    );
+}
+
+/// **Positive counterpart.** Remove with a symlinked home and no attack must
+/// succeed and clean up properly.
+#[test]
+fn matrix_home_remove_succeeds_with_symlinked_home_no_attack() {
+    let env = MatrixHomeEnv::new_applied();
+
+    env.cmd().arg("remove").arg("app").assert().success();
+
+    assert!(!env.real_home.join(".app").exists(), "link must be removed");
+    let state =
+        fs::read_to_string(env.repo.join(".stitch").join("state.toml")).expect("read state");
+    assert!(
+        !state.contains("stores.app"),
+        "state must be dropped, got: {state}"
+    );
+}
+
+// --- C × edit × symlinked-authored: edit must reject symlinked stitch.toml ---
+
+/// **P1 matrix cell.** `stitch edit` (no entry) opens `stitch.toml`. If that
+/// file is a symlink to an external file, edit must refuse rather than editing
+/// the external file.
+#[test]
+fn matrix_config_edit_rejects_symlinked_stitch_toml() {
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    repo.write_state("[stores.app]\ntarget = \"~/.app\"\n");
+
+    let external = tempfile::tempdir().unwrap();
+    let external_authored = external.path().join("stitch.toml");
+    fs::write(&external_authored, "# external\n[stores.app]\n").unwrap();
+
+    let authored = repo.path().join("stitch.toml");
+    fs::remove_file(&authored).unwrap();
+    std::os::unix::fs::symlink(&external_authored, &authored).unwrap();
+
+    // Use /bin/true as editor so we can detect if it was invoked.
+    repo.cmd()
+        .env("EDITOR", "/bin/true")
+        .arg("edit")
+        .assert()
+        .failure();
+
+    // The external file must NOT have been modified by the editor.
+    let content = fs::read_to_string(&external_authored).unwrap();
+    assert_eq!(
+        content, "# external\n[stores.app]\n",
+        "external file must not be modified"
+    );
+}
+
+/// **Positive counterpart.** `stitch edit` with a regular stitch.toml must
+/// succeed.
+#[test]
+fn matrix_config_edit_succeeds_with_regular_stitch_toml() {
+    let repo = Repo::new();
+    // stitch.toml already exists from Repo::new (empty).
+    repo.cmd()
+        .env("EDITOR", "/bin/true")
+        .arg("edit")
+        .assert()
+        .success();
+}
+
+// --- I × remove × skipped+symlinked-source-root ---
+
+/// **P1 matrix cell.** A platform-skipped store whose source root is a
+/// symlink must NOT be removable. Active stores correctly refuse this; the
+/// skipped path must agree.
+#[test]
+fn matrix_inventory_remove_skipped_store_with_symlinked_source_root() {
+    let repo = Repo::new();
+
+    // Create a symlinked store root pointing to an external directory.
+    let external = tempfile::tempdir().unwrap();
+    let external_store = external.path().join("evil");
+    fs::create_dir_all(&external_store).unwrap();
+    std::os::unix::fs::symlink(&external_store, repo.path().join("app")).unwrap();
+
+    // Authored config with a when clause that never matches.
+    repo.write_authored("[stores.app]\nwhen = { os = \"nonexistent\" }\n");
+    repo.write_state("[stores.app]\ntarget = \"~/.app\"\n");
+
+    // Create the link so there's something to remove.
+    let home = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&external_store, home.path().join(".app")).unwrap();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("remove")
+        .arg("app")
+        .assert()
+        .failure();
+
+    // State must be preserved.
+    let state =
+        fs::read_to_string(repo.path().join(".stitch").join("state.toml")).expect("read state");
+    assert!(
+        state.contains("stores.app"),
+        "state must be preserved for invalid inventory, got: {state}"
+    );
+}
+
+// --- I × remove × skipped+source-name-collision ---
+
+/// **P1 matrix cell.** A platform-skipped store with colliding sources
+/// (foo and foo.tmpl) must NOT be removable. Remove must reject the invalid
+/// inventory rather than deleting a live link and dropping state.
+#[test]
+fn matrix_inventory_remove_skipped_store_with_source_name_collision() {
+    let repo = Repo::new();
+    repo.make_store("app", &["foo", "foo.tmpl"]);
+
+    // Authored config with a when clause that never matches.
+    repo.write_authored("[stores.app]\nwhen = { os = \"nonexistent\" }\n");
+    repo.write_state("[stores.app]\ntarget = \"~/.app\"\nfiles = [\"foo\", \"foo.tmpl\"]\n");
+
+    // Create the link so there's something to remove.
+    let home = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(repo.path().join("app"), home.path().join(".app")).unwrap();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("remove")
+        .arg("app")
+        .assert()
+        .failure();
+
+    // State must be preserved.
+    let state =
+        fs::read_to_string(repo.path().join(".stitch").join("state.toml")).expect("read state");
+    assert!(
+        state.contains("stores.app"),
+        "state must be preserved for colliding sources, got: {state}"
+    );
+
+    // The link must NOT have been removed.
+    assert!(
+        home.path().join(".app").is_symlink(),
+        "link must not be removed when inventory is invalid"
+    );
+}
+
+// --- C × apply × config-change-between-load-and-hash ---
+
+/// **P1 matrix cell.** A global pre-apply hook that swaps `stitch.toml` to
+/// install a malicious per-store hook must be caught by the post-hook config
+/// hash re-check. The malicious hook must not run.
+///
+/// `ConfigSnapshot` (in `src/config.rs`) binds the parsed config to the hash
+/// of the exact bytes captured at load time, so the post-hook re-check
+/// compares against the snapshot hash — not a re-read. This test exercises
+/// the swap-without-restore variant; the stronger swap-and-restore variant
+/// is covered by `apply_rejects_malicious_config_captured_then_restored`.
+#[test]
+fn matrix_config_apply_hash_rejects_config_swap_during_hook() {
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    repo.write_state("[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n");
+
+    let home = tempfile::tempdir().unwrap();
+    let marker = repo.path().join("pwned");
+
+    // Global pre-apply hook: swap stitch.toml to install a malicious per-store
+    // hook. The hook does NOT restore the original config, so the post-hook
+    // hash check catches the change.
+    let original_authored = fs::read_to_string(repo.path().join("stitch.toml")).unwrap();
+    let malicious_authored = format!(
+        "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+        marker.display()
+    );
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    let authored_path = repo.path().join("stitch.toml");
+    let malicious = malicious_authored.clone();
+    let original = original_authored.clone();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nset -e\ncat > \"{authored}\" << 'STITCH_EOF'\n{malicious}STITCH_EOF\n",
+            authored = authored_path.display(),
+            malicious = malicious,
+        ),
+    )
+    .unwrap();
+    make_executable(&hook);
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("apply")
+        .assert()
+        .failure();
+
+    // The malicious hook marker must NOT exist.
+    assert!(
+        !marker.exists(),
+        "malicious per-store hook must not run when config was swapped by the global pre-apply hook"
+    );
+
+    // Restore authored config so the test doesn't leak.
+    let _ = fs::write(&authored_path, &original);
+}
+
+/// **Positive counterpart.** A per-store pre-hook that is present in the
+/// original config (no swap) must run normally.
+#[test]
+fn matrix_config_apply_per_store_hook_runs_when_config_stable() {
+    let repo = Repo::new();
+    repo.make_store("app", &["file"]);
+    repo.write_state("[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n");
+
+    let home = tempfile::tempdir().unwrap();
+    let marker = repo.path().join("hook_ran");
+
+    repo.write_authored(&format!(
+        "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+        marker.display()
+    ));
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .arg("apply")
+        .assert()
+        .success();
+
+    assert!(marker.exists(), "per-store hook should have run");
+}
+
+// NOTE: The deterministic parse-then-restore TOCTOU regression test lives in
+// `src/store.rs` as `apply_all_rejects_malicious_config_captured_then_restored`.
+// It uses a `#[cfg(test)]` seam inside `apply_all` to swap the on-disk config
+// between `ConfigSnapshot::load` (in `cmd_apply`) and the per-store pre-hook
+// revalidation — the exact window that `ConfigSnapshot` + `pinned_hash` fixes.
+// Integration tests here can only test global-hook swaps, which were already
+// rejected before this patch and do not exercise the parse-then-restore window.

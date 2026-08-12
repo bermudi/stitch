@@ -21,6 +21,13 @@ pub enum LinkStatus {
     /// Symlink exists, does not resolve into this repo, but resolves to a live
     /// file or directory managed by another tool.
     Foreign(PathBuf),
+    /// The configured store source is not a real directory (symlinked, missing,
+    /// or not a directory). Mirrors `apply`'s `store_is_real_dir` rejection.
+    StoreError(PathBuf),
+    /// The store's `files`/`patterns` resolve to colliding link names or another
+    /// resolution error. Surfaced by `status`, `doctor`, and `remove` so config
+    /// errors are never silent.
+    ConfigError(String),
 }
 
 /// Check the status of a symlink at `target` pointing to `source`.
@@ -41,12 +48,19 @@ pub fn check_link(target: &Path, source: &Path, repo_root: &Path) -> LinkStatus 
                     // rather than an endpoint to canonicalize. Compare the
                     // actual directory entry identity so alternate spellings
                     // cannot turn `alias/.` or `alias/..` into `alias`.
-                    is_direct_entry_path(source)
-                        && is_direct_entry_path(&resolved)
-                        && link_target_path(target, &resolved)
-                            .ok()
-                            .and_then(|path| entry_identity(&path))
-                            == entry_identity(source)
+                    // The immediate link target must also be an in-repo path
+                    // (the same `source_ancestors_within` guard used by
+                    // `points_at_source`); otherwise the link points directly
+                    // at an external endpoint and is foreign under the two-tier
+                    // ownership rule.
+                    if !is_direct_entry_path(source) || !is_direct_entry_path(&resolved) {
+                        false
+                    } else if let Ok(link_entry) = link_target_path(target, &resolved) {
+                        source_ancestors_within(&link_entry, repo_root)
+                            && entry_identity(&link_entry) == entry_identity(source)
+                    } else {
+                        false
+                    }
                 } else {
                     let source = source.canonicalize().ok();
                     let resolved = link_target_path(target, &resolved)
@@ -547,7 +561,7 @@ fn resolved_directory(path: &Path) -> Option<PathBuf> {
         .map(|_| resolved)
 }
 
-fn is_real_directory(path: &Path) -> bool {
+pub fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|meta| meta.is_dir())
         .unwrap_or(false)

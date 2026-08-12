@@ -187,6 +187,8 @@ fn status_row(repo_root: &Path, entry: &StatusEntry) -> StatusRow {
         LinkStatus::Conflict(_) => ("conflict".to_string(), None),
         LinkStatus::Broken(p) => ("broken".to_string(), Some(path_to_string(p))),
         LinkStatus::Foreign(p) => ("foreign".to_string(), Some(path_to_string(p))),
+        LinkStatus::StoreError(p) => ("error".to_string(), Some(path_to_string(p))),
+        LinkStatus::ConfigError(msg) => ("error".to_string(), Some(msg.clone())),
     };
 
     StatusRow {
