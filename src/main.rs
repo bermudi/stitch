@@ -8,18 +8,44 @@ mod plan_exec;
 mod platform;
 mod render;
 mod report;
+mod safety;
 mod scan;
 mod store;
 
 use clap::Parser;
 use config::{Config, ConfigError, Loaded, expand_home, find_root};
 use error::{FailureClass, StitchError};
-use plan_exec::{PlanExecError, PlanFile, PlanFileOp};
+use plan_exec::{
+    PlanExecError, PlanFile, PlanFileOp, TargetAncestorRedirect, TargetAncestorSnapshot,
+};
 use platform::Platform;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::Component;
+
+fn global_redirect_to_error(redirect: TargetAncestorRedirect) -> StitchError {
+    match redirect {
+        TargetAncestorRedirect::Symlinked { path, resolves_to } => {
+            StitchError::conflict_foreign(path, resolves_to)
+        }
+        TargetAncestorRedirect::Redirected {
+            path,
+            resolves_to: Some(resolves_to),
+        } => StitchError::conflict_foreign(path, Some(resolves_to)),
+        TargetAncestorRedirect::Removed { path } => StitchError::internal(format!(
+            "target ancestor {} was removed by the pre-apply hook",
+            path.display()
+        )),
+        TargetAncestorRedirect::Redirected {
+            path,
+            resolves_to: None,
+        } => StitchError::internal(format!(
+            "target ancestor {} changed identity during the pre-apply hook",
+            path.display()
+        )),
+    }
+}
 
 fn filesystem_identity(path: &std::path::Path, label: &str) -> Result<(u64, u64), StitchError> {
     // Repository aliases are supported, so follow the root entry and pin the
@@ -258,6 +284,17 @@ fn print_warnings(loaded: &Loaded) {
     for w in &loaded.warnings {
         eprintln!("warning: {w}");
     }
+}
+
+/// Clone the config and retain only the named stores. Used by commands that
+/// need a filtered view for pre-apply checks (template gitignore, global hook
+/// ancestor capture) without splitting the snapshot passed to the executor.
+fn filter_config(config: &Config, only: &[String]) -> Config {
+    let mut filtered = config.clone();
+    if !only.is_empty() {
+        filtered.stores.retain(|name, _| only.contains(name));
+    }
+    filtered
 }
 
 /// Validate that every name in `only` exists in the config. Returns an error
@@ -523,25 +560,36 @@ fn cmd_apply(
     opts: store::ApplyOpts,
     json: bool,
 ) -> Result<(), StitchError> {
-    let loaded = Config::load(root)?;
+    let snapshot = config::ConfigSnapshot::load(root)?;
+    // Test-only seam: deterministically simulate a config swap between
+    // `ConfigSnapshot::load` (above) and the rest of the direct-apply
+    // handler (global pre-apply hook revalidation, per-store pre-hook
+    // revalidation). This lets unit tests reproduce the parse-then-restore
+    // TOCTOU without a flaky race, exercising the actual `cmd_apply` /
+    // `apply_json` production path — both text and JSON.
+    #[cfg(test)]
+    test_pause_after_snapshot();
     if !json {
-        print_warnings(&loaded);
+        print_warnings(&snapshot.loaded);
     }
-    check_unknown_names(only.iter().map(|s| s.as_str()), &loaded.config)?;
-
-    let mut filtered_config = loaded.config.clone();
-    if !only.is_empty() {
-        filtered_config.stores.retain(|name, _| only.contains(name));
-    }
+    check_unknown_names(only.iter().map(|s| s.as_str()), &snapshot.loaded.config)?;
 
     if json {
-        return apply_json(root, &filtered_config, opts, "apply", loaded.warnings);
+        return apply_json(
+            root,
+            &snapshot,
+            only,
+            opts,
+            "apply",
+            snapshot.loaded.warnings.clone(),
+        );
     }
 
     let platform = Platform::detect();
 
     // Upgraded plain repos need no migration, but template apply and its
     // dry-run must agree that staging is blocked until Git ignores it.
+    let filtered_config = filter_config(&snapshot.loaded.config, only);
     if store::has_active_template_sources(root, &filtered_config, &platform)
         && !render::repo_gitignore_covers_render(root)
     {
@@ -553,8 +601,31 @@ fn cmd_apply(
 
     // Global pre-apply hook (skipped under dry-run — hooks have side effects).
     if !opts.dry_run {
+        // Pin $HOME identity (including the resolved directory behind a
+        // symlinked $HOME) across the global pre-apply hook. A hook that
+        // replaces the directory behind the symlink without changing the
+        // symlink itself must be detected.
+        let home_identity =
+            safety::HomeIdentity::capture().map_err(|e| StitchError::internal(e.to_string()))?;
+
+        // Pin every target ancestor across the global pre-apply hook, the same
+        // way execute_plan and per-store pre-hooks do.
+        let home = expand_home("~")?;
+        let mut all_targets = Vec::new();
+        let mut all_removed = BTreeSet::new();
+        for (name, store) in &filtered_config.stores {
+            let (targets, removed) =
+                store::collect_store_link_targets(root, name, store, &platform)
+                    .map_err(StitchError::internal)?;
+            all_targets.extend(targets);
+            all_removed.extend(removed);
+        }
+        let global_ancestors =
+            TargetAncestorSnapshot::capture(root, all_targets, &all_removed, &home)
+                .map_err(global_redirect_to_error)?;
+
         let root_identity = filesystem_identity(root, "repository root")?;
-        let config_hash = plan_exec::compute_config_hash(root)?;
+        let pinned_hash = snapshot.hash().to_string();
         let env = hooks::HookEnv {
             root,
             store: None,
@@ -563,20 +634,35 @@ fn cmd_apply(
         };
         hooks::run_global_hook(root, "pre-apply", &env, &platform)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
+        global_ancestors
+            .revalidate()
+            .map_err(global_redirect_to_error)?;
+        // Revalidate $HOME identity: detect a hook that replaced the directory
+        // behind a symlinked $HOME.
+        home_identity
+            .revalidate()
+            .map_err(|e| StitchError::internal(e.to_string()))?;
         ensure_filesystem_identity(
             root,
             root_identity,
             "repository changed during pre-apply hook",
             "repository root",
         )?;
-        if plan_exec::compute_config_hash(root)? != config_hash {
+        if config::revalidate_config_hash(root)? != pinned_hash {
             return Err(StitchError::plan_stale(
                 "config changed during pre-apply hook",
             ));
         }
     }
 
-    let (plan, warnings) = store::apply_all(root, &filtered_config, &platform, opts);
+    let (plan, warnings) = store::apply_all(
+        root,
+        &snapshot.loaded.config,
+        Some(snapshot.hash()),
+        only,
+        &platform,
+        opts,
+    );
 
     for w in &warnings {
         eprintln!("warning: {w}");
@@ -765,14 +851,17 @@ fn cmd_apply_plan(
 
 fn apply_json(
     root: &std::path::Path,
-    config: &config::Config,
+    snapshot: &config::ConfigSnapshot,
+    only: &[String],
     opts: store::ApplyOpts,
     command: &'static str,
     loaded_warnings: Vec<String>,
 ) -> Result<(), StitchError> {
     let platform = Platform::detect();
+    let config = &snapshot.loaded.config;
+    let filtered_config = filter_config(config, only);
 
-    if store::has_active_template_sources(root, config, &platform)
+    if store::has_active_template_sources(root, &filtered_config, &platform)
         && !render::repo_gitignore_covers_render(root)
     {
         return Err(StitchError::internal(format!(
@@ -782,8 +871,28 @@ fn apply_json(
     }
 
     if !opts.dry_run {
+        // Pin $HOME identity (including the resolved directory behind a
+        // symlinked $HOME) across the global pre-apply hook.
+        let home_identity =
+            safety::HomeIdentity::capture().map_err(|e| StitchError::internal(e.to_string()))?;
+
+        // Pin every target ancestor across the global pre-apply hook.
+        let home = expand_home("~")?;
+        let mut all_targets = Vec::new();
+        let mut all_removed = BTreeSet::new();
+        for (name, store) in &filtered_config.stores {
+            let (targets, removed) =
+                store::collect_store_link_targets(root, name, store, &platform)
+                    .map_err(StitchError::internal)?;
+            all_targets.extend(targets);
+            all_removed.extend(removed);
+        }
+        let global_ancestors =
+            TargetAncestorSnapshot::capture(root, all_targets, &all_removed, &home)
+                .map_err(global_redirect_to_error)?;
+
         let root_identity = filesystem_identity(root, "repository root")?;
-        let config_hash = plan_exec::compute_config_hash(root)?;
+        let pinned_hash = snapshot.hash().to_string();
         let env = hooks::HookEnv {
             root,
             store: None,
@@ -792,20 +901,33 @@ fn apply_json(
         };
         hooks::run_global_hook(root, "pre-apply", &env, &platform)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
+        global_ancestors
+            .revalidate()
+            .map_err(global_redirect_to_error)?;
+        home_identity
+            .revalidate()
+            .map_err(|e| StitchError::internal(e.to_string()))?;
         ensure_filesystem_identity(
             root,
             root_identity,
             "repository changed during pre-apply hook",
             "repository root",
         )?;
-        if plan_exec::compute_config_hash(root)? != config_hash {
+        if config::revalidate_config_hash(root)? != pinned_hash {
             return Err(StitchError::plan_stale(
                 "config changed during pre-apply hook",
             ));
         }
     }
 
-    let (plan, mut warnings) = store::apply_all(root, config, &platform, opts);
+    let (plan, mut warnings) = store::apply_all(
+        root,
+        &snapshot.loaded.config,
+        Some(snapshot.hash()),
+        only,
+        &platform,
+        opts,
+    );
     warnings.extend(loaded_warnings);
 
     if !opts.dry_run && plan.summary.errors == 0 && plan.summary.conflicts == 0 {
@@ -890,6 +1012,15 @@ fn cmd_status(
             }
             linker::LinkStatus::Foreign(p) => {
                 format!("◆ foreign → {}", p.display())
+            }
+            linker::LinkStatus::StoreError(p) => {
+                format!(
+                    "✗ error: store directory '{}' is missing, symlinked, or not a directory",
+                    p.display()
+                )
+            }
+            linker::LinkStatus::ConfigError(msg) => {
+                format!("✗ error: {msg}")
             }
         };
 
@@ -1590,6 +1721,30 @@ fn cmd_remove(
         .as_deref()
         .map(str::to_owned);
 
+    // InventoryCheck: validate the store's inventory regardless of platform
+    // match. A platform-skipped store with a symlinked source root or
+    // colliding sources is still invalid and must not be silently removed.
+    // "Skipped" changes whether we act, not whether we validate.
+    //
+    // For active stores, the existing classify logic below already detects
+    // these errors and produces the expected error messages and exit codes.
+    // The InventoryCheck here covers the gap: platform-skipped stores that
+    // the classify logic's status_all filter would skip entirely.
+    let store_config = loaded.config.stores.get(name);
+    let is_platform_skipped = store_config.is_some_and(|s| !platform.matches_when(&s.when));
+    if is_platform_skipped {
+        let inventory_errors = safety::validate_inventory(root, &loaded.config);
+        if safety::store_has_inventory_error(&inventory_errors, name) {
+            let inv_err = inventory_errors
+                .iter()
+                .find(|e| e.store == name)
+                .expect("store_has_inventory_error confirmed presence");
+            return Err(StitchError::path_validation(format!(
+                "cannot remove store '{name}': inventory error: {inv_err}"
+            )));
+        }
+    }
+
     // Classify this store's links from the current filesystem state. Shared by
     // dry-run (no lock needed — nothing mutates) and the real removal path
     // (recomputed after the pre-remove hook, under the lock). Returns the
@@ -1601,7 +1756,7 @@ fn cmd_remove(
                 .iter()
                 .filter(|e| e.store_name == *name && !e.skipped_platform)
                 .collect();
-            let linked: Vec<store::StatusEntry> = store_statuses
+            let mut linked: Vec<store::StatusEntry> = store_statuses
                 .iter()
                 .copied()
                 // A template link can outlive a missing staged render and therefore
@@ -1611,6 +1766,40 @@ fn cmd_remove(
                 .filter(|e| linker::points_to_source(&e.target, &e.link_source, root))
                 .cloned()
                 .collect();
+            if let Some(entry) = store_statuses
+                .iter()
+                .copied()
+                .find(|e| matches!(e.status, linker::LinkStatus::StoreError(_)))
+            {
+                return match std::fs::symlink_metadata(&entry.target) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        Err(StitchError::conflict_foreign(
+                            &entry.target,
+                            std::fs::read_link(&entry.target).ok(),
+                        ))
+                    }
+                    Ok(_) => Err(StitchError::conflict_real(&entry.target)),
+                    Err(_) => Err(StitchError::internal(format!(
+                        "store directory '{}' is missing, symlinked, or not a directory",
+                        entry.target.display()
+                    ))),
+                };
+            }
+
+            if let Some(entry) = store_statuses
+                .iter()
+                .copied()
+                .find(|e| matches!(e.status, linker::LinkStatus::ConfigError(_)))
+                && let linker::LinkStatus::ConfigError(msg) = &entry.status
+            {
+                return Err(StitchError::path_validation(format!(
+                    "store '{}': cannot remove store with configuration error at {}: {}",
+                    name,
+                    entry.target.display(),
+                    msg
+                )));
+            }
+
             if let Some(entry) = store_statuses.iter().copied().find(|e| {
                 (matches!(e.status, linker::LinkStatus::Broken(_))
                     || matches!(e.status, linker::LinkStatus::Foreign(_)))
@@ -1623,6 +1812,147 @@ fn cmd_remove(
                     std::fs::read_link(&entry.target).ok(),
                 ));
             }
+
+            // `status_all` filters out platform-skipped stores, and
+            // `collect_statuses` suppresses an owned whole-directory root when a
+            // store resolves to file mode (pending promotion to per-file links).
+            // `remove` must still unlink every owned link for the named store
+            // before dropping state, regardless of whether the store is currently
+            // active on this platform: the links exist on disk and were created
+            // by stitch.
+            let mut extra: Vec<store::StatusEntry> = Vec::new();
+            let mut seen: BTreeSet<std::path::PathBuf> =
+                linked.iter().map(|e| e.target.clone()).collect();
+            if let Some(store) = loaded.config.stores.get(name) {
+                let store_dir = root.join(name);
+                let home = config::expand_home("~").ok();
+
+                let mut add = |target: &std::path::Path,
+                               source: std::path::PathBuf,
+                               link_source: std::path::PathBuf,
+                               is_template: bool,
+                               target_name: Option<&str>,
+                               allow_dir: bool|
+                 -> Result<(), StitchError> {
+                    if seen.contains(target) {
+                        return Ok(());
+                    }
+                    match std::fs::symlink_metadata(target) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            if linker::points_to_source(target, &link_source, root) {
+                                seen.insert(target.to_path_buf());
+                                extra.push(store::StatusEntry {
+                                    store_name: name.to_string(),
+                                    target_name: target_name.map(str::to_owned),
+                                    source,
+                                    link_source,
+                                    target: target.to_path_buf(),
+                                    status: linker::LinkStatus::Linked,
+                                    skipped_platform: false,
+                                    is_template,
+                                });
+                                Ok(())
+                            } else {
+                                Err(StitchError::conflict_foreign(
+                                    target,
+                                    std::fs::read_link(target).ok(),
+                                ))
+                            }
+                        }
+                        Ok(meta) if meta.is_dir() && allow_dir => Ok(()),
+                        Ok(_) => Err(StitchError::conflict_real(target)),
+                        Err(_) => Ok(()),
+                    }
+                };
+
+                let mut process_target = |target_path: &std::path::Path,
+                                          files: &[String],
+                                          patterns: &[String],
+                                          ignore: &[String],
+                                          target_name: Option<&str>|
+                 -> Result<(), StitchError> {
+                    if home.as_ref().is_some_and(|h| h == target_path) {
+                        return Ok(());
+                    }
+                    match store::resolve_target_names(&store_dir, files, patterns, ignore) {
+                        store::LinkTargets::WholeDir => add(
+                            target_path,
+                            store_dir.clone(),
+                            store_dir.clone(),
+                            false,
+                            target_name,
+                            false,
+                        ),
+                        store::LinkTargets::Files(names) => {
+                            // A former whole-directory root may be awaiting
+                            // promotion to per-file links. A real directory at
+                            // the root is a valid file-mode parent and not a
+                            // conflict.
+                            add(
+                                target_path,
+                                store_dir.clone(),
+                                store_dir.clone(),
+                                false,
+                                target_name,
+                                true,
+                            )?;
+                            // When the root itself is a symlink it is removed
+                            // as a whole; the per-file paths underneath resolve
+                            // through the link to the source tree, so they are
+                            // not independent targets.
+                            let root_is_link = std::fs::symlink_metadata(target_path)
+                                .is_ok_and(|m| m.file_type().is_symlink());
+                            if !root_is_link {
+                                for source_name in &names {
+                                    let entry = render::resolve_entry(source_name);
+                                    let repo_source = store_dir.join(&entry.source_rel);
+                                    let target = target_path.join(&entry.link_rel);
+                                    let link_source = if entry.is_template {
+                                        render::staging_path(root, name, &entry.link_rel)
+                                    } else {
+                                        repo_source.clone()
+                                    };
+                                    add(
+                                        &target,
+                                        repo_source,
+                                        link_source,
+                                        entry.is_template,
+                                        target_name,
+                                        false,
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        }
+                    }
+                };
+
+                if store.is_multi_target() {
+                    for (target_name, target_entry) in &store.targets {
+                        let target_path = config::expand_home(&target_entry.target)
+                            .expect("HOME was validated by Config::load");
+                        process_target(
+                            &target_path,
+                            &target_entry.files,
+                            &target_entry.patterns,
+                            &target_entry.ignore,
+                            Some(target_name),
+                        )?;
+                    }
+                } else if let Some(target_str) = &store.target {
+                    let target_path = config::expand_home(target_str)
+                        .expect("HOME was validated by Config::load");
+                    process_target(
+                        &target_path,
+                        &store.files,
+                        &store.patterns,
+                        &store.ignore,
+                        None,
+                    )?;
+                }
+            }
+            linked.extend(extra);
+
             let linked_paths: Vec<String> = linked
                 .iter()
                 .map(|e| e.target.to_string_lossy().into_owned())
@@ -1663,8 +1993,12 @@ fn cmd_remove(
     // Global pre-remove hook — runs WITHOUT the state lock; a hook that
     // invokes a mutating stitch command acquires the lock itself. Pin both the
     // repository and its state directory: replacing either with another real
-    // directory must not redirect cleanup or the later state write.
+    // directory must not redirect cleanup or the later state write. Also pin
+    // $HOME identity so a hook that replaces the directory behind a symlinked
+    // $HOME cannot redirect removal to an external target.
     {
+        let home_identity =
+            safety::HomeIdentity::capture().map_err(|e| StitchError::internal(e.to_string()))?;
         let root_identity = filesystem_identity(root, "repository root")?;
         let stitch_dir = root.join(".stitch");
         let stitch_identity = filesystem_identity(&stitch_dir, "state directory")?;
@@ -1676,6 +2010,9 @@ fn cmd_remove(
         };
         hooks::run_global_hook(root, "pre-remove", &env, &platform)
             .map_err(|e| StitchError::hook("pre-remove", e))?;
+        home_identity
+            .revalidate()
+            .map_err(|e| StitchError::internal(e.to_string()))?;
         ensure_filesystem_identity(
             root,
             root_identity,
@@ -1776,13 +2113,20 @@ fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), StitchErr
     let path = match entry {
         None => {
             let authored_path = root.join("stitch.toml");
-            if !authored_path.exists() {
-                return Err(StitchError::internal(format!(
-                    "{} does not exist — run `stitch init` first",
-                    authored_path.display()
-                )));
+            // Use symlink_metadata (not exists()) so a symlinked stitch.toml
+            // is detected and rejected before the editor opens the external
+            // file. validate_authored_file rejects symlinks, non-regular
+            // files, and hard links; a missing file is reported as absent.
+            config::validate_authored_file(&authored_path)?;
+            match std::fs::symlink_metadata(&authored_path) {
+                Ok(_) => authored_path,
+                Err(_) => {
+                    return Err(StitchError::internal(format!(
+                        "{} does not exist — run `stitch init` first",
+                        authored_path.display()
+                    )));
+                }
             }
-            authored_path
         }
         Some(e) => {
             let loaded = Config::load(root)?;
@@ -2384,6 +2728,12 @@ fn cmd_prune(
             let platform = Platform::detect();
             let roots = prune_roots(scan_dirs)
                 .map_err(|e| Box::new((StitchError::from(e), warnings.clone())))?;
+
+            // Pin $HOME identity across the scan-to-removal window, matching
+            // the non-JSON path.
+            let home_identity = safety::HomeIdentity::capture()
+                .map_err(|e| Box::new((StitchError::internal(e.to_string()), warnings.clone())))?;
+
             let found = scan::scan_for_repo_links(root, &roots);
             let orphan_refs = scan::orphan_links(root, &found, &loaded.config, &platform);
             let orphans: Vec<scan::FoundLink> = orphan_refs.iter().map(|&fl| fl.clone()).collect();
@@ -2399,6 +2749,10 @@ fn cmd_prune(
             // removal.
             let _state_lock = config::StateLock::exclusive_if_present(root)
                 .map_err(|e| Box::new((StitchError::from(e), warnings.clone())))?;
+            // Revalidate $HOME identity under the lock before any removal.
+            home_identity
+                .revalidate()
+                .map_err(|e| Box::new((StitchError::internal(e.to_string()), warnings.clone())))?;
             let loaded =
                 Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             let found = scan::scan_for_repo_links(root, &roots);
@@ -2441,6 +2795,12 @@ fn cmd_prune(
 
     let roots = prune_roots(scan_dirs)?;
 
+    // Pin $HOME identity across the scan-to-removal window. A symlinked $HOME
+    // whose backing directory is replaced between scan and removal would
+    // otherwise cause prune to remove links from the wrong directory.
+    let home_identity =
+        safety::HomeIdentity::capture().map_err(|e| StitchError::internal(e.to_string()))?;
+
     let found = scan::scan_for_repo_links(root, &roots);
     let orphans = scan::orphan_links(root, &found, &loaded.config, &platform);
 
@@ -2468,6 +2828,11 @@ fn cmd_prune(
     // re-scan under the lock, so a concurrent add/apply cannot have its state
     // or links change between classification and removal.
     let _state_lock = config::StateLock::exclusive_if_present(root).map_err(StitchError::from)?;
+    // Revalidate $HOME identity under the lock: detect a replaced backing
+    // directory before any removal.
+    home_identity
+        .revalidate()
+        .map_err(|e| StitchError::internal(e.to_string()))?;
     let loaded = Config::load(root)?;
     let found = scan::scan_for_repo_links(root, &roots);
     let orphans = scan::orphan_links(root, &found, &loaded.config, &platform);
@@ -2608,6 +2973,40 @@ fn cmd_render(root: &std::path::Path, spec: &str, json: bool) -> Result<(), Stit
         .map_err(|e| StitchError::render(&source_path, e))?;
     print!("{content}");
     Ok(())
+}
+
+// ===========================================================================
+// Test-only seam for the direct-apply parse-then-restore TOCTOU regression.
+//
+// `test_pause_after_snapshot` runs inside `cmd_apply` immediately after
+// `ConfigSnapshot::load`, before the global pre-apply hook revalidation and
+// the per-store loop. A test installs a callback that swaps the on-disk
+// config (e.g. from malicious B to benign A), then calls `cmd_apply`. This
+// deterministically reproduces the race where a config is captured as B and
+// restored to A before revalidation — the exact invariant that
+// `ConfigSnapshot` + `pinned_hash` fixes. Both text and JSON paths go
+// through `cmd_apply`, so a single seam covers both.
+// ===========================================================================
+#[cfg(test)]
+thread_local! {
+    static TEST_PAUSE_AFTER_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_pause_after_snapshot() {
+    TEST_PAUSE_AFTER_SNAPSHOT.with(|p| {
+        if let Some(f) = p.borrow_mut().take() {
+            f();
+        }
+    });
+}
+
+/// Test-only setter for the post-snapshot seam. Install a callback that
+/// runs inside `cmd_apply` immediately after `ConfigSnapshot::load`.
+#[cfg(test)]
+fn set_test_pause_after_snapshot(f: Option<Box<dyn FnOnce()>>) {
+    TEST_PAUSE_AFTER_SNAPSHOT.with(|p| *p.borrow_mut() = f);
 }
 
 #[cfg(test)]
@@ -2818,6 +3217,285 @@ files = ["regular"]
         assert!(
             !state_text.contains("[stores.app]"),
             "state entry must be removed"
+        );
+    }
+
+    // --- Direct-apply parse-then-restore TOCTOU regression ---
+    //
+    // These tests exercise the actual `cmd_apply` production handler (both
+    // text and JSON paths) via a test-only seam that runs immediately after
+    // `ConfigSnapshot::load`. The seam swaps the on-disk config from
+    // malicious B (captured by the snapshot) to benign A before any
+    // revalidation, proving that the pinned hash catches the swap and the
+    // malicious per-store hook never runs.
+
+    /// Shared setup: creates a repo with a store, a malicious per-store
+    /// pre-hook in `stitch.toml` (config B), and state pointing at `~/.app`.
+    /// Returns the paths needed by the test.
+    struct SnapshotSwapSetup {
+        root: std::path::PathBuf,
+        authored_path: std::path::PathBuf,
+        marker: std::path::PathBuf,
+        home: std::path::PathBuf,
+        _guard: crate::config::TestHomeGuard,
+        _tmp: tempfile::TempDir,
+    }
+
+    fn setup_snapshot_swap_repo() -> SnapshotSwapSetup {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let stitch = root.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(root.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let store_dir = root.join("app");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("file"), "contents").unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        // Keep the guard in the returned struct so it outlives the test body —
+        // dropping it here would restore the real $HOME mid-test.
+        let guard = crate::config::test_home_guard(home.clone());
+
+        let marker = root.join("pwned");
+        let malicious_authored = format!(
+            "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+            marker.display()
+        );
+        let authored_path = root.join("stitch.toml");
+        fs::write(&authored_path, &malicious_authored).unwrap();
+        fs::write(
+            stitch.join("state.toml"),
+            "[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n",
+        )
+        .unwrap();
+
+        SnapshotSwapSetup {
+            root,
+            authored_path,
+            marker,
+            home,
+            _guard: guard,
+            _tmp: tmp,
+        }
+    }
+
+    /// **Text path:** `cmd_apply` (json=false) must reject when the config is
+    /// swapped from malicious B to benign A after snapshot capture. The
+    /// malicious per-store hook must not run, and no target link must be
+    /// created.
+    #[test]
+    fn cmd_apply_text_rejects_malicious_config_captured_then_restored() {
+        let setup = setup_snapshot_swap_repo();
+        let authored_path = setup.authored_path.clone();
+        let marker = setup.marker.clone();
+        let home = setup.home.clone();
+
+        // Swap stitch.toml from B (malicious) to A (benign, empty) immediately
+        // after the snapshot is captured.
+        set_test_pause_after_snapshot(Some(Box::new(move || {
+            fs::write(&authored_path, "").unwrap();
+        })));
+
+        let result = cmd_apply(
+            &setup.root,
+            &[],
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            false,
+        );
+        set_test_pause_after_snapshot(None);
+
+        assert!(
+            result.is_err(),
+            "text apply must reject when config was swapped after snapshot capture"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("config changed during pre-apply hook"),
+            "expected 'config changed during pre-apply hook', got: {err}"
+        );
+
+        // The malicious per-store hook must NOT have run.
+        assert!(
+            !marker.exists(),
+            "malicious per-store hook must not run when config was captured as B \
+             and restored to A before revalidation"
+        );
+        // No target link must have been created.
+        assert!(
+            !home.join(".app").exists(),
+            "no target link should be created when apply rejects due to config hash mismatch"
+        );
+    }
+
+    /// **JSON path:** `cmd_apply` (json=true) must reject when the config is
+    /// swapped from malicious B to benign A after snapshot capture. The
+    /// malicious per-store hook must not run, and no target link must be
+    /// created.
+    #[test]
+    fn cmd_apply_json_rejects_malicious_config_captured_then_restored() {
+        let setup = setup_snapshot_swap_repo();
+        let authored_path = setup.authored_path.clone();
+        let marker = setup.marker.clone();
+        let home = setup.home.clone();
+
+        set_test_pause_after_snapshot(Some(Box::new(move || {
+            fs::write(&authored_path, "").unwrap();
+        })));
+
+        let result = cmd_apply(
+            &setup.root,
+            &[],
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            true,
+        );
+        set_test_pause_after_snapshot(None);
+
+        assert!(
+            result.is_err(),
+            "json apply must reject when config was swapped after snapshot capture"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("config changed during pre-apply hook"),
+            "expected 'config changed during pre-apply hook', got: {err}"
+        );
+
+        assert!(
+            !marker.exists(),
+            "malicious per-store hook must not run when config was captured as B \
+             and restored to A before revalidation (json path)"
+        );
+        assert!(
+            !home.join(".app").exists(),
+            "no target link should be created when apply rejects due to config hash mismatch (json path)"
+        );
+    }
+
+    /// **Positive counterpart (text):** when the config is stable (no swap),
+    /// the per-store pre-hook must run and the target link must be created.
+    #[test]
+    fn cmd_apply_text_per_store_hook_runs_when_config_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let stitch = root.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(root.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let store_dir = root.join("app");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("file"), "contents").unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _guard = crate::config::test_home_guard(home.clone());
+
+        let marker = root.join("hook_ran");
+        fs::write(
+            root.join("stitch.toml"),
+            format!(
+                "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            stitch.join("state.toml"),
+            "[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n",
+        )
+        .unwrap();
+
+        // No seam callback — config stays stable.
+        let result = cmd_apply(
+            &root,
+            &[],
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            false,
+        );
+        assert!(result.is_ok(), "stable apply should succeed: {:?}", result);
+
+        assert!(marker.exists(), "per-store hook should have run");
+        assert!(
+            home.join(".app").is_dir(),
+            "target directory should be created when config is stable"
+        );
+        assert!(
+            home.join(".app").join("file").is_symlink(),
+            "file symlink should be created when config is stable"
+        );
+    }
+
+    /// **Positive counterpart (JSON):** when the config is stable (no swap),
+    /// the per-store pre-hook must run and the target link must be created.
+    #[test]
+    fn cmd_apply_json_per_store_hook_runs_when_config_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let stitch = root.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(root.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let store_dir = root.join("app");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("file"), "contents").unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _guard = crate::config::test_home_guard(home.clone());
+
+        let marker = root.join("hook_ran");
+        fs::write(
+            root.join("stitch.toml"),
+            format!(
+                "[stores.app]\nhooks = {{ pre = \"touch {}\" }}\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            stitch.join("state.toml"),
+            "[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n",
+        )
+        .unwrap();
+
+        let result = cmd_apply(
+            &root,
+            &[],
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            true,
+        );
+        assert!(
+            result.is_ok(),
+            "stable json apply should succeed: {:?}",
+            result
+        );
+
+        assert!(
+            marker.exists(),
+            "per-store hook should have run (json path)"
+        );
+        assert!(
+            home.join(".app").is_dir(),
+            "target directory should be created when config is stable (json path)"
+        );
+        assert!(
+            home.join(".app").join("file").is_symlink(),
+            "file symlink should be created when config is stable (json path)"
         );
     }
 }

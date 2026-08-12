@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.0 — 2026-08-12
+
+### Trust and safety
+
+- **New `safety` module** defines the invariants every mutating command must
+  uphold, replacing one-path-at-a-time fixes that left adjacent paths uncovered:
+  - **`HomeIdentity`** pins `$HOME` as a location, not a live pathname. Both
+    the entry itself (lstat) and the directory it resolves to (stat) are
+    captured before any hook and revalidated after. A hook that replaces the
+    directory *behind* a symlinked `$HOME` — without changing the symlink — is
+    detected and rejected before any target mutation. Enforced in `apply`
+    (text and JSON), `remove`, and plan capture.
+  - **`InventoryCheck`** enforces inventory validity (symlinked source roots,
+    source-name collisions, unreadable store dirs, unsupported template
+    sources) for *all* stores regardless of platform match. "Skipped" changes
+    whether a command acts on a store, not whether it validates it: a
+    platform-skipped store with a symlinked source root or colliding sources
+    is still invalid and is no longer silently removed or state-dropped.
+- **Config revalidation now uses the fd-validated reader.** The apply path
+  replaced the path-based `compute_config_hash` with
+  `config::revalidate_config_hash`, which re-reads via the same no-follow,
+  fd-validated reader as `ConfigSnapshot::load`. A path replacement (symlink,
+  hard link, rename) targeting the config file between open and read can no
+  longer substitute bytes for the revalidation hash. A read failure is
+  surfaced as an explicit config error (exit 3) with path and checkpoint
+  context, not silently collapsed into "hash mismatch". Parent-directory
+  replacement remains within the documented same-user race boundary.
+- **`status`/`doctor`/`remove` surface store and config errors** via new
+  `LinkStatus::StoreError` and `LinkStatus::ConfigError` variants instead of
+  treating a bad source root or unresolvable config as a missing link.
+- **Link ownership check tightened in `check_link`:** the immediate link
+  target must be an in-repo path (the same `source_ancestors_within` guard
+  used by `points_at_source`); a link pointing directly at an external
+  endpoint is now foreign under the two-tier ownership rule.
+
+### Tests
+
+- ~2100 lines of new CLI integration tests covering `$HOME` identity
+  replacement, inventory validation for platform-skipped stores, the
+  fd-validated revalidation parse-then-restore TOCTOU (deterministic test
+  seam in `cmd_apply`, covering both text and JSON paths), and the new
+  `status` error variants.
+
 ## 0.8.0 — 2026-08-11
 
 ### Trust and safety
