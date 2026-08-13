@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.11.3 — 2026-08-13
+
+### Fixed
+
+- Tests: fix `prop_source_ancestors_within_direct_child` collision when
+  `repo_name` equals `ext` by using a non-colliding external parent.
+
 ## 0.11.2 — 2026-08-13
 
 ### Fixed
