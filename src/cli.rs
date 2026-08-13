@@ -70,6 +70,10 @@ pub enum Commands {
         /// Preview .bak backup behavior (what `apply --force` would do)
         #[arg(long)]
         force: bool,
+
+        /// Exit 14 when safe changes are needed; conflicts retain their existing codes
+        #[arg(long)]
+        exit_code: bool,
     },
 
     /// List all configured stores

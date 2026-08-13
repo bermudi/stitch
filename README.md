@@ -141,7 +141,7 @@ target = "~/.config/git"
 | `stitch add <path>` | Bring a file/folder into the repo and link it back. Creates it empty if the path doesn't exist yet. |
 | `stitch apply` | Make your home match the config. Creates/fixes links, reports anything in the way. |
 | `stitch status` | Is everything linked? Shows `linked`, `missing`, `conflict`, or `broken`. |
-| `stitch diff` | Preview what `apply` would do, without changing anything. |
+| `stitch diff` | Preview what `apply` would do, without changing anything. Add `--exit-code` for a scriptable exact-state check. |
 
 **Occasionally:**
 
@@ -155,7 +155,7 @@ target = "~/.config/git"
 | `stitch import` | Found old hand-made links pointing into your repo? Register them. |
 | `stitch plan` | Save exactly what `apply` would do to a file, so you can review and run `apply --plan <file>` later. |
 
-All of `apply`, `diff`, `add`, and `remove` support `--dry-run` (just pretend). `apply` and `diff` take `--only <name>` to act on one store, and `apply` takes `--force` to back up a real file to `*.bak` before replacing it. Add `--json` to `status`, `list`, `diff`, `apply`, `plan`, `doctor`, `prune`, or `render` for machine-readable output.
+`apply`, `add`, and `remove` support `--dry-run` (just pretend); `diff` is always a preview. `apply` and `diff` take `--only <name>` to act on one store, and `apply` takes `--force` to back up a real file to `*.bak` before replacing it. Add `--json` to `status`, `list`, `diff`, `apply`, `plan`, `doctor`, `prune`, or `render` for machine-readable output.
 
 > Want the full details? See **[SPEC.md](SPEC.md)** — every flag, edge case, and design choice is there.
 

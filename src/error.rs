@@ -39,6 +39,9 @@ pub enum FailureClass {
     /// `Internal` (io/unexpected): doctor findings are the command's purpose,
     /// not an unexpected failure. Per-finding hints ride in the JSON envelope.
     Doctor,
+    /// `diff --exit-code` found safe operations required for convergence
+    /// (exit 14). Conflicts and errors retain their more specific classes.
+    Drift,
 }
 
 impl FailureClass {
@@ -57,6 +60,7 @@ impl FailureClass {
             FailureClass::Mixed => 11,
             FailureClass::PlanStale => 12,
             FailureClass::Doctor => 13,
+            FailureClass::Drift => 14,
         }
     }
 
@@ -75,6 +79,7 @@ impl FailureClass {
             FailureClass::Mixed => "mixed",
             FailureClass::PlanStale => "plan-stale",
             FailureClass::Doctor => "doctor",
+            FailureClass::Drift => "drift",
         }
     }
 
@@ -93,6 +98,7 @@ impl FailureClass {
             "mixed" => Some(FailureClass::Mixed),
             "plan-stale" => Some(FailureClass::PlanStale),
             "doctor" => Some(FailureClass::Doctor),
+            "drift" => Some(FailureClass::Drift),
             _ => None,
         }
     }
@@ -126,6 +132,7 @@ impl FailureClass {
             FailureClass::Doctor => {
                 Some("address the findings above (per-finding hints in JSON)".into())
             }
+            FailureClass::Drift => Some("run `stitch apply` to reconcile the filesystem".into()),
         }
     }
 }
@@ -197,6 +204,9 @@ pub enum StitchError {
 
     #[error("doctor found {errors} error(s)")]
     Doctor { errors: usize },
+
+    #[error("filesystem differs from desired state: {changes} change(s) needed")]
+    Drift { changes: usize },
 }
 
 #[allow(dead_code)]
@@ -295,6 +305,10 @@ impl StitchError {
         Self::Doctor { errors }
     }
 
+    pub fn drift(changes: usize) -> Self {
+        Self::Drift { changes }
+    }
+
     pub fn class(&self) -> FailureClass {
         match self {
             Self::Internal { .. } | Self::Io { .. } | Self::IoContext { .. } => {
@@ -312,6 +326,7 @@ impl StitchError {
             Self::Mixed { .. } => FailureClass::Mixed,
             Self::PlanStale { .. } => FailureClass::PlanStale,
             Self::Doctor { .. } => FailureClass::Doctor,
+            Self::Drift { .. } => FailureClass::Drift,
             Self::Apply { classes, .. } => match classes.as_slice() {
                 [] => FailureClass::Internal,
                 [c] => *c,
@@ -374,6 +389,7 @@ impl StitchError {
             }
             Self::PlanStale { .. } => FailureClass::PlanStale.hint(),
             Self::Doctor { .. } => FailureClass::Doctor.hint(),
+            Self::Drift { .. } => FailureClass::Drift.hint(),
         }
     }
 }

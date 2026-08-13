@@ -207,9 +207,13 @@ fn run(cli: cli::Cli) -> Result<(), StitchError> {
             let root = resolve_root(repo.as_deref())?;
             cmd_status(&root, &name, json)
         }
-        cli::Commands::Diff { only, force } => {
+        cli::Commands::Diff {
+            only,
+            force,
+            exit_code,
+        } => {
             let root = resolve_root(repo.as_deref())?;
-            cmd_diff(&root, &only, force, json)
+            cmd_diff(&root, &only, force, exit_code, json)
         }
         cli::Commands::List => {
             let root = resolve_root(repo.as_deref())?;
@@ -402,6 +406,7 @@ fn render_plan(plan: &plan::Plan, dry_run: bool) {
                 plan::PlanOp::AlreadyLinked { .. } => println!("ok"),
                 plan::PlanOp::ContentChanged { target, .. } => println!("content: {target}"),
                 plan::PlanOp::RemoveLink { target, .. } => println!("remove: {target}"),
+                plan::PlanOp::RemoveStaged { path } => println!("remove staged: {path}"),
                 plan::PlanOp::Error { message, .. } => println!("error: {message}"),
                 plan::PlanOp::StageRender { .. } => {}
             }
@@ -1051,10 +1056,20 @@ fn cmd_status(
     Ok(())
 }
 
+fn pending_change_count(plan: &plan::Plan) -> usize {
+    let summary = &plan.summary;
+    summary.created
+        + summary.replaced
+        + summary.backed_up
+        + summary.removed
+        + summary.content_changed
+}
+
 fn cmd_diff(
     root: &std::path::Path,
     only: &[String],
     force: bool,
+    exit_code: bool,
     json: bool,
 ) -> Result<(), StitchError> {
     let loaded = Config::load(root)?;
@@ -1082,6 +1097,11 @@ fn cmd_diff(
             );
             if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
                 let error = plan_error(&plan);
+                report::write_data_error("diff", plan, &error, loaded.warnings);
+            }
+            let changes = pending_change_count(&plan);
+            if exit_code && changes > 0 {
+                let error = StitchError::drift(changes);
                 report::write_data_error("diff", plan, &error, loaded.warnings);
             }
             Ok((plan, loaded.warnings))
@@ -1119,7 +1139,12 @@ fn cmd_diff(
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
         Err(plan_error(&plan))
     } else {
-        Ok(())
+        let changes = pending_change_count(&plan);
+        if exit_code && changes > 0 {
+            Err(StitchError::drift(changes))
+        } else {
+            Ok(())
+        }
     }
 }
 

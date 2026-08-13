@@ -807,10 +807,11 @@ pub fn stage_template(
     Ok(StageOutcome::Written(paths.dest))
 }
 
-/// Fresh in-memory render compared against the staged file.
+/// Fresh in-memory render and required metadata compared against the staged file.
 ///
-/// Used by `diff` (content dimension) and `doctor` (drift flag). Returns
-/// `true` when the staged file is missing or differs from the fresh render.
+/// Used by `diff` and `doctor`. Returns `true` when apply would atomically
+/// replace the staged file: it is missing, its content differs, its mode is not
+/// `0600`, or it has more than one hard link.
 pub fn staged_differs(
     repo_root: &Path,
     store_name: &str,
@@ -823,7 +824,9 @@ pub fn staged_differs(
     let rendered = render_file(source_path, source_rel, platform, vars)?;
     let paths = staged_paths(repo_root, store_name, &entry.link_rel)?;
     match read_staged_file(&paths)? {
-        Some((existing, _)) => Ok(existing != rendered),
+        Some((existing, meta)) => Ok(existing != rendered
+            || meta.nlink() != 1
+            || meta.permissions().mode() & 0o777 != RENDER_FILE_MODE),
         None => Ok(true),
     }
 }
@@ -1013,22 +1016,22 @@ pub fn remove_staged(repo_root: &Path, store_name: &str, link_rel: &str) -> Resu
     remove_empty_staging_parents(paths.dest.parent().map(Path::to_path_buf), &paths.store_dir)
 }
 
-/// Remove staged renders under `store_name` whose link names are not in
-/// `keep_link_rels`. Also drops empty parent directories left behind.
+/// List staged renders under `store_name` whose link names are not in
+/// `keep_link_rels`, without changing the filesystem.
 ///
-/// "Config is truth" applied to `.stitch/render/`: a deleted/renamed `.tmpl`
-/// must not leave a frozen artifact that silently never updates.
-pub fn reconcile_store_staging(
+/// This is shared by `diff` and `apply` so an exact-state check includes stale
+/// rendered content, not just target links.
+pub fn stale_store_staging(
     repo_root: &Path,
     store_name: &str,
     keep_link_rels: &BTreeSet<String>,
-) -> Result<(), String> {
+) -> Result<Vec<(String, PathBuf)>, String> {
     let store = store_staging_paths(repo_root, store_name)?;
     if !checked_render_dirs(&store.dirs, false)? {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    let mut to_remove = Vec::new();
+    let mut stale = Vec::new();
     for entry in walkdir::WalkDir::new(&store.store_dir)
         .follow_links(false)
         .into_iter()
@@ -1064,14 +1067,30 @@ pub fn reconcile_store_staging(
             .to_str()
             .ok_or_else(|| format!("staged path is not valid UTF-8: {}", entry.path().display()))?;
         if !keep_link_rels.contains(rel) {
-            to_remove.push(rel.to_string());
+            stale.push((rel.to_string(), entry.path().to_path_buf()));
         }
     }
+    Ok(stale)
+}
 
-    for rel in to_remove {
+/// Remove stale staged renders and return the paths that were removed. Also
+/// drops empty parent directories left behind.
+///
+/// "Config is truth" applied to `.stitch/render/`: a deleted/renamed `.tmpl`
+/// must not leave a frozen artifact that silently never updates.
+pub fn reconcile_store_staging(
+    repo_root: &Path,
+    store_name: &str,
+    keep_link_rels: &BTreeSet<String>,
+) -> Result<Vec<PathBuf>, String> {
+    let stale = stale_store_staging(repo_root, store_name, keep_link_rels)?;
+    let removed = stale.iter().map(|(_, path)| path.clone()).collect();
+    for (rel, _) in stale {
         remove_staged(repo_root, store_name, &rel)?;
     }
-    remove_empty_store_staging_dir(&store.store_dir)
+    let store = store_staging_paths(repo_root, store_name)?;
+    remove_empty_store_staging_dir(&store.store_dir)?;
+    Ok(removed)
 }
 
 /// Delete the entire staging tree for a store (used by `remove`). Missing

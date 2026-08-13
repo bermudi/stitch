@@ -44,6 +44,8 @@ pub enum ApplyAction {
     /// A stale stitch-owned file-mode link was removed (or would be removed in
     /// a dry run) because its source is no longer in the resolved entry set.
     Removed(PathBuf),
+    /// A stale rendered file was removed, or would be removed in a dry run.
+    StagedRemoved(PathBuf),
     Error(StitchError),
 }
 
@@ -779,12 +781,19 @@ pub fn apply_store(
 
     // Reap staging only after target cleanup fully succeeds. An I/O failure
     // while unlinking a stale target must leave its render readable rather
-    // than converting the failure into a dangling link.
-    if !opts.dry_run
-        && !link_reconciliation_failed
-        && let Err(e) = render::reconcile_store_staging(repo_root, name, &keep_links)
-    {
-        actions.push(internal_error(e));
+    // than converting the failure into a dangling link. Dry-run performs the
+    // same scan and reports removals without mutating, keeping `diff` exact.
+    if !link_reconciliation_failed {
+        let stale = if opts.dry_run {
+            render::stale_store_staging(repo_root, name, &keep_links)
+                .map(|entries| entries.into_iter().map(|(_, path)| path).collect())
+        } else {
+            render::reconcile_store_staging(repo_root, name, &keep_links)
+        };
+        match stale {
+            Ok(paths) => actions.extend(paths.into_iter().map(ApplyAction::StagedRemoved)),
+            Err(e) => actions.push(internal_error(e)),
+        }
     }
 
     ApplyResult {
@@ -1607,6 +1616,9 @@ fn action_to_plan_op(
                 requires,
             }
         }
+        ApplyAction::StagedRemoved(path) => PlanOp::RemoveStaged {
+            path: path_to_string(path),
+        },
         ApplyAction::AlreadyLinked(target) => {
             let target_str = path_to_string(target);
             let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)

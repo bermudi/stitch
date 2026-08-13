@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.10.0 — 2026-08-12
+
+### Added
+
+- `stitch diff --exit-code` provides a branchable convergence check: exit
+  0 means fully converged, exit 14 (`drift`) means safe changes are pending,
+  and conflicts/errors retain their existing codes. JSON output keeps the full
+  plan alongside the drift error. Platform-skipped stores do not count as drift.
+
+### Fixed
+
+- Authored config, generated state, and legacy config migration now reject
+  unknown keys at the root, store, target, and hook levels, so misspelled
+  safety-sensitive fields such as `ignore` or `pre` cannot be silently ignored.
+- Edited executable plans cannot remove staged output before every live stale
+  link that depends on it; omitted or reordered cleanup is rejected before
+  hooks or filesystem changes.
+- `diff` is now an exact mirror of `apply`: it reports removal of stale
+  rendered files and detects private-render drift (mode not `0600`, or more
+  than one hard link), matching what `apply` would replace. `doctor` inherits
+  the same mode/hard-link checks.
+
 ## 0.9.0 — 2026-08-12
 
 ### Trust and safety

@@ -94,6 +94,10 @@ target = "~/.config/helix"
 
 `stitch migrate` splits a v0.2 `.stitch/config.toml` in place: authored fields (`vars`, `when`, `hooks`, `ignore`) → `stitch.toml`, inventory fields (`target`, `files`, `patterns`) → `.stitch/state.toml`, then preserves the original as `.stitch/config.toml.bak` (the recovery path). One-shot, deterministic; `--dry-run` previews the planned files.
 
+All three config layouts reject unknown keys rather than silently discarding
+misspelled behavior or inventory fields. This includes legacy input during
+migration, which fails before writing either new file or moving the original.
+
 Migration is **comment-lossy by design**: v0.2 comments decorate a single-file layout that no longer exists, so there is no faithful place to carry them into the split files. The conversion prints a note to that effect; the `.bak` preserves the original so the user can re-add any comments they want to keep.
 
 Multi-target array entries get deterministic names during migration (hostname-first if present, else `target-<n>`, with a `-N` suffix on collision) — the cross-file join key.
@@ -173,6 +177,11 @@ Preview what `stitch apply` would do. Reports `ok`, `create`, `conflict`, `repla
 |---|---|---|
 | `--only` | `-o` | Diff only named stores (repeatable) |
 | `--force` | | Preview `.bak` backup behavior (what `apply --force` would do) |
+| `--exit-code` | | Exit 14 when safe changes are pending; conflicts/errors retain their existing codes |
+
+Without `--exit-code`, safe pending changes are reported with exit 0. With it,
+exit 0 means the filesystem is fully converged to the active desired state.
+Platform-skipped stores do not count as drift.
 
 ### `stitch list`
 
@@ -522,6 +531,9 @@ Plan ops are tagged by `action` (snake_case):
 - `replace_link`: `{target, source, old_resolves_to, requires}`
 - `backup_and_link`: `{target, source, backup, requires}`
 - `remove_link`: `{store, target, source, requires}`
+- `remove_staged`: `{path}` — a direct-plan report that apply will remove a
+  stale rendered file; the executable `stitch/plan` form below uses
+  `{store, rel}`.
 - `already_linked`: `{target, source, requires}`
 - `content_changed`: `{target, source, requires}`
 - `conflict`: `{target, resolves_to}`
@@ -593,11 +605,14 @@ error object carries `class` (the stable id) and `code`; text mode prints a
 | 11 | `mixed` | Multiple failure classes in one run | see the per-entry messages in JSON |
 | 12 | `plan-stale` | Plan is stale or invalid | re-run `stitch plan` |
 | 13 | `doctor` | `doctor` reported error-severity findings | address the findings (per-finding hints in JSON) |
+| 14 | `drift` | `diff --exit-code` found safe pending changes | run `stitch apply` |
 
 Aggregation rule: for `apply`, `diff`, and `plan`, a single failure class
-present → that class's code; multiple classes → 11. `apply --plan` exits 12 on
-stale or invalid plans, and on any op whose precondition changed between capture
-and execution. `doctor` exits 13 when error-level findings are present.
+present → that class's code; multiple classes → 11. Drift is considered only
+when a diff has no conflicts or errors, so `diff --exit-code` preserves the
+existing conflict/render/config code when one applies. `apply --plan` exits 12
+on stale or invalid plans, and on any op whose precondition changed between
+capture and execution. `doctor` exits 13 when error-level findings are present.
 
 ### Plan file format (`stitch/plan`)
 
@@ -640,7 +655,9 @@ and a platform/config fingerprint. Plan files are versioned and self-describing:
     repo-owned symlink. `store` identifies the originating store (including
     source-less stale cleanup); `source` is optional.
   - `remove_staged`: `{store, rel}` — remove a stale rendered template from
-    `.stitch/render/<store>/<rel>`.
+    `.stitch/render/<store>/<rel>`. Every live stale link to that render must
+    have a preceding `remove_link`; edited plans that omit or reorder one are
+    rejected before hooks or filesystem changes.
 - `requires` is the plan-file flat form:
   `{target: "<state>", value?: "...", backup?: "<state>", backup_value?: "..."}`.
   `target`/`backup` are one of `absent`, `real_entry`, `symlink_to`, or
