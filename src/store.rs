@@ -1303,6 +1303,113 @@ fn symlink_ancestor(target_root: &Path, target: &Path) -> Option<(PathBuf, Optio
 /// Apply one resolved file-mode entry. Templates render to staging first;
 /// non-templates link the store source directly.
 #[allow(clippy::too_many_arguments)] // mirrors apply_target's parameter set
+pub(crate) fn store_resolves_source(store_dir: &Path, store: &Store, source_name: &str) -> bool {
+    matches!(
+        resolve_targets(store_dir, &store.files, &store.patterns, &store.ignore),
+        Ok(LinkTargets::Files(names)) if names.iter().any(|name| name == source_name)
+    )
+}
+
+/// Validate a target path before an add moves user data. This is deliberately
+/// separate from linking: add must prove target confinement before it renames
+/// the user's source into the repository.
+pub(crate) fn preflight_add_target(
+    repo_root: &Path,
+    target_root: &Path,
+    target: &Path,
+) -> Result<(), ApplyAction> {
+    target_is_confined(target, repo_root)?;
+    if let Ok(meta) = std::fs::symlink_metadata(target_root)
+        && meta.file_type().is_symlink()
+    {
+        // The configured target root itself must be stable. The one allowed
+        // exception is the user's actual `$HOME` entry, which may legitimately
+        // be a symlink (for example, a test or managed home mount).
+        let is_home_root = crate::config::expand_home("~")
+            .ok()
+            .is_some_and(|home| home == target_root);
+        if !is_home_root {
+            return Err(ApplyAction::Conflict {
+                target: target_root.to_path_buf(),
+                resolves_to: std::fs::read_link(target_root).ok(),
+            });
+        }
+    }
+    if let Some((ancestor, resolves_to)) = symlink_ancestor(target_root, target) {
+        return Err(ApplyAction::Conflict {
+            target: ancestor,
+            resolves_to,
+        });
+    }
+    // `apply` may repair a stale stitch-owned symlink. `add` is different:
+    // it must never repoint an existing entry while the user's source is being
+    // moved, even when that entry happens to point into this repository.
+    if let Ok(meta) = std::fs::symlink_metadata(target)
+        && meta.file_type().is_symlink()
+    {
+        // A symlinked $HOME is the user's actual home directory, not an
+        // unsafe target alias. Keep allowing the root itself, while still
+        // rejecting symlinked file targets and all other aliases.
+        let is_home_root = target == target_root
+            && crate::config::expand_home("~")
+                .ok()
+                .is_some_and(|home| home == target);
+        if !is_home_root {
+            return Err(ApplyAction::Conflict {
+                target: target.to_path_buf(),
+                resolves_to: std::fs::read_link(target).ok(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Link exactly one newly adopted plain-file entry without reconciling the
+/// rest of the store. `add --to` uses this narrow path so a failed adoption
+/// cannot remove unrelated stale links or rendered files.
+pub(crate) fn apply_added_plain_file(
+    repo_root: &Path,
+    store_name: &str,
+    store: &Store,
+    source_name: &str,
+    platform: &Platform,
+    opts: ApplyOpts,
+) -> ApplyAction {
+    if !platform.matches_when(&store.when) {
+        return ApplyAction::SkippedPlatform;
+    }
+    let Some(target) = store.target.as_deref() else {
+        return internal_error(format!("store '{store_name}' has no target"));
+    };
+    let store_dir = repo_root.join(store_name);
+    if !linker::is_real_directory(&store_dir) {
+        return internal_error(format!(
+            "store directory '{}' is missing, symlinked, or not a directory",
+            store_dir.display()
+        ));
+    }
+    let target_path = match config::expand_home(target) {
+        Ok(path) => path,
+        Err(error) => return ApplyAction::Error(error.into()),
+    };
+    let entry = render::resolve_entry(source_name);
+    let target = target_path.join(&entry.link_rel);
+    if let Err(action) = preflight_add_target(repo_root, &target_path, &target) {
+        return action;
+    }
+    apply_file_entry(
+        store_name,
+        &store_dir,
+        &target_path,
+        repo_root,
+        source_name,
+        platform,
+        &BTreeMap::new(),
+        opts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_file_entry(
     store_name: &str,
     store_dir: &Path,

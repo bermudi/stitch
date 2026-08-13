@@ -33,7 +33,7 @@ impl Repo {
         fs::write(stitch.join("state.toml"), "").expect("write state.toml");
         // The state lock file is normally created by the first mutating command;
         // seed it here so tests that make .stitch/ read-only still lock first.
-        fs::write(stitch.join("lock"), "").expect("write lock");
+        fs::write(stitch.join("state.lock"), "").expect("write lock");
         // Trust foundation: doctor requires `.stitch/render/` in .gitignore.
         // Real `init` writes this; tests that bypass init need it too.
         fs::write(dir.path().join(".gitignore"), ".stitch/render/\n").expect("write .gitignore");
@@ -2418,12 +2418,13 @@ fn list_marks_stores_without_target() {
 #[test]
 fn add_dry_run_adopt_existing_makes_no_changes() {
     let repo = Repo::new();
-    let src = repo.path().join("external").join(".myrc");
-    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let src = home.path().join(".myrc");
     fs::write(&src, "data").unwrap();
 
     repo.cmd()
         .args(["add", src.to_str().unwrap(), "--dry-run"])
+        .env("HOME", home.path())
         .assert()
         .success()
         .stdout(contains("Would add (adopt existing)"));
@@ -2436,12 +2437,12 @@ fn add_dry_run_adopt_existing_makes_no_changes() {
 #[test]
 fn add_adopt_file_moves_and_links_back() {
     let repo = Repo::new();
-    let src = repo.path().join("external").join(".myrc");
-    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let src = home.path().join(".myrc");
     fs::write(&src, "data").unwrap();
-
     repo.cmd()
         .args(["add", src.to_str().unwrap()])
+        .env("HOME", home.path())
         .assert()
         .success()
         .stdout(contains("Added store"));
@@ -2460,12 +2461,14 @@ fn add_adopt_file_moves_and_links_back() {
 #[test]
 fn add_adopt_dir_moves_and_links_back() {
     let repo = Repo::new();
-    let src = repo.path().join("external").join("myconfig");
+    let home = tempfile::tempdir().unwrap();
+    let src = home.path().join("myconfig");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.conf"), "a").unwrap();
 
     repo.cmd()
         .args(["add", src.to_str().unwrap()])
+        .env("HOME", home.path())
         .assert()
         .success()
         .stdout(contains("Added store"));
@@ -2482,7 +2485,8 @@ fn add_adopt_dir_with_trailing_slash() {
     // fail at the link step because symlink(2) rejects a linkpath with a
     // trailing slash. expand_home now strips trailing slashes.
     let repo = Repo::new();
-    let src = repo.path().join("external").join("myconfig");
+    let home = tempfile::tempdir().unwrap();
+    let src = home.path().join("myconfig");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.conf"), "a").unwrap();
 
@@ -2490,6 +2494,7 @@ fn add_adopt_dir_with_trailing_slash() {
     let src_str = format!("{}/", src.to_str().unwrap());
     repo.cmd()
         .args(["add", &src_str])
+        .env("HOME", home.path())
         .assert()
         .success()
         .stdout(contains("Added store"));
@@ -2797,6 +2802,305 @@ fn add_creates_empty_store_and_links() {
 }
 
 #[test]
+fn add_file_creates_empty_regular_file_and_link() {
+    let repo = Repo::new();
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".bashrc");
+
+    repo.cmd()
+        .args(["add", target.to_str().unwrap(), "--file"])
+        .env("HOME", &home)
+        .assert()
+        .success()
+        .stdout(contains("Added store 'bashrc'"));
+
+    let source = repo.path().join("bashrc").join(".bashrc");
+    assert!(source.is_file());
+    assert_eq!(fs::metadata(&source).unwrap().len(), 0);
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), source);
+    let state = fs::read_to_string(repo.path().join(".stitch/state.toml")).unwrap();
+    assert!(state.contains("target = \"~\""));
+    assert!(state.contains("files = [\".bashrc\"]"));
+}
+
+#[test]
+fn add_file_dry_run_changes_nothing() {
+    let repo = Repo::new();
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".bashrc");
+
+    repo.cmd()
+        .args(["add", target.to_str().unwrap(), "--file", "--dry-run"])
+        .env("HOME", &home)
+        .assert()
+        .success()
+        .stdout(contains("Would add (create empty file)"));
+
+    assert!(!target.exists());
+    assert!(!repo.path().join("bashrc").exists());
+}
+
+#[test]
+fn add_file_rejects_symlinked_target_ancestor_before_creating_store() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let gateway = repo.path().join("gateway");
+    fs::create_dir_all(&gateway).unwrap();
+    std::os::unix::fs::symlink(&gateway, home.path().join(".config")).unwrap();
+    let target = home.path().join(".config/.bashrc");
+
+    repo.cmd()
+        .args(["add", target.to_str().unwrap(), "--file"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .stderr(contains("conflict"));
+    assert!(!repo.path().join("bashrc").exists());
+    assert!(!target.exists());
+}
+
+#[test]
+fn add_file_rejects_existing_path_and_incompatible_flags() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join(".bashrc");
+    fs::write(&target, "existing").unwrap();
+
+    repo.cmd()
+        .args(["add", target.to_str().unwrap(), "--file"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("already exists"));
+    repo.cmd()
+        .args(["add", "~/.zshrc", "--file", "--files", ".zshrc"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("cannot be combined"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+}
+
+#[test]
+fn add_to_existing_file_mode_store_adopts_and_records_file() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let store = repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_path)
+        .assert()
+        .success();
+    let zshrc = home_path.join(".zshrc");
+    fs::write(&zshrc, "zsh config").unwrap();
+
+    repo.cmd()
+        .args(["add", zshrc.to_str().unwrap(), "--to", "shells"])
+        .env("HOME", home_path)
+        .assert()
+        .success()
+        .stdout(contains("Added .zshrc to store 'shells'"));
+
+    let adopted = store.join(".zshrc");
+    assert_eq!(fs::read_to_string(&adopted).unwrap(), "zsh config");
+    assert!(zshrc.is_symlink());
+    assert_eq!(fs::read_link(&zshrc).unwrap(), adopted);
+    assert!(home_path.join(".bashrc").is_symlink());
+    let state = fs::read_to_string(repo.path().join(".stitch/state.toml")).unwrap();
+    assert!(state.contains(".bashrc"));
+    assert!(state.contains(".zshrc"));
+}
+
+#[test]
+fn add_to_existing_store_supports_nested_file() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target_root = home.path().join(".config/app");
+    fs::create_dir_all(target_root.join("sub")).unwrap();
+    repo.make_store("app", &["base"]);
+    repo.write_state("[stores.app]\ntarget = \"~/.config/app\"\nfiles = [\"base\"]\n");
+    let source = target_root.join("sub/config");
+    fs::write(&source, "nested").unwrap();
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap(), "--to", "app"])
+        .env("HOME", home.path())
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(repo.path().join("app/sub/config")).unwrap(),
+        "nested"
+    );
+    assert!(source.is_symlink());
+    let state = fs::read_to_string(repo.path().join(".stitch/state.toml")).unwrap();
+    assert!(state.contains("sub/config"));
+}
+
+#[test]
+fn add_to_explicit_entry_is_not_removed_by_authored_ignore() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let store = repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    repo.write_authored("[stores.shells]\nignore = [\".zshrc\"]\n");
+    let source = home.path().join(".zshrc");
+    fs::write(&source, "keep me").unwrap();
+
+    // Explicit inventory wins over ignore patterns, matching ordinary file
+    // mode. --to records the adopted path explicitly in generated state.
+    repo.cmd()
+        .args(["add", source.to_str().unwrap(), "--to", "shells"])
+        .env("HOME", home.path())
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_to_string(store.join(".zshrc")).unwrap(), "keep me");
+    assert!(source.is_symlink());
+}
+
+#[test]
+fn add_to_rejects_symlinked_store_parent_without_moving_file() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let store = repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~/.config\"\nfiles = [\".bashrc\"]\n");
+    let outside = repo.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, store.join("nested")).unwrap();
+    let source = home.path().join(".config/nested/zshrc");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "keep me").unwrap();
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap(), "--to", "shells"])
+        .env("HOME", home.path())
+        .assert()
+        .failure();
+
+    assert_eq!(fs::read_to_string(&source).unwrap(), "keep me");
+    assert!(!outside.join("zshrc").exists());
+    assert!(!source.is_symlink());
+}
+
+#[test]
+fn add_to_rejects_whole_dir_multi_target_and_wrong_target() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    repo.make_store("whole", &["x"]);
+    repo.write_state("[stores.whole]\ntarget = \"~/.whole\"\n");
+    let source = home.path().join("file");
+    fs::write(&source, "data").unwrap();
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap(), "--to", "whole"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("not an explicit file-mode store"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+}
+
+#[test]
+fn add_to_rejects_hard_linked_file_without_moving() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    let source = home.path().join(".zshrc");
+    fs::write(&source, "data").unwrap();
+    fs::hard_link(&source, home.path().join(".zshrc-alias")).unwrap();
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap(), "--to", "shells"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("hard-linked"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+    assert!(!repo.path().join("shells/.zshrc").exists());
+}
+
+#[test]
+fn add_to_rejects_template_peer_without_moving() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let store = repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    fs::write(store.join(".zshrc.tmpl"), "template").unwrap();
+    let source = home.path().join(".zshrc");
+    fs::write(&source, "data").unwrap();
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap(), "--to", "shells"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .stderr(contains("template source"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+    assert!(!source.is_symlink());
+}
+
+#[test]
+fn add_to_rejects_source_inside_repository_without_moving() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    let source = repo.path().join("unmanaged").join(".zshrc");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "repo content").unwrap();
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap(), "--to", "shells"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("inside the stitch repository"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), "repo content");
+    assert!(!repo.path().join("shells/unmanaged/.zshrc").exists());
+}
+
+#[test]
+fn add_to_dry_run_changes_nothing() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    let source = home.path().join(".zshrc");
+    fs::write(&source, "data").unwrap();
+    let before = fs::read_to_string(repo.path().join(".stitch/state.toml")).unwrap();
+
+    repo.cmd()
+        .args([
+            "add",
+            source.to_str().unwrap(),
+            "--to",
+            "shells",
+            "--dry-run",
+        ])
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(contains("Would add to store 'shells'"));
+
+    assert_eq!(fs::read_to_string(&source).unwrap(), "data");
+    assert!(!repo.path().join("shells/.zshrc").exists());
+    assert_eq!(
+        fs::read_to_string(repo.path().join(".stitch/state.toml")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn add_creates_store_with_explicit_name() {
     let repo = Repo::new();
     let target = repo.path().join("home").join(".config").join("nvim");
@@ -2934,12 +3238,13 @@ fn add_rejects_files_on_existing_path() {
     // the store layout, so --files would be silently ignored. Must error rather
     // than surprise.
     let repo = Repo::new();
-    let src = repo.path().join("external").join(".myrc");
-    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let src = home.path().join(".myrc");
     fs::write(&src, "data").unwrap();
 
     repo.cmd()
         .args(["add", src.to_str().unwrap(), "--files", "x"])
+        .env("HOME", home.path())
         .assert()
         .failure()
         .stderr(contains("only apply when creating a new empty store"));
@@ -2953,12 +3258,14 @@ fn add_rejects_files_on_existing_path() {
 #[test]
 fn add_rejects_patterns_on_existing_path() {
     let repo = Repo::new();
-    let src = repo.path().join("external").join("myconfig");
+    let home = tempfile::tempdir().unwrap();
+    let src = home.path().join("myconfig");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.conf"), "a").unwrap();
 
     repo.cmd()
         .args(["add", src.to_str().unwrap(), "--patterns", "*"])
+        .env("HOME", home.path())
         .assert()
         .failure()
         .stderr(contains("only apply when creating a new empty store"));
@@ -8191,8 +8498,8 @@ fn render_expression_works() {
 }
 
 #[test]
-fn json_rejected_on_write_commands_as_usage_envelope() {
-    // Write/mutating commands other than `apply`/`diff` are not JSON-enabled.
+fn json_rejected_on_unsupported_write_commands_as_usage_envelope() {
+    // Non-dry-run write commands other than `apply`/`diff` are not JSON-enabled.
     // The rejection must go through the same envelope contract an agent already
     // parses — a `usage` error (code 2) on stdout, honest exit 2 — not a prose
     // stderr line. The check fires before repo resolution, so no real repo is
@@ -8218,7 +8525,19 @@ fn json_rejected_on_write_commands_as_usage_envelope() {
         "message should name the unsupported flag"
     );
 
-    // Spot-check a second write command so the boundary isn't single-cmd.
+    // Dry-run add is intentionally supported and returns its normal envelope.
+    let output = repo
+        .cmd()
+        .args(["--json", "add", "~/x", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+    assert_eq!(value["data"]["mode"], "create");
+
+    // Spot-check a second unsupported write command so the boundary isn't
+    // single-command.
     let output = repo.cmd().args(["--json", "remove", "x"]).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     let value = json_output(&output);
@@ -11166,8 +11485,8 @@ fn add_io_error_includes_path() {
         return;
     }
     let repo = Repo::new();
-    let source = repo.path().join("home").join(".myrc");
-    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join(".myrc");
     fs::write(&source, "data").unwrap();
 
     fs::set_permissions(repo.path(), fs::Permissions::from_mode(0o555)).unwrap();
@@ -11178,6 +11497,7 @@ fn add_io_error_includes_path() {
 
     repo.cmd()
         .args(["add", source.to_str().unwrap()])
+        .env("HOME", home.path())
         .assert()
         .failure()
         .stderr(contains("myrc"))
@@ -11250,8 +11570,13 @@ fn state_lock_never_chmods_hard_linked_file() {
     let cfg_dir = repo.path().join(".config");
     fs::create_dir_all(&cfg_dir).unwrap();
     fs::write(cfg_dir.join("nested-file"), "ignored").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home_cfg = home.path().join(".config");
+    fs::create_dir_all(&home_cfg).unwrap();
+    fs::write(home_cfg.join("nested-file"), "ignored").unwrap();
     repo.cmd()
         .args(["add", "~/.config/nested-file"])
+        .env("HOME", home.path())
         .assert()
         .success();
 
@@ -11284,6 +11609,10 @@ fn state_lock_existing_path_refuses_symlink() {
     fs::set_permissions(&external_file, perms).unwrap();
 
     let lock = repo.path().join(".stitch").join("state.lock");
+    // Repo::new seeds the production lock filename so permission-failure tests
+    // can acquire it before making .stitch read-only. Replace that fixture
+    // lock with the symlink this test is meant to reject.
+    fs::remove_file(&lock).unwrap();
     std::os::unix::fs::symlink(&external_file, &lock).unwrap();
 
     use std::os::unix::fs::MetadataExt;

@@ -18,8 +18,8 @@ If you've ever wanted to back up your dotfiles, move them to a new machine, or j
 
 No Rust needed. Go to the **[Releases page](https://github.com/bermudi/stitch/releases)** and download the file for your computer.
 
-- Intel/AMD PC or laptop → `stitch-v0.8.0-x86_64-unknown-linux-gnu.tar.gz`
-- Raspberry Pi / ARM server → `stitch-v0.8.0-aarch64-unknown-linux-gnu.tar.gz`
+- Intel/AMD PC or laptop → `stitch-v0.10.0-x86_64-unknown-linux-gnu.tar.gz`
+- Raspberry Pi / ARM server → `stitch-v0.10.0-aarch64-unknown-linux-gnu.tar.gz`
 
 > Tip: Not sure which you need? Run `uname -m` — it prints `x86_64` for most desktops, `aarch64` for ARM.
 
@@ -28,8 +28,8 @@ Then install it:
 ```sh
 # example for x86_64 — swap the filename if you grabbed the ARM one
 # (check the Releases page for the latest version number)
-curl -LO https://github.com/bermudi/stitch/releases/download/v0.8.0/stitch-v0.8.0-x86_64-unknown-linux-gnu.tar.gz
-tar xzf stitch-v0.8.0-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/bermudi/stitch/releases/download/v0.10.0/stitch-v0.10.0-x86_64-unknown-linux-gnu.tar.gz
+tar xzf stitch-v0.10.0-x86_64-unknown-linux-gnu.tar.gz
 sudo mv stitch /usr/local/bin/
 stitch --help
 ```
@@ -62,8 +62,8 @@ stitch init
 #    This moves ~/.config/nvim INTO ~/dots and leaves a link behind
 stitch add ~/.config/nvim
 
-# 4. Or create a new empty store for a file that doesn't exist yet
-stitch add ~/.bashrc
+# 4. Or create a new empty file-backed store for a file that doesn't exist yet
+stitch add ~/.bashrc --file
 
 # 5. Put the links in place (and re-run this any time you change config)
 stitch apply
@@ -138,7 +138,7 @@ target = "~/.config/git"
 
 | Command | What it does |
 |---|---|
-| `stitch add <path>` | Bring a file/folder into the repo and link it back. Creates it empty if the path doesn't exist yet. |
+| `stitch add <path>` | Bring a file/folder into the repo and link it back. Use `--file` for a missing single file. Use `--to <store>` to add an existing file to a grouped store. Existing repo paths and unsafe target/destination parents are rejected; `--dry-run` checks them without changing anything. |
 | `stitch apply` | Make your home match the config. Creates/fixes links, reports anything in the way. |
 | `stitch status` | Is everything linked? Shows `linked`, `missing`, `conflict`, or `broken`. |
 | `stitch diff` | Preview what `apply` would do, without changing anything. Add `--exit-code` for a scriptable exact-state check. |
@@ -155,7 +155,7 @@ target = "~/.config/git"
 | `stitch import` | Found old hand-made links pointing into your repo? Register them. |
 | `stitch plan` | Save exactly what `apply` would do to a file, so you can review and run `apply --plan <file>` later. |
 
-`apply`, `add`, and `remove` support `--dry-run` (just pretend); `diff` is always a preview. `apply` and `diff` take `--only <name>` to act on one store, and `apply` takes `--force` to back up a real file to `*.bak` before replacing it. Add `--json` to `status`, `list`, `diff`, `apply`, `plan`, `doctor`, `prune`, or `render` for machine-readable output.
+`apply`, `add`, and `remove` support `--dry-run` (just pretend); `diff` is always a preview. `apply` and `diff` take `--only <name>` to act on one store, and `apply` takes `--force` to back up a real file to `*.bak` before replacing it. Add `--json` to read/plan commands, or to supported dry-run/reporting commands such as `add --dry-run`, for machine-readable output.
 
 > Want the full details? See **[SPEC.md](SPEC.md)** — every flag, edge case, and design choice is there.
 
