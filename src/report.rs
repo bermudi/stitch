@@ -466,3 +466,761 @@ fn sha256_hex(content: &str) -> String {
         .map(|b| format!("{:02x}", b))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Hooks, Store, WhenClause};
+    use crate::linker::LinkStatus;
+    use crate::scan::FoundLink;
+    use crate::store::{DoctorFinding, DoctorResult, Severity, StatusEntry};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from("/tmp/repo")
+    }
+
+    fn status_entry(
+        store_name: &str,
+        target: &str,
+        source: &str,
+        status: LinkStatus,
+        is_template: bool,
+        skipped: bool,
+    ) -> StatusEntry {
+        StatusEntry {
+            store_name: store_name.to_string(),
+            target_name: None,
+            source: PathBuf::from(source),
+            link_source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            status,
+            skipped_platform: skipped,
+            is_template,
+        }
+    }
+
+    #[test]
+    fn schema_constant_is_one() {
+        assert_eq!(SCHEMA, 1);
+    }
+
+    #[test]
+    fn envelope_serializes_with_required_fields() {
+        let env = Envelope {
+            schema: SCHEMA,
+            command: "status",
+            ok: true,
+            warnings: vec!["w".to_string()],
+            data: Some(vec!["x"]),
+            error: None,
+        };
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["command"], "status");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["warnings"][0], "w");
+        assert_eq!(v["data"][0], "x");
+        assert!(v["error"].is_null());
+    }
+
+    #[test]
+    fn envelope_error_serializes_details_as_null_when_absent() {
+        let detail = ErrorDetail {
+            class: "internal".to_string(),
+            code: 1,
+            message: "boom".to_string(),
+            hint: None,
+            details: None,
+        };
+        let env = Envelope::<()> {
+            schema: SCHEMA,
+            command: "apply",
+            ok: false,
+            warnings: vec![],
+            data: None,
+            error: Some(detail),
+        };
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["data"].is_null());
+        assert_eq!(v["error"]["class"], "internal");
+        assert_eq!(v["error"]["code"], 1);
+        assert!(v["error"]["hint"].is_null());
+        assert!(v["error"]["details"].is_null());
+        assert_eq!(v["schema"], 1);
+    }
+
+    #[test]
+    fn status_maps_link_status_variants() {
+        let repo = repo_root();
+        let cases = vec![
+            (LinkStatus::Linked, "linked", None),
+            (LinkStatus::Missing, "missing", None),
+            (LinkStatus::Conflict(PathBuf::from("/a")), "conflict", None),
+            (
+                LinkStatus::Broken(PathBuf::from("/gone")),
+                "broken",
+                Some("/gone"),
+            ),
+            (
+                LinkStatus::Foreign(PathBuf::from("/foreign")),
+                "foreign",
+                Some("/foreign"),
+            ),
+            (
+                LinkStatus::StoreError(PathBuf::from("/store")),
+                "error",
+                Some("/store"),
+            ),
+            (
+                LinkStatus::ConfigError("bad".to_string()),
+                "error",
+                Some("bad"),
+            ),
+        ];
+        for (status, expected_state, expected_resolves) in cases {
+            let entry = status_entry("s", "/tgt", "/src", status, false, false);
+            let rows = super::status(&repo, &[entry]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, expected_state);
+            match expected_resolves {
+                Some(v) => assert_eq!(rows[0].resolves_to.as_deref(), Some(v)),
+                None => assert!(rows[0].resolves_to.is_none()),
+            }
+        }
+    }
+
+    #[test]
+    fn status_row_omits_resolves_to_for_linked_and_missing() {
+        let repo = repo_root();
+        for status in [LinkStatus::Linked, LinkStatus::Missing] {
+            let entry = status_entry("s", "/tgt", "/src", status, false, false);
+            let rows = super::status(&repo, &[entry]);
+            let v = serde_json::to_value(&rows[0]).unwrap();
+            assert!(
+                v.get("resolves_to").is_none() || v["resolves_to"].is_null(),
+                "resolves_to should be omitted for {:?}",
+                rows[0].state
+            );
+        }
+    }
+
+    #[test]
+    fn status_row_staged_path_only_for_active_template() {
+        let repo = PathBuf::from("/repo");
+        // Active template: is_template true, not skipped, source under store dir
+        let source = "/repo/git/gitconfig.tmpl";
+        let entry = StatusEntry {
+            store_name: "git".to_string(),
+            target_name: None,
+            source: PathBuf::from(source),
+            link_source: PathBuf::from(source),
+            target: PathBuf::from("/home/.gitconfig"),
+            status: LinkStatus::Linked,
+            skipped_platform: false,
+            is_template: true,
+        };
+        let rows = super::status(&repo, &[entry]);
+        assert!(rows[0].staged_path.is_some());
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert!(v.get("staged_path").is_some());
+        assert!(
+            v["staged_path"]
+                .as_str()
+                .unwrap()
+                .contains(".stitch/render")
+        );
+        assert!(rows[0].templated);
+
+        // Same entry but skipped_platform => no staged_path
+        let entry2 = StatusEntry {
+            store_name: "git".to_string(),
+            target_name: None,
+            source: PathBuf::from(source),
+            link_source: PathBuf::from(source),
+            target: PathBuf::from("/home/.gitconfig"),
+            status: LinkStatus::Linked,
+            skipped_platform: true,
+            is_template: true,
+        };
+        let rows2 = super::status(&repo, &[entry2]);
+        assert!(rows2[0].staged_path.is_none());
+        let v2 = serde_json::to_value(&rows2[0]).unwrap();
+        assert!(v2.get("staged_path").is_none());
+    }
+
+    #[test]
+    fn status_row_non_template_never_has_staged_path() {
+        let repo = PathBuf::from("/repo");
+        let entry = status_entry(
+            "s",
+            "/tgt",
+            "/repo/s/file",
+            LinkStatus::Linked,
+            false,
+            false,
+        );
+        let rows = super::status(&repo, &[entry]);
+        assert!(rows[0].staged_path.is_none());
+    }
+
+    #[test]
+    fn status_preserves_target_name_and_templated_flag() {
+        let repo = repo_root();
+        let mut entry = status_entry("s", "/tgt", "/src", LinkStatus::Linked, false, false);
+        entry.target_name = Some("laptop".to_string());
+        let rows = super::status(&repo, &[entry]);
+        assert_eq!(rows[0].target_name.as_deref(), Some("laptop"));
+        assert!(!rows[0].templated);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(v["target_name"], "laptop");
+    }
+
+    #[test]
+    fn status_row_omits_optional_fields_when_none() {
+        let repo = repo_root();
+        let entry = status_entry("s", "/tgt", "/src", LinkStatus::Linked, false, false);
+        let rows = super::status(&repo, &[entry]);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert!(v.get("target_name").is_none());
+        assert!(v.get("staged_path").is_none());
+        assert!(v.get("resolves_to").is_none());
+    }
+
+    fn store_with(target: Option<&str>, files: &[&str], patterns: &[&str]) -> Store {
+        Store {
+            target: target.map(|t| t.to_string()),
+            files: files.iter().map(|s| s.to_string()).collect(),
+            patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            ignore: vec![],
+            when: WhenClause::default(),
+            hooks: Hooks::default(),
+            targets: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn list_mode_whole_dir() {
+        let mut cfg = Config::empty();
+        cfg.stores.insert(
+            "nvim".to_string(),
+            store_with(Some("~/.config/nvim"), &[], &[]),
+        );
+        let rows = super::list(&cfg);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mode, "whole-dir");
+        assert_eq!(rows[0].target.as_deref(), Some("~/.config/nvim"));
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(v["mode"], "whole-dir");
+        // files/patterns empty => omitted
+        assert!(v.get("files").is_none());
+    }
+
+    #[test]
+    fn list_mode_file_mode() {
+        let mut cfg = Config::empty();
+        cfg.stores.insert(
+            "shells".to_string(),
+            store_with(Some("~"), &[".bashrc"], &[]),
+        );
+        let rows = super::list(&cfg);
+        assert_eq!(rows[0].mode, "file-mode");
+    }
+
+    #[test]
+    fn list_mode_none_when_no_target() {
+        let mut cfg = Config::empty();
+        cfg.stores
+            .insert("blank".to_string(), store_with(None, &[], &[]));
+        let rows = super::list(&cfg);
+        assert_eq!(rows[0].mode, "none");
+    }
+
+    #[test]
+    fn list_multi_target_mode() {
+        let mut cfg = Config::empty();
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            "laptop".to_string(),
+            crate::config::TargetEntry {
+                target: "~/.config/helix".to_string(),
+                files: vec![],
+                patterns: vec![],
+                ignore: vec![],
+                when: WhenClause::default(),
+            },
+        );
+        cfg.stores.insert(
+            "helix".to_string(),
+            Store {
+                target: None,
+                files: vec![],
+                patterns: vec![],
+                ignore: vec![],
+                when: WhenClause::default(),
+                hooks: Hooks::default(),
+                targets,
+            },
+        );
+        let rows = super::list(&cfg);
+        assert_eq!(rows[0].mode, "multi-target");
+        assert!(rows[0].targets.is_some());
+        assert_eq!(rows[0].targets.as_ref().unwrap().len(), 1);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(v["mode"], "multi-target");
+        assert!(v.get("target").is_none());
+    }
+
+    #[test]
+    fn list_when_omitted_when_default() {
+        let mut cfg = Config::empty();
+        cfg.stores
+            .insert("s".to_string(), store_with(Some("~"), &[], &[]));
+        let rows = super::list(&cfg);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert!(v.get("when").is_none());
+    }
+
+    #[test]
+    fn doctor_summary_counts_by_severity() {
+        let result = DoctorResult {
+            findings: vec![
+                DoctorFinding {
+                    id: "a",
+                    severity: Severity::Error,
+                    message: "e".to_string(),
+                    path: None,
+                    hint: None,
+                },
+                DoctorFinding {
+                    id: "b",
+                    severity: Severity::Warning,
+                    message: "w".to_string(),
+                    path: Some(PathBuf::from("/p")),
+                    hint: Some("h".to_string()),
+                },
+                DoctorFinding {
+                    id: "c",
+                    severity: Severity::Info,
+                    message: "i".to_string(),
+                    path: None,
+                    hint: None,
+                },
+                DoctorFinding {
+                    id: "d",
+                    severity: Severity::Error,
+                    message: "e2".to_string(),
+                    path: None,
+                    hint: None,
+                },
+            ],
+        };
+        let data = super::doctor(&result);
+        assert_eq!(data.summary.errors, 2);
+        assert_eq!(data.summary.warnings, 1);
+        assert_eq!(data.summary.info, 1);
+        assert_eq!(data.findings.len(), 4);
+        // severity strings
+        assert_eq!(data.findings[0].severity, "error");
+        assert_eq!(data.findings[1].severity, "warning");
+        assert_eq!(data.findings[2].severity, "info");
+        // path/hint omission
+        let v = serde_json::to_value(&data.findings[0]).unwrap();
+        assert!(v.get("path").is_none());
+        assert!(v.get("hint").is_none());
+        let v1 = serde_json::to_value(&data.findings[1]).unwrap();
+        assert_eq!(v1["path"], "/p");
+        assert_eq!(v1["hint"], "h");
+    }
+
+    #[test]
+    fn prune_row_fields() {
+        let links = vec![FoundLink {
+            link: PathBuf::from("/home/.oldrc"),
+            resolves_to: PathBuf::from("/repo/old/.oldrc"),
+        }];
+        let data = super::prune(&links, 0, 0);
+        assert_eq!(data.orphans.len(), 1);
+        assert_eq!(data.orphans[0].link, "/home/.oldrc");
+        assert_eq!(data.orphans[0].resolves_to, "/repo/old/.oldrc");
+        assert_eq!(data.orphans[0].status, "listed");
+        assert_eq!(data.removed, 0);
+        assert_eq!(data.failed, 0);
+    }
+
+    #[test]
+    fn prune_with_status_pairs_correctly() {
+        let links = vec![
+            FoundLink {
+                link: PathBuf::from("/a"),
+                resolves_to: PathBuf::from("/r/a"),
+            },
+            FoundLink {
+                link: PathBuf::from("/b"),
+                resolves_to: PathBuf::from("/r/b"),
+            },
+        ];
+        let data =
+            super::prune_with_status(&links, &["removed".to_string(), "failed".to_string()], 1, 1);
+        assert_eq!(data.orphans[0].status, "removed");
+        assert_eq!(data.orphans[1].status, "failed");
+        assert_eq!(data.removed, 1);
+        assert_eq!(data.failed, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "prune statuses must match orphan count")]
+    fn prune_with_status_panics_on_mismatch() {
+        let links = vec![FoundLink {
+            link: PathBuf::from("/a"),
+            resolves_to: PathBuf::from("/r/a"),
+        }];
+        super::prune_with_status(&links, &[], 0, 0);
+    }
+
+    #[test]
+    fn render_data_sha256_is_hex_and_deterministic() {
+        let source = PathBuf::from("/repo/git/gitconfig.tmpl");
+        let d1 = super::render(&source, "gitconfig.tmpl", "hello");
+        let d2 = super::render(&source, "gitconfig.tmpl", "hello");
+        assert_eq!(d1.sha256, d2.sha256);
+        assert_eq!(d1.sha256.len(), 64);
+        assert!(d1.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        // Known value for "hello"
+        assert_eq!(
+            d1.sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(d1.link_name, "gitconfig");
+        assert_eq!(d1.content, "hello");
+        assert_eq!(d1.source, "/repo/git/gitconfig.tmpl");
+    }
+
+    #[test]
+    fn sha256_hex_empty_string() {
+        // SHA256 of empty string is well-known
+        let d = super::render(&PathBuf::from("/src"), "file", "");
+        assert_eq!(
+            d.sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    fn assert_keys_eq(value: &Value, expected: &[&str]) {
+        let obj = value.as_object().expect("expected object");
+        let actual: std::collections::BTreeSet<String> = obj.keys().cloned().collect();
+        let expected_set: std::collections::BTreeSet<String> =
+            expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            actual, expected_set,
+            "keys mismatch: got {actual:?} want {expected_set:?} full value={value}"
+        );
+    }
+
+    #[test]
+    fn envelope_schema_is_exact() {
+        let ok_env = Envelope {
+            schema: SCHEMA,
+            command: "status",
+            ok: true,
+            warnings: vec![],
+            data: Some(vec!["x"]),
+            error: None,
+        };
+        let v = serde_json::to_value(&ok_env).unwrap();
+        assert_keys_eq(
+            &v,
+            &["command", "data", "error", "ok", "schema", "warnings"],
+        );
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["command"], "status");
+        assert_eq!(v["ok"], true);
+        assert!(v["error"].is_null());
+
+        let detail = ErrorDetail {
+            class: "internal".to_string(),
+            code: 1,
+            message: "boom".to_string(),
+            hint: None,
+            details: None,
+        };
+        let err_env = Envelope::<()> {
+            schema: SCHEMA,
+            command: "apply",
+            ok: false,
+            warnings: vec![],
+            data: None,
+            error: Some(detail),
+        };
+        let v = serde_json::to_value(&err_env).unwrap();
+        assert_keys_eq(
+            &v,
+            &["command", "data", "error", "ok", "schema", "warnings"],
+        );
+        assert_eq!(v["ok"], false);
+        assert!(v["data"].is_null());
+        assert_keys_eq(
+            &v["error"],
+            &["class", "code", "details", "hint", "message"],
+        );
+    }
+
+    #[test]
+    fn status_schema_exact_and_optional_fields() {
+        let repo = PathBuf::from("/repo");
+        // Minimal: linked, no optional fields
+        let entry = status_entry("s", "/tgt", "/src", LinkStatus::Linked, false, false);
+        let rows = super::status(&repo, &[entry]);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_keys_eq(
+            &v,
+            &[
+                "skipped_platform",
+                "source",
+                "state",
+                "store",
+                "target",
+                "templated",
+            ],
+        );
+        assert_eq!(v["state"], "linked");
+
+        // With every optional populated: broken templated active
+        let entry = StatusEntry {
+            store_name: "git".to_string(),
+            target_name: Some("laptop".to_string()),
+            source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            link_source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            target: PathBuf::from("/home/.gitconfig"),
+            status: LinkStatus::Broken(PathBuf::from("/gone")),
+            skipped_platform: false,
+            is_template: true,
+        };
+        let rows = super::status(&repo, &[entry]);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_keys_eq(
+            &v,
+            &[
+                "resolves_to",
+                "skipped_platform",
+                "source",
+                "staged_path",
+                "state",
+                "store",
+                "target",
+                "target_name",
+                "templated",
+            ],
+        );
+        assert_eq!(v["state"], "broken");
+        assert_eq!(v["resolves_to"], "/gone");
+        assert_eq!(v["target_name"], "laptop");
+        assert!(
+            v["staged_path"]
+                .as_str()
+                .unwrap()
+                .contains(".stitch/render")
+        );
+
+        // Skipped platform must still omit staged_path even if templated
+        let entry = StatusEntry {
+            store_name: "git".to_string(),
+            target_name: None,
+            source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            link_source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            target: PathBuf::from("/home/.gitconfig"),
+            status: LinkStatus::Missing,
+            skipped_platform: true,
+            is_template: true,
+        };
+        let rows = super::status(&repo, &[entry]);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert!(v.get("staged_path").is_none());
+        assert_keys_eq(
+            &v,
+            &[
+                "skipped_platform",
+                "source",
+                "state",
+                "store",
+                "target",
+                "templated",
+            ],
+        );
+    }
+
+    #[test]
+    fn list_schema_exact() {
+        // Single-target whole-dir
+        let mut cfg = Config::empty();
+        cfg.stores.insert(
+            "nvim".to_string(),
+            store_with(Some("~/.config/nvim"), &[], &[]),
+        );
+        let rows = super::list(&cfg);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_keys_eq(&v, &["mode", "name", "target"]);
+        assert_eq!(v["mode"], "whole-dir");
+
+        // Single-target file-mode with files visible
+        let mut cfg = Config::empty();
+        cfg.stores.insert(
+            "shells".to_string(),
+            store_with(Some("~"), &[".bashrc"], &["*.bak"]),
+        );
+        let rows = super::list(&cfg);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_keys_eq(&v, &["files", "mode", "name", "patterns", "target"]);
+        assert_eq!(v["mode"], "file-mode");
+        assert_eq!(v["files"][0], ".bashrc");
+        assert_eq!(v["patterns"][0], "*.bak");
+
+        // Multi-target
+        let mut cfg = Config::empty();
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            "laptop".to_string(),
+            crate::config::TargetEntry {
+                target: "~/.config/helix".to_string(),
+                files: vec!["config.toml".to_string()],
+                patterns: vec![],
+                ignore: vec![],
+                when: WhenClause {
+                    hostname: Some("laptop".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.stores.insert(
+            "helix".to_string(),
+            Store {
+                target: None,
+                files: vec![],
+                patterns: vec![],
+                ignore: vec![],
+                when: WhenClause::default(),
+                hooks: Hooks::default(),
+                targets,
+            },
+        );
+        let rows = super::list(&cfg);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_keys_eq(&v, &["mode", "name", "targets"]);
+        assert_eq!(v["mode"], "multi-target");
+        let t = &v["targets"][0];
+        assert_keys_eq(t, &["files", "mode", "name", "target", "when"]);
+        assert_eq!(t["name"], "laptop");
+        assert_eq!(t["mode"], "file-mode");
+        // when populated
+        assert_eq!(t["when"]["hostname"], "laptop");
+
+        // none mode (no target)
+        let mut cfg = Config::empty();
+        cfg.stores
+            .insert("blank".to_string(), store_with(None, &[], &[]));
+        let rows = super::list(&cfg);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_keys_eq(&v, &["mode", "name"]);
+        assert_eq!(v["mode"], "none");
+    }
+
+    #[test]
+    fn doctor_schema_exact() {
+        // Empty
+        let data = super::doctor(&DoctorResult { findings: vec![] });
+        let v = serde_json::to_value(&data).unwrap();
+        assert_keys_eq(&v, &["findings", "summary"]);
+        assert_keys_eq(&v["summary"], &["errors", "info", "warnings"]);
+        assert!(v["findings"].as_array().unwrap().is_empty());
+
+        // Populated: check DoctorRow keys exact with and without optionals
+        let data = super::doctor(&DoctorResult {
+            findings: vec![
+                DoctorFinding {
+                    id: "broken-link",
+                    severity: Severity::Error,
+                    message: "bad".to_string(),
+                    path: Some(PathBuf::from("/p")),
+                    hint: Some("fix".to_string()),
+                },
+                DoctorFinding {
+                    id: "info",
+                    severity: Severity::Info,
+                    message: "ok".to_string(),
+                    path: None,
+                    hint: None,
+                },
+            ],
+        });
+        let v = serde_json::to_value(&data).unwrap();
+        let row_with = &v["findings"][0];
+        assert_keys_eq(row_with, &["hint", "id", "message", "path", "severity"]);
+        assert_eq!(row_with["severity"], "error");
+        let row_without = &v["findings"][1];
+        assert_keys_eq(row_without, &["id", "message", "severity"]);
+    }
+
+    #[test]
+    fn prune_schema_exact() {
+        let links = vec![FoundLink {
+            link: PathBuf::from("/home/.oldrc"),
+            resolves_to: PathBuf::from("/repo/old/.oldrc"),
+        }];
+        let data = super::prune(&links, 1, 2);
+        let v = serde_json::to_value(&data).unwrap();
+        assert_keys_eq(&v, &["failed", "orphans", "removed"]);
+        assert_eq!(v["removed"], 1);
+        assert_eq!(v["failed"], 2);
+        let row = &v["orphans"][0];
+        assert_keys_eq(row, &["link", "resolves_to", "status"]);
+        assert_eq!(row["status"], "listed");
+
+        let links2 = vec![
+            FoundLink {
+                link: PathBuf::from("/a"),
+                resolves_to: PathBuf::from("/r/a"),
+            },
+            FoundLink {
+                link: PathBuf::from("/b"),
+                resolves_to: PathBuf::from("/r/b"),
+            },
+        ];
+        let data = super::prune_with_status(
+            &links2,
+            &["removed".to_string(), "failed".to_string()],
+            1,
+            1,
+        );
+        let v = serde_json::to_value(&data).unwrap();
+        assert_eq!(v["orphans"][0]["status"], "removed");
+        assert_keys_eq(&v["orphans"][0], &["link", "resolves_to", "status"]);
+        // empty orphans still exact
+        let data = super::prune(&[], 0, 0);
+        let v = serde_json::to_value(&data).unwrap();
+        assert_keys_eq(&v, &["failed", "orphans", "removed"]);
+        assert!(v["orphans"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_schema_exact() {
+        let source = PathBuf::from("/repo/git/gitconfig.tmpl");
+        let d = super::render(&source, "gitconfig.tmpl", "hello");
+        let v = serde_json::to_value(&d).unwrap();
+        assert_keys_eq(&v, &["content", "link_name", "sha256", "source"]);
+        assert_eq!(v["link_name"], "gitconfig");
+        assert_eq!(v["content"], "hello");
+        assert_eq!(v["source"], "/repo/git/gitconfig.tmpl");
+        assert_eq!(
+            v["sha256"],
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+
+        // Ensure .tmpl stripping vs plain file
+        let d2 = super::render(&PathBuf::from("/repo/s/file"), "file", "x");
+        let v2 = serde_json::to_value(&d2).unwrap();
+        assert_eq!(v2["link_name"], "file");
+    }
+}
