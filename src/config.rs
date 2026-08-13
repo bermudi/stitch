@@ -28,6 +28,7 @@ use std::cell::RefCell;
 /// hooks, ignore rules). Written once by `init` (static) or `migrate` (split
 /// from v0.2); thereafter the tool never rewrites it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthoredConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vars: BTreeMap<String, String>,
@@ -36,6 +37,7 @@ pub struct AuthoredConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthoredStore {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore: Vec<String>,
@@ -48,6 +50,7 @@ pub struct AuthoredStore {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthoredTarget {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore: Vec<String>,
@@ -477,6 +480,7 @@ impl WhenClause {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hooks {
     pub pre: Option<String>,
     pub post: Option<String>,
@@ -1121,6 +1125,7 @@ fn merge_targets(
 /// Mirrors the pre-split `Config`/`Store`/`TargetEntry` shapes, including the
 /// array-form `targets`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegacyConfig {
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -1137,6 +1142,7 @@ impl LegacyConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegacyStore {
     #[serde(default)]
     pub target: Option<String>,
@@ -1155,6 +1161,7 @@ pub struct LegacyStore {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegacyTargetEntry {
     pub target: String,
     #[serde(default)]
@@ -1766,6 +1773,34 @@ mod tests {
         assert_eq!(parsed.vars, authored.vars);
         assert_eq!(parsed.stores["shells"].when.os.as_deref(), Some("linux"));
         assert_eq!(parsed.stores["shells"].ignore, vec!["*.bak"]);
+    }
+
+    #[test]
+    fn test_authored_config_rejects_unknown_root_key() {
+        let err = toml::from_str::<AuthoredConfig>("unexpected = true\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn test_authored_store_rejects_unknown_key() {
+        let err =
+            toml::from_str::<AuthoredConfig>("[stores.nvim]\nignroe = [\"tmp\"]\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field `ignroe`"));
+    }
+
+    #[test]
+    fn test_authored_target_rejects_unknown_key() {
+        let err =
+            toml::from_str::<AuthoredConfig>("[stores.nvim.targets.laptop]\nignroe = [\"tmp\"]\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown field `ignroe`"));
+    }
+
+    #[test]
+    fn test_hooks_reject_unknown_key() {
+        let err = toml::from_str::<AuthoredConfig>("[stores.nvim.hooks]\nprer = \"echo typo\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field `prer`"));
     }
 
     #[test]

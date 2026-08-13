@@ -44,7 +44,7 @@ fn compute_summary(stores: &[PlanStore]) -> PlanSummary {
                 PlanOp::CreateLink { .. } => summary.created += 1,
                 PlanOp::ReplaceLink { .. } => summary.replaced += 1,
                 PlanOp::BackupAndLink { .. } => summary.backed_up += 1,
-                PlanOp::RemoveLink { .. } => summary.removed += 1,
+                PlanOp::RemoveLink { .. } | PlanOp::RemoveStaged { .. } => summary.removed += 1,
                 PlanOp::ContentChanged { .. } => summary.content_changed += 1,
                 PlanOp::AlreadyLinked { .. } => summary.already_linked += 1,
                 PlanOp::Conflict { .. } => summary.conflicts += 1,
@@ -109,6 +109,11 @@ pub enum PlanOp {
         requires: LinkRequires,
     },
 
+    /// A stale rendered file that apply will remove after target cleanup.
+    RemoveStaged {
+        path: String,
+    },
+
     ContentChanged {
         target: String,
         source: String,
@@ -138,7 +143,7 @@ pub enum PlanOp {
 impl PlanOp {
     pub fn target(&self) -> Option<&str> {
         match self {
-            PlanOp::StageRender { .. } => None,
+            PlanOp::StageRender { .. } | PlanOp::RemoveStaged { .. } => None,
             PlanOp::CreateLink { target, .. }
             | PlanOp::ReplaceLink { target, .. }
             | PlanOp::BackupAndLink { target, .. }

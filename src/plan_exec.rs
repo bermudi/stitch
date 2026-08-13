@@ -755,7 +755,10 @@ fn convert_store_ops(
                     maybe_keep_staged(repo_root, store_name, &source, &mut keep_staged);
                 }
             }
-            PlanOp::StageRender { .. } | PlanOp::SkippedPlatform | PlanOp::Error { .. } => {}
+            PlanOp::StageRender { .. }
+            | PlanOp::RemoveStaged { .. }
+            | PlanOp::SkippedPlatform
+            | PlanOp::Error { .. } => {}
         }
     }
 
@@ -1575,6 +1578,16 @@ pub fn execute_plan(
             exec_order.extend(indices);
         }
     }
+
+    // Staged output must remain readable until every live stale link that
+    // depends on it has been removed. Edited plans may omit unrelated work,
+    // but they cannot omit or reorder this safety-critical dependency.
+    validate_cleanup_dependencies(plan, &current_removals, &exec_order).map_err(|e| {
+        PlanExecError::new(
+            report.clone(),
+            StitchError::plan_stale(format!("plan validation failed: {e}")),
+        )
+    })?;
 
     // Preflight the execution sequence against the same locked-and-verified
     // snapshot so cross-store ordering and path interactions are checked before
@@ -2542,10 +2555,14 @@ impl<'a> ValidationContext<'a> {
     }
 }
 
+type LinkRemovalKey = (String, String, Option<String>);
+type StagedRemovalKey = (String, String);
+
 #[derive(Default)]
 struct CurrentRemovals {
-    links: BTreeSet<(String, String, Option<String>)>,
-    staged: BTreeSet<(String, String)>,
+    links: BTreeSet<LinkRemovalKey>,
+    staged: BTreeSet<StagedRemovalKey>,
+    staged_dependencies: BTreeMap<StagedRemovalKey, BTreeSet<LinkRemovalKey>>,
     stage_writes: BTreeSet<String>,
     link_writes: BTreeSet<String>,
     sensitive_mutations: BTreeSet<String>,
@@ -2590,7 +2607,32 @@ fn current_removals(
     for op in &current_file.ops {
         match op {
             PlanFileOp::RemoveStaged { store, rel } => {
-                removals.staged.insert((store.clone(), rel.clone()));
+                let staged_key = (store.clone(), rel.clone());
+                let staged_path = render::staging_path(repo_root, store, rel);
+                let dependencies = current_file
+                    .ops
+                    .iter()
+                    .filter_map(|candidate| match candidate {
+                        PlanFileOp::RemoveLink {
+                            store,
+                            target,
+                            source,
+                            ..
+                        } if linker::points_to_source(
+                            Path::new(target),
+                            &staged_path,
+                            repo_root,
+                        ) =>
+                        {
+                            Some((store.clone(), target.clone(), source.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                removals.staged.insert(staged_key.clone());
+                removals
+                    .staged_dependencies
+                    .insert(staged_key, dependencies);
             }
             PlanFileOp::StageRender { .. } => {
                 removals.stage_writes.insert(
@@ -2660,6 +2702,48 @@ fn validate_fresh_link_write(
             "op {idx}: link operation is not present in the freshly computed apply plan"
         ))
     }
+}
+
+fn validate_cleanup_dependencies(
+    plan: &PlanFile,
+    current: &CurrentRemovals,
+    exec_order: &[usize],
+) -> Result<(), String> {
+    let mut preceding_links: BTreeSet<LinkRemovalKey> = BTreeSet::new();
+    for &idx in exec_order {
+        match &plan.ops[idx] {
+            PlanFileOp::RemoveLink {
+                store,
+                target,
+                source,
+                ..
+            } => {
+                preceding_links.insert((store.clone(), target.clone(), source.clone()));
+            }
+            PlanFileOp::RemoveStaged { store, rel } => {
+                let staged_key = (store.clone(), rel.clone());
+                let dependencies =
+                    current
+                        .staged_dependencies
+                        .get(&staged_key)
+                        .ok_or_else(|| {
+                            format!(
+                                "op {idx}: no fresh dependency data for remove_staged {store}/{rel}"
+                            )
+                        })?;
+                if let Some((_, target, _)) = dependencies
+                    .iter()
+                    .find(|dep| !preceding_links.contains(*dep))
+                {
+                    return Err(format!(
+                        "op {idx}: remove_staged {store}/{rel} requires preceding remove_link {target}; the edited plan omitted or reordered that cleanup"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_op(

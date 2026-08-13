@@ -1042,6 +1042,47 @@ bogus_key = "x"
 }
 
 #[test]
+fn authored_config_rejects_misspelled_ignore_and_hook_keys() {
+    for authored in [
+        "[stores.bashrc]\nignroe = [\"private\"]\n",
+        "[stores.bashrc.hooks]\nprer = \"echo unsafe\"\n",
+        "[stores.bashrc.targets.laptop]\nignroe = [\"private\"]\n",
+        "unexpected = true\n",
+    ] {
+        let (repo, _target) = repo_with_bashrc_store();
+        repo.write_authored(authored);
+
+        repo.cmd()
+            .arg("apply")
+            .assert()
+            .failure()
+            .code(3)
+            .stderr(contains("unknown field"));
+    }
+}
+
+#[test]
+fn generated_state_rejects_unknown_keys_without_mutating() {
+    for state in [
+        "unexpected = true\n",
+        "[stores.bashrc]\ntarget = \"~/home\"\nfliles = [\".bashrc\"]\n",
+        "[stores.bashrc.targets.laptop]\ntarget = \"~/home\"\nfliles = [\".bashrc\"]\n",
+    ] {
+        let repo = Repo::new();
+        repo.make_store("bashrc", &[".bashrc"]);
+        repo.write_state(state);
+
+        repo.cmd()
+            .arg("apply")
+            .assert()
+            .failure()
+            .code(3)
+            .stderr(contains("unknown field"));
+        assert!(!repo.path().join("home").exists());
+    }
+}
+
+#[test]
 fn apply_skips_on_nonmatching_hostname() {
     let (repo, target) = repo_with_bashrc_store();
     repo.write_authored(
@@ -2134,6 +2175,92 @@ files = [".bashrc"]
         .assert()
         .success()
         .stdout(contains("no differences"));
+}
+
+#[test]
+fn diff_exit_code_is_zero_when_converged() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{}"
+files = [".bashrc"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .success()
+        .stdout(contains("no differences"));
+}
+
+#[test]
+fn diff_exit_code_reports_safe_drift_without_mutating() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{}"
+files = [".bashrc"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .failure()
+        .code(14)
+        .stdout(contains("create:"))
+        .stderr(contains("run `stitch apply`"));
+
+    assert!(!target.join(".bashrc").exists());
+}
+
+#[test]
+fn diff_exit_code_ignores_platform_skipped_store() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        "[stores.bashrc]\ntarget = \"{}\"\nfiles = [\".bashrc\"]\n",
+        target.to_string_lossy()
+    ));
+    repo.write_authored("[stores.bashrc.when]\nos = \"definitely-not-this-os\"\n");
+
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .success()
+        .stdout(contains("skipped"));
+    assert!(!target.exists());
+}
+
+#[test]
+fn diff_exit_code_preserves_conflict_code() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    repo.write_state(&format!(
+        "[stores.nvim]\ntarget = \"{}\"\n",
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .failure()
+        .code(6)
+        .stdout(contains("conflict"));
 }
 
 #[test]
@@ -5629,6 +5756,40 @@ fn migrate_rejects_invalid_file_fragment_before_mutating() {
     assert_eq!(legacy, original, "legacy config must be unchanged");
 }
 
+#[test]
+fn migrate_rejects_unknown_keys_before_writing() {
+    for (args, original) in [
+        (&["migrate"][..], "unexpected = true\n"),
+        (
+            &["migrate", "--dry-run"][..],
+            "[stores.shells]\ntarget = \"~\"\nignroe = [\"secret\"]\n",
+        ),
+        (
+            &["migrate"][..],
+            "[[stores.shells.targets]]\ntarget = \"~\"\nignroe = [\"secret\"]\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+        let legacy_path = dir.path().join(".stitch/config.toml");
+        fs::write(&legacy_path, original).unwrap();
+
+        Command::cargo_bin("stitch")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .failure()
+            .code(3)
+            .stderr(contains("unknown field"));
+
+        assert!(!dir.path().join("stitch.toml").exists());
+        assert!(!dir.path().join(".stitch/state.toml").exists());
+        assert!(!dir.path().join(".stitch/config.toml.bak").exists());
+        assert_eq!(fs::read_to_string(&legacy_path).unwrap(), original);
+    }
+}
+
 /// migrate --dry-run also rejects invalid v0.2 fragments before previewing.
 #[test]
 fn migrate_dry_run_rejects_invalid_file_fragment() {
@@ -6422,6 +6583,79 @@ files = ["gitconfig.tmpl"]
 }
 
 #[test]
+fn diff_exit_code_detects_and_preserves_staged_render_mode_drift() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig.tmpl"), "v=1\n").unwrap();
+    let target = repo.path().join("home/.config/git");
+    repo.write_state(&format!(
+        "[stores.git]\ntarget = \"{}\"\nfiles = [\"gitconfig.tmpl\"]\n",
+        target.to_string_lossy()
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let staged = repo.path().join(".stitch/render/git/gitconfig");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o644)).unwrap();
+
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .failure()
+        .code(14)
+        .stdout(contains("content:"));
+    assert_eq!(
+        fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+
+    repo.cmd().arg("apply").assert().success();
+    assert_eq!(
+        fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    repo.cmd().args(["diff", "--exit-code"]).assert().success();
+}
+
+#[test]
+fn diff_exit_code_detects_and_preserves_staged_render_hard_link_drift() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig.tmpl"), "v=1\n").unwrap();
+    let target = repo.path().join("home/.config/git");
+    repo.write_state(&format!(
+        "[stores.git]\ntarget = \"{}\"\nfiles = [\"gitconfig.tmpl\"]\n",
+        target.to_string_lossy()
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let staged = repo.path().join(".stitch/render/git/gitconfig");
+    let alias = repo.path().join("staged-alias");
+    fs::hard_link(&staged, &alias).unwrap();
+    let shared_inode = fs::metadata(&staged).unwrap().ino();
+    assert_eq!(fs::metadata(&staged).unwrap().nlink(), 2);
+
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .failure()
+        .code(14)
+        .stdout(contains("content:"));
+    assert_eq!(fs::metadata(&staged).unwrap().ino(), shared_inode);
+    assert_eq!(fs::metadata(&alias).unwrap().ino(), shared_inode);
+
+    repo.cmd().arg("apply").assert().success();
+    let staged_meta = fs::metadata(&staged).unwrap();
+    let alias_meta = fs::metadata(&alias).unwrap();
+    assert_ne!(staged_meta.ino(), alias_meta.ino());
+    assert_eq!(staged_meta.nlink(), 1);
+    assert_eq!(alias_meta.nlink(), 1);
+    assert_eq!(fs::read_to_string(&alias).unwrap(), "v=1\n");
+    repo.cmd().args(["diff", "--exit-code"]).assert().success();
+}
+
+#[test]
 fn apply_removes_target_link_for_deleted_template() {
     let repo = Repo::new();
     let store = repo.path().join("git");
@@ -6677,13 +6911,43 @@ target = "{}"
     fs::remove_file(store.join("drop.tmpl")).unwrap();
 
     repo.cmd()
-        .arg("diff")
+        .args(["diff", "--exit-code"])
         .assert()
-        .success()
-        .stdout(contains("remove:"));
+        .failure()
+        .code(14)
+        .stdout(contains("remove:"))
+        .stdout(contains("remove staged:"));
 
     assert!(stale_link.is_symlink(), "diff must not unlink targets");
     assert!(stale_render.exists(), "diff must not delete staged renders");
+}
+
+#[test]
+fn diff_exit_code_reports_stale_render_without_a_stale_target_link() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("keep.tmpl"), "keep={{ os }}\n").unwrap();
+    let target = repo.path().join("home/.config/git");
+    repo.write_state(&format!(
+        "[stores.git]\ntarget = \"{}\"\n",
+        target.to_string_lossy()
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let orphan = repo.path().join(".stitch/render/git/orphan");
+    fs::write(&orphan, "old rendered secret\n").unwrap();
+
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .failure()
+        .code(14)
+        .stdout(contains("remove staged:"));
+    assert!(orphan.exists(), "diff must not delete staged renders");
+
+    repo.cmd().arg("apply").assert().success();
+    assert!(!orphan.exists(), "apply must remove stale staged renders");
 }
 
 #[test]
@@ -7141,16 +7405,19 @@ fn exit_code_and_hint_hook_failure() {
     repo.make_store("s", &["f"]);
     let target = repo.path().join("home").join(".s");
     let target_str = target.to_string_lossy().into_owned();
-    repo.write_authored(&format!(
+    repo.write_state(&format!(
         r#"
 [stores.s]
 target = "{target_str}"
 files = ["f"]
-
-[stores.s.hooks]
-pre = "exit 1"
 "#
     ));
+    repo.write_authored(
+        r#"
+[stores.s.hooks]
+pre = "exit 1"
+"#,
+    );
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     repo.cmd()
         .arg("apply")
@@ -7655,6 +7922,33 @@ target = "{}"
         repo.path().join("nvim").to_string_lossy()
     );
     assert_plan_summary_fields(&data["summary"]);
+}
+
+#[test]
+fn json_diff_exit_code_reports_plan_and_drift_class() {
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let target = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{}"
+files = [".bashrc"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "diff", "--exit-code"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(14));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "diff", false);
+    assert_error_shape(&value, "drift", 14);
+    assert_eq!(value["data"]["summary"]["created"], 1);
+    assert!(!target.join(".bashrc").exists());
 }
 
 #[test]
@@ -9178,8 +9472,8 @@ fn apply_plan_rejects_unselected_injected_stage_render() {
     assert!(!repo.path().join(".stitch/render/git/orphan").exists());
 }
 
-/// When a template is removed from state, `stitch plan` captures a `remove_staged`
-/// op to clean up the stale render before its link is removed.
+/// When a template is removed from state, `stitch plan` captures a `remove_link`
+/// before `remove_staged`, so the render stays readable until its live link is gone.
 #[test]
 fn plan_captures_stale_render_cleanup() {
     let repo = Repo::new();
@@ -9233,12 +9527,73 @@ ignore = ["gitconfig.tmpl"]
     let plan: Value = serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap())
         .expect("plan is valid JSON");
     let ops = plan["ops"].as_array().unwrap();
+    let remove_link_idx = ops
+        .iter()
+        .position(|o| {
+            o["op"] == "remove_link"
+                && o["target"] == home.join("gitconfig").to_string_lossy().as_ref()
+        })
+        .expect("plan must remove the stale target link");
+    let remove_staged_idx = ops
+        .iter()
+        .position(|o| o["op"] == "remove_staged" && o["rel"] == "gitconfig")
+        .expect("plan must remove the stale render");
     assert!(
-        ops.iter()
-            .any(|o| o["op"] == "remove_staged" && o["rel"] == "gitconfig"),
-        "plan must include a remove_staged op for the stale render"
+        remove_link_idx < remove_staged_idx,
+        "stale link removal must precede staging cleanup"
     );
 
+    // Omitting the dependent link removal must fail before hooks or deletion.
+    let hook_marker = repo.path().join("cleanup-hook-ran");
+    let hook = repo.path().join(".stitch/hooks/pre-apply");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch {}\n", hook_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut omitted = plan.clone();
+    omitted["ops"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|op| op["op"] != "remove_link");
+    let omitted_path = repo.path().join("omitted-link-plan.json");
+    fs::write(&omitted_path, serde_json::to_vec(&omitted).unwrap()).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", omitted_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("requires preceding remove_link"));
+    assert!(staged.exists());
+    assert_eq!(fs::read_to_string(home.join("gitconfig")).unwrap(), "x\n");
+    assert!(!hook_marker.exists(), "validation must run before hooks");
+
+    // Reordering staging cleanup before its link removal is equally unsafe.
+    let mut reordered = plan.clone();
+    let reordered_ops = reordered["ops"].as_array_mut().unwrap();
+    let staged_op = reordered_ops.remove(remove_staged_idx);
+    let link_idx = reordered_ops
+        .iter()
+        .position(|op| op["op"] == "remove_link")
+        .unwrap();
+    reordered_ops.insert(link_idx, staged_op);
+    let reordered_path = repo.path().join("reordered-cleanup-plan.json");
+    fs::write(&reordered_path, serde_json::to_vec(&reordered).unwrap()).unwrap();
+    repo.cmd()
+        .args(["apply", "--plan", reordered_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(12)
+        .stderr(contains("omitted or reordered"));
+    assert!(staged.exists());
+    assert_eq!(fs::read_to_string(home.join("gitconfig")).unwrap(), "x\n");
+    assert!(!hook_marker.exists(), "validation must run before hooks");
+
+    // Remove the marker hook before executing the original valid plan.
+    fs::remove_file(hook).unwrap();
     let plan_path = repo.path().join("plan.json");
     fs::write(&plan_path, &output.stdout).unwrap();
     repo.cmd()
