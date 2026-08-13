@@ -1307,8 +1307,10 @@ mod tests {
             let child_path = repo.join(&child);
             std::fs::write(&child_path, "x").unwrap();
             prop_assert!(source_ancestors_within(&child_path, &repo));
-            // An external path with same leaf name must not be within
-            let external = tmp.path().join("ext").join(&child);
+            // An external path with same leaf name must not be within — use a
+            // fixed parent that can never collide with the generated repo_name
+            // (which is only [a-z]), e.g. "_ext".
+            let external = tmp.path().join("_ext").join(&child);
             std::fs::create_dir_all(external.parent().unwrap()).unwrap();
             std::fs::write(&external, "x").unwrap();
             prop_assert!(!source_ancestors_within(&external, &repo));
