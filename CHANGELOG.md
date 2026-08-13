@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 — 2026-08-13
+
 ### Added
 
 - `stitch add <missing-path> --file` creates an empty regular file-backed store.
@@ -10,6 +12,20 @@
   the new path to generated state. Both forms support `--dry-run`.
 - Add validates repository boundaries and destination/target ancestors before
   mutation, including in dry-run mode.
+
+### CI and testing
+
+- New `ci` workflow runs `cargo fmt`, `cargo clippy -D warnings`, and
+  `cargo test --locked --all-targets` on every push/PR with concurrency
+  control, timeout, pinned action SHAs, and `persist-credentials: false`.
+  Pinned toolchain via `rust-toolchain.toml` (1.97) and Dependabot for actions.
+- Property tests (proptest) for path normalization (`is_safe_fragment` /
+  `normalize_fragment`), config merging/hash, and ownership checks
+  (`points_into_repo`, `source_ancestors_within`, `link_name`). Fixes
+  tautological `prop_unsafe_rejected` and false-idempotent `prop_link_name_idempotent`.
+- Verify step now reuses single test log, uses `set -eo pipefail` +
+  `PIPESTATUS`, checks both `skipped under root` and `skipping: running as root`,
+  and ensures `cargo test --locked --all-targets` is exercised as non-root.
 
 ## 0.10.0 — 2026-08-12
 
