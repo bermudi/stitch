@@ -674,6 +674,7 @@ pub enum LinkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_create_and_check_link() {
@@ -1235,5 +1236,82 @@ mod tests {
             std::os::unix::fs::symlink(&external, &gateway).unwrap();
         }
         gateway.join("victim")
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests — ownership and path resolution
+    // -----------------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn prop_is_direct_entry_rejects_trailing_slash(s in "[a-z0-9]{1,10}") {
+            let with_slash = format!("{}/", s);
+            prop_assert!(!is_direct_entry_path(Path::new(&with_slash)));
+            let with_dot = format!("{}/.", s);
+            prop_assert!(!is_direct_entry_path(Path::new(&with_dot)));
+            prop_assert!(is_direct_entry_path(Path::new(&s)));
+        }
+
+        #[test]
+        fn prop_is_direct_entry_rejects_parent_dir(a in "[a-z]{1,5}", b in "[a-z]{1,5}") {
+            let with_dotdot = format!("{}/../{}", a, b);
+            prop_assert!(!is_direct_entry_path(Path::new(&with_dotdot)));
+        }
+
+        #[test]
+        fn prop_resolve_path_no_symlink_is_lexical(parts in prop::collection::vec("[a-z]{1,4}", 1..5)) {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().join("base");
+            std::fs::create_dir_all(&base).unwrap();
+            // Build a path without symlinks: base/a/b/... plus some . and .. lexically
+            let mut p = base.clone();
+            for part in &parts { p.push(part); }
+            std::fs::create_dir_all(&p).unwrap();
+            // No symlinks involved — resolve should succeed and be inside base
+            let resolved = resolve_path(&p).unwrap();
+            prop_assert!(resolved.starts_with(tmp.path()));
+        }
+
+        #[test]
+        fn prop_points_into_repo_inside_vs_outside(name in "[a-z]{1,8}") {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let inside = repo.join(&name);
+            std::fs::write(&inside, "data").unwrap();
+            let target_inside = tmp.path().join(format!("link_{}", name));
+            std::os::unix::fs::symlink(&inside, &target_inside).unwrap();
+            prop_assert!(points_into_repo(&target_inside, &repo));
+
+            let external = tmp.path().join("external").join(&name);
+            std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+            std::fs::write(&external, "ext").unwrap();
+            let target_out = tmp.path().join(format!("link_ext_{}", name));
+            std::os::unix::fs::symlink(&external, &target_out).unwrap();
+            prop_assert!(!points_into_repo(&target_out, &repo));
+        }
+
+        #[test]
+        fn prop_normalize_lexical_idempotent(s in "(/[a-z]{1,4}){1,4}") {
+            let p = Path::new(&s);
+            let once = normalize_lexical(p);
+            let twice = normalize_lexical(&once);
+            prop_assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn prop_source_ancestors_within_direct_child(repo_name in "[a-z]{1,6}", child in "[a-z]{1,6}") {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join(repo_name);
+            std::fs::create_dir_all(&repo).unwrap();
+            let child_path = repo.join(&child);
+            std::fs::write(&child_path, "x").unwrap();
+            prop_assert!(source_ancestors_within(&child_path, &repo));
+            // An external path with same leaf name must not be within
+            let external = tmp.path().join("ext").join(&child);
+            std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+            std::fs::write(&external, "x").unwrap();
+            prop_assert!(!source_ancestors_within(&external, &repo));
+        }
     }
 }
