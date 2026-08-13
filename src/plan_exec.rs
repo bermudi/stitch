@@ -3517,8 +3517,9 @@ mod tests {
                 .unwrap();
 
         // Replace the real directory with a different one (same as a bind
-        // mount / rename / copy attack).
-        fs::remove_dir(&config).unwrap();
+        // mount / rename / copy attack). Use rename to guarantee a new inode.
+        let old = tmp.path().join("old_config");
+        fs::rename(&config, &old).unwrap();
         fs::create_dir_all(&config).unwrap();
 
         let err = snapshot.revalidate().unwrap_err();

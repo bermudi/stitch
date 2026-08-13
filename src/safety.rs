@@ -470,7 +470,10 @@ mod tests {
         let identity = HomeIdentity::capture().expect("capture");
 
         // Simulate the hook: replace real_home with a different directory.
-        std::fs::remove_dir_all(&real_home).expect("rm real_home");
+        // Use rename to guarantee a new inode (remove+mkdir can reuse the same
+        // inode on some filesystems, making the test flaky).
+        let old = tmp.path().join("old_real_home");
+        std::fs::rename(&real_home, &old).expect("rename old real_home");
         std::fs::create_dir_all(&real_home).expect("mkdir new real_home");
 
         let err = identity.revalidate().expect_err("must detect change");
@@ -493,9 +496,11 @@ mod tests {
 
         let identity = HomeIdentity::capture().expect("capture");
 
-        // Replace the symlink itself.
-        std::fs::remove_file(&home_link).expect("rm symlink");
-        std::os::unix::fs::symlink(&real_home_b, &home_link).expect("new symlink");
+        // Replace the symlink itself via a temp path + rename to guarantee a
+        // new inode (remove+create can reuse the same inode on some filesystems).
+        let tmp_link = tmp.path().join("tmp_new_link");
+        std::os::unix::fs::symlink(&real_home_b, &tmp_link).expect("new symlink tmp");
+        std::fs::rename(&tmp_link, &home_link).expect("rename new symlink");
 
         let err = identity.revalidate().expect_err("must detect change");
         assert!(
