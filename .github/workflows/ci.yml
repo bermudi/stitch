@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5
+        with:
+          persist-credentials: false
+
+      - name: Ensure CI is not running as root
+        run: |
+          id
+          if [ "$(id -u)" = "0" ]; then
+            echo "error: CI must run as an ordinary user, not root — permission tests would be skipped" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@a9d3ea16ad6af25240d1ff14b957caa2d026850d # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@8d6a1f490b83cc0e4c91c4117ef5416e2d89e60d # v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: |
+          set -eo pipefail
+          cargo test --locked --all-targets -- --nocapture 2>&1 | tee /tmp/test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+
+      - name: Verify permission-sensitive tests were exercised
+        run: |
+          if grep -qE "skipped under root|skipping: running as root" /tmp/test.log; then
+            echo "error: permission tests were skipped — CI must run as non-root" >&2
+            exit 1
+          fi

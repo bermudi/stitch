@@ -1268,6 +1268,7 @@ fn match_target_to_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
 
     fn test_platform() -> Platform {
@@ -1835,5 +1836,79 @@ mod tests {
         let entry = target.join("lua").join("plugin.lua");
         let resolved = resolve_edit_source(repo, &config, &entry.to_string_lossy()).unwrap();
         assert_eq!(resolved, lua_dir.join("plugin.lua"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests — template handling and gitignore detection
+    // -----------------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn prop_template_roundtrip(name in "[a-z]{1,10}") {
+            let tmpl = format!("{}.tmpl", name);
+            prop_assert!(is_template(&tmpl));
+            prop_assert_eq!(link_name(&tmpl), name.clone());
+            let entry = resolve_entry(&tmpl);
+            prop_assert!(entry.is_template);
+            prop_assert_eq!(entry.link_rel, name.clone());
+            prop_assert_eq!(entry.source_rel, tmpl);
+        }
+
+        #[test]
+        fn prop_non_template_unchanged(name in "[a-z]{1,10}") {
+            // Ensure no .tmpl suffix — filter such cases
+            prop_assume!(!name.ends_with(".tmpl"));
+            let plain = name.clone();
+            prop_assert!(!is_template(&plain));
+            prop_assert_eq!(link_name(&plain), plain.clone());
+            let entry = resolve_entry(&plain);
+            prop_assert!(!entry.is_template);
+            prop_assert_eq!(entry.link_rel, plain);
+        }
+
+        #[test]
+        fn prop_dot_tmpl_not_template(_ in proptest::strategy::Just(())) {
+            prop_assert!(!is_template(".tmpl"));
+            prop_assert_eq!(link_name(".tmpl"), ".tmpl");
+        }
+
+        #[test]
+        fn prop_gitignore_positive(entries in prop::collection::vec("[a-z/]{1,12}", 0..5)) {
+            let mut content = entries.join("\n");
+            if !content.is_empty() { content.push('\n'); }
+            content.push_str(".stitch/render/\n");
+            prop_assert!(gitignore_has_render_entry(&content));
+        }
+
+        #[test]
+        fn prop_gitignore_negation_revokes(_ in proptest::strategy::Just(())) {
+            let content = ".stitch/render/\n!**\n";
+            prop_assert!(!gitignore_has_render_entry(content));
+        }
+
+        #[test]
+        fn prop_gitignore_comment_ignored(comment in "#[a-z ]{1,20}") {
+            let content = format!("{}\n", comment);
+            prop_assert!(!gitignore_has_render_entry(&content));
+        }
+
+        #[test]
+        fn prop_link_name_idempotent(s in "[a-z0-9/_.-]{1,20}") {
+            // link_name strips at most one suffix; a second application must be stable
+            let once = link_name(&s).to_string();
+            prop_assert_eq!(link_name(&once), once.as_str());
+        }
+
+        #[test]
+        fn prop_collision_detection(names in prop::collection::vec("[a-z]{1,5}(\\.tmpl)?", 2..5)) {
+            // Check that collision detection agrees with manual link_name grouping
+            let mut by_link: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for n in &names {
+                *by_link.entry(link_name(n).to_string()).or_default() += 1;
+            }
+            let has_collision = by_link.values().any(|&c| c > 1);
+            let check = check_name_collisions(&names);
+            prop_assert_eq!(check.is_err(), has_collision);
+        }
     }
 }

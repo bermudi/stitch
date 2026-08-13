@@ -1708,6 +1708,7 @@ impl ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::fs;
 
     // --- unchanged helpers ---
@@ -2658,5 +2659,137 @@ patterns = ["./work*//"]
             hash_before,
             "hash must change when state changes"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests — path normalization, config merging, and hashing
+    // -----------------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn prop_normalize_idempotent(s in ".*") {
+            let once = normalize_fragment(&s, false);
+            let twice = normalize_fragment(&once, false);
+            prop_assert_eq!(once, twice, "normalize must be idempotent");
+        }
+
+        #[test]
+        fn prop_normalize_preserves_safe(s in "[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*") {
+            // Simple safe fragments without dots stay unchanged by normalize
+            prop_assert!(is_safe_fragment(&s));
+            let normalized = normalize_fragment(&s, false);
+            prop_assert_eq!(s.clone(), normalized.clone());
+            // Any string, after normalize, normalize again is idempotent (already tested above)
+            // and the result should still be safe if input was safe
+            prop_assert!(is_safe_fragment(&normalized));
+        }
+
+        #[test]
+        fn prop_safe_implies_validate_ok(s in ".*") {
+            // For any string, is_safe_fragment and validate_fragments agree
+            let is_safe = is_safe_fragment(&s);
+            let validate_ok = validate_fragments(std::slice::from_ref(&s), &[], "ctx").is_ok();
+            prop_assert_eq!(is_safe, validate_ok);
+            // Same for patterns position
+            let validate_pat_ok = validate_fragments(&[], std::slice::from_ref(&s), "ctx").is_ok();
+            prop_assert_eq!(is_safe, validate_pat_ok);
+        }
+
+        #[test]
+        fn prop_unsafe_rejected(s in r"(\.\.|/).*|[a-z]+/\.\./[a-z]+") {
+            prop_assume!(!is_safe_fragment(&s));
+            prop_assert!(validate_fragments(std::slice::from_ref(&s), &[], "ctx").is_err());
+            prop_assert!(validate_fragments(&[], std::slice::from_ref(&s), "ctx").is_err());
+        }
+
+        #[test]
+        fn prop_store_name_implies_safe(s in "[a-zA-Z0-9._-]{1,20}") {
+            // Single-component safe names without slash — subset of safe fragments
+            // Exclude reserved names that are rejected as store names but are safe fragments
+            if s == ".stitch" || s == ".git" || s == "." || s == ".." {
+                prop_assert!(!is_store_name(&s));
+            } else {
+                prop_assert!(is_store_name(&s));
+                prop_assert!(is_safe_fragment(&s), "store name must be a safe fragment");
+            }
+        }
+
+        #[test]
+        fn prop_store_name_rejects_slash(s in "[a-z]+/[a-z]+") {
+            prop_assert!(!is_store_name(&s), "store name with slash must be rejected: {s}");
+        }
+
+        #[test]
+        fn prop_hash_deterministic(
+            a in prop::option::of("[a-z]{0,20}"),
+            b in prop::option::of("[a-z]{0,20}")
+        ) {
+            let ab = a.as_deref().map(|s| s.as_bytes());
+            let bb = b.as_deref().map(|s| s.as_bytes());
+            let h1 = hash_config_bytes(ab, bb);
+            let h2 = hash_config_bytes(ab, bb);
+            prop_assert_eq!(h1.clone(), h2);
+            prop_assert_eq!(h1.len(), 64, "hash is 64 hex chars");
+            prop_assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        #[test]
+        fn prop_hash_distinguishes_missing_empty(
+            content in "[a-z]{1,10}"
+        ) {
+            let missing = hash_config_bytes(None, None);
+            let empty = hash_config_bytes(Some(b""), Some(b""));
+            let with_content = hash_config_bytes(Some(content.as_bytes()), None);
+            prop_assert_ne!(missing.clone(), empty.clone());
+            prop_assert_ne!(missing.clone(), with_content.clone());
+            prop_assert_ne!(empty, with_content);
+        }
+
+        #[test]
+        fn prop_validate_target_rejects_parent_dir(
+            suffix in "[a-z]{1,8}"
+        ) {
+            // Any target containing .. must be rejected even if it looks absolute after expansion
+            let target = format!("~/a/../{}", suffix);
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let _guard = test_home_guard(home);
+            prop_assert!(validate_target(&target, "ctx").is_err());
+        }
+
+        #[test]
+        fn prop_merge_disjoint_union(
+            n1 in "[a-z]{1,6}",
+            n2 in "[a-z]{1,6}"
+        ) {
+            prop_assume!(n1 != n2);
+            prop_assume!(is_store_name(&n1) && is_store_name(&n2));
+            let authored = AuthoredConfig {
+                vars: BTreeMap::new(),
+                stores: BTreeMap::from([(n1.clone(), AuthoredStore::default())]),
+            };
+            let generated = GeneratedState {
+                stores: BTreeMap::from([(n2.clone(), GeneratedStore { target: Some("~/.x".into()), ..Default::default() })]),
+            };
+            let (merged, _) = merge(&authored, &generated);
+            prop_assert!(merged.stores.contains_key(&n1));
+            prop_assert!(merged.stores.contains_key(&n2));
+            prop_assert_eq!(merged.stores.len(), 2);
+        }
+
+        #[test]
+        fn prop_merge_authored_only_warns(
+            name in "[a-z]{1,8}"
+        ) {
+            prop_assume!(is_store_name(&name));
+            let mut a_targets = BTreeMap::new();
+            a_targets.insert("t".into(), AuthoredTarget { ignore: vec![], when: WhenClause::default() });
+            let g_targets: BTreeMap<String, GeneratedTarget> = BTreeMap::new();
+            let mut warnings = Vec::new();
+            let merged = merge_targets(&name, Some(&a_targets), Some(&g_targets), &mut warnings);
+            prop_assert!(merged.is_empty(), "authored-only target contributes no link");
+            prop_assert_eq!(warnings.len(), 1);
+        }
     }
 }
