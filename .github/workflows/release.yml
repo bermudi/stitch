@@ -80,7 +80,7 @@ jobs:
           # tag's subject for the release title.
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
