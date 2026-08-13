@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.11.1 — 2026-08-13
+
+### Fixed
+
+- CI: pin actions to valid SHAs (`actions/checkout`, `dtolnay/rust-toolchain`,
+  `Swatinem/rust-cache`) and make inode-identity tests robust against
+  filesystem inode reuse (rename-based replacement).
+
 ## 0.11.0 — 2026-08-13
 
 ### Added
