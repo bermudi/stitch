@@ -429,7 +429,7 @@ fn matrix_home_apply_hook_replaces_dir_behind_symlinked_home() {
     fs::write(
         &hook,
         format!(
-            "#!/bin/sh\nset -e\nrm -rf \"{real}\"\nmkdir \"{real}\"\n",
+            "#!/bin/sh\nset -e\nmv \"{real}\" \"{real}.old\" 2>/dev/null || rm -rf \"{real}\"\nmkdir \"{real}\"\n",
             real = real_home.display()
         ),
     )
@@ -499,7 +499,7 @@ fn matrix_home_remove_hook_replaces_dir_behind_symlinked_home() {
     fs::write(
         &hook,
         format!(
-            "#!/bin/sh\nset -e\nrm -rf \"{real}\"\nmkdir \"{real}\"\nln -s \"{repo}/app\" \"{real}/.app\"\n",
+            "#!/bin/sh\nset -e\nmv \"{real}\" \"{real}.old\" 2>/dev/null || rm -rf \"{real}\"\nmkdir \"{real}\"\nln -s \"{repo}/app\" \"{real}/.app\"\n",
             real = real_home.display(),
             repo = env.repo.display()
         ),
