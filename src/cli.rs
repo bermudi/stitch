@@ -97,6 +97,14 @@ pub enum Commands {
         #[arg(short, long = "patterns", value_name = "PATTERN")]
         patterns: Vec<String>,
 
+        /// Create PATH as a single empty file (PATH must not exist)
+        #[arg(long)]
+        file: bool,
+
+        /// Adopt an existing regular file into an existing file-mode store
+        #[arg(long, value_name = "STORE")]
+        to: Option<String>,
+
         /// Preview without making changes
         #[arg(long)]
         dry_run: bool,

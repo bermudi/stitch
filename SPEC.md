@@ -189,15 +189,21 @@ Print all configured stores and their targets.
 
 ### `stitch add <path>`
 
-Add a path to stitch. If the path exists as a real file or directory, it is moved into the repo and symlinked back (adopt). If it doesn't exist, an empty store directory is created and linked to the path. Either way, the link inventory is recorded in `.stitch/state.toml` only — `stitch.toml` is untouched.
+Add a path to stitch. If the path exists as a real file or directory, it is moved into the repo and symlinked back (adopt). If it doesn't exist, an empty store directory is created and linked to the path, unless `--file` requests a single empty file. Either way, the link inventory is recorded in `.stitch/state.toml` only — `stitch.toml` is untouched.
 
-A symlink at the target path is always an error (never silently clobbered). The store name is derived from the path basename with a leading `.` stripped; override with `--name`.
+A symlink at the target path is always an error (never silently clobbered). An existing source inside the stitch repository is also rejected rather than moved out of the repo. The store name is derived from the path basename with a leading `.` stripped; override with `--name`.
+
+By default, a missing path creates a whole-directory store. Use `--file` when the missing path is a single file: stitch creates an empty regular file inside the store and records its parent as the target. `--file` requires that the target is absent.
+
+Use `--to <store>` to adopt one existing regular, non-hard-linked file into an existing single-target file-mode store. The file must be below that store's configured target and outside the stitch repository; stitch moves it to the matching store-relative path, creates the return symlink, and appends that path to generated state. This initial workflow does not accept directories, symlinks, templates, whole-directory stores, or multi-target stores. Existing store entries are not reconciled. Both normal adoption and `--to` reject repository-contained sources, symlinked target ancestors, and unsafe destination parents before changing anything; `--dry-run` performs those checks without creating directories.
 
 | Flag | Short | Description |
 |---|---|---|
 | `--name` | `-n` | Override derived store name |
 | `--files` | `-f` | Files to link individually (repeatable; create-empty only) |
 | `--patterns` | `-p` | Glob patterns (repeatable; create-empty only) |
+| `--file` | | Create a missing path as one empty file in a new store |
+| `--to` | | Adopt an existing file into an existing file-mode store |
 | `--dry-run` | | Preview |
 
 ### `stitch remove <name>`
@@ -396,9 +402,10 @@ exact op list with preflight and fingerprint checks.
 ### Global `--json` flag
 
 `--json` is global. It is supported for `status`, `list`, `diff`, `apply`,
-`plan`, `doctor`, `prune`, and `render`. It is **not** supported for `init`,
-`add`, `remove`, `edit`, `import`, or `migrate`; passing it to those commands
-exits with code 2.
+`plan`, `doctor`, `prune`, and `render`. `add` and `remove` support it only with
+`--dry-run`; `migrate` supports it only with `--dry-run`; and `import` supports
+it for its report. It is not supported for `init` or `edit`, or for non-dry-run
+`add`, `remove`, and `migrate`; those combinations exit with code 2.
 
 ### JSON envelope
 
@@ -456,10 +463,14 @@ warnings and errors travel inside the envelope.
 - `templated`: `true` when the source ends in `.tmpl`.
 - `staged_path`: absolute staged render path for active templates; omitted
   otherwise.
-- `state`: `linked`, `missing`, `conflict`, or `broken`.
+- `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`, or `error`.
 - `skipped_platform`: `true` when the store's `when` clause does not match.
 - `resolves_to`: for `broken`, the absolute path the broken symlink resolves to;
   `null` otherwise.
+
+`add --dry-run --json`: an add preview with `store`, `target`, `mode`, optional
+`source`, `files`, and `patterns` fields. `mode` is `adopt`, `create`,
+`create-file`, or `add-to-store`.
 
 `list --json`: array of configured stores.
 
@@ -756,7 +767,7 @@ below; planned milestones are renumbered to avoid collision.
 ### ✅ v0.7 — Agent interface (shipped)
 Machine-readable verification and branchable failures for agent/scripted use.
 See `docs/plans/v0.7-agent-interface.md`.
-- [x] `--json` on read/plan commands; typed `doctor` findings; `stitch render`
+- [x] `--json` on read/plan commands and supported dry-run/reporting writes; typed `doctor` findings; `stitch render`
 - [x] `stitch plan` → `stitch apply --plan` — captured op list with
       preconditions and fresh safety validation before execution
 - [x] Distinct exit codes per failure class + resolution hints

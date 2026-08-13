@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `stitch add <missing-path> --file` creates an empty regular file-backed store.
+- `stitch add <existing-file> --to <store>` adopts one regular file into an
+  existing single-target file-mode store, preserving its contents and adding
+  the new path to generated state. Both forms support `--dry-run`.
+- Add validates repository boundaries and destination/target ancestors before
+  mutation, including in dry-run mode.
+
 ## 0.10.0 — 2026-08-12
 
 ### Added
