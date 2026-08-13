@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.11.2 — 2026-08-13
+
+### Fixed
+
+- Tests: make `matrix_home_*` hook tests robust against inode reuse (use
+  `mv`+`mkdir` instead of `rm -rf`+`mkdir`). Fixes flaky CI failure on
+  filesystems that quickly recycle inode numbers.
+
 ## 0.11.1 — 2026-08-13
 
 ### Fixed
