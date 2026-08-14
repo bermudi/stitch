@@ -1,4 +1,15 @@
 mod common;
+pub(crate) mod diff;
+pub(crate) mod doctor;
+pub(crate) mod edit;
+pub(crate) mod import;
+pub(crate) mod init;
+pub(crate) mod list;
+pub(crate) mod migrate;
+pub(crate) mod plan;
+pub(crate) mod prune;
+pub(crate) mod render;
+pub(crate) mod status;
 
 pub(crate) use common::{
     add_error_from_action, apply_error_from_actions, check_unknown_names, filter_config,
@@ -44,7 +55,7 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
             if json {
                 return Err(StitchError::usage("--json is not supported for init"));
             }
-            crate::cmd_init()
+            init::cmd_init()
         }
         cli::Commands::Apply {
             only,
@@ -64,11 +75,11 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
         }
         cli::Commands::Plan { only, force } => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_plan(&root, &only, force, json)
+            plan::cmd_plan(&root, &only, force, json)
         }
         cli::Commands::Status { name } => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_status(&root, &name, json)
+            status::cmd_status(&root, &name, json)
         }
         cli::Commands::Diff {
             only,
@@ -76,11 +87,11 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
             exit_code,
         } => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_diff(&root, &only, force, exit_code, json)
+            diff::cmd_diff(&root, &only, force, exit_code, json)
         }
         cli::Commands::List => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_list(&root, json)
+            list::cmd_list(&root, json)
         }
         cli::Commands::Add {
             path,
@@ -141,15 +152,15 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
                 return Err(StitchError::usage("--json is not supported for edit"));
             }
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_edit(&root, entry.as_deref())
+            edit::cmd_edit(&root, entry.as_deref())
         }
         cli::Commands::Import { scan_dirs, dry_run } => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_import(&root, &scan_dirs, dry_run, json)
+            import::cmd_import(&root, &scan_dirs, dry_run, json)
         }
         cli::Commands::Doctor => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_doctor(&root, json)
+            doctor::cmd_doctor(&root, json)
         }
         cli::Commands::Migrate { dry_run } => {
             if json && !dry_run {
@@ -158,7 +169,7 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
                 ));
             }
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_migrate(&root, dry_run, json)
+            migrate::cmd_migrate(&root, dry_run, json)
         }
         cli::Commands::Prune {
             scan_dirs,
@@ -166,11 +177,11 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
             yes,
         } => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_prune(&root, &scan_dirs, dry_run, yes, json)
+            prune::cmd_prune(&root, &scan_dirs, dry_run, yes, json)
         }
         cli::Commands::Render { spec } => {
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_render(&root, &spec, json)
+            render::cmd_render(&root, &spec, json)
         }
     }
 }
