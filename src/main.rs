@@ -7,6 +7,8 @@ mod hooks;
 mod linker;
 mod plan;
 mod plan_exec;
+mod plan_file;
+mod plan_validate;
 mod platform;
 mod render;
 mod report;
