@@ -8,6 +8,7 @@ pub(crate) mod list;
 pub(crate) mod migrate;
 pub(crate) mod plan;
 pub(crate) mod prune;
+pub(crate) mod remove;
 pub(crate) mod render;
 pub(crate) mod status;
 
@@ -145,7 +146,7 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
                 ));
             }
             let root = resolve_root(repo.as_deref())?;
-            crate::cmd_remove(&root, &name, dry_run, json)
+            remove::cmd_remove(&root, &name, dry_run, json)
         }
         cli::Commands::Edit { entry } => {
             if json {
