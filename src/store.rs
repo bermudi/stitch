@@ -1,9 +1,9 @@
+use crate::ancestor::{TargetAncestorRedirect, TargetAncestorSnapshot};
 use crate::config::{self, Config, ConfigSnapshot, Loaded, Store, WhenClause};
 use crate::error::{FailureClass, StitchError};
 use crate::hooks::{self, HookEnv};
 use crate::linker::{self, LinkError, LinkStatus};
 use crate::plan::{LinkRequires, Plan, PlanOp, PlanStore, TargetState, path_to_string};
-use crate::plan_exec::{TargetAncestorRedirect, TargetAncestorSnapshot};
 use crate::platform::Platform;
 use crate::render;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};

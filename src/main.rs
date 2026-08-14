@@ -1,6 +1,8 @@
+mod ancestor;
 mod cli;
 mod config;
 mod error;
+mod fsutil;
 mod hooks;
 mod linker;
 mod plan;
@@ -12,12 +14,15 @@ mod safety;
 mod scan;
 mod store;
 
+use ancestor::{TargetAncestorRedirect, TargetAncestorSnapshot};
 use clap::Parser;
 use config::{Config, ConfigError, Loaded, expand_home, find_root};
 use error::{FailureClass, StitchError};
-use plan_exec::{
-    PlanExecError, PlanFile, PlanFileOp, TargetAncestorRedirect, TargetAncestorSnapshot,
+use fsutil::{
+    CreatedDirectory, InodeIdentity, ensure_filesystem_identity, ensure_inode_identity,
+    filesystem_identity, inode_identity,
 };
+use plan_exec::{PlanExecError, PlanFile, PlanFileOp};
 use platform::Platform;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -47,36 +52,6 @@ fn global_redirect_to_error(redirect: TargetAncestorRedirect) -> StitchError {
     }
 }
 
-fn filesystem_identity(path: &std::path::Path, label: &str) -> Result<(u64, u64), StitchError> {
-    // Repository aliases are supported, so follow the root entry and pin the
-    // directory it resolves to. Repointing the alias changes this identity.
-    let meta = std::fs::metadata(path)
-        .map_err(|e| StitchError::io_context(format!("{label} {}: metadata", path.display()), e))?;
-    if !meta.file_type().is_dir() {
-        return Err(StitchError::internal(format!(
-            "{label} {} does not resolve to a directory",
-            path.display()
-        )));
-    }
-    Ok((meta.dev(), meta.ino()))
-}
-
-fn ensure_filesystem_identity(
-    path: &std::path::Path,
-    expected: (u64, u64),
-    context: &str,
-    label: &str,
-) -> Result<(), StitchError> {
-    let actual = filesystem_identity(path, label)?;
-    if actual != expected {
-        return Err(StitchError::internal(format!(
-            "{context}: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
 #[derive(Serialize)]
 struct AddData {
     store: String,
@@ -88,43 +63,6 @@ struct AddData {
     files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     patterns: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InodeIdentity {
-    dev: u64,
-    ino: u64,
-}
-
-#[derive(Debug, Clone)]
-struct CreatedDirectory {
-    path: std::path::PathBuf,
-    identity: InodeIdentity,
-}
-
-fn inode_identity(path: &std::path::Path) -> Result<InodeIdentity, StitchError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-        StitchError::io_context(format!("inspecting {}", path.display()), error)
-    })?;
-    Ok(InodeIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    })
-}
-
-fn ensure_inode_identity(
-    path: &std::path::Path,
-    expected: InodeIdentity,
-    context: &str,
-) -> Result<(), StitchError> {
-    let actual = inode_identity(path)?;
-    if actual != expected {
-        return Err(StitchError::internal(format!(
-            "{context}: {} changed identity",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Serialize)]
