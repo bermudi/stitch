@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.11.4 — 2026-08-14
+
+### Fixed
+
+- `apply`: suppress pre/post hooks for stores skipped by `when`
+  clauses. Previously a skipped store could still trigger its hooks.
+
+### Internal
+
+- Module refactor: split `main.rs` (5,222 lines), `store.rs`
+  (3,827), `config.rs` (2,795), and `plan_exec.rs` (3,632) into
+  smaller modules. No behavior or public API change. Full plan in
+  `docs/plans/2026-08-13-module-refactor.md`.
+- Tests: added characterization tests for `add` rollback paths
+  before the refactor.
+
 ## 0.11.3 — 2026-08-13
 
 ### Fixed

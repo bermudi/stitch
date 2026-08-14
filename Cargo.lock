@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "stitch"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "assert_cmd",
  "clap",
