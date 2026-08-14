@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 0.11.5 — 2026-08-14
+
+### Fixed
+
+- `apply`/`diff`: reject two active stores claiming the same link path
+  (e.g. two whole-dir stores on the same target, or a whole-dir store
+  overlapping a file-mode child). Previously `apply` would report success
+  while the filesystem never converged and `diff --exit-code` alarmed
+  forever. The collision is now detected up front as a config error (exit 3)
+  naming both stores and the conflicting path. File-mode stores sharing a
+  target directory with disjoint files remain valid; mutually exclusive
+  `when` clauses and platform-skipped stores are not treated as collisions.
+  (v0.11.4 release assessment blocker.)
+- `apply`: replace a stale repo-owned symlink atomically (create new link
+  at a temp path, then `rename` over the old one). A failure during link
+  creation no longer leaves the target absent — the original symlink
+  survives. (v0.11.4 release assessment "failed apply deletes a dangling
+  link".)
+- `apply`: an orphaned store (behavior in `stitch.toml` but no link
+  inventory in `state.toml`, e.g. left behind by `remove`) now surfaces as
+  a config error (exit 3) with a fix hint, instead of an internal error
+  (exit 1).
+- `add`: strip setuid/setgid/sticky bits when adopting a file into the
+  repo. `rename(2)` preserves mode bits, but a setuid dotfile is almost
+  always unintentional and git drops these bits on clone anyway. A
+  warning is printed when bits are stripped.
+- `add`: `add <repo>` (adding the repository itself) now fails with a
+  clear "cannot add the repository itself" message instead of a generic
+  "inside the stitch repository" message.
+- `diff`: a read-only `diff` that reports conflicts no longer prints
+  "apply failed" — the error message now says "diff reported N
+  conflict(s), N error(s)". The `Apply` error variant's display no longer
+  hardcodes the "apply failed" prefix; callers pass the command name.
+
+### Documentation
+
+- README and SPEC: document that `remove` leaves the store directory in
+  the repo untouched, so re-`add`ing the same store requires renaming or
+  `rm -rf`-ing the leftover directory first (`add` refuses to adopt into
+  an existing store directory).
+
 ## 0.11.4 — 2026-08-14
 
 ### Fixed

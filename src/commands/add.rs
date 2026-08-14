@@ -8,7 +8,7 @@ use crate::render;
 use crate::report;
 use crate::safety;
 use crate::store;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 
 /// Reverse the move step of adopt: restore the user's file/dir to its
@@ -399,6 +399,44 @@ fn remove_created_parents(created: &[CreatedDirectory]) -> Vec<String> {
         }
     }
     errors
+}
+
+/// Strip setuid/setgid/sticky bits from an adopted path after it has been
+/// moved into the repository. `rename(2)` preserves mode bits, so a file with
+/// setuid/setgid would land in the repo carrying privileged bits — a surprise
+/// for a dotfiles repo that gets cloned or pushed (git does not preserve these
+/// bits across clone anyway, so keeping them is misleading rather than
+/// useful). Dotfiles do not legitimately need setuid/setgid; stripping is the
+/// defensive default. Returns a warning string if the bits were present and
+/// stripped, so `add` can tell the user what happened. Errors are reported as
+/// warnings (the adopt already succeeded; failing to chmod is not data loss).
+fn strip_privileged_bits(path: &std::path::Path) -> Option<String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    // Don't follow symlinks — chmod on a symlink is a no-op on Linux anyway.
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    let mode = meta.mode();
+    let privileged = mode & 0o7000; // setuid | setgid | sticky
+    if privileged == 0 {
+        return None;
+    }
+    let cleaned = mode & !0o7000;
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(cleaned)) {
+        Ok(()) => Some(format!(
+            "stripped setuid/setgid/sticky bits (0o{:o}) from adopted {} — \
+             dotfiles do not need them and git would drop them on clone anyway",
+            privileged,
+            path.display()
+        )),
+        Err(e) => Some(format!(
+            "warning: could not strip setuid/setgid/sticky bits from {}: {e}",
+            path.display()
+        )),
+    }
 }
 
 fn validate_store_destination_parent(
@@ -1031,6 +1069,9 @@ fn cmd_add_to_store(
 
     println!("Added {} to store '{}'", raw_name, store_name);
     println!("  linked {}", source.display());
+    if let Some(warning) = strip_privileged_bits(&destination) {
+        eprintln!("{warning}");
+    }
     Ok(())
 }
 
@@ -1245,10 +1286,17 @@ pub(crate) fn cmd_add(
             StitchError::io_context(format!("resolving repository {}", root.display()), error)
         })?;
         if source_resolved.starts_with(&repo_resolved) {
-            return Err(StitchError::usage(format!(
-                "{} is inside the stitch repository; add only adopts paths outside the repository",
-                source.display()
-            )));
+            return Err(StitchError::usage(if source_resolved == repo_resolved {
+                format!(
+                    "cannot add the repository itself (`{}` is the stitch repo); add a path outside it instead",
+                    source.display()
+                )
+            } else {
+                format!(
+                    "{} is inside the stitch repository; add only adopts paths outside the repository",
+                    source.display()
+                )
+            }));
         }
     }
     if create_file && source_exists {
@@ -1538,6 +1586,18 @@ pub(crate) fn cmd_add(
             }
         }
 
+        // Strip setuid/setgid/sticky bits from the adopted path. rename(2)
+        // preserves mode bits; a setuid dotfile would land in the repo carrying
+        // privileged bits that git would silently drop on clone anyway. This is
+        // defensive and informational — the adopt already succeeded, so a chmod
+        // failure is a warning, not a rollback.
+        let adopted_path = if is_dir {
+            store_dir.clone()
+        } else {
+            store_dir.join(&raw_name)
+        };
+        let bit_warning = strip_privileged_bits(&adopted_path);
+
         // Link: create the return symlink using the in-memory store.
         // If this fails, roll back the move so the user's file is back where
         // it was. State was never touched.
@@ -1715,6 +1775,9 @@ pub(crate) fn cmd_add(
                 store::ApplyAction::AlreadyLinked(_) => println!("  already linked"),
                 _ => {}
             }
+        }
+        if let Some(warning) = bit_warning {
+            eprintln!("{warning}");
         }
     } else {
         // --- Create-empty path: fresh directory store, or one empty file. ---

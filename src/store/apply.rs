@@ -66,6 +66,17 @@ fn internal_error(message: impl Into<String>) -> ApplyAction {
     ApplyAction::Error(StitchError::internal(message))
 }
 
+/// Wrap a plain-string apply error as a config failure (exit 3), not an
+/// internal one (exit 1). Used for user-facing config problems that surface
+/// during apply — e.g. an orphaned store (behavior in `stitch.toml` but no
+/// link inventory in `state.toml`) — so the exit code and hint reflect a
+/// fixable config issue rather than an unexpected internal failure.
+fn config_error(message: impl Into<String>) -> ApplyAction {
+    ApplyAction::Error(StitchError::config(config::ConfigError::InvalidPath(
+        message.into(),
+    )))
+}
+
 /// Wrap a config revalidation failure as a config-class error (exit 3), not
 /// an internal error (exit 1), preserving the original failed path and
 /// adding checkpoint/store context to the message. A config reread failure
@@ -781,7 +792,17 @@ pub fn apply_store(
             }
         }
     } else {
-        actions.push(internal_error("no target configured"));
+        // No target and no target entries. The common cause is an orphaned
+        // store: behavior declared in `stitch.toml` but no link inventory in
+        // `state.toml` (e.g. left behind by `remove`, which never rewrites the
+        // authored file). This is a user-facing config problem, not an
+        // internal failure, so it surfaces as a config error (exit 3) with a
+        // fix hint rather than exit 1.
+        actions.push(config_error(format!(
+            "store '{name}': no target configured — behavior is declared in stitch.toml but \
+             state.toml has no link inventory; re-add the store with `stitch add` or remove the \
+             entry from stitch.toml"
+        )));
     }
 
     // Reconcile file-mode links before staging: a deleted source must not leave
@@ -1530,6 +1551,91 @@ fn create_link_for(target: &Path, source: &Path, source_root: &Path) -> Result<(
     }
 }
 
+/// Atomically replace an existing symlink at `target` with a new link to
+/// `source`. The new link is created at a sibling temp path, then renamed over
+/// the target in a single `rename(2)`. If the link step fails the original
+/// target is untouched; if the final rename fails the original is rolled back
+/// from a second temp path. This closes the window where a failed `apply`
+/// would `remove_file` a stale repo-owned symlink and then fail to create the
+/// replacement, leaving the target absent (the v0.11.4 release assessment's
+/// "failed apply deletes a dangling link" finding).
+///
+/// Precondition: `target` is an existing symlink (caller has already
+/// classified it via `linker::check_link`). The rename-based swap preserves
+/// the symlink-replacement semantics the linker relies on.
+fn atomic_replace_link(target: &Path, source: &Path, source_root: &Path) -> Result<(), LinkError> {
+    let parent = target.parent().ok_or_else(|| {
+        LinkError::Create(
+            std::io::Error::other(format!("{} has no parent directory", target.display())),
+            target.to_path_buf(),
+        )
+    })?;
+    let name = target.file_name().ok_or_else(|| {
+        LinkError::Create(
+            std::io::Error::other(format!("{} has no file name", target.display())),
+            target.to_path_buf(),
+        )
+    })?;
+    let name_str = name.to_string_lossy();
+    let pid = std::process::id();
+    let tmp_link = parent.join(format!(".{name_str}.stitch-link-{pid}"));
+    let tmp_orig = parent.join(format!(".{name_str}.stitch-orig-{pid}"));
+
+    if tmp_link.symlink_metadata().is_ok() || tmp_orig.symlink_metadata().is_ok() {
+        return Err(LinkError::Create(
+            std::io::Error::other(format!(
+                "temporary replacement path for {} already exists",
+                target.display()
+            )),
+            target.to_path_buf(),
+        ));
+    }
+
+    // Create the new link at a temp path first. If this fails, the original
+    // target is still in place.
+    create_link_for(&tmp_link, source, source_root)?;
+
+    // Move the existing symlink aside. `rename` over an existing path is
+    // atomic on POSIX.
+    if let Err(e) = std::fs::rename(target, &tmp_orig) {
+        let _ = std::fs::remove_file(&tmp_link);
+        return Err(LinkError::Remove(e, target.to_path_buf()));
+    }
+
+    // Move the new link into place.
+    if let Err(e) = std::fs::rename(&tmp_link, target) {
+        // Roll the original back so the target is not left absent.
+        let rollback = std::fs::rename(&tmp_orig, target);
+        let _ = std::fs::remove_file(&tmp_link);
+        if let Err(re) = rollback {
+            return Err(LinkError::Create(
+                std::io::Error::other(format!(
+                    "could not place symlink at {}: {e}; rollback also failed ({re}); \
+                     the original entry is at {}",
+                    target.display(),
+                    tmp_orig.display()
+                )),
+                target.to_path_buf(),
+            ));
+        }
+        return Err(LinkError::Create(e, target.to_path_buf()));
+    }
+
+    // The original symlink is now at tmp_orig; remove it. A failure here is
+    // not data-loss (the new link is in place) but leaves a stray temp file,
+    // so report it honestly.
+    if let Err(e) = std::fs::remove_file(&tmp_orig) {
+        return Err(LinkError::Remove(
+            std::io::Error::other(format!(
+                "replaced {} but could not remove original: {e}",
+                target.display()
+            )),
+            tmp_orig,
+        ));
+    }
+    Ok(())
+}
+
 fn apply_single_link(
     source: &Path,
     target: &Path,
@@ -1603,13 +1709,13 @@ fn apply_single_link(
                 };
             }
             let old_resolves_to = resolved.clone();
-            if let Err(e) = std::fs::remove_file(target) {
-                return internal_error(format!(
-                    "could not remove stale symlink {}: {e}",
-                    target.display()
-                ));
-            }
-            match create_link_for(target, source, source_root) {
+            // Atomic swap: create the new link at a temp path, then rename it
+            // over the stale one. A failure during link creation leaves the
+            // original (stale but present) symlink in place rather than
+            // deleting it first and failing to create the replacement — the
+            // v0.11.4 release assessment's "failed apply deletes a dangling
+            // link" finding.
+            match atomic_replace_link(target, source, source_root) {
                 Ok(()) => ApplyAction::Replaced {
                     target: target.to_path_buf(),
                     old_resolves_to: Some(old_resolves_to),

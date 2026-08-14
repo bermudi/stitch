@@ -5,7 +5,7 @@
 //! `plan_compute`, `status`, `doctor`, and (out of `store`) `safety`,
 //! `plan_exec`, and `main` (prune).
 
-use crate::config::{self, Store};
+use crate::config::{self, Config, ConfigError, Store, WhenClause};
 use crate::linker::{self, LinkStatus};
 use crate::plan::path_to_string;
 use crate::platform::Platform;
@@ -279,6 +279,170 @@ pub(crate) fn collect_store_link_targets(
     }
 
     Ok((targets, removed))
+}
+
+/// A single store/target entry's claim on one link path. `whens` carries the
+/// store-level (and, for multi-target entries, target-level) `when` clauses so
+/// two claims are only a conflict when they could be active on one machine.
+struct LinkClaim {
+    store: String,
+    tname: Option<String>,
+    whens: Vec<WhenClause>,
+    path: PathBuf,
+}
+
+/// Build the message naming both claimants of a colliding link path, mirroring
+/// `doctor`'s `duplicate-target` wording so the two commands speak the same
+/// language. `tname` identifies the multi-target entry when present.
+fn link_collision_message(
+    a_store: &str,
+    a_tname: Option<&str>,
+    b_store: &str,
+    b_tname: Option<&str>,
+    path: &Path,
+) -> String {
+    let label = |store: &str, tname: Option<&str>| match tname {
+        Some(t) => format!("target '{t}' of store '{store}'"),
+        None => format!("store '{store}'"),
+    };
+    format!(
+        "{} and {} both claim link path '{}': the desired state is self-contradictory and `apply` cannot converge",
+        label(a_store, a_tname),
+        label(b_store, b_tname),
+        path.display()
+    )
+}
+
+/// Detect link-path collisions across the stores that are active on this
+/// platform, before any plan is built or filesystem mutation occurs.
+///
+/// Two claims collide when one claim's link path is equal to or nested under
+/// the other's (so a whole-directory symlink cannot coexist with a link nested
+/// inside it) and their combined `when` clauses are jointly satisfiable — i.e.
+/// both could be active on a single machine. This is the precise condition
+/// under which `apply` would report success while the filesystem never
+/// converges: two stores fighting to write the same symlink.
+///
+/// File-mode stores sharing a target *directory* with disjoint file sets do
+/// not collide (their link paths differ), so the legitimate shared-directory
+/// pattern is preserved. Only active stores are considered: stores gated off
+/// on this platform cannot collide here, and mutually-exclusive `when` clauses
+/// never collide on any one machine.
+pub(crate) fn check_link_path_collisions(
+    repo_root: &Path,
+    config: &Config,
+    platform: &Platform,
+) -> Result<(), ConfigError> {
+    let mut claims: Vec<LinkClaim> = Vec::new();
+    for (name, store) in &config.stores {
+        if !platform.matches_when(&store.when) {
+            continue;
+        }
+        let store_dir = repo_root.join(name);
+        if store.is_multi_target() {
+            for (tname, tentry) in &store.targets {
+                if !platform.matches_when(&tentry.when) {
+                    continue;
+                }
+                let target_path = config::expand_home(&tentry.target)?;
+                collect_link_claims_for_target(
+                    &store_dir,
+                    &target_path,
+                    name,
+                    Some(tname),
+                    &store.when,
+                    Some(&tentry.when),
+                    &tentry.files,
+                    &tentry.patterns,
+                    &tentry.ignore,
+                    &mut claims,
+                )?;
+            }
+        } else if let Some(target_str) = &store.target {
+            let target_path = config::expand_home(target_str)?;
+            collect_link_claims_for_target(
+                &store_dir,
+                &target_path,
+                name,
+                None,
+                &store.when,
+                None,
+                &store.files,
+                &store.patterns,
+                &store.ignore,
+                &mut claims,
+            )?;
+        }
+    }
+
+    for i in 0..claims.len() {
+        for j in (i + 1)..claims.len() {
+            let a = &claims[i];
+            let b = &claims[j];
+            // A store cannot collide with itself across the same target entry;
+            // within-store target overlap is already rejected at load time by
+            // `validate_non_overlapping_targets`.
+            if a.store == b.store && a.tname == b.tname {
+                continue;
+            }
+            let mut combined: Vec<&WhenClause> = Vec::with_capacity(a.whens.len() + b.whens.len());
+            combined.extend(a.whens.iter());
+            combined.extend(b.whens.iter());
+            if !WhenClause::are_compatible(&combined) {
+                continue;
+            }
+            if a.path == b.path || a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+                return Err(ConfigError::InvalidPath(link_collision_message(
+                    &a.store,
+                    a.tname.as_deref(),
+                    &b.store,
+                    b.tname.as_deref(),
+                    &a.path,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_link_claims_for_target(
+    store_dir: &Path,
+    target_path: &Path,
+    store_name: &str,
+    tname: Option<&str>,
+    store_when: &WhenClause,
+    target_when: Option<&WhenClause>,
+    files: &[String],
+    patterns: &[String],
+    ignore: &[String],
+    claims: &mut Vec<LinkClaim>,
+) -> Result<(), ConfigError> {
+    let mut whens = Vec::with_capacity(2);
+    whens.push(store_when.clone());
+    if let Some(w) = target_when {
+        whens.push(w.clone());
+    }
+    match resolve_target_names(store_dir, files, patterns, ignore) {
+        LinkTargets::WholeDir => claims.push(LinkClaim {
+            store: store_name.to_string(),
+            tname: tname.map(|s| s.to_string()),
+            whens,
+            path: target_path.to_path_buf(),
+        }),
+        LinkTargets::Files(names) => {
+            for source_name in names {
+                let entry = render::resolve_entry(&source_name);
+                claims.push(LinkClaim {
+                    store: store_name.to_string(),
+                    tname: tname.map(|s| s.to_string()),
+                    whens: whens.clone(),
+                    path: target_path.join(&entry.link_rel),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
