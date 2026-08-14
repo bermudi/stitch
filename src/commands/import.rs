@@ -3,10 +3,9 @@ use super::prune::prune_roots;
 use crate::config::{self, Config};
 use crate::error::StitchError;
 use crate::platform::Platform;
-use crate::report;
+use crate::report::{self, ImportData, ImportedStore};
 use crate::scan;
 use crate::store;
-use crate::{ImportData, ImportedStore};
 
 /// Import existing repo-pointing symlinks into `.stitch/state.toml`.
 ///

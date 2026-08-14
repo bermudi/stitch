@@ -1,3 +1,4 @@
+pub(crate) mod apply;
 mod common;
 pub(crate) mod diff;
 pub(crate) mod doctor;
@@ -13,8 +14,7 @@ pub(crate) mod render;
 pub(crate) mod status;
 
 pub(crate) use common::{
-    add_error_from_action, apply_error_from_actions, check_unknown_names, filter_config,
-    global_redirect_to_error, plan_error, print_warnings, resolve_root,
+    add_error_from_action, apply_error_from_actions, print_warnings, resolve_root,
 };
 
 use crate::cli;
@@ -69,9 +69,9 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
                 if !only.is_empty() {
                     return Err(StitchError::usage("--plan is not compatible with --only"));
                 }
-                crate::cmd_apply_plan(&root, &plan_file, dry_run, force, json)
+                apply::cmd_apply_plan(&root, &plan_file, dry_run, force, json)
             } else {
-                crate::cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
+                apply::cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
             }
         }
         cli::Commands::Plan { only, force } => {

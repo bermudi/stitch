@@ -1,5 +1,4 @@
 use super::common::print_warnings;
-use crate::RemoveData;
 use crate::config::{self, Config, Loaded};
 use crate::error::StitchError;
 use crate::fsutil::{ensure_filesystem_identity, filesystem_identity};
@@ -7,7 +6,7 @@ use crate::hooks;
 use crate::linker;
 use crate::platform::Platform;
 use crate::render;
-use crate::report;
+use crate::report::{self, RemoveData};
 use crate::safety;
 use crate::store;
 use std::collections::BTreeSet;

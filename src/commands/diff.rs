@@ -39,7 +39,7 @@ pub(crate) fn cmd_diff(
                 let error = plan_error(&plan);
                 report::write_data_error("diff", plan, &error, loaded.warnings);
             }
-            let changes = crate::pending_change_count(&plan);
+            let changes = crate::commands::apply::pending_change_count(&plan);
             if exit_code && changes > 0 {
                 let error = StitchError::drift(changes);
                 report::write_data_error("diff", plan, &error, loaded.warnings);
@@ -74,12 +74,12 @@ pub(crate) fn cmd_diff(
         return Ok(());
     }
 
-    crate::render_plan(&plan, true);
+    crate::commands::apply::render_plan(&plan, true);
 
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
         Err(plan_error(&plan))
     } else {
-        let changes = crate::pending_change_count(&plan);
+        let changes = crate::commands::apply::pending_change_count(&plan);
         if exit_code && changes > 0 {
             Err(StitchError::drift(changes))
         } else {
