@@ -467,6 +467,64 @@ fn sha256_hex(content: &str) -> String {
         .collect()
 }
 
+// --- Command DTOs (moved from main.rs) ---
+// These are the JSON data shapes for the mutating commands (`add`, `remove`,
+// `import`, `migrate`). They live in the report module alongside the read
+// command DTOs so all JSON output types are in one place.
+
+#[derive(Serialize)]
+pub struct AddData {
+    pub store: String,
+    pub target: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct RemoveData {
+    pub store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
+    pub staging: String,
+    pub dry_run: bool,
+}
+
+#[derive(Serialize)]
+pub struct ImportedStore {
+    pub store: String,
+    pub target: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ImportData {
+    pub dry_run: bool,
+    pub imported: usize,
+    pub skipped_owned: usize,
+    pub stores: Vec<ImportedStore>,
+}
+
+#[derive(Serialize)]
+pub struct MigrateData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

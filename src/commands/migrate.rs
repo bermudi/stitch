@@ -1,7 +1,6 @@
-use crate::MigrateData;
 use crate::config::{self, ConfigError};
 use crate::error::StitchError;
-use crate::report;
+use crate::report::{self, MigrateData};
 
 pub(crate) fn cmd_migrate(
     root: &std::path::Path,
