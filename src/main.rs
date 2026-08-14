@@ -1,5 +1,6 @@
 mod ancestor;
 mod cli;
+mod commands;
 mod config;
 mod error;
 mod fsutil;
@@ -16,10 +17,14 @@ mod safety;
 mod scan;
 mod store;
 
-use ancestor::{TargetAncestorRedirect, TargetAncestorSnapshot};
+use ancestor::TargetAncestorSnapshot;
 use clap::Parser;
-use config::{Config, ConfigError, Loaded, expand_home, find_root};
-use error::{FailureClass, StitchError};
+use commands::{
+    add_error_from_action, apply_error_from_actions, check_unknown_names, filter_config,
+    global_redirect_to_error, plan_error, print_warnings,
+};
+use config::{Config, ConfigError, Loaded, expand_home};
+use error::StitchError;
 use fsutil::{
     CreatedDirectory, InodeIdentity, ensure_filesystem_identity, ensure_inode_identity,
     filesystem_identity, inode_identity,
@@ -30,29 +35,6 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::Component;
-
-fn global_redirect_to_error(redirect: TargetAncestorRedirect) -> StitchError {
-    match redirect {
-        TargetAncestorRedirect::Symlinked { path, resolves_to } => {
-            StitchError::conflict_foreign(path, resolves_to)
-        }
-        TargetAncestorRedirect::Redirected {
-            path,
-            resolves_to: Some(resolves_to),
-        } => StitchError::conflict_foreign(path, Some(resolves_to)),
-        TargetAncestorRedirect::Removed { path } => StitchError::internal(format!(
-            "target ancestor {} was removed by the pre-apply hook",
-            path.display()
-        )),
-        TargetAncestorRedirect::Redirected {
-            path,
-            resolves_to: None,
-        } => StitchError::internal(format!(
-            "target ancestor {} changed identity during the pre-apply hook",
-            path.display()
-        )),
-    }
-}
 
 #[derive(Serialize)]
 struct AddData {
@@ -110,8 +92,8 @@ struct MigrateData {
 fn main() {
     let cli = cli::Cli::parse();
     let json = cli.json;
-    let command_name = command_name(&cli.command);
-    if let Err(e) = run(cli) {
+    let command_name = commands::command_name(&cli.command);
+    if let Err(e) = commands::run(cli) {
         if json {
             report::write_error(command_name, &e, Vec::new());
         } else {
@@ -122,281 +104,6 @@ fn main() {
         }
         std::process::exit(e.exit_code());
     }
-}
-
-fn command_name(command: &cli::Commands) -> &'static str {
-    use cli::Commands;
-    match command {
-        Commands::Init => "init",
-        Commands::Apply { .. } => "apply",
-        Commands::Status { .. } => "status",
-        Commands::Diff { .. } => "diff",
-        Commands::Plan { .. } => "plan",
-        Commands::List => "list",
-        Commands::Add { .. } => "add",
-        Commands::Remove { .. } => "remove",
-        Commands::Edit { .. } => "edit",
-        Commands::Doctor => "doctor",
-        Commands::Import { .. } => "import",
-        Commands::Migrate { .. } => "migrate",
-        Commands::Prune { .. } => "prune",
-        Commands::Render { .. } => "render",
-    }
-}
-
-fn run(cli: cli::Cli) -> Result<(), StitchError> {
-    // `init` is cwd-anchored: it creates a new repo in the current directory,
-    // so it must not honor --repo/STITCH_REPO. Every other command resolves
-    // the repo once here (flag > env > cwd walk) and receives `&root`.
-    let cli::Cli {
-        repo,
-        json,
-        command,
-    } = cli;
-    match command {
-        cli::Commands::Init => {
-            if json {
-                return Err(StitchError::usage("--json is not supported for init"));
-            }
-            cmd_init()
-        }
-        cli::Commands::Apply {
-            only,
-            dry_run,
-            force,
-            plan,
-        } => {
-            let root = resolve_root(repo.as_deref())?;
-            if let Some(plan_file) = plan {
-                if !only.is_empty() {
-                    return Err(StitchError::usage("--plan is not compatible with --only"));
-                }
-                cmd_apply_plan(&root, &plan_file, dry_run, force, json)
-            } else {
-                cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
-            }
-        }
-        cli::Commands::Plan { only, force } => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_plan(&root, &only, force, json)
-        }
-        cli::Commands::Status { name } => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_status(&root, &name, json)
-        }
-        cli::Commands::Diff {
-            only,
-            force,
-            exit_code,
-        } => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_diff(&root, &only, force, exit_code, json)
-        }
-        cli::Commands::List => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_list(&root, json)
-        }
-        cli::Commands::Add {
-            path,
-            name,
-            files,
-            patterns,
-            file,
-            to,
-            dry_run,
-        } => {
-            if json && !dry_run {
-                return Err(StitchError::usage(
-                    "--json is not supported for add without --dry-run",
-                ));
-            }
-            let root = match resolve_root(repo.as_deref()) {
-                Ok(root) => root,
-                Err(error) if json && dry_run => {
-                    report::write_error("add", &error, Vec::new());
-                    std::process::exit(error.exit_code());
-                }
-                Err(error) => return Err(error),
-            };
-            if json && dry_run {
-                return cmd_add_json(&root, &path, &name, &files, &patterns, file, to.as_deref());
-            }
-            cmd_add(
-                &root,
-                &path,
-                &name,
-                &files,
-                &patterns,
-                file,
-                to.as_deref(),
-                dry_run,
-                json,
-            )
-        }
-        cli::Commands::Remove { name, dry_run } => {
-            if json && !dry_run {
-                return Err(StitchError::usage(
-                    "--json is not supported for remove without --dry-run",
-                ));
-            }
-            let root = resolve_root(repo.as_deref())?;
-            cmd_remove(&root, &name, dry_run, json)
-        }
-        cli::Commands::Edit { entry } => {
-            if json {
-                return Err(StitchError::usage("--json is not supported for edit"));
-            }
-            let root = resolve_root(repo.as_deref())?;
-            cmd_edit(&root, entry.as_deref())
-        }
-        cli::Commands::Import { scan_dirs, dry_run } => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_import(&root, &scan_dirs, dry_run, json)
-        }
-        cli::Commands::Doctor => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_doctor(&root, json)
-        }
-        cli::Commands::Migrate { dry_run } => {
-            if json && !dry_run {
-                return Err(StitchError::usage(
-                    "--json is not supported for migrate without --dry-run",
-                ));
-            }
-            let root = resolve_root(repo.as_deref())?;
-            cmd_migrate(&root, dry_run, json)
-        }
-        cli::Commands::Prune {
-            scan_dirs,
-            dry_run,
-            yes,
-        } => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_prune(&root, &scan_dirs, dry_run, yes, json)
-        }
-        cli::Commands::Render { spec } => {
-            let root = resolve_root(repo.as_deref())?;
-            cmd_render(&root, &spec, json)
-        }
-    }
-}
-
-/// Print non-fatal load-time warnings (e.g. a stale v0.2 file alongside the new
-/// format) to stderr. Each command calls this once after `Config::load`.
-fn print_warnings(loaded: &Loaded) {
-    for w in &loaded.warnings {
-        eprintln!("warning: {w}");
-    }
-}
-
-/// Clone the config and retain only the named stores. Used by commands that
-/// need a filtered view for pre-apply checks (template gitignore, global hook
-/// ancestor capture) without splitting the snapshot passed to the executor.
-fn filter_config(config: &Config, only: &[String]) -> Config {
-    let mut filtered = config.clone();
-    if !only.is_empty() {
-        filtered.stores.retain(|name, _| only.contains(name));
-    }
-    filtered
-}
-
-/// Validate that every name in `only` exists in the config. Returns an error
-/// listing unknown names so a typo can't silently do nothing.
-fn check_unknown_names(
-    only: impl IntoIterator<Item = impl AsRef<str>>,
-    config: &Config,
-) -> Result<(), StitchError> {
-    let unknown: Vec<_> = only
-        .into_iter()
-        .filter(|n| !config.stores.contains_key(n.as_ref()))
-        .map(|n| n.as_ref().to_string())
-        .collect();
-    if unknown.is_empty() {
-        Ok(())
-    } else {
-        let valid: Vec<_> = config.stores.keys().cloned().collect();
-        Err(StitchError::unknown_store(unknown, valid))
-    }
-}
-
-/// Build an apply error from the failure actions in a single store result.
-fn apply_error_from_actions(actions: &[store::ApplyAction]) -> Option<StitchError> {
-    let mut classes = BTreeSet::new();
-    for action in actions {
-        match action {
-            store::ApplyAction::Conflict {
-                resolves_to: Some(_),
-                ..
-            } => {
-                classes.insert(FailureClass::ConflictForeign);
-            }
-            store::ApplyAction::Conflict {
-                resolves_to: None, ..
-            } => {
-                classes.insert(FailureClass::ConflictReal);
-            }
-            store::ApplyAction::Error(e) => {
-                classes.insert(e.class());
-            }
-            _ => {}
-        }
-    }
-    if classes.is_empty() {
-        None
-    } else {
-        Some(StitchError::apply(
-            classes.into_iter().collect(),
-            "apply reported conflicts or errors",
-        ))
-    }
-}
-
-fn add_error_from_action(action: &store::ApplyAction) -> StitchError {
-    match action {
-        store::ApplyAction::Conflict {
-            target,
-            resolves_to: Some(resolves_to),
-        } => StitchError::conflict_foreign(target.clone(), Some(resolves_to.clone())),
-        store::ApplyAction::Conflict {
-            target,
-            resolves_to: None,
-        } => StitchError::conflict_real(target.clone()),
-        store::ApplyAction::Error(error) => StitchError::internal(error.to_string()),
-        _ => StitchError::internal("add target preflight failed"),
-    }
-}
-
-/// Resolve the repo root.
-///
-/// Precedence: an explicit `--repo` override > the `STITCH_REPO` env var > an
-/// upward walk from cwd looking for `.stitch/`. `init` is cwd-anchored and
-/// does not call this. An override (flag or env) must point at a directory
-/// that actually contains `.stitch/` — we don't trust a bare path, so a typo
-/// can't silently operate on the wrong directory.
-fn resolve_root(override_path: Option<&str>) -> Result<std::path::PathBuf, StitchError> {
-    if let Some(p) = override_path {
-        return resolve_override(p, "--repo");
-    }
-    if let Ok(p) = std::env::var("STITCH_REPO")
-        && !p.is_empty()
-    {
-        return resolve_override(&p, "STITCH_REPO");
-    }
-    let cwd = std::env::current_dir()
-        .map_err(|e| StitchError::io_context("getting current working directory", e))?;
-    find_root(&cwd).ok_or_else(|| StitchError::repo_resolution("cwd", cwd))
-}
-
-/// Validate an explicit repo override (from `--repo` or `STITCH_REPO`):
-/// expand `~`, require a `.stitch/` dir so a typo can't silently operate on
-/// the wrong directory, and canonicalize when possible. `label` prefixes the
-/// error so the user knows which override was bad.
-fn resolve_override(path: &str, label: &str) -> Result<std::path::PathBuf, StitchError> {
-    let root = expand_home(path).map_err(StitchError::from)?;
-    if !root.join(".stitch").is_dir() {
-        return Err(StitchError::repo_resolution(label, root));
-    }
-    Ok(root.canonicalize().unwrap_or(root))
 }
 
 fn render_plan(plan: &plan::Plan, dry_run: bool) {
@@ -442,36 +149,7 @@ fn render_plan(plan: &plan::Plan, dry_run: bool) {
     );
 }
 
-fn plan_error(plan: &plan::Plan) -> StitchError {
-    let mut classes = BTreeSet::new();
-    for store in &plan.stores {
-        for op in &store.ops {
-            match op {
-                plan::PlanOp::Conflict { resolves_to, .. } => {
-                    if resolves_to.is_some() {
-                        classes.insert(FailureClass::ConflictForeign);
-                    } else {
-                        classes.insert(FailureClass::ConflictReal);
-                    }
-                }
-                plan::PlanOp::Error { class, .. } => {
-                    if let Some(c) = FailureClass::from_id(class) {
-                        classes.insert(c);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let conflicts = plan.summary.conflicts;
-    let errors = plan.summary.errors;
-    StitchError::apply(
-        classes.into_iter().collect(),
-        format!("{conflicts} conflict(s), {errors} error(s)"),
-    )
-}
-
-fn cmd_init() -> Result<(), StitchError> {
+pub(crate) fn cmd_init() -> Result<(), StitchError> {
     let cwd = std::env::current_dir()
         .map_err(|e| StitchError::io_context("getting current working directory", e))?;
     let gitignore = cwd.join(".gitignore");
@@ -579,7 +257,7 @@ fn cmd_init() -> Result<(), StitchError> {
     Ok(())
 }
 
-fn cmd_apply(
+pub(crate) fn cmd_apply(
     root: &std::path::Path,
     only: &[String],
     opts: store::ApplyOpts,
@@ -716,7 +394,7 @@ fn cmd_apply(
     Ok(())
 }
 
-fn cmd_plan(
+pub(crate) fn cmd_plan(
     root: &std::path::Path,
     only: &[String],
     force: bool,
@@ -770,7 +448,7 @@ fn cmd_plan(
     }
 }
 
-fn cmd_apply_plan(
+pub(crate) fn cmd_apply_plan(
     root: &std::path::Path,
     plan_path: &str,
     dry_run: bool,
@@ -976,7 +654,7 @@ fn apply_json(
     Ok(())
 }
 
-fn cmd_status(
+pub(crate) fn cmd_status(
     root: &std::path::Path,
     name: &Option<String>,
     json: bool,
@@ -1085,7 +763,7 @@ fn pending_change_count(plan: &plan::Plan) -> usize {
         + summary.content_changed
 }
 
-fn cmd_diff(
+pub(crate) fn cmd_diff(
     root: &std::path::Path,
     only: &[String],
     force: bool,
@@ -1168,7 +846,7 @@ fn cmd_diff(
     }
 }
 
-fn cmd_list(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
+pub(crate) fn cmd_list(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     if json {
         return report::run_json("list", || {
             let loaded =
@@ -2221,7 +1899,7 @@ fn cmd_add_to_store(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_add_json(
+pub(crate) fn cmd_add_json(
     root: &std::path::Path,
     path: &str,
     name: &Option<String>,
@@ -2258,7 +1936,7 @@ fn cmd_add_json(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_add(
+pub(crate) fn cmd_add(
     root: &std::path::Path,
     path: &str,
     name: &Option<String>,
@@ -3193,7 +2871,7 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(
+pub(crate) fn cmd_remove(
     root: &std::path::Path,
     name: &str,
     dry_run: bool,
@@ -3616,7 +3294,7 @@ fn cmd_remove(
     Ok(())
 }
 
-fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), StitchError> {
+pub(crate) fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), StitchError> {
     let path = match entry {
         None => {
             let authored_path = root.join("stitch.toml");
@@ -3672,7 +3350,7 @@ fn resolve_editor() -> Result<String, StitchError> {
 /// target is exactly a store dir becomes a whole-dir store; links into files
 /// under a store become file-mode entries. Skips links already covered by
 /// config. Never rewrites `stitch.toml`.
-fn cmd_import(
+pub(crate) fn cmd_import(
     root: &std::path::Path,
     scan_dirs: &[String],
     dry_run: bool,
@@ -3966,7 +3644,7 @@ fn collapse_home(path: &std::path::Path) -> Result<String, ConfigError> {
     Ok(path.display().to_string())
 }
 
-fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
+pub(crate) fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     if json {
         return report::run_json("doctor", || {
             let loaded =
@@ -4026,7 +3704,11 @@ fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     }
 }
 
-fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), StitchError> {
+pub(crate) fn cmd_migrate(
+    root: &std::path::Path,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), StitchError> {
     let stitch_dir = root.join(".stitch");
     let stitch_meta = std::fs::symlink_metadata(&stitch_dir).map_err(|e| {
         StitchError::internal(format!("could not inspect {}: {e}", stitch_dir.display()))
@@ -4220,7 +3902,7 @@ fn cmd_migrate(root: &std::path::Path, dry_run: bool, json: bool) -> Result<(), 
     Ok(())
 }
 
-fn cmd_prune(
+pub(crate) fn cmd_prune(
     root: &std::path::Path,
     scan_dirs: &[String],
     dry_run: bool,
@@ -4422,7 +4104,11 @@ fn validate_render_spec(
     Ok(())
 }
 
-fn cmd_render(root: &std::path::Path, spec: &str, json: bool) -> Result<(), StitchError> {
+pub(crate) fn cmd_render(
+    root: &std::path::Path,
+    spec: &str,
+    json: bool,
+) -> Result<(), StitchError> {
     let (store_name, source_rel) = spec.split_once('/').ok_or_else(|| {
         StitchError::usage("render: expected <store>/<file>, e.g. git/gitconfig.tmpl")
     })?;
