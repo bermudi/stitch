@@ -1,3 +1,4 @@
+pub(crate) mod add;
 pub(crate) mod apply;
 mod common;
 pub(crate) mod diff;
@@ -13,9 +14,7 @@ pub(crate) mod remove;
 pub(crate) mod render;
 pub(crate) mod status;
 
-pub(crate) use common::{
-    add_error_from_action, apply_error_from_actions, print_warnings, resolve_root,
-};
+pub(crate) use common::resolve_root;
 
 use crate::cli;
 use crate::error::StitchError;
@@ -117,7 +116,7 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
                 Err(error) => return Err(error),
             };
             if json && dry_run {
-                return crate::cmd_add_json(
+                return add::cmd_add_json(
                     &root,
                     &path,
                     &name,
@@ -127,7 +126,7 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
                     to.as_deref(),
                 );
             }
-            crate::cmd_add(
+            add::cmd_add(
                 &root,
                 &path,
                 &name,
