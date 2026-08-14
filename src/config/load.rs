@@ -1,151 +1,27 @@
-//! Config types: authored (`stitch.toml`), generated (`.stitch/state.toml`),
-//! and the load-time merged view.
+//! Config loading, parsing, merging, validation, and normalization.
 //!
-//! v0.3 splits human-authored config from tool-generated desired state so that
-//! mutations to the link inventory never clobber the user's comments and
-//! formatting. Authored content lives in `stitch.toml` (repo root); generated
-//! content lives in `.stitch/state.toml`. After `init`, the tool never rewrites
-//! the authored file — every mutation (`add`/`remove`) writes
-//! `state.toml` only.
+//! [`ConfigSnapshot`] is the single trusted config source for direct `apply`:
+//! it captures the exact bytes of both config files, parses from those bytes,
+//! and hashes them so that hook selection and post-hook revalidation share
+//! the same trust boundary.
 
 use globset::GlobBuilder;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(test)]
-use std::cell::RefCell;
-
-// ===========================================================================
-// Authored — from stitch.toml. Read-only to the tool after `init`.
-// ===========================================================================
-
-/// Human-authored config: user variables and per-store behavior (filters,
-/// hooks, ignore rules). Written once by `init` (static) or `migrate` (split
-/// from v0.2); thereafter the tool never rewrites it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoredConfig {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub vars: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub stores: BTreeMap<String, AuthoredStore>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoredStore {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignore: Vec<String>,
-    #[serde(default, skip_serializing_if = "skip_if_default")]
-    pub when: WhenClause,
-    #[serde(default, skip_serializing_if = "skip_if_default")]
-    pub hooks: Hooks,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub targets: BTreeMap<String, AuthoredTarget>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthoredTarget {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignore: Vec<String>,
-    #[serde(default, skip_serializing_if = "skip_if_default")]
-    pub when: WhenClause,
-}
-
-// ===========================================================================
-// Generated — from .stitch/state.toml. Tool-owned.
-// ===========================================================================
-
-/// Tool-generated desired state: the concrete link inventory. `add`/
-/// `remove` are the only writers; `init`/`migrate` seed it. Serialized
-/// deterministically (BTreeMap key order + sorted `files`/`patterns`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneratedState {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub stores: BTreeMap<String, GeneratedStore>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneratedStore {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub patterns: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub targets: BTreeMap<String, GeneratedTarget>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneratedTarget {
-    pub target: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub patterns: Vec<String>,
-}
-
-// ===========================================================================
-// Merged view — built at load, never serialized as one unit.
-// ===========================================================================
-
-/// The merged view of authored + generated halves, keyed by store name.
-/// Read-only: callers (apply/status/doctor) read it; writers mutate
-/// [`Loaded::generated`] then call [`GeneratedState::save`].
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// User variables from `stitch.toml`, carried through for the merged view.
-    /// Consumed by the template engine (`{{ vars.key }}`) at apply/diff time.
-    pub vars: BTreeMap<String, String>,
-    pub stores: BTreeMap<String, Store>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Store {
-    pub target: Option<String>,
-    pub files: Vec<String>,
-    pub patterns: Vec<String>,
-    pub ignore: Vec<String>,
-    pub when: WhenClause,
-    pub hooks: Hooks,
-    /// Name-keyed: the cross-file join key (target paths can collide across
-    /// hosts, so the path cannot be the key).
-    pub targets: BTreeMap<String, TargetEntry>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TargetEntry {
-    pub target: String,
-    pub files: Vec<String>,
-    pub patterns: Vec<String>,
-    pub ignore: Vec<String>,
-    pub when: WhenClause,
-}
-
-/// The result of [`Config::load`]: both halves alongside the merged view.
-///
-/// Writers mutate `generated` then `save()`; readers use `config`; `warnings`
-/// carries non-fatal load-time notices (e.g. a stale v0.2 file alongside the
-/// new format).
-#[derive(Debug)]
-pub struct Loaded {
-    /// Read-only to callers; carried for `doctor`'s orphaned-behavior check
-    /// and future tooling. Never saved by the running commands.
-    pub authored: AuthoredConfig,
-    pub generated: GeneratedState,
-    pub config: Config,
-    pub warnings: Vec<String>,
-}
+use super::error::ConfigError;
+use super::paths::{expand_home, is_safe_fragment, normalized_target_path, validate_store_names};
+use super::state::{
+    atomic_write, validate_authored_file, validate_state_file, validate_stitch_dir,
+};
+use super::types::{
+    AuthoredConfig, AuthoredStore, AuthoredTarget, Config, GeneratedState, GeneratedStore,
+    GeneratedTarget, Loaded, STATE_HEADER, Store, TargetEntry, WhenClause,
+};
 
 // ===========================================================================
 // ConfigSnapshot — parsed config bound to the exact bytes it was hashed from.
@@ -285,8 +161,6 @@ fn path_exists(path: &Path) -> bool {
 /// parent directory between path resolution and open; that remains within
 /// the documented same-user race boundary.
 fn open_and_read_validated(path: &Path, kind: &str) -> Result<Option<Vec<u8>>, ConfigError> {
-    use std::os::unix::io::AsRawFd;
-
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -423,85 +297,6 @@ pub(crate) fn hash_config_bytes(authored: Option<&[u8]>, state: Option<&[u8]>) -
 
     let digest = hasher.finalize();
     digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-// ===========================================================================
-// Shared clause types
-// ===========================================================================
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WhenClause {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub os: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub distro: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell: Option<String>,
-}
-
-impl WhenClause {
-    pub fn is_default(&self) -> bool {
-        self == &WhenClause::default()
-    }
-
-    /// Returns `true` if every clause in `whens` could all match a single
-    /// platform simultaneously. This is the case iff, for every field, no two
-    /// clauses supply distinct `Some` values.
-    pub fn are_compatible(whens: &[&WhenClause]) -> bool {
-        for i in 0..whens.len() {
-            for j in (i + 1)..whens.len() {
-                if !whens[i].is_compatible_with(whens[j]) {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    fn is_compatible_with(&self, other: &WhenClause) -> bool {
-        Self::field_compatible(self.os.as_deref(), other.os.as_deref())
-            && Self::field_compatible(self.arch.as_deref(), other.arch.as_deref())
-            && Self::field_compatible(self.distro.as_deref(), other.distro.as_deref())
-            && Self::field_compatible(self.hostname.as_deref(), other.hostname.as_deref())
-            && Self::field_compatible(self.shell.as_deref(), other.shell.as_deref())
-    }
-
-    fn field_compatible(a: Option<&str>, b: Option<&str>) -> bool {
-        match (a, b) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Hooks {
-    pub pre: Option<String>,
-    pub post: Option<String>,
-}
-
-/// Header prepended to every `state.toml`. Injected/stripped outside the TOML
-/// data model because the `toml` crate does not round-trip comments.
-const STATE_HEADER: &str = "# Generated by stitch — do not hand-edit; use stitch commands.\n";
-
-/// The static authored file written by `init`. Hand-written, never reserialized
-/// — the tool does not rewrite `stitch.toml` after this.
-pub const AUTHORED_TEMPLATE: &str = "\
-# stitch — authored config. Edit freely; the tool never rewrites this.
-# Fields: vars, and per-store behavior (when, hooks, ignore, targets).
-# Link inventory (target, files, patterns) is tool-managed in .stitch/state.toml.
-";
-
-impl Store {
-    pub fn is_multi_target(&self) -> bool {
-        !self.targets.is_empty()
-    }
 }
 
 impl Config {
@@ -755,273 +550,9 @@ impl GeneratedState {
     }
 }
 
-/// Reject a `.stitch/` directory that exists but is a symlink or otherwise
-/// non-directory. Missing directories are legal (empty state).
-///
-/// This guards every reader of `.stitch/state.toml`: if the parent is a
-/// symlink, the state file resolves outside the repo and must not be trusted.
-pub(crate) fn validate_stitch_dir(path: &Path) -> Result<(), ConfigError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(ConfigError::Read(
-            std::io::Error::other("refusing symlinked or non-directory state directory"),
-            path.to_path_buf(),
-        )),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(ConfigError::Read(e, path.to_path_buf())),
-    }
-}
-
-fn validate_regular_file(path: &Path, kind: &str) -> Result<(), ConfigError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => Err(ConfigError::Read(
-            std::io::Error::other(format!("refusing symlinked or non-regular {kind} file")),
-            path.to_path_buf(),
-        )),
-        Ok(meta) if meta.nlink() > 1 => Err(ConfigError::Read(
-            std::io::Error::other(format!(
-                "refusing hard-linked {kind} file (multiple paths to the same inode)"
-            )),
-            path.to_path_buf(),
-        )),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(ConfigError::Read(e, path.to_path_buf())),
-    }
-}
-
-/// Reject a `state.toml` that exists but is a symlink or otherwise
-/// non-regular. Missing files are legal (empty state).
-///
-/// State is the tool's authoritative inventory; we must never read bytes from
-/// a path that could be authored outside the repo.
-pub(crate) fn validate_state_file(path: &Path) -> Result<(), ConfigError> {
-    validate_regular_file(path, "state")
-}
-
-/// Reject a `stitch.toml` that exists but is a symlink or otherwise
-/// non-regular, or hard-linked to another path. Missing files are legal (empty
-/// authored config).
-///
-/// Authored config is human-written; we must never read bytes from a path that
-/// could be authored outside the repo and influence hook or store behavior.
-pub(crate) fn validate_authored_file(path: &Path) -> Result<(), ConfigError> {
-    validate_regular_file(path, "authored config")
-}
-
-/// Validate an existing atomic-write destination without mutating it.
-pub fn validate_atomic_write_target(path: &Path) -> Result<(), ConfigError> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let meta = std::fs::symlink_metadata(dir).map_err(|e| ConfigError::Write(e, dir.into()))?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(ConfigError::Write(
-            std::io::Error::other("refusing non-directory or symlinked state parent"),
-            dir.into(),
-        ));
-    }
-    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(ConfigError::Write(
-            std::io::Error::other("refusing to replace symlinked state file"),
-            path.to_path_buf(),
-        ));
-    }
-    Ok(())
-}
-
-/// Atomically write `contents` to `path` via a temp file in the same directory
-/// then rename. On Linux `rename(2)` is atomic for same-filesystem paths, so
-/// the destination is never truncated or partially written. The file is synced
-/// before the rename and its parent directory after it. A parent-directory sync
-/// failure is reported as a committed write: callers must not roll back work
-/// that the renamed state file already records. The exclusive random temp name
-/// avoids collisions between concurrent stitch processes. The temp file is
-/// cleaned up on errors before the rename.
-pub fn atomic_write(path: &Path, contents: &str) -> Result<(), ConfigError> {
-    let dir = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    // State must never be written through a pre-existing symlinked parent
-    // (notably a hostile `.stitch -> elsewhere`). The final-syscall race is
-    // outside stitch's same-UID threat model, but all state observed before
-    // the operation is rejected rather than followed.
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-            return Err(ConfigError::Write(
-                std::io::Error::other("refusing non-directory or symlinked state parent"),
-                dir,
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Write(e, dir.clone()))?;
-            let meta =
-                std::fs::symlink_metadata(&dir).map_err(|e| ConfigError::Write(e, dir.clone()))?;
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(ConfigError::Write(
-                    std::io::Error::other("refusing non-directory or symlinked state parent"),
-                    dir,
-                ));
-            }
-        }
-        Err(e) => return Err(ConfigError::Write(e, dir)),
-    }
-    validate_atomic_write_target(path)?;
-    let prefix = path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "stitch".into());
-    let mut random = [0_u8; 16];
-    let read = unsafe { libc::getrandom(random.as_mut_ptr().cast(), random.len(), 0) };
-    if read != random.len() as isize {
-        return Err(ConfigError::Write(
-            std::io::Error::last_os_error(),
-            path.to_path_buf(),
-        ));
-    }
-    let tmp_path = dir.join(format!(
-        ".{prefix}.{:032x}.tmp",
-        u128::from_le_bytes(random)
-    ));
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
-        f.write_all(contents.as_bytes())
-            .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
-        f.sync_all()
-            .map_err(|e| ConfigError::Write(e, tmp_path.clone()))?;
-        std::fs::rename(&tmp_path, path).map_err(|e| ConfigError::Write(e, path.to_path_buf()))?;
-        let directory = std::fs::File::open(&dir)
-            .map_err(|e| ConfigError::CommittedWrite(e, path.to_path_buf()))?;
-        directory
-            .sync_all()
-            .map_err(|e| ConfigError::CommittedWrite(e, path.to_path_buf()))
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    result
-}
-
-/// Exclusive lock on `.stitch/state.lock` via `flock(2)`. Held for the
-/// duration of a mutating command (load → mutate → save) to serialize
-/// concurrent `stitch add` etc. The lock file is created if missing at
-/// `0600`; the lock is advisory and blocking (Linux `LOCK_EX`).
-///
-/// This prevents the orphan/prune data-loss path where two concurrent adds
-/// both read an empty state, each insert one store, and the last writer wins,
-/// leaving links without a covering state entry.
-#[derive(Debug)]
-pub struct StateLock {
-    _file: std::fs::File,
-}
-
-impl StateLock {
-    /// Acquire an exclusive lock for `repo_root`. Blocks until available.
-    /// Creates `.stitch` (and the lock file) if missing — used by state
-    /// writers (`add`, `remove`, `import`, `migrate`), which create state
-    /// anyway.
-    pub fn exclusive(repo_root: &Path) -> Result<Self, ConfigError> {
-        let stitch_dir = repo_root.join(".stitch");
-        // Validate or create .stitch as a real directory (not symlink).
-        match std::fs::symlink_metadata(&stitch_dir) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                return Err(ConfigError::Write(
-                    std::io::Error::other("refusing non-directory or symlinked state parent"),
-                    stitch_dir,
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(&stitch_dir)
-                    .map_err(|e| ConfigError::Write(e, stitch_dir.clone()))?;
-            }
-            Err(e) => return Err(ConfigError::Write(e, stitch_dir)),
-        }
-        Self::acquire(repo_root)
-    }
-
-    /// Acquire the exclusive lock only when `.stitch` already exists — for
-    /// mutators that never write state (`apply`, `prune --yes`). A repo with
-    /// no state directory has nothing to serialize, so `Ok(None)`. A
-    /// symlinked `.stitch` is refused rather than followed.
-    pub fn exclusive_if_present(repo_root: &Path) -> Result<Option<Self>, ConfigError> {
-        let stitch_dir = repo_root.join(".stitch");
-        match std::fs::symlink_metadata(&stitch_dir) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(ConfigError::Write(
-                std::io::Error::other("refusing non-directory or symlinked state parent"),
-                stitch_dir,
-            )),
-            Ok(_) => Self::acquire(repo_root).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(ConfigError::Write(e, stitch_dir)),
-        }
-    }
-
-    fn acquire(repo_root: &Path) -> Result<Self, ConfigError> {
-        let stitch_dir = repo_root.join(".stitch");
-        let lock_path = stitch_dir.join("state.lock");
-        // Open or create the lock file without following symlinks. The 0600
-        // mode applies only at creation (`O_CREAT|O_EXCL`); an existing file
-        // is opened as-is and its permissions are NEVER touched — chmodding
-        // the inode would also re-permission every hard link to it.
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&lock_path)
-                .map_err(|e| ConfigError::Write(e, lock_path.clone()))?,
-            Err(e) => return Err(ConfigError::Write(e, lock_path)),
-        };
-        // `create_new` never follows a symlink, and the existing-path open now
-        // refuses symlinks too (`O_NOFOLLOW`). The metadata check below is
-        // defense-in-depth for a symlink installed after the open wins a race.
-        if std::fs::symlink_metadata(&lock_path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(ConfigError::Write(
-                std::io::Error::other("refusing symlinked state lock file"),
-                lock_path,
-            ));
-        }
-        // Blocking exclusive flock.
-        use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if ret != 0 {
-            return Err(ConfigError::Write(
-                std::io::Error::last_os_error(),
-                lock_path,
-            ));
-        }
-        Ok(Self { _file: file })
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
 /// Merge authored + generated halves into the read-only view, returning any
 /// non-fatal warnings (authored-only targets — behavior declared, no link).
-pub(crate) fn merge(
+pub(super) fn merge(
     authored: &AuthoredConfig,
     generated: &GeneratedState,
 ) -> (Config, Vec<String>) {
@@ -1118,179 +649,8 @@ fn merge_targets(
 }
 
 // ===========================================================================
-// v0.2 migration
-// ===========================================================================
-
-/// Frozen v0.2 layout, used only by `migrate` (parse-only, never serialized).
-/// Mirrors the pre-split `Config`/`Store`/`TargetEntry` shapes, including the
-/// array-form `targets`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyConfig {
-    #[serde(default)]
-    pub vars: BTreeMap<String, String>,
-    #[serde(default)]
-    pub stores: BTreeMap<String, LegacyStore>,
-}
-
-impl LegacyConfig {
-    /// Validate legacy keys before splitting so migration never writes an
-    /// invalid authored or generated config.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_store_names(self.stores.keys(), "legacy config")
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyStore {
-    #[serde(default)]
-    pub target: Option<String>,
-    #[serde(default)]
-    pub files: Vec<String>,
-    #[serde(default)]
-    pub patterns: Vec<String>,
-    #[serde(default)]
-    pub ignore: Vec<String>,
-    #[serde(default)]
-    pub when: WhenClause,
-    #[serde(default)]
-    pub hooks: Hooks,
-    #[serde(default)]
-    pub targets: Vec<LegacyTargetEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyTargetEntry {
-    pub target: String,
-    #[serde(default)]
-    pub files: Vec<String>,
-    #[serde(default)]
-    pub patterns: Vec<String>,
-    #[serde(default)]
-    pub ignore: Vec<String>,
-    #[serde(default)]
-    pub when: WhenClause,
-}
-
-/// Split a parsed v0.2 config into authored + generated halves per the
-/// field-ownership table. Multi-target array entries get deterministic names
-/// (hostname-first, else positional, with a collision suffix). A store/target
-/// with no authored content is omitted from the authored half (keeps
-/// `stitch.toml` signal, not noise); one with no inventory is omitted from the
-/// generated half.
-pub fn split_legacy(legacy: &LegacyConfig) -> (AuthoredConfig, GeneratedState) {
-    let mut authored = AuthoredConfig {
-        vars: legacy.vars.clone(),
-        stores: BTreeMap::new(),
-    };
-    let mut generated = GeneratedState {
-        stores: BTreeMap::new(),
-    };
-
-    for (name, lstore) in &legacy.stores {
-        let (a_targets, g_targets) = split_legacy_targets(&lstore.targets);
-
-        // Authored half: only stores with non-default behavior.
-        let has_behavior = !lstore.ignore.is_empty()
-            || lstore.when != WhenClause::default()
-            || lstore.hooks != Hooks::default()
-            || !a_targets.is_empty();
-        if has_behavior {
-            authored.stores.insert(
-                name.clone(),
-                AuthoredStore {
-                    ignore: lstore.ignore.clone(),
-                    when: lstore.when.clone(),
-                    hooks: lstore.hooks.clone(),
-                    targets: a_targets,
-                },
-            );
-        }
-
-        // Generated half: only stores with link inventory.
-        let has_inventory = lstore.target.is_some()
-            || !lstore.files.is_empty()
-            || !lstore.patterns.is_empty()
-            || !g_targets.is_empty();
-        if has_inventory {
-            generated.stores.insert(
-                name.clone(),
-                GeneratedStore {
-                    target: lstore.target.clone(),
-                    files: lstore.files.clone(),
-                    patterns: lstore.patterns.clone(),
-                    targets: g_targets,
-                },
-            );
-        }
-    }
-
-    (authored, generated)
-}
-
-/// Name v0.2 array-form target entries and split into authored/generated maps.
-/// Deterministic: hostname-first (meaningful to the user), else `target-{i}`
-/// positional, with a `-N` suffix on collision so the result is always unique.
-fn split_legacy_targets(
-    legacy_targets: &[LegacyTargetEntry],
-) -> (
-    BTreeMap<String, AuthoredTarget>,
-    BTreeMap<String, GeneratedTarget>,
-) {
-    let mut a_targets = BTreeMap::new();
-    let mut g_targets = BTreeMap::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-
-    for (i, lte) in legacy_targets.iter().enumerate() {
-        let base = lte
-            .when
-            .hostname
-            .clone()
-            .unwrap_or_else(|| format!("target-{}", i + 1));
-        let mut tname = base.clone();
-        let mut n = 1;
-        while seen.contains(&tname) {
-            tname = format!("{base}-{n}");
-            n += 1;
-        }
-        seen.insert(tname.clone());
-
-        // Generated side always gets the entry (it carries the target path).
-        g_targets.insert(
-            tname.clone(),
-            GeneratedTarget {
-                target: lte.target.clone(),
-                files: lte.files.clone(),
-                patterns: lte.patterns.clone(),
-            },
-        );
-
-        // Authored side only if this target declares behavior.
-        let has_behavior = !lte.ignore.is_empty() || lte.when != WhenClause::default();
-        if has_behavior {
-            a_targets.insert(
-                tname,
-                AuthoredTarget {
-                    ignore: lte.ignore.clone(),
-                    when: lte.when.clone(),
-                },
-            );
-        }
-    }
-
-    (a_targets, g_targets)
-}
-
-// ===========================================================================
 // Shared helpers (byte-unchanged from v0.2)
 // ===========================================================================
-
-/// `skip_serializing_if` helper: skip a field when it equals its default.
-fn skip_if_default<T: Default + PartialEq>(t: &T) -> bool {
-    t == &T::default()
-}
 
 /// Normalize a fragment without consulting the filesystem. Current-directory
 /// components and repeated separators disappear through `Path::components()`;
@@ -1324,44 +684,6 @@ fn normalize_ignores(ignore: &mut [String]) {
     for pattern in ignore.iter_mut().filter(|p| is_safe_fragment(p)) {
         *pattern = normalize_fragment(pattern, true);
     }
-}
-
-/// Whether `fragment` is safe to join onto a store or target directory.
-///
-/// Safe means: non-empty, relative (no leading `/`), and containing only
-/// normal path components and harmless current-directory (`./`) components.
-/// `..`, a leading `/`, and a bare `.` are rejected. Nested paths like
-/// `config/app.conf` and `./bashrc` are allowed; `.` is rejected because it
-/// normalizes to an empty path. The check is lexical — it inspects
-/// [`Path::components`] without touching the filesystem, so it is TOCTOU-free
-/// and accepts entries for files that do not exist yet.
-pub fn is_safe_fragment(fragment: &str) -> bool {
-    if fragment.is_empty() {
-        return false;
-    }
-    let path = Path::new(fragment);
-    if path.is_absolute() {
-        return false;
-    }
-    let mut has_normal = false;
-    for c in path.components() {
-        match c {
-            Component::Normal(_) => has_normal = true,
-            Component::CurDir => {}
-            _ => return false,
-        }
-    }
-    has_normal
-}
-
-/// Whether `name` is exactly one normal path component. Store names become
-/// repo directory names, so unlike file fragments they may not be nested.
-pub fn is_store_name(name: &str) -> bool {
-    if name.is_empty() || name.contains('/') || matches!(name, ".stitch" | ".git") {
-        return false;
-    }
-    let mut components = Path::new(name).components();
-    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
@@ -1416,38 +738,6 @@ pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
     )))
 }
 
-/// Canonical (symlink-following) form of `$HOME`. Config-time target
-/// validation and apply-time confinement both use it: a target's ancestors
-/// must resolve inside this path even after a hook replaced them.
-pub(crate) fn canonical_home() -> Result<PathBuf, ConfigError> {
-    normalized_target_path("~")
-}
-
-pub(crate) fn normalized_target_path(target: &str) -> Result<PathBuf, ConfigError> {
-    let expanded = expand_home(target)?;
-    if let Some(resolved) = crate::linker::resolve_path_with_missing(&expanded) {
-        return Ok(resolved);
-    }
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(expanded)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    Ok(normalized)
-}
-
 fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<(), ConfigError> {
     let mut targets: Vec<(String, String, PathBuf, WhenClause)> = Vec::new();
     for (store_name, store) in stores {
@@ -1483,20 +773,6 @@ fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<
                     right.display()
                 )));
             }
-        }
-    }
-    Ok(())
-}
-
-fn validate_store_names<'a>(
-    names: impl Iterator<Item = &'a String>,
-    source: &str,
-) -> Result<(), ConfigError> {
-    for name in names {
-        if !is_store_name(name) {
-            return Err(ConfigError::InvalidPath(format!(
-                "invalid store name '{name}' in {source}: store names must be exactly one normal path component"
-            )));
         }
     }
     Ok(())
@@ -1570,275 +846,15 @@ fn validate_store_has_target(
     Ok(())
 }
 
-/// Walk upward from `start` to find a directory containing `.stitch/`.
-pub fn find_root(start: &Path) -> Option<PathBuf> {
-    let mut current = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(start)
-    };
-
-    loop {
-        if current.join(".stitch").is_dir() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-}
-
-/// Override `$HOME` for the current thread during unit tests. This avoids
-/// unsynchronized environment-variable mutation and lets tests that place
-/// targets outside the real home directory run safely in parallel.
-#[cfg(test)]
-pub fn set_test_home(home: Option<PathBuf>) {
-    TEST_HOME.with(|h| *h.borrow_mut() = home);
-}
-
-#[cfg(test)]
-pub struct TestHomeGuard;
-
-#[cfg(test)]
-impl Drop for TestHomeGuard {
-    fn drop(&mut self) {
-        set_test_home(None);
-    }
-}
-
-/// Set the test `$HOME` for the current thread and clear it when the guard
-/// is dropped.
-#[cfg(test)]
-pub fn test_home_guard(home: PathBuf) -> TestHomeGuard {
-    set_test_home(Some(home));
-    TestHomeGuard
-}
-
-fn home_dir() -> Result<PathBuf, ConfigError> {
-    #[cfg(test)]
-    {
-        if let Some(home) = TEST_HOME.with(|h| h.borrow().clone()) {
-            return Ok(home);
-        }
-    }
-    match std::env::var("HOME") {
-        Ok(value) if value.is_empty() => Err(ConfigError::Home(
-            "$HOME is set to an empty string; stitch needs $HOME to resolve targets.".into(),
-        )),
-        Ok(value) => {
-            let path = PathBuf::from(value);
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.is_dir() => Ok(path),
-                Ok(_) => Err(ConfigError::Home(format!(
-                    "$HOME '{}' is not a directory; stitch needs $HOME to resolve targets.",
-                    path.display()
-                ))),
-                Err(_) => Err(ConfigError::Home(format!(
-                    "$HOME '{}' does not exist; stitch needs $HOME to resolve targets.",
-                    path.display()
-                ))),
-            }
-        }
-        Err(_) => Err(ConfigError::Home(
-            "$HOME is not set; stitch needs $HOME to resolve targets.".into(),
-        )),
-    }
-}
-
-/// Expand `~` at the start of a path.
-pub fn expand_home(path: &str) -> Result<PathBuf, ConfigError> {
-    let raw = if let Some(rest) = path.strip_prefix("~/") {
-        home_dir()?.join(rest)
-    } else if path == "~" {
-        home_dir()?
-    } else {
-        PathBuf::from(path)
-    };
-    // Strip trailing slashes: symlink(2) fails with ENOENT when the linkpath
-    // has a trailing slash (the kernel treats it as "must resolve to a
-    // directory", but the path doesn't exist yet when we're creating a link).
-    // User input like `stitch add ~/.config/alacritty/` would otherwise fail
-    // at the link step with a confusing rollback error.
-    let mut s = raw.to_string_lossy().into_owned();
-    while s.len() > 1 && s.ends_with('/') {
-        s.pop();
-    }
-    Ok(PathBuf::from(s))
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error("reading {1}: {0}")]
-    Read(std::io::Error, PathBuf),
-    #[error("could not parse config at {1}: {0}")]
-    Parse(toml::de::Error, PathBuf),
-    #[error("could not serialize config: {0}")]
-    Serialize(toml::ser::Error),
-    #[error("could not write config: {0}")]
-    Write(std::io::Error, PathBuf),
-    #[error(
-        "replaced config at {1}, but could not sync its parent directory: {0}; the new state is visible but may not survive power loss"
-    )]
-    CommittedWrite(std::io::Error, PathBuf),
-    #[error("{0}")]
-    InvalidPath(String),
-    #[error("{0}")]
-    Home(String),
-    /// A v0.2 single-file repo that has not been migrated. The message tells
-    /// the user exactly how to upgrade.
-    #[error(
-        "v0.2 config found at {0} — run `stitch migrate` to split into stitch.toml + .stitch/state.toml"
-    )]
-    LegacyV02(PathBuf),
-}
-
-impl ConfigError {
-    /// True when the rename completed and callers must retain the filesystem
-    /// work described by the newly written config.
-    pub fn write_committed(&self) -> bool {
-        matches!(self, Self::CommittedWrite(_, _))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::paths::test_home_guard;
+    use crate::config::{Hooks, is_store_name};
     use proptest::prelude::*;
     use std::fs;
 
-    // --- unchanged helpers ---
-
-    #[test]
-    fn test_expand_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        let _guard = test_home_guard(home.clone());
-        assert_eq!(expand_home("~").unwrap(), home);
-        assert_eq!(expand_home("~/foo/bar").unwrap(), home.join("foo/bar"));
-        assert_eq!(
-            expand_home("/absolute/path").unwrap(),
-            PathBuf::from("/absolute/path")
-        );
-        // Trailing slashes are stripped — symlink(2) fails on a linkpath
-        // with a trailing slash, so `stitch add ~/.config/foo/` must not
-        // carry the slash through to the linker.
-        assert_eq!(expand_home("~/foo/").unwrap(), home.join("foo"));
-        assert_eq!(expand_home("~/foo///").unwrap(), home.join("foo"));
-        assert_eq!(
-            expand_home("/absolute/path/").unwrap(),
-            PathBuf::from("/absolute/path")
-        );
-        // Root stays root — the `len() > 1` guard prevents stripping "/" to "".
-        assert_eq!(expand_home("/").unwrap(), PathBuf::from("/"));
-    }
-
-    #[test]
-    fn test_find_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let stitch_dir = tmp.path().join(".stitch");
-        std::fs::create_dir_all(&stitch_dir).unwrap();
-
-        assert_eq!(find_root(tmp.path()), Some(tmp.path().to_path_buf()));
-
-        let sub = tmp.path().join("some").join("nested").join("dir");
-        std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(find_root(&sub), Some(tmp.path().to_path_buf()));
-    }
-
-    // --- serde roundtrips (split halves, independently) ---
-
-    #[test]
-    fn test_authored_roundtrip() {
-        let authored = AuthoredConfig {
-            vars: BTreeMap::from([("editor".into(), "nvim".into())]),
-            stores: BTreeMap::from([(
-                "shells".into(),
-                AuthoredStore {
-                    ignore: vec!["*.bak".into()],
-                    when: WhenClause {
-                        os: Some("linux".into()),
-                        ..Default::default()
-                    },
-                    hooks: Hooks::default(),
-                    targets: BTreeMap::new(),
-                },
-            )]),
-        };
-        let toml_str = toml::to_string_pretty(&authored).unwrap();
-        let parsed: AuthoredConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.vars, authored.vars);
-        assert_eq!(parsed.stores["shells"].when.os.as_deref(), Some("linux"));
-        assert_eq!(parsed.stores["shells"].ignore, vec!["*.bak"]);
-    }
-
-    #[test]
-    fn test_authored_config_rejects_unknown_root_key() {
-        let err = toml::from_str::<AuthoredConfig>("unexpected = true\n").unwrap_err();
-        assert!(err.to_string().contains("unknown field `unexpected`"));
-    }
-
-    #[test]
-    fn test_authored_store_rejects_unknown_key() {
-        let err =
-            toml::from_str::<AuthoredConfig>("[stores.nvim]\nignroe = [\"tmp\"]\n").unwrap_err();
-        assert!(err.to_string().contains("unknown field `ignroe`"));
-    }
-
-    #[test]
-    fn test_authored_target_rejects_unknown_key() {
-        let err =
-            toml::from_str::<AuthoredConfig>("[stores.nvim.targets.laptop]\nignroe = [\"tmp\"]\n")
-                .unwrap_err();
-        assert!(err.to_string().contains("unknown field `ignroe`"));
-    }
-
-    #[test]
-    fn test_hooks_reject_unknown_key() {
-        let err = toml::from_str::<AuthoredConfig>("[stores.nvim.hooks]\nprer = \"echo typo\"\n")
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown field `prer`"));
-    }
-
-    #[test]
-    fn test_generated_state_rejects_unknown_root_key() {
-        let err = toml::from_str::<GeneratedState>("unexpected = true\n").unwrap_err();
-        assert!(err.to_string().contains("unknown field `unexpected`"));
-    }
-
-    #[test]
-    fn test_generated_state_rejects_unknown_store_key() {
-        let err =
-            toml::from_str::<GeneratedState>("[stores.nvim]\nunexpected = true\n").unwrap_err();
-        assert!(err.to_string().contains("unknown field `unexpected`"));
-    }
-
-    #[test]
-    fn test_generated_state_rejects_unknown_target_key() {
-        let err = toml::from_str::<GeneratedState>(
-            "[stores.nvim.targets.laptop]\ntarget = \"~/.config/nvim\"\nunexpected = true\n",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown field `unexpected`"));
-    }
-
-    #[test]
-    fn test_when_clause_rejects_unknown_field() {
-        let err = toml::from_str::<WhenClause>("bogus_key = \"x\"\n").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unknown field `bogus_key`"),
-            "unknown WhenClause key must be rejected, got: {msg}"
-        );
-        assert!(
-            msg.contains("expected one of `os`, `arch`, `distro`, `hostname`, `shell`"),
-            "error should list the valid WhenClause fields, got: {msg}"
-        );
-    }
+    // --- serde / state header ---
 
     #[test]
     fn test_generated_state_rejects_invalid_glob_before_write() {
@@ -1847,28 +863,6 @@ mod tests {
                 .unwrap();
         let err = generated.render_for_display().unwrap_err();
         assert!(err.to_string().contains("invalid glob pattern"));
-    }
-
-    #[test]
-    fn test_generated_roundtrip() {
-        let generated = GeneratedState {
-            stores: BTreeMap::from([(
-                "nvim".into(),
-                GeneratedStore {
-                    target: Some("~/.config/nvim".into()),
-                    files: vec!["init.lua".into()],
-                    patterns: vec![],
-                    targets: BTreeMap::new(),
-                },
-            )]),
-        };
-        let toml_str = toml::to_string_pretty(&generated).unwrap();
-        let parsed: GeneratedState = toml::from_str(&toml_str).unwrap();
-        assert_eq!(
-            parsed.stores["nvim"].target.as_deref(),
-            Some("~/.config/nvim")
-        );
-        assert_eq!(parsed.stores["nvim"].files, vec!["init.lua"]);
     }
 
     #[test]
@@ -2185,178 +1179,7 @@ mod tests {
         );
     }
 
-    // --- migrate split ---
-
-    #[test]
-    fn test_split_legacy_flat_target() {
-        let legacy = LegacyConfig {
-            vars: BTreeMap::from([("editor".into(), "nvim".into())]),
-            stores: BTreeMap::from([(
-                "nvim".into(),
-                LegacyStore {
-                    target: Some("~/.config/nvim".into()),
-                    files: vec![],
-                    patterns: vec![],
-                    ignore: vec![],
-                    when: WhenClause::default(),
-                    hooks: Hooks::default(),
-                    targets: vec![],
-                },
-            )]),
-        };
-        let (authored, generated) = split_legacy(&legacy);
-        // No behavior → authored store omitted; inventory → generated store present.
-        assert!(authored.stores.is_empty());
-        assert_eq!(authored.vars["editor"], "nvim");
-        assert_eq!(
-            generated.stores["nvim"].target.as_deref(),
-            Some("~/.config/nvim")
-        );
-    }
-
-    #[test]
-    fn test_split_legacy_names_multi_target_by_hostname() {
-        let legacy = LegacyConfig {
-            vars: BTreeMap::new(),
-            stores: BTreeMap::from([(
-                "helix".into(),
-                LegacyStore {
-                    target: None,
-                    files: vec![],
-                    patterns: vec![],
-                    ignore: vec![],
-                    when: WhenClause::default(),
-                    hooks: Hooks::default(),
-                    targets: vec![
-                        LegacyTargetEntry {
-                            target: "~/.config/h".into(),
-                            files: vec![],
-                            patterns: vec![],
-                            ignore: vec![],
-                            when: WhenClause {
-                                hostname: Some("laptop".into()),
-                                ..Default::default()
-                            },
-                        },
-                        LegacyTargetEntry {
-                            target: "~/.config/h".into(),
-                            files: vec![],
-                            patterns: vec![],
-                            ignore: vec![],
-                            when: WhenClause {
-                                hostname: Some("server".into()),
-                                ..Default::default()
-                            },
-                        },
-                    ],
-                },
-            )]),
-        };
-        let (authored, generated) = split_legacy(&legacy);
-        let names: Vec<&String> = generated.stores["helix"].targets.keys().collect();
-        assert_eq!(names, vec![&"laptop".to_string(), &"server".to_string()]);
-        assert_eq!(
-            authored.stores["helix"].targets["laptop"]
-                .when
-                .hostname
-                .as_deref(),
-            Some("laptop")
-        );
-    }
-
-    #[test]
-    fn test_split_legacy_positional_name_fallback() {
-        // No hostname → positional target-1; no behavior → authored side empty.
-        let legacy = LegacyConfig {
-            vars: BTreeMap::new(),
-            stores: BTreeMap::from([(
-                "helix".into(),
-                LegacyStore {
-                    target: None,
-                    files: vec![],
-                    patterns: vec![],
-                    ignore: vec![],
-                    when: WhenClause::default(),
-                    hooks: Hooks::default(),
-                    targets: vec![LegacyTargetEntry {
-                        target: "~/.config/h".into(),
-                        files: vec![],
-                        patterns: vec![],
-                        ignore: vec![],
-                        when: WhenClause::default(),
-                    }],
-                },
-            )]),
-        };
-        let (authored, generated) = split_legacy(&legacy);
-        assert!(authored.stores.is_empty());
-        assert!(generated.stores["helix"].targets.contains_key("target-1"));
-    }
-
-    #[test]
-    fn test_split_legacy_collision_suffix() {
-        // Two entries with the same hostname must not collide; second gets -1.
-        let legacy = LegacyConfig {
-            vars: BTreeMap::new(),
-            stores: BTreeMap::from([(
-                "helix".into(),
-                LegacyStore {
-                    target: None,
-                    files: vec![],
-                    patterns: vec![],
-                    ignore: vec![],
-                    when: WhenClause::default(),
-                    hooks: Hooks::default(),
-                    targets: vec![
-                        LegacyTargetEntry {
-                            target: "~/.config/h".into(),
-                            files: vec![],
-                            patterns: vec![],
-                            ignore: vec![],
-                            when: WhenClause {
-                                hostname: Some("box".into()),
-                                ..Default::default()
-                            },
-                        },
-                        LegacyTargetEntry {
-                            target: "~/.config/h2".into(),
-                            files: vec![],
-                            patterns: vec![],
-                            ignore: vec![],
-                            when: WhenClause {
-                                hostname: Some("box".into()),
-                                ..Default::default()
-                            },
-                        },
-                    ],
-                },
-            )]),
-        };
-        let (_, generated) = split_legacy(&legacy);
-        let keys: BTreeSet<&String> = generated.stores["helix"].targets.keys().collect();
-        assert!(keys.contains(&&"box".to_string()));
-        assert!(keys.contains(&&"box-1".to_string()));
-    }
-
-    // --- path-fragment validation (P1#6) — unchanged semantics ---
-
-    #[test]
-    fn test_is_store_name() {
-        assert!(is_store_name("shells"));
-        assert!(is_store_name(".hidden"));
-        for invalid in [
-            "",
-            ".",
-            "..",
-            ".git",
-            ".stitch",
-            "nested/name",
-            "nested/",
-            "/absolute",
-        ] {
-            assert!(!is_store_name(invalid), "{invalid:?} must be rejected");
-        }
-    }
+    // --- store name validation ---
 
     #[test]
     fn test_load_rejects_invalid_store_name_from_each_config_half() {
@@ -2378,6 +1201,8 @@ mod tests {
         assert!(err.to_string().contains("bad/name"));
         assert!(err.to_string().contains("generated state"));
     }
+
+    // --- fragment normalization ---
 
     #[test]
     fn test_load_normalizes_fragments_without_rewriting_authored_ignores() {
@@ -2427,35 +1252,7 @@ patterns = ["./work*//"]
         );
     }
 
-    #[test]
-    fn test_is_safe_fragment() {
-        assert!(is_safe_fragment(".bashrc"));
-        assert!(is_safe_fragment("config/app.conf"));
-        assert!(is_safe_fragment("./bashrc"));
-        assert!(is_safe_fragment("bashrc"));
-        assert!(is_safe_fragment("foo/./bar"));
-        assert!(is_safe_fragment("././bashrc"));
-        assert!(!is_safe_fragment(""));
-        assert!(!is_safe_fragment("/"));
-        assert!(!is_safe_fragment("/etc/passwd"));
-        assert!(!is_safe_fragment("."));
-        assert!(!is_safe_fragment(".."));
-        assert!(!is_safe_fragment("../escape"));
-        assert!(!is_safe_fragment("foo/../bar"));
-        assert!(!is_safe_fragment("ok/../../escape"));
-    }
-
-    #[test]
-    fn test_is_safe_fragment_rejects_dot() {
-        assert!(!is_safe_fragment("."));
-        assert!(!is_safe_fragment("./."));
-        assert!(!is_safe_fragment("././"));
-        assert!(is_safe_fragment("foo/./bar"));
-        assert!(is_safe_fragment("gitconfig"));
-        assert!(is_safe_fragment("lua/plugin.lua"));
-        assert!(is_safe_fragment("./bashrc"));
-        assert!(is_safe_fragment("././bashrc"));
-    }
+    // --- path-fragment validation (P1#6) — unchanged semantics ---
 
     #[test]
     fn test_validate_rejects_traversal_in_store_files() {
@@ -2495,17 +1292,6 @@ patterns = ["./work*//"]
         config.stores.get_mut("s").unwrap().target = Some("relative/target".into());
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("must expand to absolute paths"));
-    }
-
-    #[test]
-    fn test_atomic_write_rejects_symlinked_state_parent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(external.path(), tmp.path().join(".stitch")).unwrap();
-
-        let err = atomic_write(&tmp.path().join(".stitch/state.toml"), "state").unwrap_err();
-        assert!(err.to_string().contains("symlinked state parent"));
-        assert!(!external.path().join("state.toml").exists());
     }
 
     #[test]
@@ -2700,23 +1486,6 @@ patterns = ["./work*//"]
             prop_assume!(!is_safe_fragment(&s));
             prop_assert!(validate_fragments(std::slice::from_ref(&s), &[], "ctx").is_err());
             prop_assert!(validate_fragments(&[], std::slice::from_ref(&s), "ctx").is_err());
-        }
-
-        #[test]
-        fn prop_store_name_implies_safe(s in "[a-zA-Z0-9._-]{1,20}") {
-            // Single-component safe names without slash — subset of safe fragments
-            // Exclude reserved names that are rejected as store names but are safe fragments
-            if s == ".stitch" || s == ".git" || s == "." || s == ".." {
-                prop_assert!(!is_store_name(&s));
-            } else {
-                prop_assert!(is_store_name(&s));
-                prop_assert!(is_safe_fragment(&s), "store name must be a safe fragment");
-            }
-        }
-
-        #[test]
-        fn prop_store_name_rejects_slash(s in "[a-z]+/[a-z]+") {
-            prop_assert!(!is_store_name(&s), "store name with slash must be rejected: {s}");
         }
 
         #[test]
