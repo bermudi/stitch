@@ -615,6 +615,12 @@ fn cmd_init() -> Result<(), StitchError> {
         StitchError::io_context(format!("updating .gitignore in {}", cwd.display()), e)
     })?;
 
+    // The per-host `flock` lock (`.stitch/state.lock`) is meaningless shared
+    // across machines; ignore it from the start so a fresh repo never commits it.
+    render::ensure_lock_gitignore(&cwd).map_err(|e| {
+        StitchError::io_context(format!("updating .gitignore in {}", cwd.display()), e)
+    })?;
+
     // Pre-create the staging root at 0700 so the permission contract holds
     // before the first templated apply.
     render::ensure_render_root(&cwd).map_err(StitchError::internal)?;
@@ -4795,6 +4801,144 @@ files = ["regular"]
             !state_text.contains("[stores.app]"),
             "state entry must be removed"
         );
+    }
+
+    // --- Skipped stores must not run hooks (regression for v0.10.0 bug) ---
+    //
+    // `when` is the "leave this machine alone" switch. A store excluded by its
+    // `when` clause used to still fire its pre/post hooks, running commands the
+    // user deliberately gated off (e.g. `git config --global`, `systemctl`) with
+    // no sign in the summary (which reports the store as skipped). The store is
+    // gated on a hostname that can never match, so the test is deterministic on
+    // any host platform.
+    #[test]
+    fn apply_skipped_store_does_not_run_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let stitch = root.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(root.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let store_dir = root.join("bashrc");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join(".bashrc"), "set -o vi\n").unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _guard = crate::config::test_home_guard(home.clone());
+
+        let pre_marker = tmp.path().join("PRE_RAN");
+        let post_marker = tmp.path().join("POST_RAN");
+        fs::write(
+            root.join("stitch.toml"),
+            format!(
+                "[stores.bashrc]\n\
+                 hooks = {{ pre = \"touch {pre}\", post = \"touch {post}\" }}\n\
+                 [stores.bashrc.when]\n\
+                 hostname = \"__stitch_skip_never_matches__\"\n",
+                pre = pre_marker.display(),
+                post = post_marker.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            stitch.join("state.toml"),
+            "[stores.bashrc]\ntarget = \"~/.bashrc\"\nfiles = [\".bashrc\"]\n",
+        )
+        .unwrap();
+
+        // Sanity: the store really is classified as skipped on this host, so
+        // the marker assertions below prove the hooks were suppressed rather
+        // than the store being a no-op for some other reason.
+        let snap = crate::config::ConfigSnapshot::load(&root).unwrap();
+        let platform = Platform::detect();
+        let (plan, _) = store::apply_all(
+            &root,
+            &snap.loaded.config,
+            None,
+            &[],
+            &platform,
+            ApplyOpts {
+                dry_run: true,
+                force: false,
+            },
+        );
+        assert_eq!(
+            plan.summary.skipped, 1,
+            "store must be classified as skipped for this assertion to be meaningful"
+        );
+
+        // Real apply through the production handler: hooks must not fire.
+        cmd_apply(
+            &root,
+            &[],
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            false,
+        )
+        .expect("apply should succeed");
+        assert!(
+            !pre_marker.exists(),
+            "pre hook must not run for a skipped store"
+        );
+        assert!(
+            !post_marker.exists(),
+            "post hook must not run for a skipped store"
+        );
+        // And the target link was never created — the skip suppressed linking too.
+        assert!(
+            !home.join(".bashrc").exists(),
+            "skipped store must not link"
+        );
+    }
+
+    #[test]
+    fn skipped_store_hooks_still_run_when_store_is_active() {
+        // Negative control for the fix: a store that IS active on this host
+        // (no `when` gate) must still run its post hook. Guards against an
+        // over-broad fix that suppresses hooks for all stores.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let stitch = root.join(".stitch");
+        fs::create_dir_all(&stitch).unwrap();
+        fs::write(root.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+        let store_dir = root.join("app");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("file"), "contents\n").unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _guard = crate::config::test_home_guard(home.clone());
+
+        let marker = tmp.path().join("POST_RAN");
+        fs::write(
+            root.join("stitch.toml"),
+            format!(
+                "[stores.app]\nhooks = {{ post = \"touch {}\" }}\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            stitch.join("state.toml"),
+            "[stores.app]\ntarget = \"~/.app\"\nfiles = [\"file\"]\n",
+        )
+        .unwrap();
+
+        cmd_apply(
+            &root,
+            &[],
+            ApplyOpts {
+                dry_run: false,
+                force: false,
+            },
+            false,
+        )
+        .expect("apply should succeed");
+        assert!(marker.exists(), "active store must still run its post hook");
     }
 
     // --- Direct-apply parse-then-restore TOCTOU regression ---

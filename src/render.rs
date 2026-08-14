@@ -28,6 +28,12 @@ pub const RENDER_DIR: &str = ".stitch/render";
 /// Line that `init` appends to `.gitignore`; rendering requires it.
 pub const RENDER_GITIGNORE_ENTRY: &str = ".stitch/render/";
 
+/// Line that `init` appends to `.gitignore` for the per-host state lock.
+/// The lock is an advisory `flock` file (`.stitch/state.lock`) that is
+/// meaningless to share across machines; keeping it out of VCS avoids spurious
+/// diffs and merge conflicts on a zero-byte file.
+pub const LOCK_GITIGNORE_ENTRY: &str = ".stitch/state.lock";
+
 const RENDER_DIR_MODE: u32 = 0o700;
 const RENDER_FILE_MODE: u32 = 0o600;
 
@@ -216,9 +222,15 @@ pub fn has_staged_output(repo_root: &Path) -> bool {
         .any(|entry| entry.file_type().is_file())
 }
 
-/// Append `.stitch/render/` to the repo `.gitignore`, creating the file if needed.
-/// Idempotent: a no-op when the entry is already present.
-pub fn ensure_render_gitignore(repo_root: &Path) -> Result<(), std::io::Error> {
+/// Append `entry` to the repo `.gitignore` unless `covered(contents)` reports
+/// it is already ignored, creating the file if needed. Refuses a non-regular or
+/// symlinked `.gitignore`. Shared by the render and lock ensurers so the
+/// open-check-append scaffolding (and its `O_NOFOLLOW` guard) lives once.
+fn append_gitignore_entry(
+    repo_root: &Path,
+    covered: impl Fn(&str) -> bool,
+    entry: &str,
+) -> Result<(), std::io::Error> {
     use std::io::Write;
 
     let path = repo_root.join(".gitignore");
@@ -231,7 +243,7 @@ pub fn ensure_render_gitignore(repo_root: &Path) -> Result<(), std::io::Error> {
         }
         Ok(_) => {
             let contents = std::fs::read_to_string(&path)?;
-            if gitignore_has_render_entry(&contents) {
+            if covered(&contents) {
                 return Ok(());
             }
             let mut file = std::fs::OpenOptions::new()
@@ -241,18 +253,60 @@ pub fn ensure_render_gitignore(repo_root: &Path) -> Result<(), std::io::Error> {
             if !contents.is_empty() && !contents.ends_with('\n') {
                 writeln!(file)?;
             }
-            writeln!(file, "{RENDER_GITIGNORE_ENTRY}")?;
+            writeln!(file, "{entry}")?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)?;
-            writeln!(file, "{RENDER_GITIGNORE_ENTRY}")?;
+            writeln!(file, "{entry}")?;
         }
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+/// Append `.stitch/render/` to the repo `.gitignore`, creating the file if needed.
+/// Idempotent: a no-op when the entry is already present.
+pub fn ensure_render_gitignore(repo_root: &Path) -> Result<(), std::io::Error> {
+    append_gitignore_entry(
+        repo_root,
+        gitignore_has_render_entry,
+        RENDER_GITIGNORE_ENTRY,
+    )
+}
+
+/// Whether `.gitignore` text ignores the per-host state lock. Conservative, like
+/// the render check: a broad `.stitch/` or `.stitch` rule covers it, and any
+/// negation revokes coverage. Not a security boundary (the lock holds no
+/// secrets); this only keeps a machine-local file out of version control.
+pub fn gitignore_has_lock_entry(contents: &str) -> bool {
+    let mut covered = false;
+    for line in contents.lines() {
+        let rule = line.trim_end_matches('\r');
+        if rule.is_empty() || rule.starts_with('#') {
+            continue;
+        }
+        if rule.starts_with('!') {
+            covered = false;
+            continue;
+        }
+        if rule == LOCK_GITIGNORE_ENTRY
+            || rule == ".stitch/"
+            || rule == ".stitch"
+            || rule == "**/.stitch/state.lock"
+        {
+            covered = true;
+        }
+    }
+    covered
+}
+
+/// Append `.stitch/state.lock` to the repo `.gitignore`, creating the file if
+/// needed. Idempotent: a no-op when the lock is already covered.
+pub fn ensure_lock_gitignore(repo_root: &Path) -> Result<(), std::io::Error> {
+    append_gitignore_entry(repo_root, gitignore_has_lock_entry, LOCK_GITIGNORE_ENTRY)
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,6 +1672,32 @@ mod tests {
             contents2.matches(RENDER_GITIGNORE_ENTRY).count(),
             1,
             "must not duplicate the entry"
+        );
+    }
+
+    #[test]
+    fn ensure_lock_gitignore_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        ensure_lock_gitignore(repo).unwrap();
+        let contents = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+        assert!(gitignore_has_lock_entry(&contents));
+        // Idempotent.
+        ensure_lock_gitignore(repo).unwrap();
+        let contents2 = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+        assert_eq!(
+            contents2.matches(LOCK_GITIGNORE_ENTRY).count(),
+            1,
+            "must not duplicate the entry"
+        );
+        // A broad `.stitch/` rule already covers the lock: no append needed.
+        std::fs::write(repo.join(".gitignore"), ".stitch/\n").unwrap();
+        ensure_lock_gitignore(repo).unwrap();
+        let contents3 = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+        assert_eq!(
+            contents3, ".stitch/\n",
+            "broad rule must satisfy coverage without appending"
         );
     }
 

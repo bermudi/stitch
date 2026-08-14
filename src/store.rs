@@ -170,10 +170,22 @@ pub fn apply_all(
             .map(|meta| (meta.dev(), meta.ino()))
             .ok();
 
+        // A store excluded by its `when` clause is not applied on this
+        // platform, so its hooks must not run either. `when` is the "leave
+        // this machine alone" switch; a skipped store firing a hook (e.g.
+        // `git config --global`, `systemctl ...`) would execute commands the
+        // user deliberately gated off, with no sign in the summary (which
+        // reports the store as skipped). `compute_apply_actions` still emits
+        // `SkippedPlatform` for reporting; this only suppresses the hooks.
+        // Per-target `when` does NOT suppress hooks: if the store is active on
+        // this platform at all, its hooks run.
+        let skipped_by_platform = !platform.matches_when(&store.when);
+
         // Per-store pre-hook: aborts the store on failure (SPEC). Runs
         // WITHOUT the state lock — a hook may itself invoke a mutating stitch
         // command, and holding the lock across it would deadlock.
         if !opts.dry_run
+            && !skipped_by_platform
             && let Some(pre) = &store.hooks.pre
         {
             // Revalidate $HOME identity (including the resolved directory
@@ -475,6 +487,7 @@ pub fn apply_all(
         // locked snapshot for the hook target so a concurrent change cannot
         // redirect the hook.
         if !opts.dry_run
+            && !skipped_by_platform
             && let Some(locked_store) = locked_stores.get(name)
             && let Some(post) = &locked_store.hooks.post
         {
