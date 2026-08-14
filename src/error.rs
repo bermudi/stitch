@@ -350,6 +350,11 @@ impl StitchError {
                 ConfigError::Parse(_, _) => Some("fix the TOML syntax and reload".into()),
                 ConfigError::Home(_) => Some("set $HOME to an existing directory".into()),
                 ConfigError::InvalidPath(_) => FailureClass::PathValidation.hint(),
+                ConfigError::Conflict(_) => Some(
+                    "edit stitch.toml to give each store a distinct target, or gate them with \
+                     mutually-exclusive `when` clauses"
+                        .into(),
+                ),
                 _ => FailureClass::Config.hint(),
             },
             Self::RepoResolution { .. } => FailureClass::RepoResolution.hint(),

@@ -47,16 +47,18 @@ pub fn check_link(target: &Path, source: &Path, repo_root: &Path) -> LinkStatus 
                     // A source symlink is an entry we intentionally preserve,
                     // rather than an endpoint to canonicalize. Compare the
                     // actual directory entry identity so alternate spellings
-                    // cannot turn `alias/.` or `alias/..` into `alias`.
-                    // The immediate link target must also be an in-repo path
-                    // (the same `source_ancestors_within` guard used by
+                    // cannot turn `alias/.` or `alias/..` into `alias`. The
+                    // immediate link target must also resolve into the repo
+                    // (the `link_ancestors_within_repo` guard shared with
                     // `points_at_source`); otherwise the link points directly
-                    // at an external endpoint and is foreign under the two-tier
-                    // ownership rule.
-                    if !is_direct_entry_path(source) || !is_direct_entry_path(&resolved) {
+                    // at an external endpoint and is foreign under the
+                    // two-tier ownership rule. Relative readlink text is
+                    // permitted: its `..` traversal is validated by resolving
+                    // the parent, not by a lexical prefix check.
+                    if !is_direct_entry_path(source) || !is_direct_entry_link(&resolved) {
                         false
                     } else if let Ok(link_entry) = link_target_path(target, &resolved) {
-                        source_ancestors_within(&link_entry, repo_root)
+                        link_ancestors_within_repo(&link_entry, repo_root)
                             && entry_identity(&link_entry) == entry_identity(source)
                     } else {
                         false
@@ -273,6 +275,34 @@ pub fn source_resolves_within(source: &Path, root: &Path) -> bool {
         })
 }
 
+/// Whether the parent of `link_entry` resolves to a directory within
+/// `repo_root`, without following the terminal entry.
+///
+/// This is the link-entry counterpart to [`source_ancestors_within`]. Unlike
+/// that helper, it handles entries derived from *relative* readlink text:
+/// a stow-style link (`../../dots/store/alias`) joins to a path whose `..`
+/// components climb out of the link's parent directory — lexically outside the
+/// repo — before re-entering it, so the lexical `strip_prefix` and bound-based
+/// resolution in `source_ancestors_within` cannot accept it. Here the parent is
+/// resolved component-by-component (following symlinks, applying `..`) and the
+/// resolved result is checked against the resolved repo root.
+///
+/// The terminal entry is deliberately not followed, so a configured source
+/// symlink that resolves outside the repo is still a valid link target. The
+/// leaf must already be a direct-entry spelling — callers gate on
+/// [`is_direct_entry_link`] — and the exact entry match is verified separately
+/// by [`entry_identity`]. A foreign link pointing at a different entry fails
+/// that identity comparison regardless of this check.
+fn link_ancestors_within_repo(link_entry: &Path, repo_root: &Path) -> bool {
+    let Some(parent) = link_entry.parent() else {
+        return false;
+    };
+    let Some(repo) = resolved_directory(repo_root) else {
+        return false;
+    };
+    resolve_path(parent).is_ok_and(|parent| parent.starts_with(repo))
+}
+
 /// Whether the symlink at `target` points at this exact configured source
 /// *symlink entry*.
 ///
@@ -299,13 +329,13 @@ pub fn points_at_source(target: &Path, expected_source: &Path, repo_root: &Path)
     let Ok(link) = std::fs::read_link(target) else {
         return false;
     };
-    if !is_direct_entry_path(&link) {
+    if !is_direct_entry_link(&link) {
         return false;
     }
     let Ok(link_entry) = link_target_path(target, &link) else {
         return false;
     };
-    if !source_ancestors_within(&link_entry, repo_root) {
+    if !link_ancestors_within_repo(&link_entry, repo_root) {
         return false;
     }
     entry_identity(&link_entry) == entry_identity(expected_source)
@@ -395,7 +425,7 @@ fn points_at_missing_source(target: &Path, expected_source: &Path, repo_root: &P
     let Ok(link) = std::fs::read_link(target) else {
         return false;
     };
-    if !is_direct_entry_path(&link) {
+    if !is_direct_entry_link(&link) {
         return false;
     }
     let Ok(link_path) = link_target_path(target, &link) else {
@@ -574,6 +604,30 @@ fn is_direct_entry_path(path: &Path) -> bool {
         && !bytes.ends_with(b"/.")
         && !path.components().any(|part| part == Component::ParentDir)
         && matches!(path.components().next_back(), Some(Component::Normal(_)))
+}
+
+/// Whether a symlink's readlink text is a direct spelling of an entry path,
+/// suitable for the exact-entry ownership comparison in [`check_link`] and
+/// [`points_at_source`].
+///
+/// Like [`is_direct_entry_path`], this rejects a trailing `/`, a trailing
+/// `/.`, and a terminal `.`/`..` (the last component must be a normal name).
+/// Unlike it, intermediate `..` components are permitted when the link text is
+/// *relative*: a stow-style relative link (`../../dots/store/alias`) needs
+/// `..` to climb out of its parent directory, and that traversal is validated
+/// separately by [`link_ancestors_within_repo`] (the resolved parent must land
+/// in the repo) and [`entry_identity`] (the resolved entry must match). An
+/// *absolute* link containing `..` is still rejected — there it can only be
+/// obfuscation of a path that could be spelled directly, and rejecting it
+/// preserves the syntactic-directness property covered by
+/// `test_points_at_source_rejects_terminal_slash_dot_and_escaped_parent`.
+fn is_direct_entry_link(link: &Path) -> bool {
+    let bytes = link.as_os_str().as_bytes();
+    !bytes.is_empty()
+        && !bytes.ends_with(b"/")
+        && !bytes.ends_with(b"/.")
+        && matches!(link.components().next_back(), Some(Component::Normal(_)))
+        && (!link.is_absolute() || !link.components().any(|part| part == Component::ParentDir))
 }
 
 /// Resolve only a path's parent and preserve its final directory-entry name.
@@ -1192,6 +1246,66 @@ mod tests {
         let escaped_target = tmp.path().join("escaped-target");
         std::os::unix::fs::symlink(&escaped_source, &escaped_target).unwrap();
         assert!(!points_at_source(&escaped_target, &escaped_source, &repo));
+    }
+
+    #[test]
+    fn test_relative_link_to_source_symlink_is_linked() {
+        // Stow-style relative links use `..` to climb out of the link's parent
+        // directory. A live link that resolves to a configured source symlink
+        // must be recognized as `Linked` (and `points_at_source` true) — not
+        // classified `Broken` merely because the readlink text contains `..`.
+        // This is the fan-in migration bug: every stow relative link was false-
+        // negative as broken even though it resolved perfectly.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let store = repo.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+
+        // The configured source is itself a symlink to an external file (the
+        // intra-repo fan-in: a consumer entry pointing at the hub).
+        let external = tmp.path().join("external").join("real");
+        std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+        std::fs::write(&external, "outside").unwrap();
+        let source = store.join("alias");
+        std::os::unix::fs::symlink(&external, &source).unwrap();
+
+        // The live link lives several levels deep and reaches the source via a
+        // relative `..` traversal, exactly as stow produces.
+        let home = tmp.path().join("home");
+        let target = home.join(".config").join("app").join("alias");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../../../repo/store/alias", &target).unwrap();
+
+        assert_eq!(
+            check_link(&target, &source, &repo),
+            LinkStatus::Linked,
+            "a relative link resolving to the source symlink is linked"
+        );
+        assert!(
+            points_at_source(&target, &source, &repo),
+            "points_at_source must recognize the relative link"
+        );
+        assert!(
+            points_to_source(&target, &source, &repo),
+            "points_to_source must recognize the relative link"
+        );
+        // Reading through the link still serves the hub content.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
+
+        // A relative link whose `..` traversal escapes the repo is still
+        // rejected by `link_ancestors_within_repo` — the relaxed leaf check
+        // does not weaken the ancestor guard.
+        let escaped = home.join(".config").join("app").join("escaped");
+        std::os::unix::fs::symlink("../../../external/real", &escaped).unwrap();
+        assert_ne!(
+            check_link(&escaped, &source, &repo),
+            LinkStatus::Linked,
+            "a relative link resolving outside the repo is not linked"
+        );
+        assert!(
+            !points_at_source(&escaped, &source, &repo),
+            "relative escape must not be recognized as the source"
+        );
     }
 
     #[test]

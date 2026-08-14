@@ -18,6 +18,10 @@ pub enum ConfigError {
     CommittedWrite(std::io::Error, PathBuf),
     #[error("{0}")]
     InvalidPath(String),
+    /// Two active stores claim the same link path (or nested paths), so the
+    /// desired state is self-contradictory and `apply` cannot converge.
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     Home(String),
     /// A v0.2 single-file repo that has not been migrated. The message tells
