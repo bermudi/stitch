@@ -447,13 +447,13 @@ fn set_test_pause_after_snapshot(f: Option<Box<dyn FnOnce()>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd_add;
+    use crate::commands::add::cmd_add;
+    use crate::commands::add::rollback_adopt_move;
     use crate::commands::migrate::cmd_migrate;
     use crate::commands::remove::cmd_remove;
     use crate::config::Config;
     use crate::fsutil::InodeIdentity;
     use crate::platform::Platform;
-    use crate::rollback_adopt_move;
     use crate::store::ApplyOpts;
     use std::fs;
     use std::os::unix::fs::{MetadataExt, symlink};

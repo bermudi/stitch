@@ -55,7 +55,10 @@ pub(crate) fn cmd_import(
     let mut skipped_owned = 0;
 
     for fl in &found {
-        if owned.iter().any(|t| crate::paths_equal(t, &fl.link)) {
+        if owned
+            .iter()
+            .any(|t| crate::commands::add::paths_equal(t, &fl.link))
+        {
             skipped_owned += 1;
             continue;
         }
@@ -74,7 +77,7 @@ pub(crate) fn cmd_import(
             continue;
         }
         let rest: std::path::PathBuf = comps.collect();
-        let target_str = crate::collapse_home(&fl.link)?;
+        let target_str = crate::commands::add::collapse_home(&fl.link)?;
 
         let bucket = buckets.entry(store_name).or_default();
         if rest.as_os_str().is_empty() {
@@ -87,10 +90,11 @@ pub(crate) fn cmd_import(
             // symlink lives (so nested files like lua/plugin.lua resolve to
             // the common target dir, e.g. ~/.config/nvim, not its immediate
             // parent ~/.config/nvim/lua).
-            let Some(target_dir) = crate::target_dir_for_file_link(&fl.link, &rest) else {
+            let Some(target_dir) = crate::commands::add::target_dir_for_file_link(&fl.link, &rest)
+            else {
                 continue;
             };
-            let parent = crate::collapse_home(&target_dir)?;
+            let parent = crate::commands::add::collapse_home(&target_dir)?;
             bucket.files.insert(source_rel, parent);
         }
     }
