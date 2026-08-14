@@ -1137,3 +1137,198 @@ fn add_rejects_terminal_symlink_behind_dotdot() {
         "referent must not be adopted into the repo"
     );
 }
+
+// ===========================================================================
+// Phase 0 characterization tests (2026-08-13 module refactor).
+//
+// These pin the `add` rollback machinery's current behavior before the
+// mechanical module move. They target the gaps identified in the plan's
+// coverage audit: `--to` state-save rollback, and the cleanup/discard
+// branches that fire when `apply_store` fails at link creation on the
+// create-empty paths.
+//
+// All three are deterministic: the failure condition (read-only directory)
+// is set up *before* the command starts, and the failure point is naturally
+// later in the sequence than preflight (preflight_add_target checks for
+// symlink conflicts, not parent writability; atomic_write creates a temp
+// file in .stitch/ which requires .stitch/ to be writable). No filesystem
+// race is involved.
+//
+// Skipped under root: root ignores file mode bits, so the read-only
+// permission can't trigger the failure path and the test would give false
+// confidence.
+// ===========================================================================
+
+#[test]
+fn add_to_rolls_back_when_state_save_fails() {
+    // `add --to` moves the file into the store, creates the symlink, then
+    // saves state. If state save fails (`.stitch/` read-only), rollback must
+    // remove the symlink and restore the file to its original path so no
+    // half-adopted entry is left without a state record.
+    if is_root() {
+        eprintln!("note: add_to_rolls_back_when_state_save_fails skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    // Set up an existing file-mode store and apply it so the target root
+    // exists as a real directory with an existing link.
+    repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_path)
+        .assert()
+        .success();
+    assert!(home_path.join(".bashrc").is_symlink());
+
+    // A new file to adopt into the store via --to.
+    let zshrc = home_path.join(".zshrc");
+    fs::write(&zshrc, "zsh config").unwrap();
+
+    // Make .stitch/ read-only: the lock file (already present, opened by fd)
+    // and state.toml (read) are fine, but atomic_write's temp-file creation
+    // in .stitch/ will fail with EACCES.
+    let stitch_dir = repo.path().join(".stitch");
+    let mut perms = fs::metadata(&stitch_dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&stitch_dir, perms).unwrap();
+
+    repo.cmd()
+        .args(["add", zshrc.to_str().unwrap(), "--to", "shells"])
+        .env("HOME", home_path)
+        .assert()
+        .failure();
+
+    // The file is back where it started, intact, not a symlink.
+    assert!(zshrc.exists(), "file must be restored on rollback");
+    assert!(
+        !zshrc.is_symlink(),
+        "file must not be a symlink after rollback"
+    );
+    assert_eq!(fs::read_to_string(&zshrc).unwrap(), "zsh config");
+
+    // No orphaned entry in the store dir.
+    assert!(
+        !repo.path().join("shells").join(".zshrc").exists(),
+        "store dir must not retain the moved file after rollback"
+    );
+
+    // State must not record .zshrc.
+    let state = fs::read_to_string(stitch_dir.join("state.toml")).unwrap();
+    assert!(
+        !state.contains(".zshrc"),
+        "state must not record the rolled-back file"
+    );
+}
+
+#[test]
+fn add_file_rolls_back_when_link_creation_fails() {
+    // `add --file` creates an empty file in the store dir, then `apply_store`
+    // creates the symlink at the target. If the target parent ($HOME) is
+    // read-only, link creation fails and the cleanup/discard branches must
+    // remove both the empty file and the store dir so no orphaned content
+    // is left behind.
+    //
+    // Deterministic: $HOME is made read-only *before* the command. The store
+    // dir and empty file are created in the repo (writable); the target
+    // parent already exists so prepare_target_parents is a no-op; the first
+    // step that writes to $HOME is the symlink creation, which fails.
+    if is_root() {
+        eprintln!("note: add_file_rolls_back_when_link_creation_fails skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let target = home_path.join(".bashrc");
+
+    // Make $HOME read-only: the symlink at ~/.bashrc cannot be created.
+    let mut perms = fs::metadata(home_path).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(home_path, perms).unwrap();
+    let _restore = RestoreMode {
+        path: home_path,
+        mode: 0o755,
+    };
+
+    repo.cmd()
+        .args(["add", target.to_str().unwrap(), "--file"])
+        .env("HOME", home_path)
+        .assert()
+        .failure();
+
+    // No orphaned store dir or empty file left in the repo.
+    assert!(
+        !repo.path().join("bashrc").exists(),
+        "store dir must be removed on rollback"
+    );
+    // Target was never created.
+    assert!(
+        !target.exists(),
+        "target link must not exist after rollback"
+    );
+    // State must not record the store.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state.contains("bashrc"),
+        "state must not record the rolled-back store"
+    );
+}
+
+#[test]
+fn add_create_empty_rolls_back_when_link_creation_fails() {
+    // `add` (create empty store) creates the store dir, then `apply_store`
+    // creates the symlink at the target. If the target parent is read-only,
+    // link creation fails and the discard branch must remove the store dir.
+    //
+    // Deterministic: the target parent ($HOME/.config) is made read-only
+    // *before* the command. The store dir is in the repo (writable); the
+    // target parent already exists so prepare_target_parents is a no-op; the
+    // first step that writes to the target parent is the symlink creation.
+    if is_root() {
+        eprintln!("note: add_create_empty_rolls_back_when_link_creation_fails skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let config_dir = home_path.join(".config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let target = config_dir.join("nvim");
+
+    // Make $HOME/.config read-only: the symlink at ~/.config/nvim cannot be
+    // created, but the store dir in the repo can.
+    let mut perms = fs::metadata(&config_dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&config_dir, perms).unwrap();
+    let _restore = RestoreMode {
+        path: &config_dir,
+        mode: 0o755,
+    };
+
+    repo.cmd()
+        .args(["add", target.to_str().unwrap()])
+        .env("HOME", home_path)
+        .assert()
+        .failure();
+
+    // No orphaned store dir left in the repo.
+    assert!(
+        !repo.path().join("nvim").exists(),
+        "store dir must be removed on rollback"
+    );
+    // Target was never created.
+    assert!(
+        !target.exists(),
+        "target link must not exist after rollback"
+    );
+    // State must not record the store.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state.contains("nvim"),
+        "state must not record the rolled-back store"
+    );
+}
