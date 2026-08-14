@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## 0.11.6 — 2026-08-14
+
+### Fixed
+
+- `apply`/`diff`: collision errors now use a dedicated `ConfigError::Conflict`
+  variant with a targeted hint ("edit stitch.toml to give each store a distinct
+  target, or gate them with mutually-exclusive `when` clauses") instead of the
+  irrelevant path-validation hint. Nested-path collisions (e.g. a whole-dir
+  store targeting `~/.config` and a file-mode store linking into
+  `~/.config/nvim`) now produce a message naming both paths — "store A claims
+  link path X and store B claims nested link path Y" — instead of always
+  showing only the parent path.
+- `add`: setgid on adopted directories is now preserved. Previously
+  `strip_privileged_bits` stripped all three privileged bits (setuid, setgid,
+  sticky) from both files and directories; setgid on directories is a
+  legitimate configuration (new files inherit the directory's group) and git
+  preserves it via `core.sharedRepository`. Only setuid and sticky are stripped
+  from directories; files still strip all three.
+- `linker`: stow-style relative symlinks (`../../repo/store/alias`) that use
+  `..` to climb out of the link's parent directory are now recognized as
+  `Linked` instead of false-negative `Broken`. A new `link_ancestors_within_repo`
+  guard resolves the link's parent component-by-component (following symlinks,
+  applying `..`) and checks the resolved result against the repo root, rather
+  than rejecting any `..` in the readlink text lexically. An absolute link
+  containing `..` is still rejected. The ancestor guard still rejects relative
+  links whose `..` traversal escapes the repo.
+- `render`: stale-link reconciliation (`reconcile_store_links`) now skips
+  unreadable subtrees (`PermissionDenied` / `NotFound`) during the target walk
+  instead of failing. A file-mode store with `target = "~"` (the stow-mirror
+  layout) walks all of `$HOME`, which contains foreign root-owned trees
+  (podman overlays, etc.) that yield `PermissionDenied` to a same-UID process.
+  An unreadable subtree holds no stale link for this store, and `remove_link`
+  revalidates ownership before unlinking, so skipping cannot clobber a foreign
+  link. Errors at the scan root and other walk failures still surface.
+
 ## 0.11.5 — 2026-08-14
 
 ### Fixed
@@ -26,8 +61,11 @@
   (exit 1).
 - `add`: strip setuid/setgid/sticky bits when adopting a file into the
   repo. `rename(2)` preserves mode bits, but a setuid dotfile is almost
-  always unintentional and git drops these bits on clone anyway. A
-  warning is printed when bits are stripped.
+  always unintentional and git drops these bits on clone anyway. For
+  directories, only setuid and sticky are stripped — setgid on directories
+  is a legitimate configuration (new files inherit the directory's group)
+  and git preserves it via `core.sharedRepository`. A warning is printed
+  when bits are stripped.
 - `add`: `add <repo>` (adding the repository itself) now fails with a
   clear "cannot add the repository itself" message instead of a generic
   "inside the stitch repository" message.

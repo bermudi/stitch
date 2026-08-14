@@ -299,18 +299,40 @@ fn link_collision_message(
     a_tname: Option<&str>,
     b_store: &str,
     b_tname: Option<&str>,
-    path: &Path,
+    a_path: &Path,
+    b_path: &Path,
 ) -> String {
     let label = |store: &str, tname: Option<&str>| match tname {
         Some(t) => format!("target '{t}' of store '{store}'"),
         None => format!("store '{store}'"),
     };
-    format!(
-        "{} and {} both claim link path '{}': the desired state is self-contradictory and `apply` cannot converge",
-        label(a_store, a_tname),
-        label(b_store, b_tname),
-        path.display()
-    )
+    let a_label = label(a_store, a_tname);
+    let b_label = label(b_store, b_tname);
+    if a_path == b_path {
+        format!(
+            "{} and {} both claim link path '{}': the desired state is self-contradictory and `apply` cannot converge",
+            a_label,
+            b_label,
+            a_path.display()
+        )
+    } else {
+        // One path is nested under the other. Name both paths so the user can
+        // see which store claims the parent and which claims the child.
+        let (outer, outer_label, inner, inner_label) = if a_path.starts_with(b_path) {
+            (b_path, &b_label, a_path, &a_label)
+        } else {
+            (a_path, &a_label, b_path, &b_label)
+        };
+        format!(
+            "{} claims link path '{}' and {} claims nested link path '{}': the desired state is \
+             self-contradictory and `apply` cannot converge (a whole-directory symlink would \
+             clobber the directory the other links into)",
+            outer_label,
+            outer.display(),
+            inner_label,
+            inner.display()
+        )
+    }
 }
 
 /// Detect link-path collisions across the stores that are active on this
@@ -392,12 +414,13 @@ pub(crate) fn check_link_path_collisions(
                 continue;
             }
             if a.path == b.path || a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
-                return Err(ConfigError::InvalidPath(link_collision_message(
+                return Err(ConfigError::Conflict(link_collision_message(
                     &a.store,
                     a.tname.as_deref(),
                     &b.store,
                     b.tname.as_deref(),
                     &a.path,
+                    &b.path,
                 )));
             }
         }

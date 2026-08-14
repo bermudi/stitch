@@ -735,7 +735,7 @@ fn add_strips_setuid_bit_from_adopted_file() {
         .env("HOME", home.path())
         .assert()
         .success()
-        .stderr(contains("stripped setuid/setgid/sticky bits"));
+        .stderr(contains("stripped privileged bits"));
 
     // The adopted file in the repo must NOT have setuid. A single-file adopt
     // creates a store directory named after the file, with the file inside it.

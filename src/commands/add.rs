@@ -419,21 +419,29 @@ fn strip_privileged_bits(path: &std::path::Path) -> Option<String> {
     if meta.file_type().is_symlink() {
         return None;
     }
+    let is_dir = meta.file_type().is_dir();
     let mode = meta.mode();
-    let privileged = mode & 0o7000; // setuid | setgid | sticky
+    // For files, strip setuid, setgid, and sticky — these are almost always
+    // unintentional on dotfiles and git drops them on clone anyway.
+    // For directories, only strip setuid and sticky; setgid on directories
+    // (0o2000) is a legitimate and common configuration that makes new files
+    // inherit the directory's group, and git does preserve it via
+    // `core.sharedRepository`.
+    let mask = if is_dir { 0o5000 } else { 0o7000 }; // setuid | sticky (dirs); all three (files)
+    let privileged = mode & mask;
     if privileged == 0 {
         return None;
     }
-    let cleaned = mode & !0o7000;
+    let cleaned = mode & !mask;
     match std::fs::set_permissions(path, std::fs::Permissions::from_mode(cleaned)) {
         Ok(()) => Some(format!(
-            "stripped setuid/setgid/sticky bits (0o{:o}) from adopted {} — \
+            "stripped privileged bits (0o{:o}) from adopted {} — \
              dotfiles do not need them and git would drop them on clone anyway",
             privileged,
             path.display()
         )),
         Err(e) => Some(format!(
-            "warning: could not strip setuid/setgid/sticky bits from {}: {e}",
+            "warning: could not strip privileged bits from {}: {e}",
             path.display()
         )),
     }

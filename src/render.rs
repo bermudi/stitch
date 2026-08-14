@@ -929,12 +929,35 @@ pub fn reconcile_store_links(
         .follow_links(false)
         .into_iter()
     {
-        let entry = entry.map_err(|e| {
-            format!(
-                "could not scan target {} for stale links: {e}",
-                target_path.display()
-            )
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                // A file-mode store with `target = "~"` (the stow-mirror
+                // layout) makes this scan walk all of `$HOME`, which contains
+                // foreign root-owned trees (podman overlays, …) that yield
+                // `PermissionDenied` to a same-UID process. An unreadable
+                // subtree holds no stale link for *this* store — its
+                // configured links live at known, readable paths — and
+                // `remove_link` revalidates ownership before unlinking, so
+                // skipping it cannot clobber a foreign link. Skip the
+                // unreadable subtree and keep scanning the readable tree.
+                // Other walk failures (and any error at the scan root) still
+                // surface so a genuinely broken target is not silently
+                // mis-reconciled.
+                if err.depth() > 0
+                    && err.io_error().is_some_and(|io| {
+                        io.kind() == std::io::ErrorKind::PermissionDenied
+                            || io.kind() == std::io::ErrorKind::NotFound
+                    })
+                {
+                    continue;
+                }
+                return Err(format!(
+                    "could not scan target {} for stale links: {err}",
+                    target_path.display()
+                ));
+            }
+        };
         if entry.depth() == 0 || !entry.file_type().is_symlink() {
             continue;
         }

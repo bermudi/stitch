@@ -1272,6 +1272,68 @@ fn apply_io_error_includes_path_context() {
 }
 
 #[test]
+fn apply_file_mode_skips_unreadable_target_subtree() {
+    // A file-mode store whose target directory contains an unreadable subtree
+    // (e.g. a root-owned podman overlay under `$HOME` when `target = "~"`)
+    // must not abort apply. The stale-link scan skips the unreadable subtree
+    // and still reconciles the readable parts: the configured link is created
+    // and a pre-existing stale link next to the unreadable dir is removed.
+    if is_root() {
+        eprintln!("note: apply_file_mode_skips_unreadable_target_subtree skipped under root");
+        return;
+    }
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc", ".zshrc"]);
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{target_str}"
+files = [".bashrc"]
+"#
+    ));
+
+    // Pre-create the target root with: a stale repo-pointing link (`old` -> a
+    // store file not in the kept set) and an unreadable subtree mimicking a
+    // foreign root-owned tree under a `target = "~"` store.
+    fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(
+        repo.path().join("shells").join(".zshrc"),
+        target.join("old"),
+    )
+    .unwrap();
+    let unreadable = target.join("unreadable");
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = RestoreMode {
+        path: &unreadable,
+        mode: 0o755,
+    };
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("created"));
+
+    // The configured link is created...
+    let link = target.join(".bashrc");
+    assert!(link.is_symlink());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        repo.path()
+            .join("shells")
+            .join(".bashrc")
+            .canonicalize()
+            .unwrap()
+    );
+    // ...and the stale link next to the unreadable subtree is still reconciled,
+    // proving the scan continues past the skipped error rather than aborting.
+    assert!(!target.join("old").exists(), "stale link must be removed");
+}
+
+#[test]
 fn apply_real_file_root_conflicts_even_with_force() {
     // A regular file at the file-mode target root blocks the whole store.
     // status/doctor report a conflict; diff must not preview child creation;
@@ -1355,7 +1417,10 @@ target = "{target_str}"
         .code(3)
         .stderr(contains("both claim link path"))
         .stderr(contains("store 's1'"))
-        .stderr(contains("store 's2'"));
+        .stderr(contains("store 's2'"))
+        // The hint must guide the user toward fixing the collision, not
+        // toward path-validation issues.
+        .stderr(contains("distinct target"));
 
     // No symlink created: the rejection happens before any mutation.
     assert!(!target.exists());
@@ -1479,7 +1544,7 @@ files = ["init.lua"]
         .assert()
         .failure()
         .code(3)
-        .stderr(contains("both claim link path"));
+        .stderr(contains("claims nested link path"));
 }
 
 #[test]
