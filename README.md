@@ -81,7 +81,7 @@ After:   ~/.config/nvim  →  ~/dots/nvim  (a link pointing back to your repo)
 
 You edit `~/.config/nvim/init.lua` like normal — your editor follows the link and saves straight into `~/dots/nvim/init.lua`. Commit and push `~/dots` and your setup is backed up.
 
-To undo one thing: `stitch remove nvim` removes the links and the bookkeeping, but leaves the files in your repo alone.
+To undo one thing: `stitch remove nvim` removes the links and the bookkeeping, but leaves the files in your repo alone. `remove` never deletes the store directory in the repo, so to re-`add` the same store you either keep the old directory (rename it first, then `add` the original path) or remove it yourself (`rm -rf ~/dots/nvim`) before running `add` again — `add` refuses to adopt into an existing store directory.
 
 ---
 

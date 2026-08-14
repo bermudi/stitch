@@ -208,7 +208,7 @@ Use `--to <store>` to adopt one existing regular, non-hard-linked file into an e
 
 ### `stitch remove <name>`
 
-Remove store symlinks, the store's staged renders under `.stitch/render/<name>/`, and the store's `state.toml` entry. `stitch.toml` behavior is left in place (the tool never rewrites authored config) — `doctor` flags the orphaned behavior; remove it via `stitch edit`. Store directory left untouched.
+Remove store symlinks, the store's staged renders under `.stitch/render/<name>/`, and the store's `state.toml` entry. `stitch.toml` behavior is left in place (the tool never rewrites authored config) — `doctor` flags the orphaned behavior; remove it via `stitch edit`. Store directory left untouched, so re-`add`ing the same store requires renaming or `rm -rf`-ing the leftover directory first; `add` refuses to adopt into an existing store directory.
 
 ### `stitch edit [entry]`
 

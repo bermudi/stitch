@@ -78,6 +78,17 @@ pub(crate) fn cmd_apply(
     }
     check_unknown_names(only.iter().map(|s| s.as_str()), &snapshot.loaded.config)?;
 
+    // Reject two active stores claiming the same link path before any plan is
+    // built: that config is self-contradictory, and `apply` would otherwise
+    // report success while the filesystem never converges (`diff --exit-code`
+    // alarms forever). Mirrors `doctor`'s duplicate-target check, but keyed on
+    // the actual link paths so file-mode stores sharing a target directory with
+    // disjoint files remain legitimate.
+    let platform = Platform::detect();
+    let collision_config = filter_config(&snapshot.loaded.config, only);
+    store::check_link_path_collisions(root, &collision_config, &platform)
+        .map_err(StitchError::config)?;
+
     if json {
         return apply_json(
             root,
@@ -88,8 +99,6 @@ pub(crate) fn cmd_apply(
             snapshot.loaded.warnings.clone(),
         );
     }
-
-    let platform = Platform::detect();
 
     // Upgraded plain repos need no migration, but template apply and its
     // dry-run must agree that staging is blocked until Git ignores it.
@@ -175,7 +184,7 @@ pub(crate) fn cmd_apply(
     render_plan(&plan, opts.dry_run);
 
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
-        return Err(plan_error(&plan));
+        return Err(plan_error(&plan, "apply"));
     }
 
     // Global post-apply hook (skipped under dry-run). Per-store execution has
@@ -393,7 +402,7 @@ fn apply_json(
     }
 
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
-        let error = plan_error(&plan);
+        let error = plan_error(&plan, command);
         report::write_data_error(command, plan, &error, warnings);
     }
 

@@ -23,9 +23,15 @@ pub(crate) fn cmd_diff(
         filtered_config.stores.retain(|name, _| only.contains(name));
     }
 
+    // Reject two active stores claiming the same link path up front: otherwise
+    // `diff` reports drift that `apply` insists is already resolved, so
+    // `diff --exit-code` alarms forever on a self-contradictory repo.
+    let platform = Platform::detect();
+    store::check_link_path_collisions(root, &filtered_config, &platform)
+        .map_err(StitchError::config)?;
+
     if json {
         return report::run_json("diff", || {
-            let platform = Platform::detect();
             let plan = store::compute_plan(
                 root,
                 &filtered_config,
@@ -36,7 +42,7 @@ pub(crate) fn cmd_diff(
                 },
             );
             if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
-                let error = plan_error(&plan);
+                let error = plan_error(&plan, "diff");
                 report::write_data_error("diff", plan, &error, loaded.warnings);
             }
             let changes = crate::commands::apply::pending_change_count(&plan);
@@ -48,7 +54,6 @@ pub(crate) fn cmd_diff(
         });
     }
 
-    let platform = Platform::detect();
     let plan = store::compute_plan(
         root,
         &filtered_config,
@@ -77,7 +82,7 @@ pub(crate) fn cmd_diff(
     crate::commands::apply::render_plan(&plan, true);
 
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
-        Err(plan_error(&plan))
+        Err(plan_error(&plan, "diff"))
     } else {
         let changes = crate::commands::apply::pending_change_count(&plan);
         if exit_code && changes > 0 {

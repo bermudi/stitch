@@ -699,6 +699,63 @@ fn add_to_rejects_source_inside_repository_without_moving() {
 }
 
 #[test]
+fn add_rejects_the_repository_itself_with_a_clear_message() {
+    // `add <repo>` must fail with a message naming the repo itself, not a
+    // generic "inside the repository" message and not a raw OS error.
+    let repo = Repo::new();
+    repo.cmd()
+        .args(["add", repo.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("cannot add the repository itself"));
+}
+
+#[test]
+fn add_strips_setuid_bit_from_adopted_file() {
+    // A setuid bit on a dotfile is almost always unintentional and git would
+    // drop it on clone anyway. `add` must strip setuid/setgid/sticky bits when
+    // adopting a file into the repo, and warn the user.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join(".local").join("bin").join("helper");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "#!/bin/sh\necho hi\n").unwrap();
+    // Make it executable + setuid. Any user can set setuid on a file they own.
+    let mut perms = fs::metadata(&source).unwrap().permissions();
+    perms.set_mode(0o4755);
+    fs::set_permissions(&source, perms).unwrap();
+    assert!(
+        fs::metadata(&source).unwrap().mode() & 0o4000 != 0,
+        "setuid must be set before add"
+    );
+
+    repo.cmd()
+        .args(["add", source.to_str().unwrap()])
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stderr(contains("stripped setuid/setgid/sticky bits"));
+
+    // The adopted file in the repo must NOT have setuid. A single-file adopt
+    // creates a store directory named after the file, with the file inside it.
+    let adopted = repo.path().join("helper").join("helper");
+    assert!(
+        adopted.is_file(),
+        "adopted file must exist at {}",
+        adopted.display()
+    );
+    let mode = fs::metadata(&adopted).unwrap().mode();
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "setuid/setgid/sticky bits must be stripped from adopted file (mode=0o{mode:o})"
+    );
+    // The executable bits are preserved.
+    assert_eq!(mode & 0o111, 0o111, "executable bits must be preserved");
+}
+
+#[test]
 fn add_to_dry_run_changes_nothing() {
     let repo = Repo::new();
     let home = tempfile::tempdir().unwrap();

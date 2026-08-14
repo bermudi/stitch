@@ -175,6 +175,102 @@ target = "{target_str}"
 }
 
 #[test]
+fn apply_atomic_replace_leaves_no_temp_files() {
+    // The atomic-replace path creates temp siblings (.name.stitch-link-*, .name.stitch-orig-*)
+    // and must clean them up on success. A stale repo-owned symlink is the trigger.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let parent = target.parent().unwrap();
+    fs::create_dir_all(parent).unwrap();
+    let stale = repo.path().join("nvim").join("does-not-exist");
+    std::os::unix::fs::symlink(&stale, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("replaced"));
+
+    assert!(target.is_symlink());
+    // No leftover temp artifacts in the target's parent directory.
+    let leftovers: Vec<_> = fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.starts_with(".nvim.stitch-link-") || s.starts_with(".nvim.stitch-orig-")
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "atomic replace left temp files: {leftovers:?}"
+    );
+}
+
+#[test]
+fn apply_atomic_replace_preserves_original_when_create_fails() {
+    // If the new link cannot be created (target parent is read-only), the
+    // original stale symlink must remain in place — not be deleted first and
+    // then left absent. This is the v0.11.4 release assessment's "failed apply
+    // deletes a dangling link" finding.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let parent = target.parent().unwrap();
+    fs::create_dir_all(parent).unwrap();
+    let stale = repo.path().join("nvim").join("does-not-exist");
+    std::os::unix::fs::symlink(&stale, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    // Make the parent read-only so creating the temp symlink fails. Skip under
+    // root, which bypasses permission checks.
+    if is_root() {
+        eprintln!("skipping read-only-parent assertion under root");
+        return;
+    }
+    let mut perms = fs::metadata(parent).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(parent, perms).unwrap();
+
+    let result = repo.cmd().arg("apply").output().unwrap();
+    // Restore permissions so cleanup works.
+    let mut perms = fs::metadata(parent).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(parent, perms).unwrap();
+
+    assert!(
+        !result.status.success(),
+        "apply must fail when the target parent is read-only"
+    );
+    // The original stale symlink must still be present (atomic replace did not
+    // remove it before failing to create the replacement).
+    assert!(
+        target.symlink_metadata().is_ok(),
+        "original stale symlink must survive a failed atomic replace"
+    );
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        stale,
+        "original symlink target must be unchanged after a failed replace"
+    );
+}
+
+#[test]
 fn apply_conflicts_on_foreign_symlink() {
     // A symlink managed by another tool (stow/chezmoi/Nix/Home-Manager) points
     // outside this repo — even when its target is valid. apply must report a
@@ -1198,7 +1294,10 @@ files = ["f"]
         .arg("diff")
         .assert()
         .failure()
-        .stderr(contains("conflict"));
+        .stderr(contains("conflict"))
+        // `diff` is a read-only preview; its error must not claim "apply failed".
+        .stderr(contains("apply failed").not())
+        .stderr(contains("diff reported"));
 
     repo.cmd()
         .arg("apply")
@@ -1219,4 +1318,223 @@ files = ["f"]
         fs::read_to_string(&root).unwrap(),
         "i am a file, not a directory"
     );
+}
+
+// ===========================================================================
+// Target/link-path collision rejection (v0.11.4 release assessment blocker).
+//
+// Two active stores claiming the same link path produce a self-contradictory
+// desired state: `apply` would report success while the filesystem never
+// converges, and `diff --exit-code` alarms forever. Both `apply` and `diff`
+// must reject the collision up front (config error, exit 3) instead of
+// silently fighting. File-mode stores sharing a target *directory* with
+// disjoint files remain legitimate.
+// ===========================================================================
+
+#[test]
+fn apply_rejects_two_whole_dir_stores_on_same_target() {
+    let repo = Repo::new();
+    repo.make_store("s1", &[]);
+    repo.make_store("s2", &[]);
+    let target = repo.path().join("home").join("t");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.s1]
+target = "{target_str}"
+
+[stores.s2]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("both claim link path"))
+        .stderr(contains("store 's1'"))
+        .stderr(contains("store 's2'"));
+
+    // No symlink created: the rejection happens before any mutation.
+    assert!(!target.exists());
+}
+
+#[test]
+fn diff_rejects_two_whole_dir_stores_on_same_target() {
+    let repo = Repo::new();
+    repo.make_store("s1", &[]);
+    repo.make_store("s2", &[]);
+    let target = repo.path().join("home").join("t");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.s1]
+target = "{target_str}"
+
+[stores.s2]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("both claim link path"));
+
+    // `diff --exit-code` must not report eternal drift on a self-contradictory
+    // repo; it rejects the config instead.
+    repo.cmd()
+        .args(["diff", "--exit-code"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("both claim link path"));
+}
+
+#[test]
+fn apply_rejects_two_file_mode_stores_linking_same_file() {
+    let repo = Repo::new();
+    repo.make_store("s1", &["x"]);
+    repo.make_store("s2", &["x"]);
+    let target = repo.path().join("home").join("t");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.s1]
+target = "{target_str}"
+files = ["x"]
+
+[stores.s2]
+target = "{target_str}"
+files = ["x"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("both claim link path"))
+        .stderr(contains(&target.join("x").to_string_lossy().to_string()));
+}
+
+#[test]
+fn apply_allows_file_mode_stores_sharing_target_dir_with_disjoint_files() {
+    // The legitimate shared-directory pattern: two file-mode stores link
+    // different files into the same target directory. This must NOT be flagged
+    // as a collision.
+    let repo = Repo::new();
+    repo.make_store("alpha", &["keep"]);
+    repo.make_store("zeta", &["old", "new"]);
+    let home = repo.path().join("home");
+    let home_str = home.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.alpha]
+target = "{home_str}"
+files = ["keep"]
+
+[stores.zeta]
+target = "{home_str}"
+files = ["old", "new"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    assert!(home.join("keep").is_symlink());
+    assert!(home.join("old").is_symlink());
+    assert!(home.join("new").is_symlink());
+}
+
+#[test]
+fn apply_rejects_whole_dir_store_overlapping_file_mode_child() {
+    // A whole-dir store targeting ~/.config and a file-mode store linking into
+    // ~/.config/nvim: the whole-dir symlink would clobber the directory the
+    // file-mode store links into. Structurally incompatible -> rejected.
+    let repo = Repo::new();
+    repo.make_store("alpha", &[]);
+    repo.make_store("beta", &["init.lua"]);
+    let config = repo.path().join("home").join(".config");
+    repo.write_state(&format!(
+        r#"
+[stores.alpha]
+target = "{}"
+
+[stores.beta]
+target = "{}/nvim"
+files = ["init.lua"]
+"#,
+        config.display(),
+        config.display(),
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("both claim link path"));
+}
+
+#[test]
+fn apply_only_skips_collision_check_for_unselected_store() {
+    // `apply --only s1` must not error on s2's competing claim, because s2 is
+    // not being applied and cannot fight s1 on this run.
+    let repo = Repo::new();
+    repo.make_store("s1", &[]);
+    repo.make_store("s2", &[]);
+    let target = repo.path().join("home").join("t");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.s1]
+target = "{target_str}"
+
+[stores.s2]
+target = "{target_str}"
+"#
+    ));
+
+    repo.cmd()
+        .args(["apply", "--only", "s1"])
+        .assert()
+        .success();
+
+    assert!(target.is_symlink());
+    assert_eq!(
+        fs::read_link(&target).unwrap(),
+        repo.path().join("s1").canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn apply_orphaned_authored_store_reports_config_error_not_internal() {
+    // A store declared in stitch.toml but with no link inventory in state.toml
+    // (e.g. left behind by `remove`) is a user-facing config problem. It must
+    // surface as a config error (exit 3) with a fix hint, not an internal
+    // error (exit 1).
+    let repo = Repo::new();
+    repo.make_store("ghost", &["init.lua"]);
+    repo.write_authored(
+        r#"
+[stores.ghost]
+when = { os = "linux" }
+"#,
+    );
+    // No state.toml entry for `ghost` — orphaned authored behavior.
+    repo.write_state("");
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stdout(contains("ghost"))
+        .stdout(contains("no target configured"));
 }

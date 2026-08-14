@@ -146,7 +146,7 @@ fn resolve_override(path: &str, label: &str) -> Result<std::path::PathBuf, Stitc
     Ok(root.canonicalize().unwrap_or(root))
 }
 
-pub(crate) fn plan_error(plan: &plan::Plan) -> StitchError {
+pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
     let mut classes = BTreeSet::new();
     for store in &plan.stores {
         for op in &store.ops {
@@ -171,6 +171,6 @@ pub(crate) fn plan_error(plan: &plan::Plan) -> StitchError {
     let errors = plan.summary.errors;
     StitchError::apply(
         classes.into_iter().collect(),
-        format!("{conflicts} conflict(s), {errors} error(s)"),
+        format!("{command} reported {conflicts} conflict(s), {errors} error(s)"),
     )
 }

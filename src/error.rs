@@ -187,7 +187,7 @@ pub enum StitchError {
     #[error("hook failed: {name}: {detail}")]
     Hook { name: String, detail: String },
 
-    #[error("apply failed: {message}")]
+    #[error("{message}")]
     Apply {
         classes: Vec<FailureClass>,
         message: String,

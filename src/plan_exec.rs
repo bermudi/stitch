@@ -993,7 +993,7 @@ pub fn plan_exec_error(plan: &PlanFile) -> StitchError {
         return StitchError::plan_stale("plan reported conflicts or errors");
     }
     let message = format!(
-        "{} conflict(s), {} error(s)",
+        "apply --plan reported {} conflict(s), {} error(s)",
         plan.conflicts.len(),
         plan.errors.len()
     );
