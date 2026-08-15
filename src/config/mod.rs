@@ -24,7 +24,8 @@ pub use load::{
 pub use paths::{expand_home, find_root, is_safe_fragment, is_store_name};
 pub use state::{StateLock, atomic_write, validate_atomic_write_target};
 pub use types::{
-    AUTHORED_TEMPLATE, Config, GeneratedState, GeneratedStore, Hooks, Loaded, Store, WhenClause,
+    AUTHORED_TEMPLATE, Config, GeneratedState, GeneratedStore, GeneratedTarget, Hooks, Loaded,
+    Store, WhenClause,
 };
 
 pub(crate) use load::{hash_config_bytes, revalidate_config_hash};

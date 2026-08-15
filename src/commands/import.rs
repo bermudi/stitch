@@ -3,7 +3,7 @@ use super::prune::prune_roots;
 use crate::config::{self, Config};
 use crate::error::StitchError;
 use crate::platform::Platform;
-use crate::report::{self, ImportData, ImportedStore};
+use crate::report::{self, ImportData, ImportedStore, ImportedTarget};
 use crate::scan;
 use crate::store;
 
@@ -141,7 +141,10 @@ pub(crate) fn cmd_import(
             continue;
         }
 
-        let imported_store = if let Some(ref whole) = bucket.whole_dir_target {
+        // Build the report record and the generated state entry together so the
+        // two never diverge. `generated_entry` is None when there is nothing to
+        // import for this store (e.g. an empty bucket).
+        let (imported_store, generated_entry) = if let Some(ref whole) = bucket.whole_dir_target {
             // Whole-dir wins if present; file entries under the same store are
             // noted but not mixed (a store is one mode).
             if !bucket.files.is_empty() {
@@ -155,63 +158,129 @@ pub(crate) fn cmd_import(
                     eprintln!("warning: {msg}");
                 }
             }
-            if json {
-                ImportedStore {
-                    store: store_name.clone(),
-                    target: whole.clone(),
-                    mode: "whole-dir".into(),
-                    files: Vec::new(),
-                }
-            } else {
-                println!("  import '{store_name}' → {whole} (whole-dir)");
-                ImportedStore {
-                    store: store_name.clone(),
-                    target: whole.clone(),
-                    mode: "whole-dir".into(),
-                    files: Vec::new(),
-                }
-            }
-        } else if !bucket.files.is_empty() {
-            // All file links must share the same target parent.
-            let parents: std::collections::BTreeSet<_> = bucket.files.values().cloned().collect();
-            if parents.len() != 1 {
-                let msg = format!(
-                    "store '{store_name}': file links point at multiple target \
-                     dirs ({}); skipping",
-                    parents.into_iter().collect::<Vec<_>>().join(", ")
-                );
-                if json {
-                    warnings.push(msg);
-                } else {
-                    eprintln!("warning: {msg}");
-                }
-                continue;
-            }
-            let target = parents.into_iter().next().unwrap();
-            let files: Vec<String> = bucket.files.keys().cloned().collect();
             if !json {
-                println!(
-                    "  import '{store_name}' → {target} (files: {})",
-                    files.join(", ")
-                );
+                println!("  import '{store_name}' → {whole} (whole-dir)");
             }
-            ImportedStore {
+            let store = ImportedStore {
                 store: store_name.clone(),
-                target,
-                mode: "file-mode".into(),
-                files,
+                target: whole.clone(),
+                mode: "whole-dir".into(),
+                files: Vec::new(),
+                targets: Vec::new(),
+            };
+            let entry = config::GeneratedStore {
+                target: Some(whole.clone()),
+                files: vec![],
+                patterns: vec![],
+                targets: std::collections::BTreeMap::new(),
+            };
+            (store, Some(entry))
+        } else if !bucket.files.is_empty() {
+            // Group file links by their target parent. One parent → a plain
+            // single-target file-mode store; multiple parents → a stow-style
+            // fan-in, imported as a multi-target store (one named target per
+            // parent, each with its own file set) instead of being dropped.
+            let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (source_rel, parent) in &bucket.files {
+                groups
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(source_rel.clone());
+            }
+
+            if groups.len() == 1 {
+                let (target, mut files) = groups.into_iter().next().unwrap();
+                files.sort();
+                if !json {
+                    println!(
+                        "  import '{store_name}' → {target} (files: {})",
+                        files.join(", ")
+                    );
+                }
+                let store = ImportedStore {
+                    store: store_name.clone(),
+                    target,
+                    mode: "file-mode".into(),
+                    files,
+                    targets: Vec::new(),
+                };
+                let entry = config::GeneratedStore {
+                    target: Some(store.target.clone()),
+                    files: store.files.clone(),
+                    patterns: vec![],
+                    targets: std::collections::BTreeMap::new(),
+                };
+                (store, Some(entry))
+            } else {
+                // Stow-style fan-in: one store's links span several target
+                // dirs. Emit a multi-target store with one named target per
+                // parent. Names are positional (`target-{i}`, 1-indexed) with a
+                // `-N` collision suffix, matching `migrate`'s fallback so the
+                // cross-file join key is deterministic.
+                let mut seen: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                let mut report_targets: Vec<ImportedTarget> = Vec::new();
+                let mut gen_targets: std::collections::BTreeMap<String, config::GeneratedTarget> =
+                    std::collections::BTreeMap::new();
+                for (i, (target, mut files)) in groups.into_iter().enumerate() {
+                    files.sort();
+                    let base = format!("target-{}", i + 1);
+                    let mut name = base.clone();
+                    let mut n = 1;
+                    while seen.contains(&name) {
+                        name = format!("{base}-{n}");
+                        n += 1;
+                    }
+                    seen.insert(name.clone());
+                    if !json {
+                        println!(
+                            "  import '{store_name}' → {target} as {name} (files: {})",
+                            files.join(", ")
+                        );
+                    }
+                    report_targets.push(ImportedTarget {
+                        name: name.clone(),
+                        target: target.clone(),
+                        files: files.clone(),
+                    });
+                    gen_targets.insert(
+                        name,
+                        config::GeneratedTarget {
+                            target,
+                            files,
+                            patterns: vec![],
+                        },
+                    );
+                }
+                if !json {
+                    println!(
+                        "  import '{store_name}' (multi-target: {} target(s))",
+                        report_targets.len()
+                    );
+                }
+                let store = ImportedStore {
+                    store: store_name.clone(),
+                    target: String::new(),
+                    mode: "multi-target".into(),
+                    files: Vec::new(),
+                    targets: report_targets,
+                };
+                let entry = config::GeneratedStore {
+                    target: None,
+                    files: vec![],
+                    patterns: vec![],
+                    targets: gen_targets,
+                };
+                (store, Some(entry))
             }
         } else {
             continue;
         };
 
-        if !dry_run {
-            let entry = config::GeneratedStore {
-                target: Some(imported_store.target.clone()),
-                files: imported_store.files.clone(),
-                patterns: vec![],
-                targets: std::collections::BTreeMap::new(),
-            };
+        if let Some(entry) = generated_entry
+            && !dry_run
+        {
             loaded.generated.stores.insert(store_name.clone(), entry);
         }
         stores.push(imported_store);

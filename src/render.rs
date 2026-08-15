@@ -894,6 +894,16 @@ pub fn staged_differs(
 /// its staging tree are candidates; `remove_link` performs the final
 /// repo-ownership check immediately before unlinking, so foreign links are not
 /// clobbered.
+///
+/// The walk never descends into the repository itself. A file-mode store with
+/// `target = "~"` (the stow-mirror layout) walks all of `$HOME`; if the repo
+/// lives under `~`, descending into it would classify repo-internal
+/// organizational symlinks (e.g. `store/alias -> store/realfile`) as stale and
+/// `remove_link` them — eating the user's repo layout. Pruning the repo subtree
+/// also avoids walking the (potentially large) repo and its trees for every
+/// apply. The walk root is canonicalized so the prefix check against the
+/// canonical repo root stays exact when `target_path` has symlinked ancestors
+/// (e.g. a symlinked `$HOME`).
 pub fn reconcile_store_links(
     target_path: &Path,
     repo_root: &Path,
@@ -923,11 +933,27 @@ pub fn reconcile_store_links(
         }
     }
 
+    let repo_canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    // Walk the canonical target so `e.path()` starts from a canonical base and
+    // the `starts_with(repo_canon)` prune is exact even when `target_path`
+    // reaches the real directory through symlinked ancestors. The relative
+    // structure under the target is unchanged, so `keep_link_rels` still match.
+    let walk_root = target_path
+        .canonicalize()
+        .unwrap_or_else(|_| target_path.to_path_buf());
+    // Only prune the repo subtree when the target lives *outside* the repo —
+    // the stow-mirror case where `target = "~"` contains `~/dotfiles`. When
+    // the target itself is inside the repo, the whole walk is the target's
+    // own subtree and must not be pruned.
+    let target_in_repo = walk_root.starts_with(&repo_canon);
     let staging_dir = store_render_dir(repo_root, store_name);
     let mut stale = Vec::new();
-    for entry in walkdir::WalkDir::new(target_path)
+    for entry in walkdir::WalkDir::new(&walk_root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|e| target_in_repo || !e.path().starts_with(&repo_canon))
     {
         let entry = match entry {
             Ok(entry) => entry,
@@ -963,7 +989,7 @@ pub fn reconcile_store_links(
         }
 
         let path = entry.path();
-        let Ok(rel) = path.strip_prefix(target_path) else {
+        let Ok(rel) = path.strip_prefix(&walk_root) else {
             continue;
         };
         let rel = rel.to_string_lossy();

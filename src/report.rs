@@ -503,6 +503,20 @@ pub struct ImportedStore {
     pub mode: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// Present only for `multi-target` imports (stow-style fan-in: one store's
+    /// file links span several target dirs). Each entry is one named target
+    /// with its own file set. Empty for whole-dir and single-target file-mode
+    /// imports, which use `target`/`files` instead.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ImportedTarget>,
+}
+
+#[derive(Serialize)]
+pub struct ImportedTarget {
+    pub name: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 #[derive(Serialize)]
