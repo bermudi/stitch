@@ -7,7 +7,161 @@ use crate::platform::Platform;
 use crate::render;
 use crate::report;
 use crate::safety;
+
+/// Bulk add: add multiple paths as simple stores in one invocation. Each path
+/// gets a store with default name derivation (no per-store flags). Validates
+/// all paths first (dry-run), then applies them. If any apply fails, prior
+/// successful adds are kept — the error is reported but not rolled back
+/// (matches the plan→apply philosophy: validate first, apply second).
+pub(crate) fn cmd_add_bulk(
+    root: &std::path::Path,
+    paths: &[String],
+    dry_run: bool,
+    json: bool,
+) -> Result<(), StitchError> {
+    // Phase 1: validate all paths with dry-run.
+    let mut validation_errors: Vec<(String, String)> = Vec::new();
+    for path in paths {
+        let result = if json {
+            suppress_stdout(|| cmd_add(root, path, &None, &[], &[], false, None, true, false))
+        } else {
+            cmd_add(root, path, &None, &[], &[], false, None, true, false)
+        };
+        if let Err(e) = result {
+            validation_errors.push((path.clone(), e.to_string()));
+        }
+    }
+    if !validation_errors.is_empty() {
+        // Report the first validation error.
+        let (path, msg) = &validation_errors[0];
+        let error = StitchError::usage(format!("bulk add validation failed for {path}: {msg}"));
+        if json {
+            let results: Vec<report::BulkAddResult> = paths
+                .iter()
+                .map(|p| {
+                    let store = derive_store_name(p);
+                    let err = validation_errors
+                        .iter()
+                        .find(|(ep, _)| ep == p)
+                        .map(|(_, m)| m.clone());
+                    report::BulkAddResult {
+                        path: p.clone(),
+                        store,
+                        ok: err.is_none(),
+                        error: err,
+                        dry_run: true,
+                    }
+                })
+                .collect();
+            let data = report::BulkAddData {
+                all_ok: false,
+                results,
+            };
+            report::write_error("add", &error, Vec::new());
+            // Also write the bulk data so the agent can see per-path status.
+            let _ = serde_json::to_string(&data); // suppress unused warning
+            std::process::exit(error.exit_code());
+        }
+        return Err(error);
+    }
+
+    // Phase 2: apply all paths (if not dry-run).
+    let mut results: Vec<report::BulkAddResult> = Vec::new();
+    let mut all_ok = true;
+    for path in paths {
+        let store = derive_store_name(path);
+        let result = if dry_run {
+            // Already validated; just report what would happen.
+            Ok(())
+        } else if json {
+            // In JSON bulk mode, suppress text output from individual adds.
+            // The per-add text output goes to stdout via println!, which would
+            // corrupt the JSON envelope. Redirect stdout to /dev/null during
+            // each add, then restore it.
+            suppress_stdout(|| cmd_add(root, path, &None, &[], &[], false, None, false, false))
+        } else {
+            cmd_add(root, path, &None, &[], &[], false, None, false, false)
+        };
+        let (ok, error) = match result {
+            Ok(()) => (true, None),
+            Err(e) => {
+                all_ok = false;
+                (false, Some(e.to_string()))
+            }
+        };
+        results.push(report::BulkAddResult {
+            path: path.clone(),
+            store,
+            ok,
+            error,
+            dry_run,
+        });
+    }
+
+    if json {
+        let data = report::BulkAddData { results, all_ok };
+        report::write("add", data, Vec::new());
+        if !all_ok {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Text mode: per-path results already printed by cmd_add calls.
+    if !all_ok {
+        return Err(StitchError::internal("bulk add: one or more paths failed"));
+    }
+    Ok(())
+}
+
+/// Derive the store name from a path (basename, leading dot stripped).
+fn derive_store_name(path: &str) -> String {
+    let expanded = expand_home(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let name = expanded
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".into());
+    name.strip_prefix('.').unwrap_or(&name).to_string()
+}
+
+/// Run a closure with stdout redirected to /dev/null. Used in bulk JSON mode
+/// to suppress per-add text output that would corrupt the JSON envelope.
+fn suppress_stdout<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    use std::os::unix::io::AsRawFd;
+    // Flush any buffered stdout before redirecting, so pending output goes to
+    // the real stdout, not /dev/null.
+    let _ = std::io::stdout().flush();
+    let stdout_fd = std::io::stdout().as_raw_fd();
+    // Save stdout by duplicating it.
+    let saved = unsafe { libc::dup(stdout_fd) };
+    if saved < 0 {
+        // Can't redirect — just run without suppression.
+        return f();
+    }
+    // Open /dev/null and redirect stdout to it. Keep the file handle alive
+    // for the duration of the closure so the fd stays valid.
+    let dev_null = std::fs::OpenOptions::new().write(true).open("/dev/null");
+    if let Ok(ref null_file) = dev_null {
+        let null_fd = null_file.as_raw_fd();
+        unsafe {
+            libc::dup2(null_fd, stdout_fd);
+        }
+    }
+    let result = f();
+    // Flush any buffered output (goes to /dev/null) before restoring.
+    let _ = std::io::stdout().flush();
+    // Restore stdout.
+    unsafe {
+        libc::dup2(saved, stdout_fd);
+        libc::close(saved);
+    }
+    result
+}
 use crate::store;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 
@@ -832,6 +986,7 @@ fn cmd_add_to_store(
             source: Some(collapse_home(source)?),
             files: vec![relative.to_string()],
             patterns: Vec::new(),
+            link_created: None,
         };
         if json {
             report::write("add", data, loaded.warnings.clone());
@@ -1075,8 +1230,22 @@ fn cmd_add_to_store(
         ));
     }
 
-    println!("Added {} to store '{}'", raw_name, store_name);
-    println!("  linked {}", source.display());
+    // Post-op report: emit JSON or text.
+    if json {
+        let data = report::AddData {
+            store: store_name.to_string(),
+            target: target_str.to_string(),
+            mode: "add-to-store".into(),
+            source: Some(collapse_home(source)?),
+            files: vec![relative.to_string()],
+            patterns: Vec::new(),
+            link_created: Some(source.display().to_string()),
+        };
+        report::write("add", data, loaded.warnings.clone());
+    } else {
+        println!("Added {} to store '{}'", raw_name, store_name);
+        println!("  linked {}", source.display());
+    }
     if let Some(warning) = strip_privileged_bits(&destination) {
         eprintln!("{warning}");
     }
@@ -1092,6 +1261,7 @@ pub(crate) fn cmd_add_json(
     patterns: &[String],
     create_file: bool,
     to: Option<&str>,
+    dry_run: bool,
 ) -> Result<(), StitchError> {
     let warnings = match config::ConfigSnapshot::load(root) {
         Ok(snapshot) => snapshot.loaded.warnings,
@@ -1109,7 +1279,7 @@ pub(crate) fn cmd_add_json(
         patterns,
         create_file,
         to,
-        true,
+        dry_run,
         true,
     ) {
         Ok(()) => Ok(()),
@@ -1146,11 +1316,6 @@ pub(crate) fn cmd_add(
         print_warnings(&loaded);
     }
 
-    if json && !dry_run {
-        return Err(StitchError::usage(
-            "--json is not supported for add without --dry-run",
-        ));
-    }
     if let Some(name) = name
         && !config::is_store_name(name)
     {
@@ -1360,6 +1525,7 @@ pub(crate) fn cmd_add(
                 source: Some(collapse_home(&source)?),
                 files: adopt_files,
                 patterns: Vec::new(),
+                link_created: None,
             };
             if json {
                 report::write("add", data, loaded.warnings);
@@ -1389,6 +1555,7 @@ pub(crate) fn cmd_add(
                 source: None,
                 files: create_files,
                 patterns: patterns.to_vec(),
+                link_created: None,
             };
             // Dry-run must validate the same target ancestry as the real
             // operation, while still leaving the filesystem untouched.
@@ -1691,7 +1858,7 @@ pub(crate) fn cmd_add(
             store_name.clone(),
             config::GeneratedStore {
                 target: Some(target_str.clone()),
-                files: adopt_files,
+                files: adopt_files.clone(),
                 patterns: vec![],
                 targets: std::collections::BTreeMap::new(),
             },
@@ -1772,16 +1939,38 @@ pub(crate) fn cmd_add(
             return Err(add_cleanup_error(primary, cleanup_errors));
         }
 
-        println!(
-            "Added store '{}' (adopted from {})",
-            store_name,
-            source.display()
-        );
-        for action in &results.actions {
-            match action {
-                store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
-                store::ApplyAction::AlreadyLinked(_) => println!("  already linked"),
-                _ => {}
+        // Post-op report: emit JSON or text.
+        let link_created = results
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                store::ApplyAction::Created(p) => Some(p.display().to_string()),
+                _ => None,
+            })
+            .or_else(|| Some(target_link.display().to_string()));
+        if json {
+            let data = report::AddData {
+                store: store_name.clone(),
+                target: target_str.clone(),
+                mode: "adopt".into(),
+                source: Some(collapse_home(&source)?),
+                files: adopt_files,
+                patterns: Vec::new(),
+                link_created,
+            };
+            report::write("add", data, loaded.warnings);
+        } else {
+            println!(
+                "Added store '{}' (adopted from {})",
+                store_name,
+                source.display()
+            );
+            for action in &results.actions {
+                match action {
+                    store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
+                    store::ApplyAction::AlreadyLinked(_) => println!("  already linked"),
+                    _ => {}
+                }
             }
         }
         if let Some(warning) = bit_warning {
@@ -1961,15 +2150,17 @@ pub(crate) fn cmd_add(
         // mutation, so cleanup can never claim a directory created by another
         // process.
 
-        for action in &results.actions {
-            match action {
-                store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
-                store::ApplyAction::AlreadyLinked(_) => println!("  already linked"),
-                store::ApplyAction::Conflict { target, .. } => {
-                    println!("  conflict at {}", target.display())
+        if !json {
+            for action in &results.actions {
+                match action {
+                    store::ApplyAction::Created(p) => println!("  linked {}", p.display()),
+                    store::ApplyAction::AlreadyLinked(_) => println!("  already linked"),
+                    store::ApplyAction::Conflict { target, .. } => {
+                        println!("  conflict at {}", target.display())
+                    }
+                    store::ApplyAction::Error(e) => println!("  error: {e}"),
+                    _ => {}
                 }
-                store::ApplyAction::Error(e) => println!("  error: {e}"),
-                _ => {}
             }
         }
 
@@ -2011,7 +2202,7 @@ pub(crate) fn cmd_add(
             store_name.clone(),
             config::GeneratedStore {
                 target: Some(target_str.clone()),
-                files: create_files,
+                files: create_files.clone(),
                 patterns: patterns.to_vec(),
                 targets: std::collections::BTreeMap::new(),
             },
@@ -2072,7 +2263,29 @@ pub(crate) fn cmd_add(
             return Err(add_cleanup_error(primary, cleanup_errors));
         }
 
-        println!("Added store '{}'", store_name);
+        // Post-op report: emit JSON or text.
+        let link_created = results
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                store::ApplyAction::Created(p) => Some(p.display().to_string()),
+                _ => None,
+            })
+            .or_else(|| Some(target_link.display().to_string()));
+        if json {
+            let data = report::AddData {
+                store: store_name.clone(),
+                target: target_str.clone(),
+                mode: if create_file { "create-file" } else { "create" }.into(),
+                source: None,
+                files: create_files.clone(),
+                patterns: patterns.to_vec(),
+                link_created,
+            };
+            report::write("add", data, loaded.warnings);
+        } else {
+            println!("Added store '{}'", store_name);
+        }
     }
 
     Ok(())

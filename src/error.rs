@@ -6,6 +6,7 @@
 
 use crate::config::ConfigError;
 use crate::linker::LinkError;
+use serde::Serialize;
 use std::path::PathBuf;
 
 /// Failure class. Each variant maps to a stable exit code and a generic hint.
@@ -137,6 +138,87 @@ impl FailureClass {
     }
 }
 
+/// A machine-readable recovery action for an error. Appears in the JSON
+/// envelope's `error.recoverable_via` array so an agent can branch without
+/// parsing the prose `hint`.
+///
+/// Kinds:
+/// - `force-apply` — run `apply --force` to back up and replace conflicts.
+/// - `adopt` — run `add <path>` to move the conflicting file into the repo.
+/// - `edit-template` — run `edit <source>` to open the template for fixing.
+/// - `list` — run `list` to see valid stores.
+/// - `init` — run `init` to create a new repo.
+/// - `migrate` — run `migrate` to convert a v0.2 config.
+/// - `replan` — run `plan` to capture a fresh plan.
+/// - `apply` — run `apply` to reconcile drift.
+/// - `manual` — no stitch command can fix this; `reason` explains why. The
+///   agent should escalate rather than retry stitch commands.
+/// - `set-env` — set environment variables (listed in `vars`) and retry.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryAction {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vars: Vec<String>,
+}
+
+impl RecoveryAction {
+    /// A recovery that runs a stitch command with no flags or args.
+    fn command(kind: &str, command: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            command: Some(command.to_string()),
+            flags: Vec::new(),
+            args: Vec::new(),
+            reason: None,
+            vars: Vec::new(),
+        }
+    }
+
+    /// A recovery that runs a stitch command with flags.
+    fn with_flags(kind: &str, command: &str, flags: &[&str]) -> Self {
+        Self {
+            kind: kind.to_string(),
+            command: Some(command.to_string()),
+            flags: flags.iter().map(|s| s.to_string()).collect(),
+            args: Vec::new(),
+            reason: None,
+            vars: Vec::new(),
+        }
+    }
+
+    /// A recovery that runs a stitch command with positional args.
+    fn with_args(kind: &str, command: &str, args: &[String]) -> Self {
+        Self {
+            kind: kind.to_string(),
+            command: Some(command.to_string()),
+            flags: Vec::new(),
+            args: args.to_vec(),
+            reason: None,
+            vars: Vec::new(),
+        }
+    }
+
+    /// A manual recovery — no stitch command; the agent should escalate.
+    fn manual(reason: &str) -> Self {
+        Self {
+            kind: "manual".to_string(),
+            command: None,
+            flags: Vec::new(),
+            args: Vec::new(),
+            reason: Some(reason.to_string()),
+            vars: Vec::new(),
+        }
+    }
+}
+
 /// A typed, branchable stitch error. The `exit_code` and `hint` are derived
 /// from the failure class; `thiserror` provides the human message.
 #[derive(Debug, thiserror::Error)]
@@ -185,12 +267,23 @@ pub enum StitchError {
     PathValidation { message: String },
 
     #[error("hook failed: {name}: {detail}")]
-    Hook { name: String, detail: String },
+    Hook {
+        name: String,
+        detail: String,
+        /// Store name for per-store hooks; None for global hooks.
+        store: Option<String>,
+        /// "global" or "per-store".
+        scope: String,
+    },
 
     #[error("{message}")]
     Apply {
         classes: Vec<FailureClass>,
         message: String,
+        /// Structured details (JSON string) for aggregate errors where the
+        /// single class has structured info (e.g. hook store/scope). Populated
+        /// by `plan_error` when the only class is `Hook`.
+        details: Option<String>,
     },
 
     #[error("mixed failures: {message}")]
@@ -285,6 +378,22 @@ impl StitchError {
         Self::Hook {
             name: name.into(),
             detail: detail.into(),
+            store: None,
+            scope: "global".into(),
+        }
+    }
+
+    /// Create a hook error with store and scope context (for per-store hooks).
+    pub fn hook_store(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        store: impl Into<String>,
+    ) -> Self {
+        Self::Hook {
+            name: name.into(),
+            detail: detail.into(),
+            store: Some(store.into()),
+            scope: "per-store".into(),
         }
     }
 
@@ -292,6 +401,7 @@ impl StitchError {
         Self::Apply {
             classes,
             message: message.into(),
+            details: None,
         }
     }
 
@@ -395,6 +505,87 @@ impl StitchError {
             Self::PlanStale { .. } => FailureClass::PlanStale.hint(),
             Self::Doctor { .. } => FailureClass::Doctor.hint(),
             Self::Drift { .. } => FailureClass::Drift.hint(),
+        }
+    }
+
+    /// Machine-readable structured details for this error, serialized as a
+    /// JSON string in the envelope's `error.details` field. Currently
+    /// populated only for `Hook` errors (store, scope, hook name).
+    pub fn details(&self) -> Option<String> {
+        match self {
+            Self::Hook {
+                name, store, scope, ..
+            } => {
+                let store_json = store
+                    .as_ref()
+                    .map(|s| format!("\"{s}\""))
+                    .unwrap_or_else(|| "null".to_string());
+                Some(format!(
+                    r#"{{"hook":"{name}","store":{store_json},"scope":"{scope}"}}"#
+                ))
+            }
+            Self::Apply { details, .. } => details.clone(),
+            _ => None,
+        }
+    }
+
+    /// Machine-readable recovery actions for this error. Empty when the error
+    /// is not recoverable via a stitch command (e.g. `internal`, `usage`,
+    /// `path-validation`). `manual` entries signal "escalate, don't retry."
+    ///
+    /// For `Apply` with a single failure class, delegates to that class's
+    /// generic recovery (without target-specific args — the agent should
+    /// consult the plan's `conflict`/`error` ops in the JSON `data` field for
+    /// per-entry targets). `Apply` with multiple classes and `Mixed` return
+    /// empty; the per-entry detail is in the plan ops.
+    pub fn recoverable_via(&self) -> Vec<RecoveryAction> {
+        match self {
+            Self::Internal { .. } | Self::Io { .. } | Self::IoContext { .. } => vec![],
+            Self::Usage { .. } => vec![],
+            Self::Config(source) => match source {
+                ConfigError::LegacyV02(_) => vec![RecoveryAction::command("migrate", "migrate")],
+                _ => vec![],
+            },
+            Self::RepoResolution { .. } => vec![RecoveryAction::command("init", "init")],
+            Self::UnknownStore { .. } => vec![RecoveryAction::command("list", "list")],
+            Self::ConflictReal { target } => vec![
+                RecoveryAction::with_flags("force-apply", "apply", &["--force"]),
+                RecoveryAction::with_args("adopt", "add", &[target.display().to_string()]),
+            ],
+            Self::ConflictForeign { .. } => vec![RecoveryAction::manual(
+                "foreign symlinks are never auto-clobbered; remove or repoint the symlink manually",
+            )],
+            Self::Render { source_path, .. } => vec![RecoveryAction::with_args(
+                "edit-template",
+                "edit",
+                &[source_path.display().to_string()],
+            )],
+            Self::PathValidation { .. } => vec![],
+            Self::Hook { name, .. } => vec![RecoveryAction::manual(&format!(
+                "fix or disable the `{name}` hook"
+            ))],
+            Self::Apply { classes, .. } => match classes.as_slice() {
+                // Single class: delegate to generic recovery for that class.
+                // Target-specific args are unavailable at the aggregate level;
+                // the agent should consult the plan ops in `data` for per-entry targets.
+                [FailureClass::ConflictReal] => vec![RecoveryAction::with_flags(
+                    "force-apply",
+                    "apply",
+                    &["--force"],
+                )],
+                [FailureClass::ConflictForeign] => vec![RecoveryAction::manual(
+                    "foreign symlinks are never auto-clobbered; remove or repoint the symlink manually",
+                )],
+                [FailureClass::Render] => vec![RecoveryAction::manual(
+                    "fix the failing template(s); see per-entry errors in the plan",
+                )],
+                [FailureClass::Drift] => vec![RecoveryAction::command("apply", "apply")],
+                _ => vec![],
+            },
+            Self::Mixed { .. } => vec![],
+            Self::PlanStale { .. } => vec![RecoveryAction::command("replan", "plan")],
+            Self::Doctor { .. } => vec![],
+            Self::Drift { .. } => vec![RecoveryAction::command("apply", "apply")],
         }
     }
 }
@@ -812,5 +1003,170 @@ mod tests {
         ] {
             assert!(!err.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn recoverable_via_conflict_real_offers_force_and_adopt() {
+        let err = StitchError::conflict_real("/home/user/.gitconfig");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].kind, "force-apply");
+        assert_eq!(actions[0].command.as_deref(), Some("apply"));
+        assert_eq!(actions[0].flags, vec!["--force"]);
+        assert!(actions[0].args.is_empty());
+
+        assert_eq!(actions[1].kind, "adopt");
+        assert_eq!(actions[1].command.as_deref(), Some("add"));
+        assert_eq!(actions[1].args, vec!["/home/user/.gitconfig"]);
+    }
+
+    #[test]
+    fn recoverable_via_conflict_foreign_is_manual() {
+        let err = StitchError::conflict_foreign("/t", Some(PathBuf::from("/r")));
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "manual");
+        assert!(actions[0].command.is_none());
+        assert!(actions[0].reason.is_some());
+        // Red line: foreign symlinks are never auto-clobbered.
+        assert!(
+            actions[0]
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("never auto-clobbered")
+        );
+    }
+
+    #[test]
+    fn recoverable_via_render_offers_edit_template() {
+        let err = StitchError::render("/repo/git/gitconfig.tmpl", "missing env");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "edit-template");
+        assert_eq!(actions[0].command.as_deref(), Some("edit"));
+        assert_eq!(actions[0].args, vec!["/repo/git/gitconfig.tmpl"]);
+    }
+
+    #[test]
+    fn recoverable_via_hook_is_manual() {
+        let err = StitchError::hook("pre-apply", "exit 1");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "manual");
+        assert!(actions[0].reason.as_ref().unwrap().contains("pre-apply"));
+    }
+
+    #[test]
+    fn recoverable_via_drift_offers_apply() {
+        let err = StitchError::drift(3);
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "apply");
+        assert_eq!(actions[0].command.as_deref(), Some("apply"));
+    }
+
+    #[test]
+    fn recoverable_via_plan_stale_offers_replan() {
+        let err = StitchError::plan_stale("config changed");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "replan");
+        assert_eq!(actions[0].command.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn recoverable_via_unknown_store_offers_list() {
+        let err = StitchError::unknown_store(vec!["foo".into()], vec!["bar".into()]);
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "list");
+        assert_eq!(actions[0].command.as_deref(), Some("list"));
+    }
+
+    #[test]
+    fn recoverable_via_repo_resolution_offers_init() {
+        let err = StitchError::repo_resolution("cwd", "/tmp");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "init");
+        assert_eq!(actions[0].command.as_deref(), Some("init"));
+    }
+
+    #[test]
+    fn recoverable_via_config_legacy_offers_migrate() {
+        let err = StitchError::config(ConfigError::LegacyV02(PathBuf::from("/p")));
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "migrate");
+        assert_eq!(actions[0].command.as_deref(), Some("migrate"));
+    }
+
+    #[test]
+    fn recoverable_via_unrecoverable_is_empty() {
+        // These errors have no stitch-command recovery path.
+        for err in [
+            StitchError::internal("x"),
+            StitchError::usage("x"),
+            StitchError::path_validation("bad"),
+            StitchError::doctor(1),
+        ] {
+            assert!(
+                err.recoverable_via().is_empty(),
+                "{:?} should have no recovery actions",
+                err.class()
+            );
+        }
+    }
+
+    #[test]
+    fn recoverable_via_apply_single_class_delegates() {
+        // Single conflict-real class → force-apply (no target-specific args).
+        let err = StitchError::apply(vec![FailureClass::ConflictReal], "m");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "force-apply");
+        assert_eq!(actions[0].command.as_deref(), Some("apply"));
+
+        // Single conflict-foreign class → manual.
+        let err = StitchError::apply(vec![FailureClass::ConflictForeign], "m");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "manual");
+    }
+
+    #[test]
+    fn recoverable_via_apply_multi_class_and_mixed_are_empty() {
+        // Multiple classes → empty; per-entry recovery is in the plan ops.
+        let err = StitchError::apply(vec![FailureClass::ConflictReal, FailureClass::Render], "m");
+        assert!(err.recoverable_via().is_empty());
+
+        let err = StitchError::Mixed {
+            classes: vec![FailureClass::ConflictReal, FailureClass::Render],
+            message: "m".into(),
+        };
+        assert!(err.recoverable_via().is_empty());
+    }
+
+    #[test]
+    fn recovery_action_serializes_minimal_fields() {
+        let action = RecoveryAction::command("list", "list");
+        let v = serde_json::to_value(&action).unwrap();
+        assert_eq!(v["kind"], "list");
+        assert_eq!(v["command"], "list");
+        // Optional fields are skipped when empty
+        assert!(v.get("flags").is_none());
+        assert!(v.get("args").is_none());
+        assert!(v.get("reason").is_none());
+        assert!(v.get("vars").is_none());
+    }
+
+    #[test]
+    fn recovery_action_manual_serializes_reason_only() {
+        let action = RecoveryAction::manual("escalate");
+        let v = serde_json::to_value(&action).unwrap();
+        assert_eq!(v["kind"], "manual");
+        assert!(v.get("command").is_none());
+        assert_eq!(v["reason"], "escalate");
     }
 }

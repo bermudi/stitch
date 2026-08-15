@@ -177,20 +177,36 @@ pub(crate) fn cmd_migrate(
         )
     })?;
 
-    println!("Migrated v0.2 config:");
-    println!("  wrote {}", authored_path.display());
-    println!("  wrote {}", state_path.display());
-    println!(
-        "  backed up {} → {}",
-        legacy_path.display(),
-        backup_path.display()
-    );
-    eprintln!(
-        "note: comments in the old config were not carried into stitch.toml \
-         (structural conversion drops them). The original is preserved at {}. \
-         Re-add any comments you want to keep.",
-        backup_path.display()
-    );
+    if json {
+        let data = MigrateData {
+            authored_path: Some(authored_path.to_string_lossy().into_owned()),
+            authored: Some(authored_str),
+            state_path: Some(state_path.to_string_lossy().into_owned()),
+            state: Some(state_str),
+        };
+        let mut warnings = durability_warnings.clone();
+        warnings.push(format!(
+            "comments in the old config were not carried into stitch.toml \
+             (structural conversion drops them). The original is preserved at {}",
+            backup_path.display()
+        ));
+        report::write("migrate", data, warnings);
+    } else {
+        println!("Migrated v0.2 config:");
+        println!("  wrote {}", authored_path.display());
+        println!("  wrote {}", state_path.display());
+        println!(
+            "  backed up {} → {}",
+            legacy_path.display(),
+            backup_path.display()
+        );
+        eprintln!(
+            "note: comments in the old config were not carried into stitch.toml \
+             (structural conversion drops them). The original is preserved at {}. \
+             Re-add any comments you want to keep.",
+            backup_path.display()
+        );
+    }
     if !durability_warnings.is_empty() {
         return Err(StitchError::internal(format!(
             "migration completed, but its config directory could not be synced: {}",

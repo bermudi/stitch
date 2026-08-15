@@ -953,7 +953,8 @@ fn run_store_pre_hook(
             target: store.target.as_deref(),
             action: "apply",
         };
-        hooks::run_store_hook(pre, &env, platform).map_err(|e| StitchError::hook("pre", e))?;
+        hooks::run_store_hook(pre, &env, platform)
+            .map_err(|e| StitchError::hook_store("pre", e, store_name))?;
     }
     Ok(())
 }

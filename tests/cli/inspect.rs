@@ -2345,3 +2345,638 @@ fn list_allows_targetless_store_with_no_files() {
         .stdout(contains("behavior"))
         .stdout(contains("(no target)"));
 }
+
+#[test]
+fn explain_json_resolves_active_and_skipped_stores() {
+    // `explain --json` emits the fully-resolved desired state with `active`
+    // reflecting the current host's `when` evaluation. A platform-skipped
+    // store must appear with `active: false`.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.make_store("shells", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.shells]
+target = "~"
+files = [".bashrc"]
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+    repo.write_authored(
+        r#"
+[stores.shells]
+when = { os = "linux" }
+
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(output.status.success(), "explain --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "explain", true);
+    let stores = value["data"]["stores"].as_array().expect("stores array");
+    // Three stores, sorted by name (BTreeMap): macos-only, nvim, shells.
+    assert_eq!(stores.len(), 3);
+    let by_name: std::collections::HashMap<&str, &Value> = stores
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap(), s))
+        .collect();
+    // macos-only is skipped on linux.
+    assert_eq!(by_name["macos-only"]["active"], false);
+    assert_eq!(by_name["macos-only"]["mode"], "whole-dir");
+    // nvim is active, whole-dir, no entries (WholeDir mode).
+    assert_eq!(by_name["nvim"]["active"], true);
+    assert_eq!(by_name["nvim"]["mode"], "whole-dir");
+    // shells is active, file-mode, with one resolved entry.
+    assert_eq!(by_name["shells"]["active"], true);
+    assert_eq!(by_name["shells"]["mode"], "file-mode");
+    let entries = by_name["shells"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["source"], ".bashrc");
+    assert_eq!(entries[0]["templated"], false);
+    assert_eq!(entries[0]["link_name"], ".bashrc");
+    // Platform is reported.
+    assert!(value["data"]["platform"]["os"].is_string());
+    assert!(value["data"]["platform"]["hostname"].is_string());
+}
+
+#[test]
+fn explain_json_active_only_filters_skipped() {
+    // `--active-only` filters out stores whose `when` does not match.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+    repo.write_authored(
+        r#"
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let output = repo
+        .cmd()
+        .args(["--json", "explain", "--active-only"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let stores = value["data"]["stores"].as_array().unwrap();
+    // Only nvim (active on linux); macos-only is filtered out.
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0]["name"], "nvim");
+    assert_eq!(stores[0]["active"], true);
+}
+
+#[test]
+fn explain_json_reports_template_entries() {
+    // A `.tmpl` source must be reported with `templated: true` and the link
+    // name with `.tmpl` stripped.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig.tmpl"]);
+    repo.write_state(
+        r#"
+[stores.git]
+target = "~/.config/git"
+files = ["gitconfig.tmpl"]
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let stores = value["data"]["stores"].as_array().unwrap();
+    assert_eq!(stores.len(), 1);
+    let entries = stores[0]["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["source"], "gitconfig.tmpl");
+    assert_eq!(entries[0]["templated"], true);
+    assert_eq!(entries[0]["link_name"], "gitconfig");
+}
+
+#[test]
+fn explain_text_mode_prints_summary() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+    repo.write_authored(
+        r#"
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let output = repo.cmd().arg("explain").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("platform:"),
+        "text mode prints platform: {stdout}"
+    );
+    assert!(
+        stdout.contains("nvim [active]"),
+        "active store shown: {stdout}"
+    );
+    assert!(
+        stdout.contains("macos-only [skipped]"),
+        "skipped store shown: {stdout}"
+    );
+}
+
+#[test]
+fn schema_json_emits_canonical_schema() {
+    // `schema --json` emits the canonical agent schema in the envelope. It
+    // doesn't need a repo (meta command).
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .args(["--json", "schema"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "schema --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "schema", true);
+    let data = &value["data"];
+    // Top-level keys present.
+    assert_eq!(data["schema_version"], 1);
+    assert!(data["envelope"].is_object(), "envelope shape present");
+    assert!(data["error"].is_object(), "error shape present");
+    assert!(
+        data["recoverable_via"].is_object(),
+        "recoverable_via shape present"
+    );
+    assert!(data["commands"].is_object(), "commands table present");
+    assert!(data["shapes"].is_object(), "shapes table present");
+    assert!(data["exit_codes"].is_array(), "exit_codes table present");
+    // Every command documented in the schema.
+    let commands = data["commands"].as_object().unwrap();
+    for cmd in [
+        "status", "list", "diff", "plan", "apply", "doctor", "prune", "render", "add", "remove",
+        "migrate", "import", "explain", "schema",
+    ] {
+        assert!(commands.contains_key(cmd), "schema.commands missing {cmd}");
+    }
+    // BulkAddData shape is documented for bulk add.
+    let shapes = data["shapes"].as_object().unwrap();
+    assert!(
+        shapes.contains_key("BulkAddData"),
+        "schema.shapes missing BulkAddData"
+    );
+    assert!(
+        shapes.contains_key("BulkAddResult"),
+        "schema.shapes missing BulkAddResult"
+    );
+    // Error details field documents hook detail shape.
+    let error_details = data["error"]["fields"]["details"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        error_details.contains("hook"),
+        "error.details description should mention hook: {error_details}"
+    );
+}
+
+#[test]
+fn schema_text_mode_emits_pretty_json() {
+    // Text mode pretty-prints the schema document (still JSON, just readable).
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .arg("schema")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Should be valid JSON (pretty-printed).
+    let value: Value = serde_json::from_str(&stdout).expect("text mode emits valid JSON");
+    assert_eq!(value["schema_version"], 1);
+}
+
+#[test]
+fn schema_consistency_every_cli_command_is_documented() {
+    // Consistency check: every command the CLI accepts must have an entry in
+    // docs/agent-schema.json. This catches drift between the schema file and
+    // the actual CLI surface.
+    let schema_output = Command::cargo_bin("stitch")
+        .unwrap()
+        .args(["--json", "schema"])
+        .output()
+        .unwrap();
+    assert!(schema_output.status.success());
+    let schema = json_output(&schema_output);
+    let documented: std::collections::HashSet<String> = schema["data"]["commands"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    // Every command in the CLI enum (from --help) must be documented.
+    let help_output = Command::cargo_bin("stitch")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8(help_output.stdout).unwrap();
+    // The help text lists subcommands. Check the ones we expose.
+    for cmd in [
+        "init", "apply", "plan", "status", "diff", "list", "add", "remove", "edit", "doctor",
+        "import", "migrate", "prune", "render", "explain", "schema", "why", "log",
+    ] {
+        assert!(help.contains(cmd), "CLI help should list {cmd}");
+        // init and edit don't support --json, so they're not in the schema's
+        // commands table (which documents --json data shapes). Skip them.
+        if cmd != "init" && cmd != "edit" {
+            assert!(
+                documented.contains(cmd),
+                "schema.commands missing {cmd} (CLI exposes it)"
+            );
+        }
+    }
+}
+
+#[test]
+fn why_json_reports_owner_of_linked_target() {
+    // `why <target>` finds the store that owns a path and reports its source
+    // and link state.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    // Apply to create the link.
+    repo.cmd().arg("apply").assert().success();
+
+    let target = home.join(".bashrc");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "shells");
+    assert_eq!(entry["target"], target.to_string_lossy().as_ref());
+    assert_eq!(
+        entry["source"],
+        repo.path()
+            .join("shells/.bashrc")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(entry["templated"], false);
+    assert_eq!(entry["state"], "linked");
+    assert_eq!(entry["owning_config"], "state.toml");
+}
+
+#[test]
+fn why_json_reports_missing_for_unlinked_target() {
+    // Before apply, the target doesn't exist — `why` reports state: missing.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let target = home.join(".bashrc");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "shells");
+    assert_eq!(entry["state"], "missing");
+}
+
+#[test]
+fn why_json_reports_no_owner_for_unmanaged_path() {
+    // A path no store references has no entry.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        repo.path().join("home").to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", "/tmp/nonexistent/path"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert!(
+        value["data"]["entry"].is_null(),
+        "no entry for unmanaged path"
+    );
+}
+
+#[test]
+fn why_json_reports_skipped_platform() {
+    // A path under a store skipped on this host reports skipped_platform.
+    let repo = Repo::new();
+    repo.make_store("macos-only", &["config"]);
+    repo.write_state(&format!(
+        r#"
+[stores.macos-only]
+target = "{}/.config/macos"
+"#,
+        repo.path().join("home").to_string_lossy(),
+    ));
+    repo.write_authored(
+        r#"
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let target = repo.path().join("home").join(".config").join("macos");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert!(value["data"]["entry"].is_null(), "no active entry");
+    assert_eq!(value["data"]["skipped_platform"], true);
+}
+
+#[test]
+fn edit_print_path_resolves_store_name() {
+    // `edit <store> --print-path` prints the repo source path without
+    // launching an editor. This is the agent-friendly path.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    let output = repo
+        .cmd()
+        .args(["edit", "nvim", "--print-path"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let expected = repo.path().join("nvim").to_string_lossy().into_owned();
+    assert_eq!(stdout.trim(), expected);
+}
+
+#[test]
+fn edit_print_path_resolves_stitch_toml() {
+    // `edit --print-path` (no entry) prints the stitch.toml path.
+    let repo = Repo::new();
+
+    let output = repo.cmd().args(["edit", "--print-path"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let expected = repo
+        .path()
+        .join("stitch.toml")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(stdout.trim(), expected);
+}
+
+#[test]
+fn audit_log_records_successful_apply() {
+    // A successful `apply` appends an audit-log entry with outcome: "ok".
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+    let entries = value["data"].as_array().expect("log entries array");
+    assert!(!entries.is_empty(), "log should have at least one entry");
+    let last = entries.last().unwrap();
+    assert_eq!(last["command"], "apply");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+    assert!(last["timestamp"].is_string());
+}
+
+#[test]
+fn audit_log_records_failed_apply() {
+    // A failed `apply` (conflict) appends an entry with outcome: "error"
+    // and the exit class.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    // Apply fails with conflict-real (exit 6).
+    repo.cmd().arg("apply").assert().failure().code(6);
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().unwrap();
+    assert_eq!(last["command"], "apply");
+    assert_eq!(last["outcome"], "error");
+    assert_eq!(last["exit_class"], "conflict-real");
+    assert_eq!(last["exit_code"], 6);
+}
+
+#[test]
+fn audit_log_limit_returns_tail() {
+    // `--limit N` returns only the last N entries.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // Run apply twice to create two log entries.
+    repo.cmd().arg("apply").assert().success();
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "log", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "limit should return only 1 entry");
+}
+
+#[test]
+fn audit_log_empty_when_no_mutations() {
+    // A fresh repo with no mutations has an empty log.
+    let repo = Repo::new();
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(entries.is_empty(), "log should be empty");
+}
+
+#[test]
+fn bulk_add_json_adds_multiple_paths() {
+    // `add path1 path2 --json` adds both paths as simple stores and returns
+    // a BulkAddData envelope with per-path results.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".config").join("nvim")).unwrap();
+    fs::write(
+        home.path().join(".config").join("nvim").join("init.lua"),
+        "nvim",
+    )
+    .unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            home.path().join(".config/nvim").to_str().unwrap(),
+            home.path().join(".bashrc").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "bulk add should succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+    let results = value["data"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "two paths added");
+    assert_eq!(results[0]["store"], "nvim");
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[1]["store"], "bashrc");
+    assert_eq!(results[1]["ok"], true);
+    assert_eq!(value["data"]["all_ok"], true);
+}
+
+#[test]
+fn bulk_add_dry_run_json() {
+    // `add path1 path2 --dry-run --json` validates without mutating.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".config").join("nvim")).unwrap();
+    fs::write(
+        home.path().join(".config").join("nvim").join("init.lua"),
+        "nvim",
+    )
+    .unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            home.path().join(".config/nvim").to_str().unwrap(),
+            home.path().join(".bashrc").to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let results = value["data"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["dry_run"], true);
+    assert_eq!(results[1]["dry_run"], true);
+    // No actual store dirs created.
+    assert!(!repo.path().join("nvim").exists());
+    assert!(!repo.path().join("bashrc").exists());
+}
+
+#[test]
+fn bulk_add_rejects_per_store_flags() {
+    // `add path1 path2 --name foo` is rejected: per-store flags don't work
+    // in bulk mode.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            home.path().join(".bashrc").to_str().unwrap(),
+            home.path().join(".zshrc").to_str().unwrap(),
+            "--name",
+            "foo",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "should reject --name in bulk mode"
+    );
+}

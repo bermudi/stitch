@@ -329,6 +329,11 @@ fn apply_json(
         )));
     }
 
+    // Build the `desired` half of the composite envelope from the pre-apply
+    // config. This is the host-evaluated merge — what the world should look
+    // like — so the agent doesn't need a separate `explain` call.
+    let desired = super::explain::build_explain_data(root, config, &platform, false);
+
     if !opts.dry_run {
         // Pin $HOME identity (including the resolved directory behind a
         // symlinked $HOME) across the global pre-apply hook.
@@ -401,13 +406,91 @@ fn apply_json(
         }
     }
 
+    // Build `result`: per-op execution outcome. On dry-run, `result` is null.
+    let result = if opts.dry_run {
+        None
+    } else {
+        Some(build_apply_result(&plan))
+    };
+
+    // Build `post_status`: re-run status for the applied stores after
+    // execution. On dry-run this reflects pre-apply state (still useful —
+    // it shows the agent what's already converged).
+    let post_status = build_post_status(root, config, &platform);
+
+    let data = report::ApplyData {
+        desired,
+        plan: plan.clone(),
+        result,
+        post_status,
+    };
+
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
         let error = plan_error(&plan, command);
-        report::write_data_error(command, plan, &error, warnings);
+        report::write_data_error(command, data, &error, warnings);
     }
 
-    report::write(command, plan, warnings);
+    report::write(command, data, warnings);
     Ok(())
+}
+
+/// Build the per-store execution result summary from the plan.
+fn build_apply_result(plan: &plan::Plan) -> report::ApplyResult {
+    let stores = plan
+        .stores
+        .iter()
+        .map(|s| {
+            let mut ok = 0;
+            let mut conflicts = 0;
+            let mut errors = 0;
+            let mut skipped = 0;
+            for op in &s.ops {
+                match op {
+                    plan::PlanOp::Conflict { .. } => conflicts += 1,
+                    plan::PlanOp::Error { .. } => errors += 1,
+                    plan::PlanOp::SkippedPlatform => skipped += 1,
+                    _ => ok += 1,
+                }
+            }
+            report::ApplyResultStore {
+                store: s.store_name.clone(),
+                ok,
+                conflicts,
+                errors,
+                skipped,
+            }
+        })
+        .collect();
+    report::ApplyResult {
+        ops_executed: plan.summary.created
+            + plan.summary.replaced
+            + plan.summary.backed_up
+            + plan.summary.removed
+            + plan.summary.content_changed
+            + plan.summary.already_linked,
+        ops_total: plan.summary.created
+            + plan.summary.replaced
+            + plan.summary.backed_up
+            + plan.summary.removed
+            + plan.summary.content_changed
+            + plan.summary.already_linked
+            + plan.summary.conflicts
+            + plan.summary.errors
+            + plan.summary.skipped,
+        conflicts: plan.summary.conflicts,
+        errors: plan.summary.errors,
+        stores,
+    }
+}
+
+/// Build `post_status` by re-running status for all stores after apply.
+fn build_post_status(
+    root: &std::path::Path,
+    config: &Config,
+    platform: &Platform,
+) -> Vec<report::StatusRow> {
+    let entries = store::status_all(root, config, platform);
+    report::status(root, &entries)
 }
 
 pub(crate) fn pending_change_count(plan: &plan::Plan) -> usize {

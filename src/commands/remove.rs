@@ -26,12 +26,6 @@ pub(crate) fn cmd_remove(
     }
     let platform = Platform::detect();
 
-    if json && !dry_run {
-        return Err(StitchError::usage(
-            "--json is not supported for remove without --dry-run",
-        ));
-    }
-
     // Check existence (borrow) before removing, so the config stays intact for
     // status_all and the hook env.
     let target = loaded
@@ -297,6 +291,7 @@ pub(crate) fn cmd_remove(
             links: linked_paths,
             staging: staging_str,
             dry_run: true,
+            behavior_orphaned: None,
         };
         if json {
             report::write("remove", data, loaded.warnings);
@@ -359,7 +354,22 @@ pub(crate) fn cmd_remove(
     // store itself). Removal must act on the state it serializes with.
     let mut loaded = Config::load(root)?;
     if !loaded.config.stores.contains_key(name) {
-        println!("Store '{name}' was already removed (e.g. by the pre-remove hook).");
+        if json {
+            report::write(
+                "remove",
+                RemoveData {
+                    store: name.into(),
+                    target,
+                    links: Vec::new(),
+                    staging: staging_str,
+                    dry_run: false,
+                    behavior_orphaned: None,
+                },
+                loaded.warnings,
+            );
+        } else {
+            println!("Store '{name}' was already removed (e.g. by the pre-remove hook).");
+        }
         return Ok(());
     }
     let (linked, _) = classify(&loaded)?;
@@ -373,6 +383,7 @@ pub(crate) fn cmd_remove(
     // source recorded by status_all, so a source-symlink entry that resolves
     // outside the repo (still stitch-owned) is removed, while a link repointed
     // to a foreign target between status and removal is left untouched.
+    let mut removed_links: Vec<String> = Vec::new();
     for entry in &linked {
         if !linker::remove_link_to(&entry.target, &entry.link_source, root)? {
             match std::fs::symlink_metadata(&entry.target) {
@@ -392,12 +403,18 @@ pub(crate) fn cmd_remove(
                 // The symlink is already gone (e.g. a pre-remove hook removed
                 // it). The goal is achieved, so keep removing other links.
                 Err(_) => {
-                    println!("  note: {} is already gone", entry.target.display());
+                    if !json {
+                        println!("  note: {} is already gone", entry.target.display());
+                    }
+                    removed_links.push(entry.target.to_string_lossy().into_owned());
                     continue;
                 }
             }
         }
-        println!("  removed {}", entry.target.display());
+        if !json {
+            println!("  removed {}", entry.target.display());
+        }
+        removed_links.push(entry.target.to_string_lossy().into_owned());
     }
 
     // All links removed safely: now drop the generated state entry.
@@ -430,6 +447,21 @@ pub(crate) fn cmd_remove(
         }
     }
 
-    println!("Removed store '{}' (directory left untouched)", name);
+    if json {
+        report::write(
+            "remove",
+            RemoveData {
+                store: name.into(),
+                target,
+                links: removed_links,
+                staging: staging_str,
+                dry_run: false,
+                behavior_orphaned: Some(true),
+            },
+            loaded.warnings,
+        );
+    } else {
+        println!("Removed store '{}' (directory left untouched)", name);
+    }
     Ok(())
 }
