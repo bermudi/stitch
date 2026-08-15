@@ -309,7 +309,9 @@ pub fn apply_all(
             if let Err(msg) = hooks::run_store_hook(pre, &env, platform) {
                 results.push(ApplyResult {
                     store_name: name.clone(),
-                    actions: vec![ApplyAction::Error(StitchError::hook("pre", msg))],
+                    actions: vec![ApplyAction::Error(StitchError::hook_store(
+                        "pre", msg, name,
+                    ))],
                 });
                 continue;
             }

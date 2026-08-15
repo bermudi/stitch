@@ -427,7 +427,15 @@ files = [".bashrc"]
     assert_envelope_shape(&value, "apply", true);
 
     let data = value.get("data").unwrap();
-    let stores = data["stores"].as_array().expect("stores array");
+    // Composite apply --json: data = {desired, plan, result, post_status}.
+    assert!(
+        data["desired"]["stores"].is_array(),
+        "desired.stores present"
+    );
+    assert!(data["result"].is_object(), "result present on real apply");
+    assert!(data["post_status"].is_array(), "post_status present");
+    let plan = &data["plan"];
+    let stores = plan["stores"].as_array().expect("plan.stores array");
     assert_eq!(stores.len(), 1);
     assert_eq!(stores[0]["store_name"], "shells");
     let ops = stores[0]["ops"].as_array().expect("ops array");
@@ -448,7 +456,85 @@ files = [".bashrc"]
 
     // The link was actually created.
     assert!(home.join(".bashrc").is_symlink());
-    assert_plan_summary_fields(&data["summary"]);
+    assert_plan_summary_fields(&plan["summary"]);
+    // post_status confirms convergence.
+    let post = data["post_status"].as_array().unwrap();
+    assert_eq!(post.len(), 1);
+    assert_eq!(post[0]["state"], "linked");
+}
+
+#[test]
+fn json_apply_dry_run_composite_has_null_result() {
+    // On --dry-run, the composite `result` field is null (no execution) and
+    // `post_status` reflects pre-apply state.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+    let data = &value["data"];
+    assert!(data["desired"]["stores"].is_array(), "desired present");
+    assert!(data["plan"]["stores"].is_array(), "plan present");
+    assert!(data["result"].is_null(), "result is null on dry-run");
+    assert!(data["post_status"].is_array(), "post_status present");
+    // No link was created.
+    assert!(!home.join(".bashrc").exists());
+}
+
+#[test]
+fn json_apply_composite_desired_matches_explain() {
+    // The `desired` field of `apply --json` should match `explain --json`
+    // output for the same repo (same platform, same stores).
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{home}/.config/nvim"
+
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+    repo.write_authored(
+        r#"
+[stores.shells]
+when = { os = "linux" }
+"#,
+    );
+
+    let apply_output = repo
+        .cmd()
+        .args(["--json", "apply", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(apply_output.status.success());
+    let apply_value = json_output(&apply_output);
+    let explain_output = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(explain_output.status.success());
+    let explain_value = json_output(&explain_output);
+    // `desired` from apply should equal `data` from explain (same platform,
+    // same stores, same resolution).
+    assert_eq!(apply_value["data"]["desired"], explain_value["data"]);
 }
 
 #[test]
@@ -542,10 +628,18 @@ target = "{target_str}"
     assert_error_shape(&value, "conflict-real", 6);
 
     let data = value["data"].as_object().expect("partial plan data");
-    let summary = &data["summary"];
+    // Composite apply --json: data = {desired, plan, result, post_status}.
+    assert!(
+        data["desired"]["stores"].is_array(),
+        "desired.stores present"
+    );
+    assert!(data["result"].is_object(), "result present on real apply");
+    assert!(data["post_status"].is_array(), "post_status present");
+    let plan = &data["plan"];
+    let summary = &plan["summary"];
     assert_plan_summary_fields(summary);
     assert_eq!(summary["conflicts"].as_u64().unwrap(), 1);
-    let stores = data["stores"].as_array().unwrap();
+    let stores = plan["stores"].as_array().unwrap();
     assert!(stores.iter().any(|s| {
         s["ops"]
             .as_array()
@@ -598,37 +692,17 @@ target = "{target_str}"
 }
 
 #[test]
-fn json_rejected_on_unsupported_write_commands_as_usage_envelope() {
-    // Non-dry-run write commands other than `apply`/`diff` are not JSON-enabled.
-    // The rejection must go through the same envelope contract an agent already
-    // parses — a `usage` error (code 2) on stdout, honest exit 2 — not a prose
-    // stderr line. The check fires before repo resolution, so no real repo is
-    // needed, but we use one to keep the test realistic.
+fn json_supported_on_mutation_commands() {
+    // `add` and `remove` both support `--json` for real mutations (not just
+    // dry-run). The post-op envelope goes to stdout (one-stream rule) with
+    // an honest exit code.
     let repo = Repo::new();
-    let output = repo.cmd().args(["--json", "add", "~/x"]).output().unwrap();
-    assert!(!output.status.success(), "add --json must not succeed");
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "add --json must exit with the usage code 2"
-    );
 
-    // The envelope goes to stdout (one-stream rule); stderr is hook passthrough.
-    let value = json_output(&output);
-    assert_envelope_shape(&value, "add", false);
-    assert_error_shape(&value, "usage", 2);
-    assert!(
-        value["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("--json is not supported for add"),
-        "message should name the unsupported flag"
-    );
-
-    // Dry-run add is intentionally supported and returns its normal envelope.
+    // Dry-run add is supported and returns its normal envelope.
+    let target = repo.path().join("home").join(".config").join("x");
     let output = repo
         .cmd()
-        .args(["--json", "add", "~/x", "--dry-run"])
+        .args(["--json", "add", &target.to_string_lossy(), "--dry-run"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -636,13 +710,82 @@ fn json_rejected_on_unsupported_write_commands_as_usage_envelope() {
     assert_envelope_shape(&value, "add", true);
     assert_eq!(value["data"]["mode"], "create");
 
-    // Spot-check a second unsupported write command so the boundary isn't
-    // single-command.
-    let output = repo.cmd().args(["--json", "remove", "x"]).output().unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    // Real add is also supported and reports the created link.
+    let output = repo
+        .cmd()
+        .args(["--json", "add", &target.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
     let value = json_output(&output);
-    assert_envelope_shape(&value, "remove", false);
-    assert_error_shape(&value, "usage", 2);
+    assert_envelope_shape(&value, "add", true);
+    assert!(value["data"]["link_created"].is_string());
+
+    // Real remove is supported and reports the removed link.
+    let output = repo.cmd().args(["--json", "remove", "x"]).output().unwrap();
+    assert!(output.status.success(), "remove --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", true);
+    assert_eq!(value["data"]["store"], "x");
+    assert!(value["data"]["behavior_orphaned"].is_boolean());
+}
+
+#[test]
+fn add_json_post_op_reports_created_link() {
+    // `add --json` without --dry-run emits a post-op report with the created
+    // symlink path, so an agent can verify the mutation without a second call.
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("x");
+    let output = repo
+        .cmd()
+        .args(["--json", "add", &target.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+    assert_eq!(value["data"]["mode"], "create");
+    assert!(
+        value["data"]["link_created"].is_string(),
+        "link_created must be present"
+    );
+    // The link should actually exist at the reported path.
+    let link = value["data"]["link_created"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(link).is_symlink(),
+        "reported link must exist"
+    );
+}
+
+#[test]
+fn add_json_post_op_adopt_reports_moved_source() {
+    // `add --json` on an existing file (adopt) reports the mode as "adopt"
+    // and the original source path, so an agent can verify the move.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join(".gitconfig");
+    fs::write(&target, "[user]\nname = test\n").unwrap();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "add", &target.to_string_lossy()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --json adopt must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+    assert_eq!(value["data"]["mode"], "adopt");
+    assert!(
+        value["data"]["source"].is_string(),
+        "source must be present for adopt"
+    );
+    assert!(
+        value["data"]["link_created"].is_string(),
+        "link_created must be present"
+    );
+    // The target is now a symlink.
+    assert!(target.is_symlink(), "target must be a symlink after adopt");
 }
 
 #[test]

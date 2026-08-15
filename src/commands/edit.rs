@@ -3,7 +3,11 @@ use crate::config::{self, Config};
 use crate::error::StitchError;
 use crate::render;
 
-pub(crate) fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<(), StitchError> {
+pub(crate) fn cmd_edit(
+    root: &std::path::Path,
+    entry: Option<&str>,
+    print_path: bool,
+) -> Result<(), StitchError> {
     let path = match entry {
         None => {
             let authored_path = root.join("stitch.toml");
@@ -24,10 +28,20 @@ pub(crate) fn cmd_edit(root: &std::path::Path, entry: Option<&str>) -> Result<()
         }
         Some(e) => {
             let loaded = Config::load(root)?;
-            print_warnings(&loaded);
+            if !print_path {
+                print_warnings(&loaded);
+            }
             render::resolve_edit_source(root, &loaded.config, e).map_err(StitchError::internal)?
         }
     };
+
+    if print_path {
+        // Print the resolved repo source path and exit — no editor launched.
+        // This is the agent-friendly path: the agent opens the file with its
+        // own tools.
+        println!("{}", path.display());
+        return Ok(());
+    }
 
     let editor = resolve_editor()?;
     let status = std::process::Command::new(&editor)

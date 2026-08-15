@@ -1,0 +1,444 @@
+{
+  "$comment": "Canonical machine-readable schema for stitch's --json interface. The `stitch schema --json` command reads and echoes this file. Keep in sync with src/report.rs and SPEC.md.",
+  "schema_version": 1,
+  "envelope": {
+    "description": "Every --json command prints one of these to stdout.",
+    "fields": {
+      "schema": { "type": "u32", "value": 1 },
+      "command": { "type": "string", "description": "The command name (e.g. 'apply', 'status')." },
+      "ok": { "type": "bool", "description": "true on success, false on error or conflict." },
+      "warnings": { "type": "array<string>", "description": "Non-fatal notices, e.g. load-time warnings." },
+      "data": { "type": "object|null", "description": "Command-specific data; null on hard error. Shape depends on `command`." },
+      "error": { "type": "object|null", "description": "Present when ok=false; see `error` shape." }
+    }
+  },
+  "error": {
+    "description": "Machine-readable error detail, including structured recovery actions.",
+    "fields": {
+      "class": { "type": "string", "description": "Failure class id (e.g. 'conflict-real')." },
+      "code": { "type": "i32", "description": "Exit code; matches the exit-code table." },
+      "message": { "type": "string" },
+      "hint": { "type": "string|null", "description": "Human-readable recovery hint." },
+      "details": { "type": "string|null", "description": "JSON string with structured detail for hook errors: {\"hook\":\"<name>\",\"store\":\"<store>|null\",\"scope\":\"global|per-store\"}. Null for non-hook errors." },
+      "recoverable_via": {
+        "type": "array<RecoveryAction>",
+        "description": "Machine-readable recovery actions. Empty when not recoverable via a stitch command."
+      }
+    }
+  },
+  "recoverable_via": {
+    "description": "A recovery action an agent can take.",
+    "fields": {
+      "kind": {
+        "type": "string",
+        "values": [
+          "force-apply",
+          "adopt",
+          "edit-template",
+          "list",
+          "init",
+          "migrate",
+          "replan",
+          "apply",
+          "manual",
+          "set-env"
+        ]
+      },
+      "command": { "type": "string|null", "description": "The stitch command to run, if any." },
+      "flags": { "type": "array<string>", "description": "Flags to pass (e.g. '--force')." },
+      "args": { "type": "array<string>", "description": "Positional args (e.g. target path)." },
+      "reason": { "type": "string|null", "description": "Why this action applies; for 'manual', explains why no stitch command can fix it." },
+      "vars": { "type": "array<string>", "description": "For 'set-env': environment variables to set before retrying." }
+    }
+  },
+  "commands": {
+    "status": {
+      "data": "StatusRow[]",
+      "description": "Symlink state for all stores (or one if `status <name>`)."
+    },
+    "list": {
+      "data": "ListStore[]",
+      "description": "Configured stores."
+    },
+    "diff": {
+      "data": "Plan",
+      "description": "What apply would do. Lean — not the composite."
+    },
+    "plan": {
+      "data": "Plan",
+      "description": "Captured executable plan for `apply --plan`."
+    },
+    "apply": {
+      "data": "ApplyData",
+      "description": "Composite: desired + plan + result + post_status. Direct apply only; `apply --plan` emits PlanExecReport instead."
+    },
+    "doctor": {
+      "data": "DoctorData",
+      "description": "Health-check findings."
+    },
+    "prune": {
+      "data": "PruneData",
+      "description": "Orphaned symlinks and removal report."
+    },
+    "render": {
+      "data": "RenderData",
+      "description": "Rendered template content and metadata."
+    },
+    "add": {
+      "data": "AddData|BulkAddData",
+      "description": "Single-path add: AddData. Bulk add (multiple paths): BulkAddData with per-path results. Real mutations include link_created."
+    },
+    "remove": {
+      "data": "RemoveData",
+      "description": "Remove report; real mutations include behavior_orphaned."
+    },
+    "migrate": {
+      "data": "MigrateData",
+      "description": "Migrate report with authored/state file contents. Real mutations carry the comment-lossy warning."
+    },
+    "import": {
+      "data": "ImportData",
+      "description": "Import report with imported stores."
+    },
+    "explain": {
+      "data": "ExplainData",
+      "description": "Fully-resolved, host-evaluated desired state."
+    },
+    "why": {
+      "data": "WhyData",
+      "description": "Single-path investigation: what owns this target, its source, link state."
+    },
+    "log": {
+      "data": "AuditEntry[]",
+      "description": "Audit log of mutating operations (.stitch/log.jsonl). --limit N returns the tail."
+    },
+    "schema": {
+      "data": "object",
+      "description": "This document, echoed in the envelope's data field."
+    }
+  },
+  "shapes": {
+    "StatusRow": {
+      "fields": {
+        "store": "string",
+        "target_name": "string|null (multi-target name)",
+        "target": "string (absolute path)",
+        "source": "string (absolute path)",
+        "templated": "bool",
+        "staged_path": "string|null",
+        "state": "string (linked|missing|conflict|broken)",
+        "skipped_platform": "bool",
+        "resolves_to": "string|null"
+      }
+    },
+    "ListStore": {
+      "fields": {
+        "name": "string",
+        "mode": "string (whole-dir|file-mode|multi-target|none)",
+        "target": "string|null",
+        "targets": "ListTarget[]|absent",
+        "files": "string[]",
+        "patterns": "string[]",
+        "when": "WhenClause|absent"
+      }
+    },
+    "ListTarget": {
+      "fields": {
+        "name": "string",
+        "target": "string",
+        "mode": "string",
+        "files": "string[]",
+        "patterns": "string[]",
+        "when": "WhenClause|absent"
+      }
+    },
+    "Plan": {
+      "fields": {
+        "stores": "PlanStore[]",
+        "summary": "PlanSummary"
+      }
+    },
+    "PlanStore": {
+      "fields": {
+        "store_name": "string",
+        "ops": "PlanOp[]"
+      }
+    },
+    "PlanOp": {
+      "tag": "action",
+      "variants": {
+        "stage_render": { "store": "string", "source_rel": "string", "source": "string", "staged": "string", "sha256": "string" },
+        "create_link": { "target": "string", "source": "string", "requires": "LinkRequires" },
+        "replace_link": { "target": "string", "source": "string", "old_resolves_to": "string|null", "requires": "LinkRequires" },
+        "backup_and_link": { "target": "string", "source": "string", "backup": "string", "requires": "LinkRequires" },
+        "remove_link": { "store": "string", "target": "string", "source": "string|null", "requires": "LinkRequires" },
+        "remove_staged": { "path": "string" },
+        "content_changed": { "target": "string", "source": "string", "requires": "LinkRequires" },
+        "already_linked": { "target": "string", "source": "string", "requires": "LinkRequires" },
+        "conflict": { "target": "string", "resolves_to": "string|null" },
+        "skipped_platform": {},
+        "error": { "message": "string", "class": "string" }
+      }
+    },
+    "PlanSummary": {
+      "fields": {
+        "created": "usize",
+        "replaced": "usize",
+        "backed_up": "usize",
+        "removed": "usize",
+        "content_changed": "usize",
+        "already_linked": "usize",
+        "conflicts": "usize",
+        "errors": "usize",
+        "skipped": "usize"
+      }
+    },
+    "LinkRequires": {
+      "description": "Precondition for an op. `target` is a TargetState: {target: 'absent'} | {target: 'symlink', resolves_to: string|null} | {target: 'real'} | {target: 'replaceable'}.",
+      "fields": {
+        "target": "TargetState"
+      }
+    },
+    "ApplyData": {
+      "description": "Composite apply --json envelope.",
+      "fields": {
+        "desired": "ExplainData",
+        "plan": "Plan",
+        "result": "ApplyResult|null (null on --dry-run)",
+        "post_status": "StatusRow[]"
+      }
+    },
+    "ApplyResult": {
+      "fields": {
+        "ops_executed": "usize",
+        "ops_total": "usize",
+        "conflicts": "usize",
+        "errors": "usize",
+        "stores": "ApplyResultStore[]"
+      }
+    },
+    "ApplyResultStore": {
+      "fields": {
+        "store": "string",
+        "ok": "usize",
+        "conflicts": "usize",
+        "errors": "usize",
+        "skipped": "usize"
+      }
+    },
+    "DoctorData": {
+      "fields": {
+        "findings": "DoctorRow[]",
+        "summary": { "errors": "usize", "warnings": "usize", "info": "usize" }
+      }
+    },
+    "DoctorRow": {
+      "fields": {
+        "severity": "string (error|warning|info)",
+        "store": "string|null",
+        "target": "string|null",
+        "message": "string",
+        "hint": "string|null",
+        "path": "string|null"
+      }
+    },
+    "PruneData": {
+      "fields": {
+        "dry_run": "bool",
+        "scanned": "usize",
+        "removed": "usize",
+        "orphans": "PruneRow[]"
+      }
+    },
+    "PruneRow": {
+      "fields": {
+        "link": "string",
+        "resolves_to": "string|null",
+        "action": "string (would-remove|removed|skipped)"
+      }
+    },
+    "RenderData": {
+      "fields": {
+        "source": "string",
+        "link_name": "string",
+        "sha256": "string",
+        "content": "string"
+      }
+    },
+    "AddData": {
+      "fields": {
+        "dry_run": "bool",
+        "store": "string",
+        "mode": "string",
+        "target": "string|null",
+        "create_files": "string[]",
+        "adopt_files": "string[]",
+        "link_created": "string|null (real mutations only; absent on dry-run)"
+      }
+    },
+    "RemoveData": {
+      "fields": {
+        "dry_run": "bool",
+        "store": "string",
+        "removed_links": "string[]",
+        "staging_removed": "string[]",
+        "behavior_orphaned": "bool|absent (real mutations only; omitted on dry-run)"
+      }
+    },
+    "MigrateData": {
+      "fields": {
+        "authored_path": "string|null",
+        "authored": "string|null",
+        "state_path": "string|null",
+        "state": "string|null"
+      }
+    },
+    "ImportData": {
+      "fields": {
+        "dry_run": "bool",
+        "imported": "usize",
+        "skipped_owned": "usize",
+        "stores": "ImportedStore[]"
+      }
+    },
+    "ImportedStore": {
+      "fields": {
+        "store": "string",
+        "target": "string",
+        "mode": "string",
+        "files": "string[]",
+        "targets": "ImportedTarget[]|absent"
+      }
+    },
+    "ImportedTarget": {
+      "fields": {
+        "name": "string",
+        "target": "string",
+        "files": "string[]"
+      }
+    },
+    "ExplainData": {
+      "fields": {
+        "platform": "ExplainPlatform",
+        "stores": "ExplainStore[]"
+      }
+    },
+    "ExplainPlatform": {
+      "fields": {
+        "os": "string",
+        "arch": "string",
+        "distro": "string|null",
+        "hostname": "string",
+        "shell": "string"
+      }
+    },
+    "ExplainStore": {
+      "fields": {
+        "name": "string",
+        "active": "bool",
+        "when": "WhenClause|absent",
+        "mode": "string (whole-dir|file-mode|multi-target|none)",
+        "target": "string|null",
+        "entries": "ExplainEntry[] (omitted for whole-dir)",
+        "targets": "ExplainTarget[] (multi-target only)",
+        "hooks": "Hooks|absent",
+        "ignore": "string[]"
+      }
+    },
+    "ExplainTarget": {
+      "fields": {
+        "name": "string",
+        "active": "bool",
+        "when": "WhenClause|absent",
+        "target": "string",
+        "mode": "string",
+        "entries": "ExplainEntry[]",
+        "ignore": "string[]"
+      }
+    },
+    "ExplainEntry": {
+      "fields": {
+        "source": "string (may end in .tmpl)",
+        "templated": "bool",
+        "link_name": "string (.tmpl stripped)"
+      }
+    },
+    "WhenClause": {
+      "fields": {
+        "os": "string|null",
+        "arch": "string|null",
+        "distro": "string|null",
+        "hostname": "string|null",
+        "shell": "string|null"
+      }
+    },
+    "Hooks": {
+      "fields": {
+        "pre": "string|null",
+        "post": "string|null"
+      }
+    },
+    "WhyData": {
+      "fields": {
+        "query": "string",
+        "entry": "WhyEntry|null",
+        "skipped_platform": "bool|absent (omitted when false)"
+      }
+    },
+    "WhyEntry": {
+      "fields": {
+        "store": "string",
+        "target_name": "string|null (multi-target name)",
+        "target": "string (absolute path)",
+        "source": "string (absolute path; .tmpl source for templates)",
+        "templated": "bool",
+        "state": "string (linked|missing|conflict|broken|foreign|store-error|config-error)",
+        "resolves_to": "string|null",
+        "owning_config": "string (always 'state.toml')"
+      }
+    },
+    "AuditEntry": {
+      "fields": {
+        "timestamp": "string (unix:SECONDS)",
+        "command": "string (apply|add|remove|migrate|import|prune)",
+        "store": "string|null (omitted when not applicable)",
+        "target": "string|null (omitted when not applicable)",
+        "outcome": "string (ok|error)",
+        "exit_class": "string|null (omitted on success)",
+        "exit_code": "i32"
+      }
+    },
+    "BulkAddData": {
+      "fields": {
+        "results": "BulkAddResult[]",
+        "all_ok": "bool"
+      }
+    },
+    "BulkAddResult": {
+      "fields": {
+        "path": "string",
+        "store": "string (derived from basename)",
+        "ok": "bool",
+        "error": "string|null (omitted on success)",
+        "dry_run": "bool"
+      }
+    }
+  },
+  "exit_codes": [
+    { "code": 0, "class": "ok", "description": "Success" },
+    { "code": 1, "class": "internal", "description": "Generic / I/O / unexpected" },
+    { "code": 2, "class": "usage", "description": "CLI usage error" },
+    { "code": 3, "class": "config", "description": "Config load, parse, or v0.2 migration" },
+    { "code": 4, "class": "repo-resolution", "description": "Repo root resolution failed" },
+    { "code": 5, "class": "unknown-store", "description": "Unknown store name" },
+    { "code": 6, "class": "conflict-real", "description": "Real file/dir blocks the target" },
+    { "code": 7, "class": "conflict-foreign", "description": "Foreign symlink blocks the target" },
+    { "code": 8, "class": "render", "description": "Template render failed" },
+    { "code": 9, "class": "path-validation", "description": "Path fragment validation failed" },
+    { "code": 10, "class": "hook", "description": "Hook execution failed" },
+    { "code": 11, "class": "mixed", "description": "Multiple failure classes in one run" },
+    { "code": 12, "class": "plan-stale", "description": "Plan is stale or invalid" },
+    { "code": 13, "class": "doctor", "description": "doctor reported error-severity findings" },
+    { "code": 14, "class": "drift", "description": "diff --exit-code: safe pending changes" }
+  ]
+}

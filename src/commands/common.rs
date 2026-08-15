@@ -148,6 +148,7 @@ fn resolve_override(path: &str, label: &str) -> Result<std::path::PathBuf, Stitc
 
 pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
     let mut classes = BTreeSet::new();
+    let mut hook_errors: Vec<(String, String)> = Vec::new(); // (store, message)
     for store in &plan.stores {
         for op in &store.ops {
             match op {
@@ -158,9 +159,12 @@ pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
                         classes.insert(FailureClass::ConflictReal);
                     }
                 }
-                plan::PlanOp::Error { class, .. } => {
+                plan::PlanOp::Error { class, message } => {
                     if let Some(c) = FailureClass::from_id(class) {
                         classes.insert(c);
+                        if c == FailureClass::Hook {
+                            hook_errors.push((store.store_name.clone(), message.clone()));
+                        }
                     }
                 }
                 _ => {}
@@ -169,8 +173,36 @@ pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
     }
     let conflicts = plan.summary.conflicts;
     let errors = plan.summary.errors;
-    StitchError::apply(
-        classes.into_iter().collect(),
+    let classes_vec: Vec<FailureClass> = classes.into_iter().collect();
+
+    // When the only error class is Hook, populate structured details with
+    // the store and hook name extracted from the plan ops.
+    let details = if classes_vec.as_slice() == [FailureClass::Hook] {
+        if let Some((store, msg)) = hook_errors.first() {
+            // Extract hook name from the message. The message format is
+            // "hook failed: <name>: <detail>". Extract the name between the
+            // first and second ": ".
+            let hook_name = msg
+                .strip_prefix("hook failed: ")
+                .and_then(|rest| rest.split(": ").next())
+                .unwrap_or("unknown");
+            Some(format!(
+                r#"{{"hook":"{hook_name}","store":"{store}","scope":"per-store"}}"#
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut error = StitchError::apply(
+        classes_vec,
         format!("{command} reported {conflicts} conflict(s), {errors} error(s)"),
-    )
+    );
+    // Populate details on the Apply variant directly.
+    if let StitchError::Apply { details: d, .. } = &mut error {
+        *d = details;
+    }
+    error
 }

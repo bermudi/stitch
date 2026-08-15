@@ -4,8 +4,8 @@
 //! `list`, `doctor`, `prune`, `render`). It keeps the text and JSON views of
 //! the same data structurally close so they do not drift.
 
-use crate::config::{Config, WhenClause};
-use crate::error::StitchError;
+use crate::config::{Config, Hooks, WhenClause};
+use crate::error::{RecoveryAction, StitchError};
 use crate::linker::LinkStatus;
 use crate::render;
 use crate::scan::FoundLink;
@@ -38,6 +38,10 @@ pub struct ErrorDetail {
     /// today; it is `None` and serialized as `null`. Kept in the struct so
     /// the envelope shape is locked now and later fills are additive-only.
     pub details: Option<String>,
+    /// Machine-readable recovery actions an agent can take to resolve this
+    /// error. Empty when the error is not recoverable via a stitch command.
+    /// `manual` entries signal "escalate, don't retry stitch commands."
+    pub recoverable_via: Vec<RecoveryAction>,
 }
 
 /// Print a successful JSON envelope to stdout.
@@ -63,7 +67,8 @@ pub fn write_error(command: &'static str, error: &StitchError, warnings: Vec<Str
         code: error.exit_code(),
         message: error.to_string(),
         hint: error.hint(),
-        details: None,
+        details: error.details(),
+        recoverable_via: error.recoverable_via(),
     };
     let envelope = Envelope::<()> {
         schema: SCHEMA,
@@ -93,7 +98,8 @@ pub fn write_data_error<T: Serialize>(
         code: error.exit_code(),
         message: error.to_string(),
         hint: error.hint(),
-        details: None,
+        details: error.details(),
+        recoverable_via: error.recoverable_via(),
     };
     let envelope = Envelope {
         schema: SCHEMA,
@@ -483,6 +489,10 @@ pub struct AddData {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// Absolute path of the created symlink(s). Present on post-op reports
+    /// (real mutations); omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_created: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -494,6 +504,11 @@ pub struct RemoveData {
     pub links: Vec<String>,
     pub staging: String,
     pub dry_run: bool,
+    /// Present on post-op reports (real mutations); omitted on dry-run.
+    /// `true` when `stitch.toml` behavior was left in place (the tool never
+    /// rewrites authored config) — `doctor` will flag it as orphaned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behavior_orphaned: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -537,6 +552,186 @@ pub struct MigrateData {
     pub state_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// apply --json (composite)
+// ---------------------------------------------------------------------------
+
+/// Composite `apply --json` data: the full agent loop in one call.
+///
+/// `desired` is the host-evaluated merge (same shape as `explain --json`).
+/// `plan` is the existing `Plan` shape — byte-identical to the pre-composite
+/// `apply --json` output, so key-access consumers keep working.
+/// `result` is `null` on `--dry-run`; on real apply it carries per-op
+/// execution outcome. `post_status` is the status of the applied stores
+/// after execution (the verification an agent would otherwise do via a
+/// second `status` call).
+#[derive(Serialize)]
+pub struct ApplyData {
+    pub desired: ExplainData,
+    pub plan: crate::plan::Plan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ApplyResult>,
+    pub post_status: Vec<StatusRow>,
+}
+
+/// Per-op execution outcome. On a clean apply, every op is `ok`. On a
+/// partial failure, the agent sees which target failed and the error class.
+#[derive(Serialize)]
+pub struct ApplyResult {
+    pub ops_executed: usize,
+    pub ops_total: usize,
+    pub conflicts: usize,
+    pub errors: usize,
+    /// Per-store outcome summary. Each store's ops are classified as
+    /// `ok`, `conflict`, or `error` based on the plan ops.
+    pub stores: Vec<ApplyResultStore>,
+}
+
+#[derive(Serialize)]
+pub struct ApplyResultStore {
+    pub store: String,
+    pub ok: usize,
+    pub conflicts: usize,
+    pub errors: usize,
+    pub skipped: usize,
+}
+
+// ---------------------------------------------------------------------------
+// explain --json
+// ---------------------------------------------------------------------------
+
+/// The fully-resolved, host-evaluated desired state. Reused as `desired` in
+/// the composite `apply --json` envelope (§3 of the agent-loop plan).
+#[derive(Serialize)]
+pub struct ExplainData {
+    pub platform: ExplainPlatform,
+    pub stores: Vec<ExplainStore>,
+}
+
+#[derive(Serialize)]
+pub struct ExplainPlatform {
+    pub os: String,
+    pub arch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+    pub hostname: String,
+    pub shell: String,
+}
+
+#[derive(Serialize)]
+pub struct ExplainStore {
+    pub name: String,
+    /// Whether this store's `when` matches the current host.
+    pub active: bool,
+    #[serde(skip_serializing_if = "WhenClause::is_default")]
+    pub when: WhenClause,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ExplainEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ExplainTarget>,
+    #[serde(skip_serializing_if = "Hooks::is_default")]
+    pub hooks: Hooks,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ExplainTarget {
+    pub name: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "WhenClause::is_default")]
+    pub when: WhenClause,
+    pub target: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ExplainEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ExplainEntry {
+    /// Source path relative to the store directory (may end in `.tmpl`).
+    pub source: String,
+    /// `true` when the source ends in `.tmpl`.
+    pub templated: bool,
+    /// Link name under the target (`.tmpl` stripped).
+    pub link_name: String,
+}
+
+// ---------------------------------------------------------------------------
+// why --json
+// ---------------------------------------------------------------------------
+
+/// Single-path investigation: what owns this target, its source, link state.
+/// Merges config + filesystem for one target so an agent doesn't cross-
+/// reference `list` + `status` + `doctor`.
+#[derive(Serialize)]
+pub struct WhyData {
+    pub query: String,
+    /// The matched entry, or null when no store owns this path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<WhyEntry>,
+    /// True when the query path is under a store's target but the store is
+    /// skipped on this host (when mismatch).
+    #[serde(skip_serializing_if = "skip_bool_false")]
+    pub skipped_platform: bool,
+}
+
+#[derive(Serialize)]
+pub struct WhyEntry {
+    pub store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    pub target: String,
+    /// Repo source path (absolute). For templates, this is the `.tmpl` source
+    /// — never the staged render.
+    pub source: String,
+    pub templated: bool,
+    /// Link state: linked|missing|conflict|broken|store-error|config-error.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolves_to: Option<String>,
+    /// Which config file owns the inventory for this entry.
+    pub owning_config: String,
+}
+
+fn skip_bool_false(b: &bool) -> bool {
+    !b
+}
+
+// ---------------------------------------------------------------------------
+// bulk add --json
+// ---------------------------------------------------------------------------
+
+/// Result of a bulk `add` operation (multiple paths in one invocation).
+#[derive(Serialize)]
+pub struct BulkAddData {
+    /// One entry per path, in order.
+    pub results: Vec<BulkAddResult>,
+    /// True if every path succeeded.
+    pub all_ok: bool,
+}
+
+/// One path's outcome in a bulk add.
+#[derive(Serialize)]
+pub struct BulkAddResult {
+    /// The path that was added.
+    pub path: String,
+    /// The store name it was added as (derived from basename).
+    pub store: String,
+    /// True if this path was added successfully.
+    pub ok: bool,
+    /// Error message if `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Dry-run: no changes were made.
+    pub dry_run: bool,
 }
 
 #[cfg(test)]
@@ -606,6 +801,7 @@ mod tests {
             message: "boom".to_string(),
             hint: None,
             details: None,
+            recoverable_via: Vec::new(),
         };
         let env = Envelope::<()> {
             schema: SCHEMA,
@@ -622,6 +818,8 @@ mod tests {
         assert_eq!(v["error"]["code"], 1);
         assert!(v["error"]["hint"].is_null());
         assert!(v["error"]["details"].is_null());
+        assert!(v["error"]["recoverable_via"].is_array());
+        assert!(v["error"]["recoverable_via"].as_array().unwrap().is_empty());
         assert_eq!(v["schema"], 1);
     }
 
@@ -1018,6 +1216,7 @@ mod tests {
             message: "boom".to_string(),
             hint: None,
             details: None,
+            recoverable_via: Vec::new(),
         };
         let err_env = Envelope::<()> {
             schema: SCHEMA,
@@ -1036,7 +1235,14 @@ mod tests {
         assert!(v["data"].is_null());
         assert_keys_eq(
             &v["error"],
-            &["class", "code", "details", "hint", "message"],
+            &[
+                "class",
+                "code",
+                "details",
+                "hint",
+                "message",
+                "recoverable_via",
+            ],
         );
     }
 

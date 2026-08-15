@@ -199,6 +199,12 @@ pub struct Hooks {
     pub post: Option<String>,
 }
 
+impl Hooks {
+    pub fn is_default(&self) -> bool {
+        self == &Hooks::default()
+    }
+}
+
 /// Header prepended to every `state.toml`. Injected/stripped outside the TOML
 /// data model because the `toml` crate does not round-trip comments.
 pub(super) const STATE_HEADER: &str =

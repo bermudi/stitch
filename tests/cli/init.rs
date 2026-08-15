@@ -312,6 +312,51 @@ when = { os = \"linux\" }
         .stdout(contains("nvim"));
 }
 
+/// `stitch migrate --json` performs the real migration and emits a post-op
+/// envelope with the authored/state paths and contents, so an agent can verify
+/// the write without re-reading the files.
+#[test]
+fn migrate_json_emits_post_op_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let original = "\
+vars = { editor = \"nvim\" }
+
+[stores.nvim]
+target = \"~/.config/nvim\"
+";
+    fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "migrate"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "migrate --json must succeed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON envelope");
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["command"], "migrate");
+    assert_eq!(value["ok"], true);
+    assert!(value["data"]["authored_path"].is_string());
+    assert!(value["data"]["state_path"].is_string());
+    assert!(value["data"]["authored"].is_string());
+    assert!(value["data"]["state"].is_string());
+    // The warning about comments being dropped is carried in the envelope.
+    let warnings = value["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.contains("comments"))),
+        "warnings should mention comments: {warnings:?}"
+    );
+    // The files were actually written.
+    assert!(dir.path().join("stitch.toml").exists());
+    assert!(dir.path().join(".stitch").join("state.toml").exists());
+    assert!(dir.path().join(".stitch").join("config.toml.bak").exists());
+}
+
 /// `stitch migrate --dry-run` previews without writing.
 #[test]
 fn migrate_dry_run_writes_nothing() {

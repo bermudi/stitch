@@ -1668,3 +1668,92 @@ fn apply_target_home_does_not_eat_repo_internal_symlinks() {
         "repo-internal symlink still resolves"
     );
 }
+
+#[test]
+fn apply_json_conflict_real_has_recoverable_via() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "I am a real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    let err = &v["error"];
+    assert_eq!(err["class"], "conflict-real");
+    assert_eq!(err["code"], 6);
+    let actions = err["recoverable_via"]
+        .as_array()
+        .expect("recoverable_via array");
+    // apply aggregates into an Apply error with a single ConflictReal class.
+    // It delegates to force-apply (no target-specific args at the aggregate
+    // level; the agent should consult the plan ops in `data` for per-entry targets).
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["kind"], "force-apply");
+    assert_eq!(actions[0]["command"], "apply");
+    assert_eq!(actions[0]["flags"][0], "--force");
+}
+
+#[test]
+fn apply_json_conflict_foreign_has_manual_recoverable_via() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    // Foreign symlink: points outside this repo (another manager's store).
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("nvim");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("init.lua"), "not ours").unwrap();
+    std::os::unix::fs::symlink(&foreign, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    let err = &v["error"];
+    assert_eq!(err["class"], "conflict-foreign");
+    let actions = err["recoverable_via"]
+        .as_array()
+        .expect("recoverable_via array");
+    // Red line: foreign symlinks are never auto-clobbered — only manual.
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["kind"], "manual");
+    assert!(actions[0].get("command").is_none() || actions[0]["command"].is_null());
+    assert!(
+        actions[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("never auto-clobbered")
+    );
+}
