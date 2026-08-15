@@ -1817,6 +1817,89 @@ fn import_registers_nested_file_links() {
 }
 
 #[test]
+fn import_registers_stow_fan_in_as_multi_target() {
+    // Regression: a stow-style package can fan out to several target dirs —
+    // one store directory's files are symlinked into multiple parents that do
+    // not mirror the source tree (here: flat store `mixed` with `a` linked at
+    // `~/.config/alpha/a` and `b` linked at `~/.config/beta/b`). `import` used
+    // to skip the whole store with a warning; it must instead register a
+    // multi-target store with one named target per parent, each carrying its
+    // own file set, so the migration is not silently lossy. (Parents that
+    // overlap — one nested under the other — are still emitted; apply's
+    // existing overlap validation then rejects them with a clear error rather
+    // than import dropping them silently. This case uses sibling parents so
+    // the full import → apply round-trip converges.)
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let repo = home.join("dotfiles");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("stitch.toml"), "").unwrap();
+    let stitch_dir = repo.join(".stitch");
+    fs::create_dir_all(&stitch_dir).unwrap();
+    fs::write(stitch_dir.join("state.toml"), "").unwrap();
+    fs::write(stitch_dir.join("state.lock"), "").unwrap();
+    fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+    // Flat store `mixed` whose two files are symlinked into sibling parents.
+    let store_dir = repo.join("mixed");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(store_dir.join("a"), "a\n").unwrap();
+    fs::write(store_dir.join("b"), "b\n").unwrap();
+
+    let alpha = home.join(".config").join("alpha");
+    let beta = home.join(".config").join("beta");
+    fs::create_dir_all(&alpha).unwrap();
+    fs::create_dir_all(&beta).unwrap();
+    std::os::unix::fs::symlink(store_dir.join("a"), alpha.join("a")).unwrap();
+    std::os::unix::fs::symlink(store_dir.join("b"), beta.join("b")).unwrap();
+
+    let mut cmd = Command::cargo_bin("stitch").expect("stitch binary");
+    cmd.current_dir(&repo)
+        .env("HOME", &home)
+        .env_remove("STITCH_REPO")
+        .arg("import")
+        .arg("--scan-dir")
+        .arg(&home)
+        .assert()
+        .success()
+        .stdout(contains("import 'mixed'"))
+        .stdout(contains("multi-target"));
+
+    let state = fs::read_to_string(stitch_dir.join("state.toml")).unwrap();
+    assert!(
+        state.contains("[stores.mixed.targets.target-1]"),
+        "state must have target-1: {state}"
+    );
+    assert!(
+        state.contains("[stores.mixed.targets.target-2]"),
+        "state must have target-2: {state}"
+    );
+    assert!(state.contains("\"a\""), "state must record file a: {state}");
+    assert!(state.contains("\"b\""), "state must record file b: {state}");
+    assert!(
+        state.contains("target = \"~/.config/alpha\""),
+        "state must record the alpha target: {state}"
+    );
+    assert!(
+        state.contains("target = \"~/.config/beta\""),
+        "state must record the beta target: {state}"
+    );
+
+    // The imported state must be directly re-applicable: both links converge.
+    let mut cmd = Command::cargo_bin("stitch").expect("stitch binary");
+    cmd.current_dir(&repo)
+        .env("HOME", &home)
+        .env_remove("STITCH_REPO")
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("Summary: 2 ok"));
+
+    assert!(alpha.join("a").is_symlink());
+    assert!(beta.join("b").is_symlink());
+}
+
+#[test]
 fn exit_code_and_hint_outside_repo() {
     let tmp = tempfile::tempdir().unwrap();
     Command::cargo_bin("stitch")

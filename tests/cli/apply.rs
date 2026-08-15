@@ -1603,3 +1603,68 @@ when = { os = "linux" }
         .stdout(contains("ghost"))
         .stdout(contains("no target configured"));
 }
+
+#[test]
+fn apply_target_home_does_not_eat_repo_internal_symlinks() {
+    // Regression: the stale-link sweep (`reconcile_store_links`) walks the
+    // file-mode target to remove repo-pointing symlinks no longer in the
+    // store's keep set. A file-mode store with `target = "~"` (the stow-mirror
+    // layout) walks all of `$HOME`; when the repo lives under `~`, the sweep
+    // used to descend *into the repo* and `remove_link` repo-internal
+    // organizational symlinks that resolved into their own store dir. The sweep
+    // must prune the repo subtree, so repo-internal layout survives apply.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let repo = home.join("dotfiles");
+    fs::create_dir_all(&repo).unwrap();
+    // Minimal v0.3 layout: empty authored half + generated half + gitignore.
+    fs::write(repo.join("stitch.toml"), "").unwrap();
+    let stitch_dir = repo.join(".stitch");
+    fs::create_dir_all(&stitch_dir).unwrap();
+    fs::write(stitch_dir.join("state.toml"), "").unwrap();
+    fs::write(stitch_dir.join("state.lock"), "").unwrap();
+    fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+
+    // Store `shells` targets `~` and manages only `.bashrc`.
+    let store_dir = repo.join("shells");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(store_dir.join(".bashrc"), "# bashrc\n").unwrap();
+    // A repo-internal organizational symlink inside the store dir: `alias ->
+    // realfile`. It points into the store, so without the repo prune the sweep
+    // classified it as a stale link for this store and removed it.
+    fs::write(store_dir.join("realfile"), "real\n").unwrap();
+    std::os::unix::fs::symlink("realfile", store_dir.join("alias")).unwrap();
+
+    fs::write(
+        stitch_dir.join("state.toml"),
+        "[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("stitch").expect("stitch binary");
+    cmd.current_dir(&repo)
+        .env("HOME", &home)
+        .env_remove("STITCH_REPO")
+        .arg("apply")
+        .assert()
+        .success();
+
+    // The configured link is created at the top of $HOME...
+    let link = home.join(".bashrc");
+    assert!(link.is_symlink(), "managed .bashrc link created");
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        store_dir.join(".bashrc").canonicalize().unwrap()
+    );
+    // ...and the repo-internal symlink survives — the sweep never entered the
+    // repo, so it was not classified as a stale link for this store.
+    assert!(
+        store_dir.join("alias").is_symlink(),
+        "repo-internal symlink must survive the stale-link sweep"
+    );
+    assert_eq!(
+        fs::read_to_string(store_dir.join("alias")).unwrap(),
+        "real\n",
+        "repo-internal symlink still resolves"
+    );
+}

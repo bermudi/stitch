@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed
+
+- `import`: stow-style fan-in (one store's file links spanning several target
+  parents) is no longer silently dropped. The store is now imported as a
+  multi-target store — one named target per parent (`target-1`, `target-2`, …,
+  with a `-N` collision suffix, matching `migrate`'s fallback), each carrying
+  its own file set. Parents that overlap (one nested under the other) are still
+  emitted; `apply`'s overlap validation then rejects them with a clear error
+  instead of `import` skipping the whole store with a warning. The `import`
+  JSON envelope gains a per-store `targets` array for multi-target imports.
+- `apply`: the file-mode stale-link sweep (`reconcile_store_links`) no longer
+  descends into the repository. A file-mode store with `target = "~"` (the
+  stow-mirror layout) walks all of `$HOME`; when the repo lives under `~`, the
+  sweep used to enter the repo and `remove_link` repo-internal organizational
+  symlinks that resolved into their own store dir. The sweep now prunes the
+  repo subtree (canonicalizing the walk root so the prefix check stays exact
+  with a symlinked `$HOME`), and only when the target is outside the repo — a
+  target inside the repo is still walked as the target's own subtree.
+
 ## 0.11.6 — 2026-08-14
 
 ### Fixed

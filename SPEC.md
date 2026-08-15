@@ -264,7 +264,13 @@ Scan for existing symlinks pointing into the repo and register them in
 `.stitch/state.toml`. Shares the `src/scan.rs` scanner with `prune`. Links
 already covered by config are skipped. Never rewrites `stitch.toml`. A link
 pointing at a store directory becomes a whole-dir store; links into files under
-a store become file-mode entries (all must share one target parent).
+a store become file-mode entries. When one store's file links span several
+target parents (stow-style fan-in), the store is imported as a multi-target
+store — one named target per parent (`target-1`, `target-2`, …, with a `-N`
+collision suffix, matching `migrate`'s fallback), each carrying its own file
+set — instead of being dropped. Parents that overlap (one nested under the
+other) are still emitted; `apply`'s overlap validation then rejects them with a
+clear error rather than `import` silently dropping the store.
 
 | Flag | Description |
 |---|---|
@@ -328,7 +334,7 @@ Contract (rationale in `docs/plans/v0.6-templates.md`):
 - **Staging is locked down from day one.** `.stitch/render/` is `0700`, rendered files `0600`. All rendering (apply and diff) happens in memory — no tempfile ever holds rendered plaintext under a default umask. Threat model: multi-user machines, shared CI runners, `env()` pulling tokens in v0.6, and encrypted secrets planned for v0.9 all read through these files. `init` appends `.stitch/render/` to the repo's `.gitignore`; an upgraded repo must add the entry manually before its first template apply. `apply` refuses to render without it, and `doctor` errors when templates or staged output make the entry relevant.
 - **Failure model is per-entry.** A template error (parse failure, missing `env` key) fails that entry and skips its link — never created, never broken. Render is atomic and happens before linking, so staging is never half-written. `apply` continues with other entries and stores, exiting non-zero at the end if anything failed (same aggregation as conflicts).
 - **`diff` gains a content dimension for templated entries only**: a fresh in-memory render compared against the staged file — "would `apply` change anything?" Non-templated entries remain link-state-only.
-- **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed. Hand-edits inside `.stitch/render/` are unsupported and overwritten on the next `apply`; `doctor` flags drift (staged ≠ fresh render) so this is never silent. Writes are hash-gated: unchanged content preserves mtime.
+- **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed. The stale-link sweep walks the target directory but never descends into the repository itself, so a file-mode store with `target = "~"` (whose target contains the repo) does not classify or remove repo-internal organizational symlinks. Hand-edits inside `.stitch/render/` are unsupported and overwritten on the next `apply`; `doctor` flags drift (staged ≠ fresh render) so this is never silent. Writes are hash-gated: unchanged content preserves mtime.
 - **Authoring is by hand.** Write `gitconfig.tmpl` in the store and `apply` — whole-dir stores pick it up via promotion; file-mode stores list the source name in `files`. There is no `add --template` in v0.6.
 
 ## Hooks (v0.2)
