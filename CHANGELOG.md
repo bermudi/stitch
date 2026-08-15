@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.0 — 2026-08-14
+
 ### Fixed
 
 - `import`: stow-style fan-in (one store's file links spanning several target
