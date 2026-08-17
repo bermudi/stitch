@@ -28,7 +28,7 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
@@ -74,7 +74,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # Full history + tag refs so `git tag -l` can read the annotated
           # tag's subject for the release title.
