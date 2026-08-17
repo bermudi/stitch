@@ -516,15 +516,22 @@ impl StitchError {
             Self::Hook {
                 name, store, scope, ..
             } => {
-                let store_json = store
-                    .as_ref()
-                    .map(|s| format!("\"{s}\""))
-                    .unwrap_or_else(|| "null".to_string());
-                Some(format!(
-                    r#"{{"hook":"{name}","store":{store_json},"scope":"{scope}"}}"#
-                ))
+                // Build the JSON object with serde_json so special characters
+                // in hook names and store names are escaped correctly.
+                let value = serde_json::json!({
+                    "hook": name,
+                    "store": store.as_deref(),
+                    "scope": scope,
+                });
+                Some(serde_json::to_string(&value).expect("hook details are serializable"))
             }
-            Self::Apply { details, .. } => details.clone(),
+            Self::Apply { details, .. } => details.as_ref().and_then(|s| {
+                // Validate that any caller-supplied details string is valid JSON
+                // before returning it; malformed details fall back to None.
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|v| serde_json::to_string(&v).ok())
+            }),
             _ => None,
         }
     }
@@ -576,8 +583,13 @@ impl StitchError {
                 [FailureClass::ConflictForeign] => vec![RecoveryAction::manual(
                     "foreign symlinks are never auto-clobbered; remove or repoint the symlink manually",
                 )],
+                // The aggregate knows a template render failed, but it does not
+                // record which source path failed. `edit-template` requires a
+                // specific source; an unqualified `edit` would open the wrong
+                // file. The source is in the JSON `data` plan ops, so keep this
+                // as `manual` and point the agent at the plan.
                 [FailureClass::Render] => vec![RecoveryAction::manual(
-                    "fix the failing template(s); see per-entry errors in the plan",
+                    "fix the failing template(s); see the source in the plan ops",
                 )],
                 [FailureClass::Drift] => vec![RecoveryAction::command("apply", "apply")],
                 _ => vec![],
@@ -632,6 +644,7 @@ impl From<LinkError> for StitchError {
 mod tests {
     use super::*;
     use crate::config::ConfigError;
+    use serde_json::Value;
     use std::path::PathBuf;
 
     #[test]
@@ -1168,5 +1181,138 @@ mod tests {
         assert_eq!(v["kind"], "manual");
         assert!(v.get("command").is_none());
         assert_eq!(v["reason"], "escalate");
+    }
+
+    #[test]
+    fn recoverable_via_apply_single_render_is_manual() {
+        // The aggregate has the failure class but not the source path, so it
+        // cannot emit a useful `edit-template` action without other files.
+        let err = StitchError::apply(vec![FailureClass::Render], "m");
+        let actions = err.recoverable_via();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "manual");
+        assert!(actions[0].command.is_none());
+        assert!(actions[0].reason.as_ref().unwrap().contains("template"));
+    }
+
+    #[test]
+    fn details_basic_hook() {
+        let err = StitchError::hook("pre-apply", "exit 1");
+        let details = err.details().expect("details should be present");
+        let parsed: Value = serde_json::from_str(&details).expect("details should be valid JSON");
+        assert_eq!(parsed["hook"], "pre-apply");
+        assert!(parsed["store"].is_null());
+        assert_eq!(parsed["scope"], "global");
+    }
+
+    #[test]
+    fn details_per_store_hook() {
+        let err = StitchError::hook_store("pre", "exit 1", "dotfiles");
+        let details = err.details().expect("details should be present");
+        let parsed: Value = serde_json::from_str(&details).expect("details should be valid JSON");
+        assert_eq!(parsed["hook"], "pre");
+        assert_eq!(parsed["store"], "dotfiles");
+        assert_eq!(parsed["scope"], "per-store");
+    }
+
+    #[test]
+    fn details_special_characters_are_escaped() {
+        // Quotes and backslashes must be escaped in the JSON output.
+        let name = "pre\"apply";
+        let store = "store\\backslash";
+        let err = StitchError::hook_store(name, "detail", store);
+        let details = err.details().expect("details should be present");
+        let parsed: Value = serde_json::from_str(&details).expect("details should be valid JSON");
+        assert_eq!(parsed["hook"], name);
+        assert_eq!(parsed["store"], store);
+        assert_eq!(parsed["scope"], "per-store");
+
+        // Unicode characters should pass through unchanged.
+        let err = StitchError::hook_store("日本語", "detail", "mañana");
+        let details = err.details().expect("details should be present");
+        let parsed: Value = serde_json::from_str(&details).expect("details should be valid JSON");
+        assert_eq!(parsed["hook"], "日本語");
+        assert_eq!(parsed["store"], "mañana");
+    }
+
+    #[test]
+    fn details_all_outputs_are_valid_json() {
+        for err in [
+            StitchError::hook("pre-apply", "exit 1"),
+            StitchError::hook_store("pre", "exit 1", "dotfiles"),
+            StitchError::hook_store("quote\"hook", "d", "store\\name"),
+            StitchError::Apply {
+                classes: vec![FailureClass::Hook],
+                message: "m".into(),
+                details: Some(r#"{"hook":"pre","store":"s","scope":"per-store"}"#.into()),
+            },
+        ] {
+            if let Some(details) = err.details() {
+                serde_json::from_str::<Value>(&details).expect("details should be valid JSON");
+            }
+        }
+    }
+
+    #[test]
+    fn details_apply_passes_through_valid_json() {
+        let err = StitchError::Apply {
+            classes: vec![FailureClass::Hook],
+            message: "m".into(),
+            details: Some(r#"{"hook":"pre","store":"s","scope":"per-store"}"#.into()),
+        };
+        let details = err.details().expect("details should be present");
+        let parsed: Value = serde_json::from_str(&details).expect("details should be valid JSON");
+        assert_eq!(parsed["hook"], "pre");
+        assert_eq!(parsed["store"], "s");
+        assert_eq!(parsed["scope"], "per-store");
+    }
+
+    #[test]
+    fn details_apply_re_escapes_caller_supplied_strings() {
+        // A valid caller-supplied details string with escaped quotes and
+        // backslashes round-trips through serde_json correctly.
+        let err = StitchError::Apply {
+            classes: vec![FailureClass::Hook],
+            message: "m".into(),
+            details: Some(
+                r#"{"hook":"quote\"hook","store":"slash\\store","scope":"per-store"}"#.into(),
+            ),
+        };
+        let details = err.details().expect("details should be present");
+        let parsed: Value = serde_json::from_str(&details).expect("details should be valid JSON");
+        assert_eq!(parsed["hook"], "quote\"hook");
+        assert_eq!(parsed["store"], "slash\\store");
+        assert_eq!(parsed["scope"], "per-store");
+    }
+
+    #[test]
+    fn details_apply_malformed_returns_none() {
+        // Malformed caller-supplied details must not be returned as-is.
+        let err = StitchError::Apply {
+            classes: vec![FailureClass::Hook],
+            message: "m".into(),
+            details: Some(r#"{"hook":"pre","store":"unescaped"quote","scope":"per-store"}"#.into()),
+        };
+        assert!(err.details().is_none());
+    }
+
+    #[test]
+    fn details_is_none_for_non_hook_errors() {
+        for err in [
+            StitchError::internal("x"),
+            StitchError::render("/s", "d"),
+            StitchError::conflict_real("/t"),
+            StitchError::Apply {
+                classes: vec![FailureClass::Render],
+                message: "m".into(),
+                details: None,
+            },
+        ] {
+            assert!(
+                err.details().is_none(),
+                "{:?} should have no details",
+                err.class()
+            );
+        }
     }
 }

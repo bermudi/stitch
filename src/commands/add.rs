@@ -39,7 +39,9 @@ pub(crate) fn cmd_add_bulk(
             let results: Vec<report::BulkAddResult> = paths
                 .iter()
                 .map(|p| {
-                    let store = derive_store_name(p);
+                    let expanded =
+                        expand_home(p).unwrap_or_else(|_| std::path::PathBuf::from(p.as_str()));
+                    let store = derive_store_name(&expanded);
                     let err = validation_errors
                         .iter()
                         .find(|(ep, _)| ep == p)
@@ -67,7 +69,9 @@ pub(crate) fn cmd_add_bulk(
     let mut results: Vec<report::BulkAddResult> = Vec::new();
     let mut all_ok = true;
     for path in paths {
-        let store = derive_store_name(path);
+        let expanded =
+            expand_home(path).unwrap_or_else(|_| std::path::PathBuf::from(path.as_str()));
+        let store = derive_store_name(&expanded);
         let result = if dry_run {
             // Already validated; just report what would happen.
             Ok(())
@@ -116,9 +120,8 @@ pub(crate) fn cmd_add_bulk(
 }
 
 /// Derive the store name from a path (basename, leading dot stripped).
-fn derive_store_name(path: &str) -> String {
-    let expanded = expand_home(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
-    let name = expanded
+fn derive_store_name(path: &std::path::Path) -> String {
+    let name = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unnamed".into());
@@ -1420,9 +1423,7 @@ pub(crate) fn cmd_add(
         );
     }
 
-    let store_name = name
-        .clone()
-        .unwrap_or_else(|| raw_name.trim_start_matches('.').to_string());
+    let store_name = name.clone().unwrap_or_else(|| derive_store_name(&source));
     if !config::is_store_name(&store_name) {
         return Err(StitchError::path_validation(format!(
             "invalid store name '{store_name}': store names must be exactly one normal path component"

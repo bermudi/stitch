@@ -735,6 +735,10 @@ can compute, execute, and verify in one call. The `data` object is:
   would otherwise do via a second `status` call. On `--dry-run` it reflects
   pre-apply state.
 
+When `--only <store>` is used, all four composite fields — `desired`, `plan`,
+`result`, and `post_status` — are filtered to the named store(s), not just
+`plan`.
+
 `diff --json` and `plan --json` are **unchanged** — they stay lean (desired
 state isn't executed, so the composite isn't needed). Only `apply --json`
 gets the composite, because only `apply` both computes and mutates.
