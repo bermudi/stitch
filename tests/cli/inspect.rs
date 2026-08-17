@@ -2882,6 +2882,158 @@ fn audit_log_empty_when_no_mutations() {
 }
 
 #[test]
+fn audit_log_records_failed_add_json() {
+    // A failed `add --json` (store already exists) appends an audit entry.
+    let repo = Repo::new();
+    repo.write_state("[stores.bashrc]\ntarget = \"~/.bashrc\"\n");
+
+    let home = tempfile::tempdir().unwrap();
+    let bashrc = home.path().join(".bashrc");
+    fs::write(&bashrc, "data").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args(["--json", "add", bashrc.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", false);
+
+    let log = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(log.status.success());
+    let log_value = json_output(&log);
+    let entries = log_value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "add");
+    assert_eq!(last["outcome"], "error");
+    assert_eq!(last["exit_code"], 1);
+    assert!(last["exit_class"].is_string());
+}
+
+#[test]
+fn audit_log_records_failed_apply_json() {
+    // A failed `apply --json` (conflict with a real file) appends an audit entry.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(6));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", false);
+    assert_error_shape(&value, "conflict-real", 6);
+
+    let log = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(log.status.success());
+    let log_value = json_output(&log);
+    let entries = log_value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "apply");
+    assert_eq!(last["outcome"], "error");
+    assert_eq!(last["exit_class"], "conflict-real");
+    assert_eq!(last["exit_code"], 6);
+}
+
+#[test]
+fn audit_log_records_remove() {
+    // A successful `remove` appends an audit entry.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    repo.cmd().args(["remove", "bashrc"]).assert().success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "remove");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+}
+
+#[test]
+fn audit_log_records_migrate() {
+    // A successful `migrate` appends an audit entry.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "log"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_envelope_shape(&value, "log", true);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "migrate");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+}
+
+#[test]
+fn audit_log_records_prune_yes() {
+    // A successful `prune --yes` appends an audit entry.
+    let (repo, _covered, _orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--yes")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .env("HOME", home.path().as_os_str())
+        .assert()
+        .success()
+        .stdout(contains("Removed 1 link(s)."));
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "prune");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+}
+
+#[test]
 fn bulk_add_json_adds_multiple_paths() {
     // `add path1 path2 --json` adds both paths as simple stores and returns
     // a BulkAddData envelope with per-path results.

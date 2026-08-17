@@ -48,7 +48,7 @@ pub(crate) fn cmd_render(
     }
 
     if json {
-        return report::run_json("render", || {
+        return report::run_json("render", None, || {
             let loaded =
                 Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             validate_render_spec(&loaded, store_name, source_rel)

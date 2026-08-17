@@ -126,8 +126,13 @@ pub type JsonResult<T> = Result<(T, Vec<String>), Box<(StitchError, Vec<String>)
 /// the error's class code so callers never return a successful exit code for a
 /// failed run. The closure returns warnings alongside the result so load-time
 /// warnings are preserved even when a later step fails.
+///
+/// `audit_root` is `Some` for mutating commands (e.g. `prune --yes`) so the
+/// audit log captures JSON-mode failures that would otherwise bypass the
+/// central runner.
 pub fn run_json<T: Serialize, F: FnOnce() -> JsonResult<T>>(
     command: &'static str,
+    audit_root: Option<&std::path::Path>,
     f: F,
 ) -> Result<(), StitchError> {
     match f() {
@@ -137,6 +142,9 @@ pub fn run_json<T: Serialize, F: FnOnce() -> JsonResult<T>>(
         }
         Err(boxed) => {
             let (error, warnings) = *boxed;
+            if let Some(root) = audit_root {
+                crate::audit::append_command_result(root, command, Err(&error));
+            }
             write_error(command, &error, warnings);
             std::process::exit(error.exit_code());
         }
@@ -737,8 +745,10 @@ pub struct BulkAddResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditEntry;
     use crate::config::{Config, Hooks, Store, WhenClause};
     use crate::linker::LinkStatus;
+    use crate::plan::*;
     use crate::scan::FoundLink;
     use crate::store::{DoctorFinding, DoctorResult, Severity, StatusEntry};
     use serde_json::Value;
@@ -1190,6 +1200,93 @@ mod tests {
         );
     }
 
+    fn agent_schema() -> Value {
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/agent-schema.json"
+        ));
+        serde_json::from_str(raw).expect("docs/agent-schema.json is valid JSON")
+    }
+
+    fn base_shape_name(type_str: &str) -> Option<&str> {
+        let delimiters = ['|', '(', ' ', '['];
+        let end = type_str
+            .char_indices()
+            .find(|(_, c)| delimiters.contains(c))
+            .map(|(i, _)| i)
+            .unwrap_or(type_str.len());
+        let base = &type_str[..end];
+        let base = base.trim();
+        if base.is_empty() { None } else { Some(base) }
+    }
+
+    fn check_value_against_shape(value: &Value, shape: &Value, path: &str, schema: &Value) {
+        let obj = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}: expected a JSON object"));
+
+        let (field_map, tag) = if let Some(fields) = shape.get("fields").and_then(Value::as_object)
+        {
+            (fields.clone(), None)
+        } else if let Some(tag) = shape.get("tag").and_then(Value::as_str) {
+            let variants = shape["variants"]
+                .as_object()
+                .expect("enum shape must declare variants");
+            let variant_name = obj[tag]
+                .as_str()
+                .unwrap_or_else(|| panic!("{path}: missing enum tag {tag}"));
+            let variant = variants
+                .get(variant_name)
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{path}: unknown variant {variant_name}"));
+            (variant.clone(), Some(tag.to_string()))
+        } else {
+            panic!("{path}: schema node is not an object or enum shape: {shape}");
+        };
+
+        let mut expected: std::collections::BTreeSet<String> = field_map.keys().cloned().collect();
+        if let Some(tag) = &tag {
+            expected.insert(tag.clone());
+        }
+        let actual: std::collections::BTreeSet<String> = obj.keys().cloned().collect();
+        assert_eq!(actual, expected, "{path}: JSON keys do not match schema");
+
+        for (key, field_value) in obj {
+            if Some(key) == tag.as_ref() {
+                continue;
+            }
+            let field_schema = &field_map[key];
+            if let Some(type_str) = field_schema.as_str()
+                && let Some(base) = base_shape_name(type_str)
+                && let Some(nested_shape) = schema["shapes"].get(base)
+            {
+                match field_value {
+                    Value::Object(_) => {
+                        check_value_against_shape(
+                            field_value,
+                            nested_shape,
+                            &format!("{path}.{key}"),
+                            schema,
+                        );
+                    }
+                    Value::Array(arr) => {
+                        for (i, item) in arr.iter().enumerate() {
+                            if !item.is_null() {
+                                check_value_against_shape(
+                                    item,
+                                    nested_shape,
+                                    &format!("{path}.{key}[{i}]"),
+                                    schema,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     #[test]
     fn envelope_schema_is_exact() {
         let ok_env = Envelope {
@@ -1500,5 +1597,389 @@ mod tests {
         let d2 = super::render(&PathBuf::from("/repo/s/file"), "file", "x");
         let v2 = serde_json::to_value(&d2).unwrap();
         assert_eq!(v2["link_name"], "file");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dto_samples() -> Vec<(&'static str, Value)> {
+        let mut samples = Vec::new();
+
+        let wc = WhenClause {
+            os: Some("linux".into()),
+            arch: Some("x86_64".into()),
+            distro: Some("ubuntu".into()),
+            hostname: Some("h".into()),
+            shell: Some("bash".into()),
+        };
+
+        let hooks = Hooks {
+            pre: Some("echo pre".into()),
+            post: Some("echo post".into()),
+        };
+
+        // StatusRow (and reused later in ApplyData.post_status)
+        let status_row = StatusRow {
+            store: "git".into(),
+            target_name: Some("laptop".into()),
+            target: "/home/.gitconfig".into(),
+            source: "/repo/git/gitconfig.tmpl".into(),
+            templated: true,
+            staged_path: Some("/repo/.stitch/render/git/gitconfig".into()),
+            state: "broken".into(),
+            skipped_platform: false,
+            resolves_to: Some("/gone".into()),
+        };
+        samples.push(("StatusRow", serde_json::to_value(&status_row).unwrap()));
+
+        // ListStore (covers ListTarget and WhenClause via recursion)
+        samples.push((
+            "ListStore",
+            serde_json::to_value(ListStore {
+                name: "shells".into(),
+                mode: "file-mode".into(),
+                target: Some("~".into()),
+                targets: Some(vec![ListTarget {
+                    name: "laptop".into(),
+                    target: "~/.config/helix".into(),
+                    mode: "file-mode".into(),
+                    files: vec!["config.toml".into()],
+                    patterns: vec!["*.bak".into()],
+                    when: wc.clone(),
+                }]),
+                files: vec![".bashrc".into()],
+                patterns: vec!["*.bak".into()],
+                when: wc.clone(),
+            })
+            .unwrap(),
+        ));
+
+        // Plan (covers PlanStore, PlanSummary, PlanOp, LinkRequires, TargetState)
+        let plan = Plan::from_stores(vec![PlanStore {
+            store_name: "git".into(),
+            ops: vec![PlanOp::CreateLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: LinkRequires::with_backup(
+                    TargetState::SymlinkTo("/repo/git/gitconfig".into()),
+                    TargetState::Absent,
+                ),
+            }],
+        }]);
+        samples.push(("Plan", serde_json::to_value(&plan).unwrap()));
+
+        // ExplainData (covers ExplainPlatform, ExplainStore, ExplainTarget, ExplainEntry, WhenClause, Hooks)
+        let explain_data = ExplainData {
+            platform: ExplainPlatform {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                distro: Some("ubuntu".into()),
+                hostname: "h".into(),
+                shell: "bash".into(),
+            },
+            stores: vec![ExplainStore {
+                name: "git".into(),
+                active: true,
+                when: wc.clone(),
+                mode: "file-mode".into(),
+                target: Some("~".into()),
+                entries: vec![ExplainEntry {
+                    source: "gitconfig.tmpl".into(),
+                    templated: true,
+                    link_name: "gitconfig".into(),
+                }],
+                targets: vec![ExplainTarget {
+                    name: "laptop".into(),
+                    active: true,
+                    when: wc.clone(),
+                    target: "~/.config/helix".into(),
+                    mode: "file-mode".into(),
+                    entries: vec![ExplainEntry {
+                        source: "config.toml".into(),
+                        templated: false,
+                        link_name: "config.toml".into(),
+                    }],
+                    ignore: vec!["*.bak".into()],
+                }],
+                hooks: hooks.clone(),
+                ignore: vec!["*.log".into()],
+            }],
+        };
+        samples.push(("ExplainData", serde_json::to_value(&explain_data).unwrap()));
+
+        // ApplyData (covers ApplyResult, ApplyResultStore, StatusRow, Plan, ExplainData)
+        samples.push((
+            "ApplyData",
+            serde_json::to_value(ApplyData {
+                desired: explain_data,
+                plan,
+                result: Some(ApplyResult {
+                    ops_executed: 1,
+                    ops_total: 2,
+                    conflicts: 0,
+                    errors: 0,
+                    stores: vec![ApplyResultStore {
+                        store: "git".into(),
+                        ok: 1,
+                        conflicts: 0,
+                        errors: 0,
+                        skipped: 0,
+                    }],
+                }),
+                post_status: vec![status_row],
+            })
+            .unwrap(),
+        ));
+
+        // DoctorData (covers DoctorRow, DoctorSummary)
+        samples.push((
+            "DoctorData",
+            serde_json::to_value(DoctorData {
+                findings: vec![DoctorRow {
+                    id: "broken-link".into(),
+                    severity: "error".into(),
+                    message: "bad".into(),
+                    path: Some("/p".into()),
+                    hint: Some("fix".into()),
+                }],
+                summary: DoctorSummary {
+                    errors: 1,
+                    warnings: 2,
+                    info: 3,
+                },
+            })
+            .unwrap(),
+        ));
+
+        // PruneData (covers PruneRow)
+        samples.push((
+            "PruneData",
+            serde_json::to_value(PruneData {
+                orphans: vec![PruneRow {
+                    link: "/home/.oldrc".into(),
+                    resolves_to: "/repo/old/.oldrc".into(),
+                    status: "removed".into(),
+                }],
+                removed: 1,
+                failed: 2,
+            })
+            .unwrap(),
+        ));
+
+        // RenderData
+        samples.push((
+            "RenderData",
+            serde_json::to_value(RenderData {
+                source: "/repo/git/gitconfig.tmpl".into(),
+                link_name: "gitconfig".into(),
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+                content: "hello".into(),
+            })
+            .unwrap(),
+        ));
+
+        // AddData
+        samples.push((
+            "AddData",
+            serde_json::to_value(AddData {
+                store: "git".into(),
+                target: "~/.gitconfig".into(),
+                mode: "add-to-store".into(),
+                source: Some("/repo/git/gitconfig".into()),
+                files: vec!["gitconfig".into()],
+                patterns: vec!["*.tmpl".into()],
+                link_created: Some("/home/.gitconfig".into()),
+            })
+            .unwrap(),
+        ));
+
+        // RemoveData
+        samples.push((
+            "RemoveData",
+            serde_json::to_value(RemoveData {
+                store: "git".into(),
+                target: Some("laptop".into()),
+                links: vec!["/home/.gitconfig".into()],
+                staging: "/repo/.stitch/render".into(),
+                dry_run: false,
+                behavior_orphaned: Some(true),
+            })
+            .unwrap(),
+        ));
+
+        // MigrateData
+        samples.push((
+            "MigrateData",
+            serde_json::to_value(MigrateData {
+                authored_path: Some("/repo/stitch.toml".into()),
+                authored: Some("# authored".into()),
+                state_path: Some("/repo/.stitch/state.toml".into()),
+                state: Some("# state".into()),
+            })
+            .unwrap(),
+        ));
+
+        // ImportData (covers ImportedStore, ImportedTarget)
+        samples.push((
+            "ImportData",
+            serde_json::to_value(ImportData {
+                dry_run: false,
+                imported: 1,
+                skipped_owned: 2,
+                stores: vec![ImportedStore {
+                    store: "git".into(),
+                    target: "~".into(),
+                    mode: "file-mode".into(),
+                    files: vec![".bashrc".into()],
+                    targets: vec![ImportedTarget {
+                        name: "laptop".into(),
+                        target: "~/.config/helix".into(),
+                        files: vec![".bashrc".into()],
+                    }],
+                }],
+            })
+            .unwrap(),
+        ));
+
+        // BulkAddData (covers BulkAddResult)
+        samples.push((
+            "BulkAddData",
+            serde_json::to_value(BulkAddData {
+                results: vec![BulkAddResult {
+                    path: "/home/.bashrc".into(),
+                    store: "bashrc".into(),
+                    ok: false,
+                    error: Some("boom".into()),
+                    dry_run: false,
+                }],
+                all_ok: false,
+            })
+            .unwrap(),
+        ));
+
+        // WhyData (covers WhyEntry)
+        samples.push((
+            "WhyData",
+            serde_json::to_value(WhyData {
+                query: "/home/.gitconfig".into(),
+                entry: Some(WhyEntry {
+                    store: "git".into(),
+                    target_name: Some("laptop".into()),
+                    target: "/home/.gitconfig".into(),
+                    source: "/repo/git/gitconfig.tmpl".into(),
+                    templated: true,
+                    state: "broken".into(),
+                    resolves_to: Some("/gone".into()),
+                    owning_config: "state.toml".into(),
+                }),
+                skipped_platform: true,
+            })
+            .unwrap(),
+        ));
+
+        // AuditEntry
+        samples.push((
+            "AuditEntry",
+            serde_json::to_value(AuditEntry {
+                timestamp: "2024-01-01T00:00:00Z".into(),
+                command: "apply".into(),
+                store: Some("git".into()),
+                target: Some("/home/.gitconfig".into()),
+                outcome: "ok".into(),
+                exit_class: Some("internal".into()),
+                exit_code: 1,
+            })
+            .unwrap(),
+        ));
+
+        // WhenClause and Hooks (referenced by many shapes; also tested directly)
+        samples.push(("WhenClause", serde_json::to_value(wc).unwrap()));
+        samples.push(("Hooks", serde_json::to_value(hooks).unwrap()));
+
+        // PlanOp: every variant
+        let op_requires = LinkRequires::with_backup(
+            TargetState::SymlinkTo("/repo/git/gitconfig".into()),
+            TargetState::Absent,
+        );
+        for op in [
+            PlanOp::StageRender {
+                store: "git".into(),
+                source_rel: "gitconfig.tmpl".into(),
+                source: "/repo/git/gitconfig.tmpl".into(),
+                staged: "/repo/.stitch/render/git/gitconfig".into(),
+                sha256: "abc".into(),
+            },
+            PlanOp::CreateLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::ReplaceLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                old_resolves_to: Some("/old".into()),
+                requires: op_requires.clone(),
+            },
+            PlanOp::BackupAndLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                backup: "/home/.gitconfig.bak".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::RemoveLink {
+                store: "git".into(),
+                target: "/home/.gitconfig".into(),
+                source: Some("/repo/git/gitconfig".into()),
+                requires: op_requires.clone(),
+            },
+            PlanOp::RemoveStaged {
+                path: "/repo/.stitch/render/git/gitconfig".into(),
+            },
+            PlanOp::ContentChanged {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::AlreadyLinked {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::Conflict {
+                target: "/home/.gitconfig".into(),
+                resolves_to: Some("/foreign".into()),
+            },
+            PlanOp::SkippedPlatform,
+            PlanOp::Error {
+                message: "boom".into(),
+                class: "internal".into(),
+            },
+        ] {
+            samples.push(("PlanOp", serde_json::to_value(op).unwrap()));
+        }
+
+        // TargetState: every variant
+        for state in [
+            TargetState::Absent,
+            TargetState::RealEntry,
+            TargetState::SymlinkTo("/repo/git/gitconfig".into()),
+            TargetState::SymlinkIntoRepo,
+        ] {
+            samples.push(("TargetState", serde_json::to_value(state).unwrap()));
+        }
+
+        samples
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn schema_shape_keys_match_dto_serializations() {
+        let schema = agent_schema();
+        let shapes = schema["shapes"]
+            .as_object()
+            .expect("shapes must be an object");
+
+        for (name, value) in dto_samples() {
+            let shape = &shapes[name];
+            check_value_against_shape(&value, shape, name, &schema);
+        }
     }
 }

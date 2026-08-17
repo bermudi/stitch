@@ -20,7 +20,6 @@ pub(crate) mod why;
 
 pub(crate) use common::resolve_root;
 
-use crate::audit::AuditEntry;
 use crate::cli;
 use crate::error::StitchError;
 use crate::report;
@@ -66,24 +65,7 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
     // Audit-log mutating operations. Best-effort: a log write failure is a
     // warning, not a hard error, so the log never blocks a mutation.
     if is_mutation && let Some(root) = resolved_repo_for_audit(repo.as_deref()) {
-        let (outcome, exit_class, exit_code) = match &result {
-            Ok(()) => ("ok".to_string(), None, 0),
-            Err(e) => (
-                "error".to_string(),
-                Some(e.class().id().to_string()),
-                e.exit_code(),
-            ),
-        };
-        let entry = AuditEntry {
-            timestamp: now_iso8601(),
-            command: command_name,
-            store: None,
-            target: None,
-            outcome,
-            exit_class,
-            exit_code,
-        };
-        crate::audit::append(&root, &entry);
+        crate::audit::append_command_result(&root, &command_name, result.as_ref().map(|_| ()));
     }
 
     result
@@ -108,18 +90,6 @@ fn is_mutation_command(command: &cli::Commands) -> bool {
 /// path).
 fn resolved_repo_for_audit(repo: Option<&str>) -> Option<std::path::PathBuf> {
     resolve_root(repo).ok()
-}
-
-fn now_iso8601() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Simple ISO 8601-ish timestamp without a chrono dependency. Format:
-    // unix-seconds aren't ISO 8601, but a stable machine-readable timestamp
-    // is what the audit log needs. Use a clear prefix so it's not mistaken
-    // for ISO 8601.
-    format!("unix:{secs}")
 }
 
 fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<(), StitchError> {
@@ -196,6 +166,7 @@ fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<()
                         "--name, --files, --patterns, --file, and --to are not supported with multiple paths (bulk mode)",
                     );
                     if json {
+                        crate::audit::append_command_result(&root, "add", Err(&error));
                         report::write_error("add", &error, Vec::new());
                         std::process::exit(error.exit_code());
                     }

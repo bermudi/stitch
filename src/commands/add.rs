@@ -22,10 +22,10 @@ pub(crate) fn cmd_add_bulk(
     // Phase 1: validate all paths with dry-run.
     let mut validation_errors: Vec<(String, String)> = Vec::new();
     for path in paths {
-        let result = if json {
-            suppress_stdout(|| cmd_add(root, path, &None, &[], &[], false, None, true, false))
-        } else {
+        let result = if dry_run && !json {
             cmd_add(root, path, &None, &[], &[], false, None, true, false)
+        } else {
+            suppress_stdout(|| cmd_add(root, path, &None, &[], &[], false, None, true, false))
         };
         if let Err(e) = result {
             validation_errors.push((path.clone(), e.to_string()));
@@ -57,10 +57,8 @@ pub(crate) fn cmd_add_bulk(
                 all_ok: false,
                 results,
             };
-            report::write_error("add", &error, Vec::new());
-            // Also write the bulk data so the agent can see per-path status.
-            let _ = serde_json::to_string(&data); // suppress unused warning
-            std::process::exit(error.exit_code());
+            crate::audit::append_command_result(root, "add", Err(&error));
+            report::write_data_error("add", data, &error, Vec::new());
         }
         return Err(error);
     }
@@ -100,9 +98,12 @@ pub(crate) fn cmd_add_bulk(
 
     if json {
         let data = report::BulkAddData { results, all_ok };
-        report::write("add", data, Vec::new());
-        if !all_ok {
-            std::process::exit(1);
+        if all_ok {
+            report::write("add", data, Vec::new());
+        } else {
+            let error = StitchError::internal("bulk add: one or more paths failed");
+            crate::audit::append_command_result(root, "add", Err(&error));
+            report::write_data_error("add", data, &error, Vec::new());
         }
         return Ok(());
     }
@@ -1267,6 +1268,7 @@ pub(crate) fn cmd_add_json(
         Ok(snapshot) => snapshot.loaded.warnings,
         Err(error) => {
             let error = StitchError::from(error);
+            crate::audit::append_command_result(root, "add", Err(&error));
             report::write_error("add", &error, Vec::new());
             std::process::exit(error.exit_code());
         }
@@ -1284,6 +1286,7 @@ pub(crate) fn cmd_add_json(
     ) {
         Ok(()) => Ok(()),
         Err(error) => {
+            crate::audit::append_command_result(root, "add", Err(&error));
             report::write_error("add", &error, warnings);
             std::process::exit(error.exit_code());
         }

@@ -9,6 +9,7 @@
 //! under `.stitch/`, documented in SPEC.md, and `stitch log` is the only
 //! reader. It is not a quarantine or retention mechanism.
 
+use crate::error::StitchError;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -59,6 +60,41 @@ pub fn append(root: &Path, entry: &AuditEntry) {
             log_path.display()
         );
     }
+}
+
+/// Append an audit entry for a command result. Used by the central runner
+/// and by JSON error paths that must exit before returning to the runner.
+pub fn append_command_result(root: &Path, command: &str, result: Result<(), &StitchError>) {
+    let (outcome, exit_class, exit_code) = match result {
+        Ok(()) => ("ok".to_string(), None, 0),
+        Err(error) => (
+            "error".to_string(),
+            Some(error.class().id().to_string()),
+            error.exit_code(),
+        ),
+    };
+    let entry = AuditEntry {
+        timestamp: now_iso8601(),
+        command: command.to_string(),
+        store: None,
+        target: None,
+        outcome,
+        exit_class,
+        exit_code,
+    };
+    append(root, &entry);
+}
+
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Simple ISO 8601-ish timestamp without a chrono dependency. Format:
+    // unix-seconds aren't ISO 8601, but a stable machine-readable timestamp
+    // is what the audit log needs. Use a clear prefix so it's not mistaken
+    // for ISO 8601.
+    format!("unix:{secs}")
 }
 
 /// Read the audit log, returning the last `limit` entries (or all if

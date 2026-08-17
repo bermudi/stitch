@@ -126,7 +126,7 @@
         "source": "string (absolute path)",
         "templated": "bool",
         "staged_path": "string|null",
-        "state": "string (linked|missing|conflict|broken)",
+        "state": "string (linked|missing|conflict|broken|foreign|error)",
         "skipped_platform": "bool",
         "resolves_to": "string|null"
       }
@@ -194,9 +194,20 @@
       }
     },
     "LinkRequires": {
-      "description": "Precondition for an op. `target` is a TargetState: {target: 'absent'} | {target: 'symlink', resolves_to: string|null} | {target: 'real'} | {target: 'replaceable'}.",
+      "description": "Precondition for an op. `target` is a TargetState; `backup` is present when a backup target must also be verified.",
       "fields": {
-        "target": "TargetState"
+        "target": "TargetState",
+        "backup": "TargetState|null"
+      }
+    },
+    "TargetState": {
+      "description": "Expected state of a path when an op is executed.",
+      "tag": "target",
+      "variants": {
+        "absent": {},
+        "real_entry": {},
+        "symlink_to": { "value": "string" },
+        "symlink_into_repo": {}
       }
     },
     "ApplyData": {
@@ -229,32 +240,37 @@
     "DoctorData": {
       "fields": {
         "findings": "DoctorRow[]",
-        "summary": { "errors": "usize", "warnings": "usize", "info": "usize" }
+        "summary": "DoctorSummary"
+      }
+    },
+    "DoctorSummary": {
+      "fields": {
+        "errors": "usize",
+        "warnings": "usize",
+        "info": "usize"
       }
     },
     "DoctorRow": {
       "fields": {
+        "id": "string",
         "severity": "string (error|warning|info)",
-        "store": "string|null",
-        "target": "string|null",
         "message": "string",
-        "hint": "string|null",
-        "path": "string|null"
+        "path": "string|null",
+        "hint": "string|null"
       }
     },
     "PruneData": {
       "fields": {
-        "dry_run": "bool",
-        "scanned": "usize",
+        "orphans": "PruneRow[]",
         "removed": "usize",
-        "orphans": "PruneRow[]"
+        "failed": "usize"
       }
     },
     "PruneRow": {
       "fields": {
         "link": "string",
-        "resolves_to": "string|null",
-        "action": "string (would-remove|removed|skipped)"
+        "resolves_to": "string",
+        "status": "string (listed|removed|failed)"
       }
     },
     "RenderData": {
@@ -267,21 +283,22 @@
     },
     "AddData": {
       "fields": {
-        "dry_run": "bool",
         "store": "string",
+        "target": "string",
         "mode": "string",
-        "target": "string|null",
-        "create_files": "string[]",
-        "adopt_files": "string[]",
+        "source": "string|null (repo source path; null for create modes)",
+        "files": "string[]",
+        "patterns": "string[]",
         "link_created": "string|null (real mutations only; absent on dry-run)"
       }
     },
     "RemoveData": {
       "fields": {
-        "dry_run": "bool",
         "store": "string",
-        "removed_links": "string[]",
-        "staging_removed": "string[]",
+        "target": "string|null (multi-target name)",
+        "links": "string[]",
+        "staging": "string",
+        "dry_run": "bool",
         "behavior_orphaned": "bool|absent (real mutations only; omitted on dry-run)"
       }
     },
@@ -399,7 +416,7 @@
     },
     "AuditEntry": {
       "fields": {
-        "timestamp": "string (unix:SECONDS)",
+        "timestamp": "string (ISO 8601 UTC timestamp)",
         "command": "string (apply|add|remove|migrate|import|prune)",
         "store": "string|null (omitted when not applicable)",
         "target": "string|null (omitted when not applicable)",

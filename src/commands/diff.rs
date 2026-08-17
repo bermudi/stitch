@@ -31,7 +31,7 @@ pub(crate) fn cmd_diff(
         .map_err(StitchError::config)?;
 
     if json {
-        return report::run_json("diff", || {
+        return report::run_json("diff", None, || {
             let plan = store::compute_plan(
                 root,
                 &filtered_config,

@@ -538,6 +538,68 @@ when = { os = "linux" }
 }
 
 #[test]
+fn json_apply_only_filters_composite_data() {
+    // `apply --only foo --json` should only include store `foo` in the
+    // composite desired/plan/result/post_status fields.
+    let repo = Repo::new();
+    repo.make_store("foo", &[".foorc"]);
+    repo.make_store("bar", &[".barrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.foo]
+target = "{home}"
+files = [".foorc"]
+
+[stores.bar]
+target = "{home}"
+files = [".barrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--only", "foo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply --only foo --json should succeed"
+    );
+
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    let data = &value["data"];
+    let desired_stores = data["desired"]["stores"]
+        .as_array()
+        .expect("desired stores");
+    assert_eq!(desired_stores.len(), 1, "desired should only contain foo");
+    assert_eq!(desired_stores[0]["name"], "foo");
+
+    let plan_stores = data["plan"]["stores"].as_array().expect("plan stores");
+    assert_eq!(plan_stores.len(), 1, "plan should only contain foo");
+    assert_eq!(plan_stores[0]["store_name"], "foo");
+
+    let result = data["result"].as_object().expect("result object");
+    let result_stores = result["stores"].as_array().expect("result stores");
+    assert_eq!(result_stores.len(), 1, "result should only contain foo");
+    assert_eq!(result_stores[0]["store"], "foo");
+
+    let post_status = data["post_status"].as_array().expect("post_status");
+    assert!(
+        post_status.iter().all(|row| row["store"] == "foo"),
+        "post_status must only contain store foo"
+    );
+
+    // The unselected store should not have been linked.
+    assert!(home.join(".foorc").is_symlink(), "foo should be linked");
+    assert!(!home.join(".barrc").exists(), "bar should not be linked");
+}
+
+#[test]
 fn json_diff_reports_plan() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);

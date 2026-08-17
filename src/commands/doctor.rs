@@ -7,7 +7,7 @@ use crate::store;
 
 pub(crate) fn cmd_doctor(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     if json {
-        return report::run_json("doctor", || {
+        return report::run_json("doctor", None, || {
             let loaded =
                 Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             let platform = Platform::detect();
