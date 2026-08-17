@@ -197,3 +197,230 @@ fn print_explain(data: &ExplainData) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Hooks, Store, TargetEntry, WhenClause};
+    use crate::platform::Platform;
+    use crate::report::ExplainEntry;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    fn test_platform() -> Platform {
+        Platform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            distro: Some("testdistro".into()),
+            hostname: "testhost".into(),
+            shell: "bash".into(),
+        }
+    }
+
+    #[test]
+    fn mode_for_whole_dir() {
+        assert_eq!(mode_for(true, &[]), "whole-dir");
+    }
+
+    #[test]
+    fn mode_for_file_mode_when_not_whole() {
+        assert_eq!(mode_for(false, &[]), "file-mode");
+    }
+
+    #[test]
+    fn mode_for_file_mode_with_entries() {
+        let entry = ExplainEntry {
+            source: "a".into(),
+            templated: false,
+            link_name: "a".into(),
+        };
+        assert_eq!(mode_for(true, &[entry]), "file-mode");
+    }
+
+    #[test]
+    fn resolve_entries_empty_store_is_whole_dir() {
+        let tmp = tempdir().unwrap();
+        let store_dir = tmp.path().join("empty");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let entries = resolve_entries(&store_dir, &[], &[], &[]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn resolve_entries_template_strips_tmpl_suffix() {
+        let tmp = tempdir().unwrap();
+        let store_dir = tmp.path().join("tmpl");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("gitconfig.tmpl"), "host={{ hostname }}\n").unwrap();
+        let entries = resolve_entries(&store_dir, &["gitconfig.tmpl".into()], &[], &[]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "gitconfig.tmpl");
+        assert_eq!(entries[0].link_name, "gitconfig");
+        assert!(entries[0].templated);
+    }
+
+    #[test]
+    fn resolve_entries_plain_file_uses_basename() {
+        let tmp = tempdir().unwrap();
+        let store_dir = tmp.path().join("plain");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("foo.conf"), "x").unwrap();
+        let entries = resolve_entries(&store_dir, &[], &["*".into()], &[]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "foo.conf");
+        assert_eq!(entries[0].link_name, "foo.conf");
+        assert!(!entries[0].templated);
+    }
+
+    #[test]
+    fn explain_store_single_target_none_mode() {
+        let tmp = tempdir().unwrap();
+        let store = Store {
+            target: None,
+            files: Vec::new(),
+            patterns: Vec::new(),
+            ignore: Vec::new(),
+            when: WhenClause::default(),
+            hooks: Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let out = explain_store(tmp.path(), "s", &store, &test_platform());
+        assert_eq!(out.mode, "none");
+        assert!(out.target.is_none());
+        assert!(out.entries.is_empty());
+        assert!(out.active);
+    }
+
+    #[test]
+    fn explain_store_single_target_whole_dir() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("s")).unwrap();
+        let store = Store {
+            target: Some("/home/.config/s".into()),
+            files: Vec::new(),
+            patterns: Vec::new(),
+            ignore: Vec::new(),
+            when: WhenClause::default(),
+            hooks: Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let out = explain_store(tmp.path(), "s", &store, &test_platform());
+        assert_eq!(out.mode, "whole-dir");
+        assert_eq!(out.target.as_deref(), Some("/home/.config/s"));
+        assert!(out.entries.is_empty());
+    }
+
+    #[test]
+    fn explain_store_single_target_file_mode() {
+        let tmp = tempdir().unwrap();
+        let store_dir = tmp.path().join("s");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("a"), "x").unwrap();
+        let store = Store {
+            target: Some("/home/.config/s".into()),
+            files: vec!["a".into()],
+            patterns: Vec::new(),
+            ignore: Vec::new(),
+            when: WhenClause::default(),
+            hooks: Hooks::default(),
+            targets: BTreeMap::new(),
+        };
+        let out = explain_store(tmp.path(), "s", &store, &test_platform());
+        assert_eq!(out.mode, "file-mode");
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].source, "a");
+        assert!(!out.entries[0].templated);
+    }
+
+    #[test]
+    fn explain_store_multi_target_modes_and_activity() {
+        let tmp = tempdir().unwrap();
+        let store_dir = tmp.path().join("s");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("a"), "x").unwrap();
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            "home".into(),
+            TargetEntry {
+                target: "/home".into(),
+                files: vec!["a".into()],
+                patterns: Vec::new(),
+                ignore: Vec::new(),
+                when: WhenClause::default(),
+            },
+        );
+        targets.insert(
+            "work".into(),
+            TargetEntry {
+                target: "/work".into(),
+                files: Vec::new(),
+                patterns: Vec::new(),
+                ignore: Vec::new(),
+                when: WhenClause {
+                    os: Some("macos".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let store = Store {
+            target: None,
+            files: Vec::new(),
+            patterns: Vec::new(),
+            ignore: Vec::new(),
+            when: WhenClause::default(),
+            hooks: Hooks::default(),
+            targets,
+        };
+        let out = explain_store(tmp.path(), "s", &store, &test_platform());
+        assert_eq!(out.mode, "multi-target");
+        assert_eq!(out.targets.len(), 2);
+        assert_eq!(out.targets[0].name, "home");
+        assert_eq!(out.targets[0].mode, "file-mode");
+        assert!(out.targets[0].active);
+        assert_eq!(out.targets[1].name, "work");
+        assert_eq!(out.targets[1].mode, "whole-dir");
+        assert!(!out.targets[1].active);
+    }
+
+    #[test]
+    fn build_explain_data_active_only_filters() {
+        let tmp = tempdir().unwrap();
+        let mut stores = BTreeMap::new();
+        stores.insert(
+            "active".into(),
+            Store {
+                target: None,
+                files: Vec::new(),
+                patterns: Vec::new(),
+                ignore: Vec::new(),
+                when: WhenClause::default(),
+                hooks: Hooks::default(),
+                targets: BTreeMap::new(),
+            },
+        );
+        stores.insert(
+            "inactive".into(),
+            Store {
+                target: None,
+                files: Vec::new(),
+                patterns: Vec::new(),
+                ignore: Vec::new(),
+                when: WhenClause {
+                    os: Some("macos".into()),
+                    ..Default::default()
+                },
+                hooks: Hooks::default(),
+                targets: BTreeMap::new(),
+            },
+        );
+        let config = Config {
+            vars: BTreeMap::new(),
+            stores,
+        };
+        let data = build_explain_data(tmp.path(), &config, &test_platform(), true);
+        assert_eq!(data.stores.len(), 1);
+        assert_eq!(data.stores[0].name, "active");
+        let data_all = build_explain_data(tmp.path(), &config, &test_platform(), false);
+        assert_eq!(data_all.stores.len(), 2);
+    }
+}
