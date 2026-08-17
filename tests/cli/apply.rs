@@ -1757,3 +1757,213 @@ target = "{target_str}"
             .contains("never auto-clobbered")
     );
 }
+
+#[test]
+fn apply_json_result_happy_path() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    assert_envelope_shape(&v, "apply", true);
+
+    let data = &v["data"];
+    assert!(data.is_object());
+    let result = &data["result"];
+    assert!(result.is_object(), "data.result must be an object");
+    assert_eq!(
+        result["ops_executed"].as_u64(),
+        result["ops_total"].as_u64()
+    );
+    assert!(result["ops_executed"].as_u64().is_some());
+    assert_eq!(result["conflicts"].as_u64(), Some(0));
+    assert_eq!(result["errors"].as_u64(), Some(0));
+
+    let stores = result["stores"]
+        .as_array()
+        .expect("result.stores must be an array");
+    assert_eq!(stores.len(), 1);
+    let nvim = &stores[0];
+    assert_eq!(nvim["store"].as_str(), Some("nvim"));
+    assert!(nvim["ok"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(nvim["conflicts"].as_u64(), Some(0));
+    assert_eq!(nvim["errors"].as_u64(), Some(0));
+    assert_eq!(nvim["skipped"].as_u64(), Some(0));
+}
+
+#[test]
+fn apply_json_result_conflict_real_file() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "I am a real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    assert_envelope_shape(&v, "apply", false);
+
+    let data = &v["data"];
+    assert!(data.is_object());
+    let result = &data["result"];
+    assert!(result.is_object(), "data.result must be an object");
+    assert!(result["conflicts"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(result["errors"].as_u64(), Some(0));
+    assert!(
+        result["ops_executed"].as_u64().unwrap_or(0) < result["ops_total"].as_u64().unwrap_or(0)
+    );
+
+    let stores = result["stores"]
+        .as_array()
+        .expect("result.stores must be an array");
+    let nvim = stores
+        .iter()
+        .find(|s| s["store"].as_str() == Some("nvim"))
+        .expect("nvim in result.stores");
+    assert!(nvim["conflicts"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(nvim["errors"].as_u64(), Some(0));
+}
+
+#[test]
+fn apply_json_result_error_no_target() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+"#,
+    );
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    assert_envelope_shape(&v, "apply", false);
+
+    let data = &v["data"];
+    assert!(data.is_object());
+    let result = &data["result"];
+    assert!(result.is_object(), "data.result must be an object");
+    assert!(result["errors"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(result["conflicts"].as_u64(), Some(0));
+
+    let stores = result["stores"]
+        .as_array()
+        .expect("result.stores must be an array");
+    let nvim = stores
+        .iter()
+        .find(|s| s["store"].as_str() == Some("nvim"))
+        .expect("nvim in result.stores");
+    assert!(nvim["errors"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(nvim["conflicts"].as_u64(), Some(0));
+}
+
+#[test]
+fn apply_json_post_status_conflict_real_file() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "I am a real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    let post_status = v["data"]["post_status"]
+        .as_array()
+        .expect("data.post_status must be an array");
+    assert!(
+        !post_status.is_empty(),
+        "post_status must not be empty on conflict"
+    );
+    let entry = &post_status[0];
+    assert_eq!(entry["store"].as_str(), Some("nvim"));
+    assert_eq!(entry["state"].as_str(), Some("conflict"));
+}
+
+#[test]
+fn apply_json_post_status_foreign_symlink() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("nvim");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("init.lua"), "not ours").unwrap();
+    std::os::unix::fs::symlink(&foreign, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    let post_status = v["data"]["post_status"]
+        .as_array()
+        .expect("data.post_status must be an array");
+    assert!(
+        !post_status.is_empty(),
+        "post_status must not be empty on foreign symlink"
+    );
+    let entry = &post_status[0];
+    assert_eq!(entry["store"].as_str(), Some("nvim"));
+    assert_eq!(entry["state"].as_str(), Some("foreign"));
+}

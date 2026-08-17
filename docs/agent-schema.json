@@ -416,7 +416,7 @@
     },
     "AuditEntry": {
       "fields": {
-        "timestamp": "string (ISO 8601 UTC timestamp)",
+        "timestamp": "string (unix:SECONDS timestamp, UTC)",
         "command": "string (apply|add|remove|migrate|import|prune)",
         "store": "string|null (omitted when not applicable)",
         "target": "string|null (omitted when not applicable)",
