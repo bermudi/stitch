@@ -2742,6 +2742,250 @@ when = { os = "macos" }
 }
 
 #[test]
+fn why_json_reports_conflict_for_real_file_target() {
+    // A real file at the target path is a conflict for a whole-dir store.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "nvim");
+    assert_eq!(entry["state"], "conflict");
+    assert!(entry["resolves_to"].is_null());
+}
+
+#[test]
+fn why_json_reports_broken_for_dangling_symlink() {
+    // A dangling symlink not owned by this repo is reported as broken.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".bashrc");
+    std::os::unix::fs::symlink("/nonexistent", &target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "bashrc");
+    assert_eq!(entry["state"], "broken");
+    assert_eq!(entry["resolves_to"].as_str().unwrap(), "/nonexistent");
+}
+
+#[test]
+fn why_json_reports_foreign_for_live_external_symlink() {
+    // A symlink pointing to a live file outside this repo is foreign.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".bashrc");
+
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign_file = foreign_dir.path().join("bashrc");
+    fs::write(&foreign_file, "foreign").unwrap();
+    std::os::unix::fs::symlink(&foreign_file, &target).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "bashrc");
+    assert_eq!(entry["state"], "foreign");
+    assert_eq!(
+        entry["resolves_to"].as_str().unwrap(),
+        foreign_file.to_str().unwrap()
+    );
+}
+
+#[test]
+fn why_json_reports_store_error_for_non_directory_store() {
+    // A store source that is not a real directory surfaces as store-error.
+    let repo = Repo::new();
+    let store = repo.path().join("bad");
+    fs::write(&store, "not a directory").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.bad]
+target = "{}"
+"#,
+        store.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", store.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "bad");
+    assert_eq!(entry["state"], "store-error");
+    assert_eq!(
+        entry["resolves_to"].as_str().unwrap(),
+        store.to_str().unwrap()
+    );
+}
+
+#[test]
+fn why_json_reports_config_error_for_source_name_collision() {
+    // A source-name collision in files/patterns is reported as config-error.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig", "gitconfig.tmpl"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig", "gitconfig.tmpl"]
+"#,
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "git");
+    assert_eq!(entry["state"], "config-error");
+    assert!(
+        entry["resolves_to"]
+            .as_str()
+            .unwrap()
+            .contains("name collision"),
+        "resolves_to should describe the collision"
+    );
+}
+
+#[test]
+fn why_json_reports_template_source() {
+    // A .tmpl source is reported as templated with the .tmpl source path.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig.tmpl"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig.tmpl"]
+"#,
+    ));
+
+    let query = target.join("gitconfig");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "git");
+    assert_eq!(entry["state"], "missing");
+    assert_eq!(entry["templated"], true);
+    assert_eq!(
+        entry["source"].as_str().unwrap(),
+        repo.path()
+            .join("git")
+            .join("gitconfig.tmpl")
+            .to_str()
+            .unwrap()
+    );
+}
+
+#[test]
+fn why_json_reports_target_name_for_multi_target_store() {
+    // Multi-target stores populate target_name for the matched named target.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let t1 = repo.path().join("home1");
+    let t2 = repo.path().join("home2");
+    repo.write_state(&format!(
+        r#"
+[stores.shells.targets.laptop]
+target = "{t1}"
+files = [".bashrc"]
+
+[stores.shells.targets.server]
+target = "{t2}"
+files = [".bashrc"]
+"#,
+        t1 = t1.to_string_lossy(),
+        t2 = t2.to_string_lossy(),
+    ));
+
+    for (target_name, target_dir) in [("laptop", &t1), ("server", &t2)] {
+        let query = target_dir.join(".bashrc");
+        let output = repo
+            .cmd()
+            .args(["--json", "why", query.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value = json_output(&output);
+        assert_envelope_shape(&value, "why", true);
+        let entry = &value["data"]["entry"];
+        assert_eq!(entry["store"], "shells");
+        assert_eq!(entry["target_name"].as_str().unwrap(), target_name);
+        assert_eq!(entry["state"], "missing");
+    }
+}
+
+#[test]
 fn edit_print_path_resolves_store_name() {
     // `edit <store> --print-path` prints the repo source path without
     // launching an editor. This is the agent-friendly path.

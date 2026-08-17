@@ -18,7 +18,7 @@ use std::path::Path;
 /// One audit-log entry. Serialized as one JSON line.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditEntry {
-    /// ISO 8601 timestamp (UTC).
+    /// unix:SECONDS timestamp (UTC).
     pub timestamp: String,
     /// The stitch command that mutated (e.g. "apply", "add", "remove").
     pub command: String,
@@ -74,7 +74,7 @@ pub fn append_command_result(root: &Path, command: &str, result: Result<(), &Sti
         ),
     };
     let entry = AuditEntry {
-        timestamp: now_iso8601(),
+        timestamp: now_timestamp(),
         command: command.to_string(),
         store: None,
         target: None,
@@ -85,15 +85,13 @@ pub fn append_command_result(root: &Path, command: &str, result: Result<(), &Sti
     append(root, &entry);
 }
 
-fn now_iso8601() -> String {
+fn now_timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Simple ISO 8601-ish timestamp without a chrono dependency. Format:
-    // unix-seconds aren't ISO 8601, but a stable machine-readable timestamp
-    // is what the audit log needs. Use a clear prefix so it's not mistaken
-    // for ISO 8601.
+    // unix:SECONDS timestamp — a stable machine-readable timestamp without
+    // a chrono dependency. The prefix makes it clear this is not ISO 8601.
     format!("unix:{secs}")
 }
 

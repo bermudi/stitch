@@ -724,3 +724,121 @@ files = ["f"]
         "hook-invoked adds must have persisted:\n{state}"
     );
 }
+
+/// `remove --dry-run --json` reports the links that would be removed without
+/// touching the filesystem and omits `behavior_orphaned`.
+#[test]
+fn remove_dry_run_json_previews_without_removing() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    repo.make_store("app", &["f"]);
+    repo.write_state("[stores.app]\ntarget = \"~\"\nfiles = [\"f\"]\n");
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_path)
+        .assert()
+        .success();
+
+    let link = home_path.join("f");
+    assert!(link.is_symlink());
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "app", "--dry-run"])
+        .env("HOME", home_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "remove --dry-run --json must succeed"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", true);
+
+    let data = &value["data"];
+    assert_eq!(data["store"], "app");
+    assert_eq!(data["target"], "~");
+    assert_eq!(data["dry_run"], true);
+    assert!(
+        data["behavior_orphaned"].is_null(),
+        "behavior_orphaned must be omitted on dry-run"
+    );
+    let staging = data["staging"].as_str().expect("staging string");
+    assert!(
+        staging.ends_with("/app"),
+        "staging must include store name: {staging}"
+    );
+
+    let links = data["links"].as_array().expect("links array");
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].as_str(), Some(link.to_str().unwrap()));
+
+    // Nothing was actually removed.
+    assert!(link.is_symlink());
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state.contains("[stores.app]"));
+}
+
+/// A pre-remove hook that removes the generated state before `remove` runs
+/// produces a graceful already-removed JSON response.
+#[test]
+fn remove_json_already_removed_by_pre_hook() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    repo.make_store("app", &["f"]);
+    repo.write_state("[stores.app]\ntarget = \"~\"\nfiles = [\"f\"]\n");
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_path)
+        .assert()
+        .success();
+
+    let link = home_path.join("f");
+    assert!(link.is_symlink());
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let pre = hooks_dir.join("pre-remove");
+    fs::write(
+        &pre,
+        format!(
+            "#!/bin/sh\nrm -f \"{}\"\n",
+            repo.path().join(".stitch").join("state.toml").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&pre);
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "app"])
+        .env("HOME", home_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "remove --json on already-removed store must succeed"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", true);
+
+    let data = &value["data"];
+    assert_eq!(data["store"], "app");
+    assert_eq!(data["target"], "~");
+    assert_eq!(data["dry_run"], false);
+    assert!(
+        data["behavior_orphaned"].is_null(),
+        "behavior_orphaned must be omitted for an already-removed store"
+    );
+    assert!(
+        data["links"].is_null(),
+        "links must be omitted when the store was already removed"
+    );
+
+    // The pre-hook removed the state, not the link, and the command returned
+    // success without touching the filesystem.
+    assert!(!repo.path().join(".stitch").join("state.toml").exists());
+    assert!(link.is_symlink());
+}

@@ -1542,3 +1542,98 @@ fn bulk_add_dry_run_text() {
     assert!(!bashrc.is_symlink());
     assert!(!nvim.is_symlink());
 }
+
+/// `add --to <store> --json` adopts a file into an existing file-mode store
+/// and reports the created symlink in the post-op envelope.
+#[test]
+fn add_to_store_json_post_op() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    repo.make_store("shells", &[".bashrc"]);
+    repo.write_state("[stores.shells]\ntarget = \"~\"\nfiles = [\".bashrc\"]\n");
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_path)
+        .assert()
+        .success();
+    assert!(home_path.join(".bashrc").is_symlink());
+
+    let zshrc = home_path.join(".zshrc");
+    fs::write(&zshrc, "zsh config").unwrap();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "add", zshrc.to_str().unwrap(), "--to", "shells"])
+        .env("HOME", home_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --to --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+
+    let data = &value["data"];
+    assert_eq!(data["store"], "shells");
+    assert_eq!(data["target"], "~");
+    assert_eq!(data["mode"], "add-to-store");
+    assert_eq!(data["source"], "~/.zshrc");
+    let files = data["files"].as_array().expect("files array");
+    assert_eq!(files.as_slice(), &[Value::String(".zshrc".into())]);
+    assert!(data["patterns"].as_array().map_or(true, |a| a.is_empty()));
+
+    let link_str = data["link_created"].as_str().expect("link_created string");
+    let link = Path::new(link_str);
+    assert!(link.is_symlink(), "link_created must be a symlink");
+    let adopted = repo.path().join("shells").join(".zshrc");
+    assert_eq!(fs::read_to_string(&adopted).unwrap(), "zsh config");
+    assert_eq!(fs::read_link(link).unwrap(), adopted);
+
+    assert!(zshrc.is_symlink());
+    assert_eq!(fs::read_link(&zshrc).unwrap(), adopted);
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state.contains(".bashrc"));
+    assert!(state.contains(".zshrc"));
+}
+
+/// `add --file --json` creates an empty file in a new store, links it, and
+/// reports the post-op shape.
+#[test]
+fn add_file_json_post_op() {
+    let repo = Repo::new();
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".bashrc");
+
+    let output = repo
+        .cmd()
+        .args(["--json", "add", target.to_str().unwrap(), "--file"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --file --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+
+    let data = &value["data"];
+    assert_eq!(data["store"], "bashrc");
+    assert_eq!(data["target"], "~");
+    assert_eq!(data["mode"], "create-file");
+    assert!(data["source"].is_null());
+    let files = data["files"].as_array().expect("files array");
+    assert_eq!(files.as_slice(), &[Value::String(".bashrc".into())]);
+    assert!(data["patterns"].as_array().map_or(true, |a| a.is_empty()));
+
+    let source_file = repo.path().join("bashrc").join(".bashrc");
+    assert!(source_file.is_file());
+    assert_eq!(fs::metadata(&source_file).unwrap().len(), 0);
+    assert!(target.is_symlink());
+    assert_eq!(fs::read_link(&target).unwrap(), source_file);
+
+    let link_str = data["link_created"].as_str().expect("link_created string");
+    assert_eq!(Path::new(link_str), target);
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state.contains(r#"target = "~""#));
+    assert!(state.contains(r#"".bashrc""#));
+}
