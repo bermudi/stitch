@@ -71,13 +71,8 @@ fn explain_store(
             .iter()
             .map(|(target_name, target)| {
                 let target_active = active && platform.matches_when(&target.when);
-                let target_path = root.join(name);
-                let entries = resolve_entries(
-                    &target_path,
-                    &target.files,
-                    &target.patterns,
-                    &target.ignore,
-                );
+                let entries =
+                    resolve_entries(&store_dir, &target.files, &target.patterns, &target.ignore);
                 ExplainTarget {
                     name: target_name.clone(),
                     active: target_active,
