@@ -126,7 +126,7 @@
         "source": "string (absolute path)",
         "templated": "bool",
         "staged_path": "string|null",
-        "state": "string (linked|missing|conflict|broken|foreign|error)",
+        "state": "string (linked|missing|conflict|broken|foreign|store-error|config-error)",
         "skipped_platform": "bool",
         "resolves_to": "string|null"
       }

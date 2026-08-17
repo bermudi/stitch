@@ -23,3 +23,35 @@ pub(crate) fn cmd_schema(json: bool) -> Result<(), StitchError> {
     println!("{pretty}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_schema_is_valid_json_object() {
+        let value: Value = serde_json::from_str(AGENT_SCHEMA_JSON)
+            .expect("AGENT_SCHEMA_JSON should parse as JSON");
+        assert!(value.is_object());
+        assert!(value.get("schema_version").is_some());
+    }
+
+    #[test]
+    fn embedded_schema_pretty_roundtrips() {
+        let value: Value = serde_json::from_str(AGENT_SCHEMA_JSON).unwrap();
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        assert!(pretty.starts_with('{'));
+        let reparsed: Value = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(value, reparsed);
+    }
+
+    #[test]
+    fn cmd_schema_json_mode_ok() {
+        cmd_schema(true).unwrap();
+    }
+
+    #[test]
+    fn cmd_schema_text_mode_ok() {
+        cmd_schema(false).unwrap();
+    }
+}

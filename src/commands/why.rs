@@ -148,3 +148,137 @@ fn print_why(data: &WhyData) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linker::LinkStatus;
+    use crate::report::WhyEntry;
+    use crate::store::StatusEntry;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    fn why_entry(status: LinkStatus) -> WhyEntry {
+        let entry = StatusEntry {
+            store_name: "bash".to_string(),
+            target_name: Some("work".to_string()),
+            source: PathBuf::from("/repo/bash/.bashrc"),
+            link_source: PathBuf::from("/repo/bash/.bashrc"),
+            target: PathBuf::from("/home/.bashrc"),
+            status,
+            skipped_platform: false,
+            is_template: true,
+        };
+        build_why_entry(&entry, Path::new("/repo"))
+    }
+
+    #[test]
+    fn path_matches_literal_path() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("a");
+        std::fs::write(&target, "").unwrap();
+        let query = tmp.path().join("a");
+        assert!(path_matches(&target, &canonicalize_or_path(&query), &query));
+    }
+
+    #[test]
+    fn path_matches_canonical_symlink() {
+        let tmp = tempdir().unwrap();
+        let real = tmp.path().join("a");
+        std::fs::write(&real, "").unwrap();
+        let link = tmp.path().join("b");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let query_canonical = std::fs::canonicalize(&real).unwrap();
+        assert!(path_matches(&link, &query_canonical, &real));
+    }
+
+    #[test]
+    fn path_matches_mismatch_returns_false() {
+        let a = Path::new("/home/a");
+        let b = Path::new("/home/b");
+        assert!(!path_matches(a, &canonicalize_or_path(b), b));
+    }
+
+    #[test]
+    fn canonicalize_or_path_existing_returns_canonical() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("sub").join("a");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "").unwrap();
+        let c = canonicalize_or_path(&p);
+        assert!(c.is_absolute());
+        assert!(c.ends_with("sub/a"));
+    }
+
+    #[test]
+    fn canonicalize_or_path_missing_returns_literal() {
+        let p = Path::new("/no/such/path/exists");
+        let c = canonicalize_or_path(p);
+        assert_eq!(c, p);
+    }
+
+    #[test]
+    fn build_why_entry_linked_and_missing() {
+        for status in [LinkStatus::Linked, LinkStatus::Missing] {
+            let expected = if matches!(&status, LinkStatus::Linked) {
+                "linked"
+            } else {
+                "missing"
+            };
+            let e = why_entry(status);
+            assert_eq!(e.state, expected);
+            assert!(e.resolves_to.is_none());
+        }
+    }
+
+    #[test]
+    fn build_why_entry_conflict() {
+        let e = why_entry(LinkStatus::Conflict(PathBuf::from("/x")));
+        assert_eq!(e.state, "conflict");
+        assert!(e.resolves_to.is_none());
+    }
+
+    #[test]
+    fn build_why_entry_broken_foreign_store_error() {
+        let cases = [
+            (
+                LinkStatus::Broken(PathBuf::from("/gone")),
+                "broken",
+                Some("/gone"),
+            ),
+            (
+                LinkStatus::Foreign(PathBuf::from("/other")),
+                "foreign",
+                Some("/other"),
+            ),
+            (
+                LinkStatus::StoreError(PathBuf::from("/store")),
+                "store-error",
+                Some("/store"),
+            ),
+        ];
+        for (status, expected_state, expected_resolves) in cases {
+            let e = why_entry(status);
+            assert_eq!(e.state, expected_state);
+            assert_eq!(e.resolves_to.as_deref(), expected_resolves);
+        }
+    }
+
+    #[test]
+    fn build_why_entry_config_error() {
+        let e = why_entry(LinkStatus::ConfigError("bad pattern".to_string()));
+        assert_eq!(e.state, "config-error");
+        assert_eq!(e.resolves_to.as_deref(), Some("bad pattern"));
+    }
+
+    #[test]
+    fn build_why_entry_preserves_identity() {
+        let e = why_entry(LinkStatus::Linked);
+        assert_eq!(e.store, "bash");
+        assert_eq!(e.target_name.as_deref(), Some("work"));
+        assert_eq!(e.target, "/home/.bashrc");
+        assert_eq!(e.source, "/repo/bash/.bashrc");
+        assert!(e.templated);
+        assert_eq!(e.owning_config, "state.toml");
+    }
+}

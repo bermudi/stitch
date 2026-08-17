@@ -247,8 +247,7 @@ investigating a broken dotfile. Read-only.
 
 - `entry`: the matched status entry, or `null` when no store owns the path.
 - `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`,
-  `store-error`, or `config-error` (same states as `status --json`, with
-  `foreign` and the two error states spelled out).
+  `store-error`, or `config-error` (same states as `status --json`).
 - `skipped_platform`: present and `true` when the query is under a store's
   target but the store is skipped on this host (when mismatch). In that case
   `entry` is `null` (no active entry exists).
@@ -279,7 +278,7 @@ never blocks a mutation.
 
 ### `stitch status [name]`
 
-Show symlink state for one or all stores. States: `linked`, `missing`, `conflict`, `broken`.
+Show symlink state for one or all stores. States: `linked`, `missing`, `conflict`, `broken`, `foreign`, `store-error`, or `config-error`.
 
 ### `stitch diff`
 
@@ -626,7 +625,7 @@ the plan ops.
 - `templated`: `true` when the source ends in `.tmpl`.
 - `staged_path`: absolute staged render path for active templates; omitted
   otherwise.
-- `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`, or `error`.
+- `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`, `store-error`, or `config-error`.
 - `skipped_platform`: `true` when the store's `when` clause does not match.
 - `resolves_to`: for `broken`, the absolute path the broken symlink resolves to;
   `null` otherwise.

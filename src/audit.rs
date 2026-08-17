@@ -114,3 +114,139 @@ pub fn read(root: &Path, limit: Option<usize>) -> Vec<AuditEntry> {
     }
     entries
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::StitchError;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn sample_entry(timestamp: &str, command: &str, outcome: &str, exit_code: i32) -> AuditEntry {
+        AuditEntry {
+            timestamp: timestamp.to_string(),
+            command: command.to_string(),
+            store: Some("store".to_string()),
+            target: Some("/home/.bashrc".to_string()),
+            outcome: outcome.to_string(),
+            exit_class: None,
+            exit_code,
+        }
+    }
+
+    fn write_log(root: &Path, lines: &[&str]) {
+        let stitch_dir = root.join(".stitch");
+        std::fs::create_dir_all(&stitch_dir).unwrap();
+        let log_path = stitch_dir.join("log.jsonl");
+        std::fs::write(&log_path, lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn read_skips_malformed_lines() {
+        let good = r#"{"timestamp":"unix:1","command":"apply","store":"s","target":"/t","outcome":"ok","exit_code":0}"#;
+        let lines = ["not json", good];
+        let tmp = tempdir().unwrap();
+        write_log(tmp.path(), &lines);
+        let entries = read(tmp.path(), None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "apply");
+        assert_eq!(entries[0].outcome, "ok");
+    }
+
+    #[test]
+    fn read_limit_greater_than_entries_returns_all() {
+        let lines = [
+            r#"{"timestamp":"unix:1","command":"a","outcome":"ok","exit_code":0}"#,
+            r#"{"timestamp":"unix:2","command":"b","outcome":"ok","exit_code":0}"#,
+            r#"{"timestamp":"unix:3","command":"c","outcome":"ok","exit_code":0}"#,
+        ];
+        let tmp = tempdir().unwrap();
+        write_log(tmp.path(), &lines);
+        let entries = read(tmp.path(), Some(5));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].command, "c");
+    }
+
+    #[test]
+    fn read_limit_less_than_entries_returns_last_n() {
+        let lines = [
+            r#"{"timestamp":"unix:1","command":"a","outcome":"ok","exit_code":0}"#,
+            r#"{"timestamp":"unix:2","command":"b","outcome":"ok","exit_code":0}"#,
+            r#"{"timestamp":"unix:3","command":"c","outcome":"ok","exit_code":0}"#,
+        ];
+        let tmp = tempdir().unwrap();
+        write_log(tmp.path(), &lines);
+        let entries = read(tmp.path(), Some(2));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].command, "b");
+        assert_eq!(entries[1].command, "c");
+    }
+
+    #[test]
+    fn read_missing_log_returns_empty() {
+        let tmp = tempdir().unwrap();
+        let entries = read(tmp.path(), None);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn append_writes_valid_json_line() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".stitch")).unwrap();
+        let entry = sample_entry("unix:10", "add", "ok", 0);
+        append(tmp.path(), &entry);
+        let read_back = read(tmp.path(), None);
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].timestamp, "unix:10");
+        assert_eq!(read_back[0].command, "add");
+        assert_eq!(read_back[0].outcome, "ok");
+        assert_eq!(read_back[0].exit_code, 0);
+
+        let log_path = tmp.path().join(".stitch").join("log.jsonl");
+        let line = std::fs::read_to_string(log_path).unwrap();
+        let parsed: AuditEntry = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed.command, "add");
+    }
+
+    #[test]
+    fn append_command_result_ok_writes_ok_entry() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".stitch")).unwrap();
+        append_command_result(tmp.path(), "apply", Ok(()));
+        let entries = read(tmp.path(), None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, "ok");
+        assert_eq!(entries[0].exit_code, 0);
+        assert!(entries[0].exit_class.is_none());
+    }
+
+    #[test]
+    fn append_command_result_err_writes_error_entry() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".stitch")).unwrap();
+
+        let err = StitchError::usage("bad args");
+        append_command_result(tmp.path(), "apply", Err(&err));
+        let entries = read(tmp.path(), None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, "error");
+        assert_eq!(entries[0].exit_class.as_deref(), Some("usage"));
+        assert_eq!(entries[0].exit_code, 2);
+
+        let err2 = StitchError::conflict_real("/home/.bashrc");
+        append_command_result(tmp.path(), "apply", Err(&err2));
+        let entries = read(tmp.path(), Some(1));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, "error");
+        assert_eq!(entries[0].exit_class.as_deref(), Some("conflict-real"));
+        assert_eq!(entries[0].exit_code, 6);
+    }
+
+    #[test]
+    fn now_timestamp_starts_with_unix_prefix() {
+        let ts = now_timestamp();
+        assert!(ts.starts_with("unix:"));
+        let suffix = ts.strip_prefix("unix:").unwrap();
+        assert!(suffix.parse::<u64>().is_ok());
+    }
+}
