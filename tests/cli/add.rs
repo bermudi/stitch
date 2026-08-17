@@ -1389,3 +1389,156 @@ fn add_create_empty_rolls_back_when_link_creation_fails() {
         "state must not record the rolled-back store"
     );
 }
+
+#[test]
+fn bulk_add_partial_failure_json() {
+    // One path succeeds; the second fails because its derived store name
+    // collides with the first. The envelope must report ok: false and include
+    // per-path results.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let bashrc = home.path().join(".bashrc");
+    let config_bashrc = home.path().join(".config").join(".bashrc");
+    fs::write(&bashrc, "bashrc").unwrap();
+    fs::create_dir_all(config_bashrc.parent().unwrap()).unwrap();
+    fs::write(&config_bashrc, "config bashrc").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            bashrc.to_str().unwrap(),
+            config_bashrc.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "partial bulk add must exit non-zero"
+    );
+    assert_eq!(output.status.code(), Some(1), "exit code must be 1");
+
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", false);
+    assert_error_shape(&value, "internal", 1);
+    assert!(value["data"].is_object(), "data must not be null");
+    assert_eq!(value["data"]["all_ok"], false);
+    let results = value["data"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[0]["store"], "bashrc");
+    assert!(results[0]["error"].is_null());
+    assert_eq!(results[1]["ok"], false);
+    assert_eq!(results[1]["store"], "bashrc");
+    let err = results[1]["error"].as_str().expect("error string");
+    assert!(
+        err.contains("already exists"),
+        "per-path error should describe the collision: {err}"
+    );
+
+    // The first path was committed; the second was not.
+    assert!(repo.path().join("bashrc").join(".bashrc").exists());
+    assert!(bashrc.is_symlink());
+    assert!(!config_bashrc.is_symlink());
+}
+
+#[test]
+fn bulk_add_validation_error_json() {
+    // Validation fails for a path inside the repo. The error envelope must
+    // carry the bulk data so the agent can see per-path status.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let good = home.path().join(".good");
+    fs::write(&good, "good").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            good.to_str().unwrap(),
+            ".stitch/state.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "validation failure must exit non-zero"
+    );
+
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", false);
+    assert_error_shape(&value, "usage", 2);
+    assert!(value["data"].is_object(), "data must not be null");
+    assert_eq!(value["data"]["all_ok"], false);
+    let results = value["data"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[0]["store"], "good");
+    assert!(results[0]["error"].is_null());
+    assert_eq!(results[1]["ok"], false);
+    assert_eq!(results[1]["store"], "state.toml");
+    let err = results[1]["error"].as_str().expect("error string");
+    assert!(
+        err.contains("inside the stitch repository"),
+        "per-path error should describe the repo containment violation: {err}"
+    );
+}
+
+#[test]
+fn bulk_add_text_suppresses_validation_output() {
+    // Real bulk add in text mode must not print dry-run "Would add" lines from
+    // the validation phase; only the real "Added store" output should appear.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let bashrc = home.path().join(".bashrc");
+    let nvim = home.path().join(".config").join("nvim");
+    fs::write(&bashrc, "bashrc").unwrap();
+    fs::create_dir_all(&nvim).unwrap();
+    fs::write(nvim.join("init.lua"), "nvim").unwrap();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", bashrc.to_str().unwrap(), nvim.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Added store").and(contains("Would add").not()));
+
+    assert!(repo.path().join("bashrc").join(".bashrc").exists());
+    assert!(repo.path().join("nvim").join("init.lua").exists());
+    assert!(bashrc.is_symlink());
+    assert!(nvim.is_symlink());
+}
+
+#[test]
+fn bulk_add_dry_run_text() {
+    // Bulk dry-run in text mode should show the would-add previews and not
+    // print real add output or mutate the filesystem.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let bashrc = home.path().join(".bashrc");
+    let nvim = home.path().join(".config").join("nvim");
+    fs::write(&bashrc, "bashrc").unwrap();
+    fs::create_dir_all(&nvim).unwrap();
+    fs::write(nvim.join("init.lua"), "nvim").unwrap();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args([
+            "add",
+            bashrc.to_str().unwrap(),
+            nvim.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Would add").and(contains("Added store").not()));
+
+    assert!(!repo.path().join("bashrc").exists());
+    assert!(!repo.path().join("nvim").exists());
+    assert!(!bashrc.is_symlink());
+    assert!(!nvim.is_symlink());
+}

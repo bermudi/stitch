@@ -248,6 +248,7 @@ pub(crate) fn cmd_apply_plan(
             Err(e) => {
                 let mut warnings = loaded.warnings;
                 warnings.extend(e.report.warnings.iter().cloned());
+                crate::audit::append_command_result(root, "apply", Err(&e.error));
                 report::write_data_error("apply", e.report, &e.error, warnings);
             }
         }
@@ -331,8 +332,10 @@ fn apply_json(
 
     // Build the `desired` half of the composite envelope from the pre-apply
     // config. This is the host-evaluated merge — what the world should look
-    // like — so the agent doesn't need a separate `explain` call.
-    let desired = super::explain::build_explain_data(root, config, &platform, false);
+    // like — so the agent doesn't need a separate `explain` call. The same
+    // `--only` filter that applies to the plan also applies here so composite
+    // output is consistent.
+    let desired = super::explain::build_explain_data(root, &filtered_config, &platform, false);
 
     if !opts.dry_run {
         // Pin $HOME identity (including the resolved directory behind a
@@ -415,8 +418,9 @@ fn apply_json(
 
     // Build `post_status`: re-run status for the applied stores after
     // execution. On dry-run this reflects pre-apply state (still useful —
-    // it shows the agent what's already converged).
-    let post_status = build_post_status(root, config, &platform);
+    // it shows the agent what's already converged). Filtered to `--only`
+    // so the composite output is consistent with the plan.
+    let post_status = build_post_status(root, &filtered_config, &platform);
 
     let data = report::ApplyData {
         desired,
@@ -427,6 +431,7 @@ fn apply_json(
 
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
         let error = plan_error(&plan, command);
+        crate::audit::append_command_result(root, command, Err(&error));
         report::write_data_error(command, data, &error, warnings);
     }
 
