@@ -165,7 +165,9 @@ pub struct RecoveryAction {
     pub args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// `vars` is always present so a `set-env` action signals whether
+    /// extraction succeeded (`vars` populated) or extraction was unreliable
+    /// (`vars: []` — the prose `hint` carries the detail).
     pub vars: Vec<String>,
 }
 
@@ -1190,11 +1192,12 @@ mod tests {
         let v = serde_json::to_value(&action).unwrap();
         assert_eq!(v["kind"], "list");
         assert_eq!(v["command"], "list");
-        // Optional fields are skipped when empty
+        // Optional command fields are skipped when empty; vars is always
+        // present (even empty) so `set-env` can signal unreliable extraction.
         assert!(v.get("flags").is_none());
         assert!(v.get("args").is_none());
         assert!(v.get("reason").is_none());
-        assert!(v.get("vars").is_none());
+        assert_eq!(v["vars"], serde_json::json!([]));
     }
 
     #[test]

@@ -501,6 +501,29 @@ pub struct AddData {
     /// (real mutations); omitted on dry-run previews.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_created: Option<String>,
+    /// Original path when an adopt moved existing content into the repo.
+    /// Omitted for create modes and on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
+    /// The `[stores.<name>]` slice that was written to `.stitch/state.toml`.
+    /// Omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_entry: Option<String>,
+}
+
+/// Render the `[stores.<name>]` slice that was (or would be) written to
+/// `.stitch/state.toml`. Returns `None` when the store is not in generated
+/// state, which only happens on dry-run or a partially failed real mutation.
+pub fn state_entry_for(
+    generated: &crate::config::GeneratedState,
+    store_name: &str,
+) -> Option<String> {
+    generated.stores.get(store_name).cloned().and_then(|store| {
+        let slice = crate::config::GeneratedState {
+            stores: std::collections::BTreeMap::from([(store_name.to_string(), store)]),
+        };
+        slice.render_for_display().ok()
+    })
 }
 
 #[derive(Serialize)]
@@ -517,6 +540,14 @@ pub struct RemoveData {
     /// rewrites authored config) — `doctor` will flag it as orphaned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavior_orphaned: Option<bool>,
+    /// Staged-render paths removed alongside the store. Empty when no
+    /// templates were staged; omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_staging: Vec<String>,
+    /// `true` when the `.stitch/state.toml` entry for this store was removed.
+    /// Omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_entry_removed: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -564,6 +595,13 @@ pub struct MigrateData {
     /// Present on real migrations; omitted on dry-run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
+    /// Number of v0.2 stores split into the new authored/generated files.
+    /// `0` when there is nothing to migrate.
+    pub stores_split: usize,
+    /// `true` when a comment-loss note is carried in `warnings[]`.
+    /// Omitted when there is nothing to migrate or no comment was lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_loss_note: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -583,7 +621,9 @@ pub struct MigrateData {
 pub struct ApplyData {
     pub desired: ExplainData,
     pub plan: crate::plan::Plan,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `null` on `--dry-run`; the per-op execution outcome on a real apply.
+    /// Always serialized so agents can key on `data.result` without a
+    /// missing-key fallback.
     pub result: Option<ApplyResult>,
     pub post_status: Vec<StatusRow>,
 }
@@ -1224,6 +1264,20 @@ mod tests {
         if base.is_empty() { None } else { Some(base) }
     }
 
+    fn resolve_shape<'a>(schema: &'a Value, base: &str) -> Option<&'a Value> {
+        schema["shapes"].get(base).or_else(|| schema.get(base))
+    }
+
+    fn field_type_str(field_schema: &Value) -> Option<&str> {
+        field_schema
+            .as_str()
+            .or_else(|| field_schema.get("type").and_then(Value::as_str))
+    }
+
+    fn type_allows(type_str: &str, variant: &str) -> bool {
+        type_str.split('|').any(|p| p.trim() == variant)
+    }
+
     fn check_value_against_shape(value: &Value, shape: &Value, path: &str, schema: &Value) {
         let obj = value
             .as_object()
@@ -1248,21 +1302,43 @@ mod tests {
             panic!("{path}: schema node is not an object or enum shape: {shape}");
         };
 
-        let mut expected: std::collections::BTreeSet<String> = field_map.keys().cloned().collect();
+        let mut allowed: std::collections::BTreeSet<String> = field_map.keys().cloned().collect();
+        let mut required: std::collections::BTreeSet<String> = field_map
+            .iter()
+            .filter(|(_, schema)| {
+                let Some(type_str) = field_type_str(schema) else {
+                    return true;
+                };
+                !type_allows(type_str, "absent")
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         if let Some(tag) = &tag {
-            expected.insert(tag.clone());
+            allowed.insert(tag.clone());
+            required.insert(tag.clone());
         }
         let actual: std::collections::BTreeSet<String> = obj.keys().cloned().collect();
-        assert_eq!(actual, expected, "{path}: JSON keys do not match schema");
+        assert!(
+            actual.is_subset(&allowed),
+            "{path}: unexpected keys: {actual:?} not in {allowed:?}"
+        );
+        assert!(
+            required.is_subset(&actual),
+            "{path}: missing required keys: {required:?} not in {actual:?}"
+        );
 
         for (key, field_value) in obj {
             if Some(key) == tag.as_ref() {
                 continue;
             }
             let field_schema = &field_map[key];
-            if let Some(type_str) = field_schema.as_str()
+            let type_str = field_type_str(field_schema);
+            if field_value.is_null() && type_str.is_some_and(|t| type_allows(t, "null")) {
+                continue;
+            }
+            if let Some(type_str) = type_str
                 && let Some(base) = base_shape_name(type_str)
-                && let Some(nested_shape) = schema["shapes"].get(base)
+                && let Some(nested_shape) = resolve_shape(schema, base)
             {
                 match field_value {
                     Value::Object(_) => {
@@ -1791,6 +1867,10 @@ mod tests {
                 files: vec!["gitconfig".into()],
                 patterns: vec!["*.tmpl".into()],
                 link_created: Some("/home/.gitconfig".into()),
+                moved_from: Some("/home/.gitconfig".into()),
+                state_entry: Some(
+                    "[stores.git]\ntarget = \"~/.gitconfig\"\nfiles = [\"gitconfig\"]\n".into(),
+                ),
             })
             .unwrap(),
         ));
@@ -1805,6 +1885,8 @@ mod tests {
                 staging: "/repo/.stitch/render".into(),
                 dry_run: false,
                 behavior_orphaned: Some(true),
+                removed_staging: vec!["/repo/.stitch/render/git/gitconfig".into()],
+                state_entry_removed: Some(true),
             })
             .unwrap(),
         ));
@@ -1818,6 +1900,8 @@ mod tests {
                 state_path: Some("/repo/.stitch/state.toml".into()),
                 state: Some("# state".into()),
                 backup_path: Some("/repo/.stitch/config.toml.bak".into()),
+                stores_split: 1,
+                comment_loss_note: Some(true),
             })
             .unwrap(),
         ));
@@ -1962,6 +2046,20 @@ mod tests {
             samples.push(("PlanOp", serde_json::to_value(op).unwrap()));
         }
 
+        // RecoveryAction (set-env with a var, and a manual action)
+        samples.push((
+            "RecoveryAction",
+            serde_json::to_value(RecoveryAction {
+                kind: "set-env".into(),
+                command: None,
+                flags: Vec::new(),
+                args: Vec::new(),
+                reason: None,
+                vars: vec!["EDITOR".into()],
+            })
+            .unwrap(),
+        ));
+
         // TargetState: every variant
         for state in [
             TargetState::Absent,
@@ -1986,6 +2084,50 @@ mod tests {
         for (name, value) in dto_samples() {
             let shape = &shapes[name];
             check_value_against_shape(&value, shape, name, &schema);
+        }
+    }
+
+    #[test]
+    fn error_detail_and_recovery_action_match_schema() {
+        // The top-level `error` and `recoverable_via` shapes are not under
+        // `shapes`, so they need their own consistency check.
+        let schema = agent_schema();
+        let error = ErrorDetail {
+            class: "render".into(),
+            code: 8,
+            message: "missing env".into(),
+            hint: Some("set EDITOR".into()),
+            details: None,
+            recoverable_via: vec![
+                RecoveryAction {
+                    kind: "edit-template".into(),
+                    command: Some("edit".into()),
+                    flags: Vec::new(),
+                    args: vec!["/repo/git/gitconfig.tmpl".into()],
+                    reason: None,
+                    vars: Vec::new(),
+                },
+                RecoveryAction {
+                    kind: "set-env".into(),
+                    command: None,
+                    flags: Vec::new(),
+                    args: Vec::new(),
+                    reason: None,
+                    vars: vec!["EDITOR".into()],
+                },
+            ],
+        };
+        let v = serde_json::to_value(&error).unwrap();
+        check_value_against_shape(&v, &schema["error"], "error", &schema);
+        let action_shape = &schema["recoverable_via"];
+        for (i, action) in error.recoverable_via.iter().enumerate() {
+            let v = serde_json::to_value(action).unwrap();
+            check_value_against_shape(
+                &v,
+                action_shape,
+                &format!("error.recoverable_via[{i}]"),
+                &schema,
+            );
         }
     }
 }

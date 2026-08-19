@@ -13,7 +13,7 @@ use crate::error::StitchError;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -175,12 +175,13 @@ fn now_timestamp() -> String {
 /// JSON lines, read errors). A missing log is not an error — it returns an
 /// empty vec with no warnings.
 ///
-/// When `limit` is set, lines are streamed through a bounded `VecDeque` so
-/// memory usage is proportional to the requested limit, not the full log.
+/// Lines are streamed from a `BufReader`; when `limit` is set, a bounded
+/// `VecDeque` is used so memory usage is proportional to the requested limit,
+/// not the full log.
 pub fn read(root: &Path, limit: Option<usize>) -> Result<(Vec<AuditEntry>, Vec<String>), String> {
     let log_path = root.join(".stitch").join("log.jsonl");
-    let contents = match std::fs::read_to_string(&log_path) {
-        Ok(c) => c,
+    let file = match std::fs::File::open(&log_path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -191,6 +192,7 @@ pub fn read(root: &Path, limit: Option<usize>) -> Result<(Vec<AuditEntry>, Vec<S
             ));
         }
     };
+    let reader = std::io::BufReader::new(file);
     let mut warnings = Vec::new();
     let entries: Vec<AuditEntry> = if let Some(limit) = limit {
         if limit == 0 {
@@ -198,11 +200,12 @@ pub fn read(root: &Path, limit: Option<usize>) -> Result<(Vec<AuditEntry>, Vec<S
         }
         // Bounded buffer: keep only the last `limit` parsed entries.
         let mut buf: VecDeque<AuditEntry> = VecDeque::with_capacity(limit + 1);
-        for (i, line) in contents.lines().enumerate() {
+        for (i, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| format!("could not read {}: {e}", log_path.display()))?;
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<AuditEntry>(line) {
+            match serde_json::from_str::<AuditEntry>(&line) {
                 Ok(entry) => {
                     if buf.len() == limit {
                         buf.pop_front();
@@ -216,15 +219,30 @@ pub fn read(root: &Path, limit: Option<usize>) -> Result<(Vec<AuditEntry>, Vec<S
         }
         buf.into_iter().collect()
     } else {
-        contents
+        reader
             .lines()
             .enumerate()
-            .filter(|(_, l)| !l.is_empty())
-            .filter_map(|(i, line)| match serde_json::from_str::<AuditEntry>(line) {
-                Ok(entry) => Some(entry),
-                Err(_) => {
-                    warnings.push(format!("malformed JSON at line {} — skipped", i + 1));
-                    None
+            .filter_map(|(i, line)| {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => {
+                        warnings.push(format!(
+                            "could not read line {} of {}: {e}",
+                            i + 1,
+                            log_path.display()
+                        ));
+                        return None;
+                    }
+                };
+                if line.is_empty() {
+                    return None;
+                }
+                match serde_json::from_str::<AuditEntry>(&line) {
+                    Ok(entry) => Some(entry),
+                    Err(_) => {
+                        warnings.push(format!("malformed JSON at line {} — skipped", i + 1));
+                        None
+                    }
                 }
             })
             .collect()

@@ -93,7 +93,11 @@ fn command_audit_context(command: &cli::Commands) -> (Option<String>, Option<Str
             paths, name, to, ..
         } => {
             let store = to.clone().or_else(|| name.clone());
-            let target = paths.first().cloned();
+            let target = if paths.len() > 1 {
+                Some(paths.join(", "))
+            } else {
+                paths.first().cloned()
+            };
             (store, target)
         }
         _ => (None, None),

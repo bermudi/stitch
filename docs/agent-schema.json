@@ -44,10 +44,10 @@
           "set-env"
         ]
       },
-      "command": { "type": "string|null", "description": "The stitch command to run, if any." },
-      "flags": { "type": "array<string>", "description": "Flags to pass (e.g. '--force')." },
-      "args": { "type": "array<string>", "description": "Positional args (e.g. target path)." },
-      "reason": { "type": "string|null", "description": "Why this action applies; for 'manual', explains why no stitch command can fix it." },
+      "command": { "type": "string|absent", "description": "The stitch command to run, if any." },
+      "flags": { "type": "array<string>|absent", "description": "Flags to pass (e.g. '--force')." },
+      "args": { "type": "array<string>|absent", "description": "Positional args (e.g. target path)." },
+      "reason": { "type": "string|absent", "description": "Why this action applies; for 'manual', explains why no stitch command can fix it." },
       "vars": { "type": "array<string>", "description": "For 'set-env': environment variables to set before retrying." }
     }
   },
@@ -118,6 +118,17 @@
     }
   },
   "shapes": {
+    "RecoveryAction": {
+      "description": "A recovery action an agent can take.",
+      "fields": {
+        "kind": "string",
+        "command": "string|absent",
+        "flags": "array<string>|absent",
+        "args": "array<string>|absent",
+        "reason": "string|absent",
+        "vars": "array<string>"
+      }
+    },
     "StatusRow": {
       "fields": {
         "store": "string",
@@ -286,10 +297,12 @@
         "store": "string",
         "target": "string",
         "mode": "string",
-        "source": "string|null (repo source path; null for create modes)",
+        "source": "string|absent (repo source path; omitted for create modes and on dry-run)",
         "files": "string[]",
         "patterns": "string[]",
-        "link_created": "string|null (real mutations only; absent on dry-run)"
+        "link_created": "string|absent (real mutations only; omitted on dry-run)",
+        "moved_from": "string|absent (original path for adopt modes; omitted for create modes and on dry-run)",
+        "state_entry": "string|absent (the [stores.<name>] slice written to state.toml; omitted on dry-run)"
       }
     },
     "RemoveData": {
@@ -299,7 +312,9 @@
         "links": "string[]",
         "staging": "string",
         "dry_run": "bool",
-        "behavior_orphaned": "bool|absent (real mutations only; omitted on dry-run)"
+        "behavior_orphaned": "bool|absent (real mutations only; omitted on dry-run)",
+        "removed_staging": "string[]|absent (staged-render files removed; omitted on dry-run)",
+        "state_entry_removed": "bool|absent (real mutations only; omitted on dry-run)"
       }
     },
     "MigrateData": {
@@ -308,7 +323,9 @@
         "authored": "string|null",
         "state_path": "string|null",
         "state": "string|null",
-        "backup_path": "string|null (real migrations only; omitted on dry-run)"
+        "backup_path": "string|null (real migrations only; omitted on dry-run)",
+        "stores_split": "usize (number of v0.2 stores split; 0 when nothing to migrate)",
+        "comment_loss_note": "bool|absent (true when a comment-loss note is in warnings)"
       }
     },
     "ImportData": {
@@ -357,10 +374,10 @@
         "when": "WhenClause|absent",
         "mode": "string (whole-dir|file-mode|multi-target|none)",
         "target": "string|null",
-        "entries": "ExplainEntry[] (omitted for whole-dir)",
-        "targets": "ExplainTarget[] (multi-target only)",
+        "entries": "ExplainEntry[]|absent (omitted when empty, e.g. whole-dir or multi-target stores)",
+        "targets": "ExplainTarget[]|absent (multi-target only)",
         "hooks": "Hooks|absent",
-        "ignore": "string[]"
+        "ignore": "string[]|absent"
       }
     },
     "ExplainTarget": {

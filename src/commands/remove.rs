@@ -292,6 +292,8 @@ pub(crate) fn cmd_remove(
             staging: staging_str,
             dry_run: true,
             behavior_orphaned: None,
+            removed_staging: Vec::new(),
+            state_entry_removed: None,
         };
         if json {
             report::write("remove", data, loaded.warnings);
@@ -395,7 +397,11 @@ pub(crate) fn cmd_remove(
             }
         }
         // Clean up staging too, if it still exists.
-        let _ = render::remove_store_staging(root, name);
+        let removed_staging = render::remove_store_staging(root, name)
+            .map_err(StitchError::internal)?
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         if json {
             report::write(
                 "remove",
@@ -406,6 +412,8 @@ pub(crate) fn cmd_remove(
                     staging: staging_str,
                     dry_run: false,
                     behavior_orphaned: None,
+                    removed_staging,
+                    state_entry_removed: Some(true),
                 },
                 loaded.warnings,
             );
@@ -466,12 +474,17 @@ pub(crate) fn cmd_remove(
     // stitch.toml behavior is deliberately left in place (the tool never
     // rewrites authored config); `doctor` flags the orphaned behavior if the
     // user wants to clean it up via `stitch edit`.
+    let state_existed = loaded.generated.stores.contains_key(name);
     loaded.generated.stores.remove(name);
 
     // Staging is tool-owned: drop the store's render tree alongside its links.
     // A staging safety failure leaves generated state intact so the user can
     // retry rather than losing the inventory for still-present output.
-    render::remove_store_staging(root, name).map_err(StitchError::internal)?;
+    let removed_staging = render::remove_store_staging(root, name)
+        .map_err(StitchError::internal)?
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
 
     loaded.generated.save(root)?;
 
@@ -502,6 +515,8 @@ pub(crate) fn cmd_remove(
                 staging: staging_str,
                 dry_run: false,
                 behavior_orphaned: Some(loaded.authored.stores.contains_key(name)),
+                removed_staging,
+                state_entry_removed: Some(state_existed),
             },
             loaded.warnings,
         );

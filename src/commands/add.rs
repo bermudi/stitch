@@ -1099,13 +1099,15 @@ fn cmd_add_to_store(
             files: vec![relative.to_string()],
             patterns: Vec::new(),
             link_created: None,
+            moved_from: None,
+            state_entry: None,
         };
         if json {
             report::write("add", data, loaded.warnings.clone());
         } else {
             println!("Would add to store '{store_name}':");
             println!("  {} → {}", source.display(), destination.display());
-            println!("  then symlink back to {}", source.display());
+            println!("  then symlink back to {}", target.display());
         }
         return Ok(());
     }
@@ -1343,7 +1345,16 @@ fn cmd_add_to_store(
         ));
     }
 
-    // Post-op report: emit JSON or text.
+    // Post-op report: emit JSON or text. Reflect what actually happened:
+    // the apply action tells us the created link path; fall back to the
+    // intended target only if it didn't report one.
+    let link_created = if let store::ApplyAction::Created(p) = &action {
+        Some(p.display().to_string())
+    } else {
+        Some(target.display().to_string())
+    };
+    let moved_from = Some(collapse_home(source)?);
+    let state_entry = report::state_entry_for(&loaded.generated, store_name);
     if json {
         let data = report::AddData {
             store: store_name.to_string(),
@@ -1352,12 +1363,14 @@ fn cmd_add_to_store(
             source: Some(collapse_home(source)?),
             files: vec![relative.to_string()],
             patterns: Vec::new(),
-            link_created: Some(source.display().to_string()),
+            link_created,
+            moved_from,
+            state_entry,
         };
         report::write("add", data, loaded.warnings.clone());
     } else {
         println!("Added {} to store '{}'", raw_name, store_name);
-        println!("  linked {}", source.display());
+        println!("  linked {}", target.display());
     }
     if let Some(warning) = strip_privileged_bits(&destination) {
         eprintln!("{warning}");
@@ -1639,6 +1652,8 @@ pub(crate) fn cmd_add(
                 files: adopt_files,
                 patterns: Vec::new(),
                 link_created: None,
+                moved_from: None,
+                state_entry: None,
             };
             if json {
                 report::write("add", data, loaded.warnings);
@@ -1669,6 +1684,8 @@ pub(crate) fn cmd_add(
                 files: create_files,
                 patterns: patterns.to_vec(),
                 link_created: None,
+                moved_from: None,
+                state_entry: None,
             };
             // Dry-run must validate the same target ancestry as the real
             // operation, while still leaving the filesystem untouched.
@@ -2062,6 +2079,8 @@ pub(crate) fn cmd_add(
                 _ => None,
             })
             .or_else(|| Some(target_link.display().to_string()));
+        let moved_from = Some(collapse_home(&source)?);
+        let state_entry = report::state_entry_for(&loaded.generated, &store_name);
         if json {
             let data = report::AddData {
                 store: store_name.clone(),
@@ -2071,6 +2090,8 @@ pub(crate) fn cmd_add(
                 files: adopt_files,
                 patterns: Vec::new(),
                 link_created,
+                moved_from,
+                state_entry,
             };
             report::write("add", data, loaded.warnings);
         } else {
@@ -2387,6 +2408,7 @@ pub(crate) fn cmd_add(
                 _ => None,
             })
             .or_else(|| Some(target_link.display().to_string()));
+        let state_entry = report::state_entry_for(&loaded.generated, &store_name);
         if json {
             let data = report::AddData {
                 store: store_name.clone(),
@@ -2396,6 +2418,8 @@ pub(crate) fn cmd_add(
                 files: create_files.clone(),
                 patterns: patterns.to_vec(),
                 link_created,
+                moved_from: None,
+                state_entry,
             };
             report::write("add", data, loaded.warnings);
         } else {
