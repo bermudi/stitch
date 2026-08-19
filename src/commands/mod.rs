@@ -60,15 +60,44 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
     } = cli;
     let command_name = command_name(&command).to_string();
     let is_mutation = is_mutation_command(&command);
+    let (audit_store, audit_target) = command_audit_context(&command);
     let result = dispatch(repo.as_deref(), json, command);
 
     // Audit-log mutating operations. Best-effort: a log write failure is a
     // warning, not a hard error, so the log never blocks a mutation.
     if is_mutation && let Some(root) = resolved_repo_for_audit(repo.as_deref()) {
-        crate::audit::append_command_result(&root, &command_name, result.as_ref().map(|_| ()));
+        if audit_store.is_some() || audit_target.is_some() {
+            crate::audit::append_with_context(
+                &root,
+                &command_name,
+                audit_store.as_deref(),
+                audit_target.as_deref(),
+                result.as_ref().map(|_| ()),
+            );
+        } else {
+            crate::audit::append_command_result(&root, &command_name, result.as_ref().map(|_| ()));
+        }
     }
 
     result
+}
+
+/// Best-effort store/target strings for audit logging, derived from the CLI.
+/// Errors before dispatch still get logged; this only enriches entries where
+/// the command itself carries enough context.
+fn command_audit_context(command: &cli::Commands) -> (Option<String>, Option<String>) {
+    use cli::Commands;
+    match command {
+        Commands::Remove { name, .. } => (Some(name.clone()), None),
+        Commands::Add {
+            paths, name, to, ..
+        } => {
+            let store = to.clone().or_else(|| name.clone());
+            let target = paths.first().cloned();
+            (store, target)
+        }
+        _ => (None, None),
+    }
 }
 
 /// Whether a command mutates state and should be audit-logged.

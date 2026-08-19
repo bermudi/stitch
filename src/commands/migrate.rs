@@ -41,6 +41,7 @@ pub(crate) fn cmd_migrate(
                         authored: None,
                         state_path: None,
                         state: None,
+                        backup_path: None,
                     },
                     vec![msg],
                 );
@@ -121,6 +122,7 @@ pub(crate) fn cmd_migrate(
                 authored: Some(authored_str),
                 state_path: Some(state_path.to_string_lossy().into_owned()),
                 state: Some(state_str),
+                backup_path: None,
             };
             report::write("migrate", data, Vec::new());
         } else {
@@ -183,6 +185,7 @@ pub(crate) fn cmd_migrate(
             authored: Some(authored_str),
             state_path: Some(state_path.to_string_lossy().into_owned()),
             state: Some(state_str),
+            backup_path: Some(backup_path.to_string_lossy().into_owned()),
         };
         let mut warnings = durability_warnings.clone();
         warnings.push(format!(

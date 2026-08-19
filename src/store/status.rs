@@ -53,21 +53,42 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
 
         let store_dir = repo_root.join(name);
         if std::fs::symlink_metadata(&store_dir).is_ok() && !linker::is_real_directory(&store_dir) {
-            // A store root that exists but is not a real directory is
-            // unhealthy in the same way `apply` rejects it. Surface it as a
-            // `StoreError` status so `status`, `doctor`, and `remove` all
-            // agree instead of letting `check_link` declare the external
-            // target linked.
-            entries.push(StatusEntry {
-                store_name: name.clone(),
-                target_name: None,
-                source: store_dir.clone(),
-                link_source: store_dir.clone(),
-                target: store_dir.clone(),
-                status: LinkStatus::StoreError(store_dir.clone()),
-                skipped_platform: false,
-                is_template: false,
-            });
+            // The store root is unhealthy (not a real directory). Surface it as
+            // `StoreError` for every target so `status`, `doctor`, `why`, and
+            // `remove` all agree. Use the home target path (not the repo path) so
+            // `stitch why <home-target>` can find the entry.
+            if store.is_multi_target() {
+                for (target_name, target_entry) in &store.targets {
+                    if !platform.matches_when(&target_entry.when) {
+                        continue;
+                    }
+                    let target_path = config::expand_home(&target_entry.target)
+                        .expect("HOME was validated by Config::load");
+                    entries.push(StatusEntry {
+                        store_name: name.clone(),
+                        target_name: Some(target_name.clone()),
+                        source: store_dir.clone(),
+                        link_source: store_dir.clone(),
+                        target: target_path,
+                        status: LinkStatus::StoreError(store_dir.clone()),
+                        skipped_platform: false,
+                        is_template: false,
+                    });
+                }
+            } else if let Some(ref target_str) = store.target {
+                let target_path =
+                    config::expand_home(target_str).expect("HOME was validated by Config::load");
+                entries.push(StatusEntry {
+                    store_name: name.clone(),
+                    target_name: None,
+                    source: store_dir.clone(),
+                    link_source: store_dir.clone(),
+                    target: target_path,
+                    status: LinkStatus::StoreError(store_dir.clone()),
+                    skipped_platform: false,
+                    is_template: false,
+                });
+            }
             continue;
         }
         if store.is_multi_target() {

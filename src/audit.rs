@@ -129,6 +129,37 @@ pub fn append_command_result(root: &Path, command: &str, result: Result<(), &Sti
     append(root, &entry);
 }
 
+/// Append an audit entry for a command result with store/target context.
+/// Used by command paths that know which store/target was involved (e.g.
+/// `remove <name>`, `add <path>`), so the audit log is useful for
+/// post-hoc investigation without cross-referencing `list`.
+pub fn append_with_context(
+    root: &Path,
+    command: &str,
+    store: Option<&str>,
+    target: Option<&str>,
+    result: Result<(), &StitchError>,
+) {
+    let (outcome, exit_class, exit_code) = match result {
+        Ok(()) => ("ok".to_string(), None, 0),
+        Err(error) => (
+            "error".to_string(),
+            Some(error.class().id().to_string()),
+            error.exit_code(),
+        ),
+    };
+    let entry = AuditEntry {
+        timestamp: now_timestamp(),
+        command: command.to_string(),
+        store: store.map(|s| s.to_string()),
+        target: target.map(|t| t.to_string()),
+        outcome,
+        exit_class,
+        exit_code,
+    };
+    append(root, &entry);
+}
+
 fn now_timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -161,7 +192,10 @@ pub fn read(root: &Path, limit: Option<usize>) -> Result<(Vec<AuditEntry>, Vec<S
         }
     };
     let mut warnings = Vec::new();
-    let mut entries: Vec<AuditEntry> = if let Some(limit) = limit {
+    let entries: Vec<AuditEntry> = if let Some(limit) = limit {
+        if limit == 0 {
+            return Ok((Vec::new(), warnings));
+        }
         // Bounded buffer: keep only the last `limit` parsed entries.
         let mut buf: VecDeque<AuditEntry> = VecDeque::with_capacity(limit + 1);
         for (i, line) in contents.lines().enumerate() {
@@ -195,8 +229,6 @@ pub fn read(root: &Path, limit: Option<usize>) -> Result<(Vec<AuditEntry>, Vec<S
             })
             .collect()
     };
-    // Suppress unused-mut when limit is None.
-    let _ = &mut entries;
     Ok((entries, warnings))
 }
 
@@ -271,6 +303,19 @@ mod tests {
     }
 
     #[test]
+    fn read_limit_zero_returns_empty() {
+        let lines = [
+            r#"{"timestamp":"unix:1","command":"a","outcome":"ok","exit_code":0}"#,
+            r#"{"timestamp":"unix:2","command":"b","outcome":"ok","exit_code":0}"#,
+        ];
+        let tmp = tempdir().unwrap();
+        write_log(tmp.path(), &lines);
+        let (entries, warnings) = read(tmp.path(), Some(0)).unwrap();
+        assert!(entries.is_empty(), "limit=0 must return no entries");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn read_missing_log_returns_empty() {
         let tmp = tempdir().unwrap();
         let (entries, warnings) = read(tmp.path(), None).unwrap();
@@ -330,6 +375,24 @@ mod tests {
         assert_eq!(entries[0].outcome, "error");
         assert_eq!(entries[0].exit_class.as_deref(), Some("conflict-real"));
         assert_eq!(entries[0].exit_code, 6);
+    }
+
+    #[test]
+    fn append_with_context_records_store_and_target() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".stitch")).unwrap();
+        append_with_context(
+            tmp.path(),
+            "remove",
+            Some("git"),
+            Some("/home/.gitconfig"),
+            Ok(()),
+        );
+        let (entries, _) = read(tmp.path(), None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].store.as_deref(), Some("git"));
+        assert_eq!(entries[0].target.as_deref(), Some("/home/.gitconfig"));
+        assert_eq!(entries[0].outcome, "ok");
     }
 
     #[test]

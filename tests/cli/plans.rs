@@ -793,6 +793,65 @@ fn json_supported_on_mutation_commands() {
 }
 
 #[test]
+fn remove_state_only_reports_behavior_not_orphaned() {
+    // A store created by `add` lives only in `.stitch/state.toml`. Removing it
+    // leaves no authored behavior, so the JSON report says behavior_orphaned=false.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join(".myapp");
+    fs::write(&target, "data").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args(["--json", "add", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --json must succeed");
+    let value = json_output(&output);
+    assert_eq!(value["data"]["store"], "myapp");
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "myapp"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "remove --json must succeed");
+    let value = json_output(&output);
+    assert_eq!(value["data"]["behavior_orphaned"], false);
+}
+
+#[test]
+fn remove_authored_store_reports_behavior_orphaned() {
+    // A store defined in `stitch.toml` with a matching generated entry: removing
+    // it drops the generated state but the authored behavior remains, so the
+    // JSON report says behavior_orphaned=true.
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    repo.write_authored("[stores.app]\n");
+    repo.write_state("[stores.app]\ntarget = \"~/.app\"\nfiles = [\"f\"]\n");
+
+    let home = tempfile::tempdir().unwrap();
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home.path())
+        .assert()
+        .success();
+    assert!(home.path().join(".app").join("f").is_symlink());
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "app"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "remove --json must succeed");
+    let value = json_output(&output);
+    assert_eq!(value["data"]["behavior_orphaned"], true);
+}
+
+#[test]
 fn add_json_post_op_reports_created_link() {
     // `add --json` without --dry-run emits a post-op report with the created
     // symlink path, so an agent can verify the mutation without a second call.

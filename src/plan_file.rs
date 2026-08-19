@@ -267,7 +267,7 @@ pub fn build_plan_file(
                     kind: conflict_kind(resolves_to),
                     resolves_to: resolves_to.clone(),
                 });
-            } else if let PlanOp::Error { message, class } = op {
+            } else if let PlanOp::Error { message, class, .. } = op {
                 errors.push(PlanError {
                     target: PlanOp::target(op).map(str::to_owned),
                     message: message.clone(),

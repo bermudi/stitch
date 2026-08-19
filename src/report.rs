@@ -560,6 +560,10 @@ pub struct MigrateData {
     pub state_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// The `.toml.bak` path where the original v0.2 config was preserved.
+    /// Present on real migrations; omitted on dry-run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +705,7 @@ pub struct WhyEntry {
     /// — never the staged render.
     pub source: String,
     pub templated: bool,
-    /// Link state: linked|missing|conflict|broken|store-error|config-error.
+    /// Link state: linked|missing|conflict|broken|foreign|store-error|config-error.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolves_to: Option<String>,
@@ -1813,6 +1817,7 @@ mod tests {
                 authored: Some("# authored".into()),
                 state_path: Some("/repo/.stitch/state.toml".into()),
                 state: Some("# state".into()),
+                backup_path: Some("/repo/.stitch/config.toml.bak".into()),
             })
             .unwrap(),
         ));
@@ -1879,7 +1884,7 @@ mod tests {
         samples.push((
             "AuditEntry",
             serde_json::to_value(AuditEntry {
-                timestamp: "2024-01-01T00:00:00Z".into(),
+                timestamp: "unix:1700000000".into(),
                 command: "apply".into(),
                 store: Some("git".into()),
                 target: Some("/home/.gitconfig".into()),
@@ -1951,6 +1956,7 @@ mod tests {
             PlanOp::Error {
                 message: "boom".into(),
                 class: "internal".into(),
+                hook_name: None,
             },
         ] {
             samples.push(("PlanOp", serde_json::to_value(op).unwrap()));

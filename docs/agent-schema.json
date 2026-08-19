@@ -177,7 +177,7 @@
         "already_linked": { "target": "string", "source": "string", "requires": "LinkRequires" },
         "conflict": { "target": "string", "resolves_to": "string|null" },
         "skipped_platform": {},
-        "error": { "message": "string", "class": "string" }
+        "error": { "message": "string", "class": "string", "hook_name": "string|null (hook failures only)" }
       }
     },
     "PlanSummary": {
@@ -307,7 +307,8 @@
         "authored_path": "string|null",
         "authored": "string|null",
         "state_path": "string|null",
-        "state": "string|null"
+        "state": "string|null",
+        "backup_path": "string|null (real migrations only; omitted on dry-run)"
       }
     },
     "ImportData": {

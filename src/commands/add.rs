@@ -59,7 +59,13 @@ pub(crate) fn cmd_add_bulk(
                 all_ok: false,
                 results,
             };
-            crate::audit::append_command_result(root, "add", Err(&error));
+            crate::audit::append_with_context(
+                root,
+                "add",
+                None,
+                paths.first().map(|s| s.as_str()),
+                Err(&error),
+            );
             report::write_data_error("add", data, &error, Vec::new());
         }
         return Err(error);
@@ -107,7 +113,13 @@ pub(crate) fn cmd_add_bulk(
                     all_ok: false,
                     results,
                 };
-                crate::audit::append_command_result(root, "add", Err(&error));
+                crate::audit::append_with_context(
+                    root,
+                    "add",
+                    None,
+                    paths.first().map(|s| s.as_str()),
+                    Err(&error),
+                );
                 report::write_data_error("add", data, &error, Vec::new());
             }
             return Err(error);
@@ -155,14 +167,29 @@ pub(crate) fn cmd_add_bulk(
             report::write("add", data, Vec::new());
             return Ok(());
         }
-        let error = StitchError::internal("bulk add: one or more paths failed");
-        crate::audit::append_command_result(root, "add", Err(&error));
+        let error = StitchError::Mixed {
+            classes: vec![],
+            message: "bulk add: one or more paths failed".to_string(),
+        };
+        // `write_data_error` calls `process::exit`, so the central runner's
+        // audit log never runs for this path. Log here with the first path as
+        // target context (matching `command_audit_context` for `Add`).
+        crate::audit::append_with_context(
+            root,
+            "add",
+            None,
+            paths.first().map(|s| s.as_str()),
+            Err(&error),
+        );
         report::write_data_error("add", data, &error, Vec::new());
     }
 
     // Text mode: per-path results already printed by cmd_add calls.
     if !all_ok {
-        return Err(StitchError::internal("bulk add: one or more paths failed"));
+        return Err(StitchError::Mixed {
+            classes: vec![],
+            message: "bulk add: one or more paths failed".to_string(),
+        });
     }
     Ok(())
 }
