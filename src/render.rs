@@ -1198,14 +1198,28 @@ pub fn reconcile_store_staging(
 
 /// Delete the entire staging tree for a store (used by `remove`). Missing
 /// staging stays a no-op and never causes directories to be created.
-pub fn remove_store_staging(repo_root: &Path, store_name: &str) -> Result<(), String> {
+///
+/// Returns the paths of staged files that were removed (empty when the
+/// staging tree did not exist or contained no files).
+pub fn remove_store_staging(repo_root: &Path, store_name: &str) -> Result<Vec<PathBuf>, String> {
     let store = store_staging_paths(repo_root, store_name)?;
     if !checked_render_dirs(&store.dirs, false)? {
-        return Ok(());
+        return Ok(Vec::new());
+    }
+    // Collect the staged-file paths before dropping the tree, so callers can
+    // report exactly what was removed.
+    let mut removed = Vec::new();
+    for entry in walkdir::WalkDir::new(&store.store_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        removed.push(entry.path().to_path_buf());
     }
     match std::fs::remove_dir_all(&store.store_dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(
             "could not remove staging {}: {e}",
             store.store_dir.display()

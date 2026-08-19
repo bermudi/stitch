@@ -194,7 +194,8 @@ the current host. Read-only; no filesystem mutation.
   can't compute itself without replicating platform detection).
 - `entries`: per-file resolution (source name, `templated` flag, link name
   with `.tmpl` stripped) — the resolved inventory, not raw `files`/`patterns`.
-  Omitted for `whole-dir` stores (one symlink covers the whole directory).
+  Omitted when empty (e.g. `whole-dir` stores, where one symlink covers the
+  whole directory, or multi-target stores whose entries live under `targets`).
 - `targets`: present for multi-target stores; each has its own `active`,
   `when`, `target`, `mode`, `entries`, and `ignore`.
 - This is the `desired` object embedded in the composite `apply --json`
@@ -633,21 +634,26 @@ the plan ops.
 `add --json`: an add report with `store`, `target`, `mode`, optional `source`,
 `files`, and `patterns` fields. `mode` is `adopt`, `create`, `create-file`, or
 `add-to-store`. On a real mutation (no `--dry-run`), the report also includes
-`link_created`: the absolute path of the created symlink, so an agent can
-verify the link exists without a second call. On `--dry-run`, `link_created`
-is omitted.
+`link_created` (the absolute path of the created symlink), `moved_from` (the
+original path for adopt modes, `null` for create modes), and `state_entry` (the
+`[stores.<name>]` slice written to `.stitch/state.toml`). On `--dry-run`, these
+real-mutation fields are omitted.
 
 `remove --json`: a remove report with `store`, optional `target`, `links`
 (removed link paths), `staging` (the staging dir removed), and `dry_run`. On
 a real mutation, `behavior_orphaned` is `true` — `stitch.toml` behavior is
 left in place (the tool never rewrites authored config); `doctor` will flag
-it. On `--dry-run`, `behavior_orphaned` is omitted.
+it. `removed_staging` lists staged-render files removed, and
+`state_entry_removed` is `true` when the `.stitch/state.toml` entry was removed.
+On `--dry-run`, these real-mutation fields are omitted.
 
 `migrate --json`: a migrate report with `authored_path`, `authored`,
-`state_path`, and `state` (the written file contents). On a real migration,
-the comment-lossy warning is carried in `warnings[]`. When there is nothing
-to migrate (already converted), all four fields are `null` and a note is in
-`warnings[]`.
+`state_path`, and `state` (the written file contents). `stores_split` is the
+number of v0.2 stores that were split, and `comment_loss_note` is `true` when
+a comment-loss note is carried in `warnings[]`. On a real migration, the
+comment-lossy warning is carried in `warnings[]`. When there is nothing to
+migrate (already converted), the string fields are `null`, `stores_split` is
+`0`, and a note is in `warnings[]`.
 
 `explain --json`: the fully-resolved desired state — `platform` (os, arch,
 distro, hostname, shell) and `stores[]` (each with `name`, `active`, `when`,

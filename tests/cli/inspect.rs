@@ -2596,20 +2596,38 @@ fn schema_consistency_every_cli_command_is_documented() {
         .output()
         .unwrap();
     let help = String::from_utf8(help_output.stdout).unwrap();
-    // The help text lists subcommands. Check the ones we expose.
-    for cmd in [
-        "init", "apply", "plan", "status", "diff", "list", "add", "remove", "edit", "doctor",
-        "import", "migrate", "prune", "render", "explain", "schema", "why", "log",
-    ] {
-        assert!(help.contains(cmd), "CLI help should list {cmd}");
+    // Derive the subcommand list from the help text so adding a new command
+    // without updating this test is impossible.
+    let commands_section = help
+        .split("Commands:")
+        .nth(1)
+        .expect("help should have a Commands section")
+        .split("Options:")
+        .next()
+        .expect("Commands section should end before Options");
+    let mut cli_commands = Vec::new();
+    for line in commands_section.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let name = line.split_whitespace().next().unwrap();
+        if name == "help" {
+            // `help` is a clap auto-subcommand with no JSON data shape.
+            continue;
+        }
+        cli_commands.push(name.to_string());
+    }
+    for cmd in cli_commands {
         // init and edit don't support --json, so they're not in the schema's
         // commands table (which documents --json data shapes). Skip them.
-        if cmd != "init" && cmd != "edit" {
-            assert!(
-                documented.contains(cmd),
-                "schema.commands missing {cmd} (CLI exposes it)"
-            );
+        if cmd == "init" || cmd == "edit" {
+            continue;
         }
+        assert!(
+            documented.contains(&cmd),
+            "schema.commands missing {cmd} (CLI exposes it)"
+        );
     }
 }
 

@@ -42,6 +42,8 @@ pub(crate) fn cmd_migrate(
                         state_path: None,
                         state: None,
                         backup_path: None,
+                        stores_split: 0,
+                        comment_loss_note: None,
                     },
                     vec![msg],
                 );
@@ -115,6 +117,9 @@ pub(crate) fn cmd_migrate(
     );
     let state_str = generated.render_for_display()?;
 
+    let stores_split = legacy.stores.len();
+    let comment_loss_note = Some(true);
+
     if dry_run {
         if json {
             let data = MigrateData {
@@ -123,6 +128,8 @@ pub(crate) fn cmd_migrate(
                 state_path: Some(state_path.to_string_lossy().into_owned()),
                 state: Some(state_str),
                 backup_path: None,
+                stores_split,
+                comment_loss_note,
             };
             report::write("migrate", data, Vec::new());
         } else {
@@ -186,6 +193,8 @@ pub(crate) fn cmd_migrate(
             state_path: Some(state_path.to_string_lossy().into_owned()),
             state: Some(state_str),
             backup_path: Some(backup_path.to_string_lossy().into_owned()),
+            stores_split,
+            comment_loss_note,
         };
         let mut warnings = durability_warnings.clone();
         warnings.push(format!(

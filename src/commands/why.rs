@@ -26,11 +26,8 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
     let mut skipped_platform = false;
     for entry in &entries {
         if entry.skipped_platform {
-            // Check if the query is under this store's target (so we can
-            // report skipped_platform even when no active entry matches).
-            if path_matches(&entry.target, &query_canonical, &query_path) {
-                skipped_platform = true;
-            }
+            // Skipped-platform entries carry an empty target; the second loop
+            // below handles skipped-platform matching by store config.
             continue;
         }
         if path_matches(&entry.target, &query_canonical, &query_path) {
@@ -82,7 +79,7 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
         }
     }
 
-    let entry = matched.map(|e| build_why_entry(e, root));
+    let entry = matched.map(build_why_entry);
 
     let data = WhyData {
         query: query.to_string(),
@@ -99,7 +96,7 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
     Ok(())
 }
 
-fn build_why_entry(entry: &store::StatusEntry, _root: &std::path::Path) -> WhyEntry {
+fn build_why_entry(entry: &store::StatusEntry) -> WhyEntry {
     let (state, resolves_to) = match &entry.status {
         LinkStatus::Linked => ("linked".to_string(), None),
         LinkStatus::Missing => ("missing".to_string(), None),
@@ -219,7 +216,7 @@ mod tests {
             skipped_platform: false,
             is_template: true,
         };
-        build_why_entry(&entry, Path::new("/repo"))
+        build_why_entry(&entry)
     }
 
     #[test]
