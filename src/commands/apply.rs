@@ -435,6 +435,8 @@ fn apply_json(
         report::write_data_error(command, data, &error, warnings);
     }
 
+    // `write_data_error` calls `process::exit`, so this is only reached when
+    // the plan has no errors or conflicts (the success path).
     report::write(command, data, warnings);
     Ok(())
 }

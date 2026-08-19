@@ -56,6 +56,10 @@ fn action_to_plan_op(
         ApplyAction::Error(e) => PlanOp::Error {
             message: e.to_string(),
             class: e.class().id().to_string(),
+            hook_name: match e {
+                crate::error::StitchError::Hook { name, .. } => Some(name.clone()),
+                _ => None,
+            },
         },
         ApplyAction::Conflict {
             target,
@@ -155,6 +159,7 @@ fn unresolved_source_op(target: &str) -> PlanOp {
     PlanOp::Error {
         message: format!("could not resolve source for target {target}"),
         class: FailureClass::Internal.id().to_string(),
+        hook_name: None,
     }
 }
 

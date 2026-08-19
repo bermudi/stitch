@@ -1646,3 +1646,64 @@ fn add_file_json_post_op() {
     assert!(state.contains(r#"target = "~""#));
     assert!(state.contains(r#"".bashrc""#));
 }
+
+#[test]
+fn bulk_add_phase2_partial_failure_json() {
+    // Adding a directory and then a file inside it in the same bulk invocation:
+    // the first path succeeds and moves the directory into the repo + symlinks
+    // it back, so the second path now resolves inside the repo and fails in
+    // Phase 2 (apply). The earlier path is kept, the bulk error is "mixed",
+    // and the per-path results show one ok and one not ok.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config");
+    let init = config_dir.join("nvim").join("init.lua");
+    fs::create_dir_all(init.parent().unwrap()).unwrap();
+    fs::write(&init, "vim").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            config_dir.to_str().unwrap(),
+            init.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "bulk add must fail");
+    assert_eq!(
+        output.status.code(),
+        Some(11),
+        "exit code must be 11 (mixed)"
+    );
+
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", false);
+    assert_error_shape(&value, "mixed", 11);
+    assert!(value["data"].is_object(), "data must not be null");
+    assert_eq!(value["data"]["all_ok"], false);
+    let results = value["data"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[0]["store"], "config");
+    assert_eq!(results[1]["ok"], false);
+    assert_eq!(results[1]["store"], "init.lua");
+    let err = results[1]["error"].as_str().expect("error string");
+    assert!(
+        err.contains("inside the stitch repository"),
+        "per-path error should describe repo containment: {err}"
+    );
+
+    // The first path was committed (store + symlink), the second was not.
+    assert!(
+        repo.path()
+            .join("config")
+            .join("nvim")
+            .join("init.lua")
+            .exists()
+    );
+    assert!(config_dir.is_symlink());
+    assert!(!repo.path().join("init.lua").exists());
+}

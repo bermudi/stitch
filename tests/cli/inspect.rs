@@ -2532,7 +2532,7 @@ fn schema_json_emits_canonical_schema() {
     let commands = data["commands"].as_object().unwrap();
     for cmd in [
         "status", "list", "diff", "plan", "apply", "doctor", "prune", "render", "add", "remove",
-        "migrate", "import", "explain", "schema",
+        "migrate", "import", "explain", "schema", "why", "log",
     ] {
         assert!(commands.contains_key(cmd), "schema.commands missing {cmd}");
     }
@@ -3275,6 +3275,59 @@ fn audit_log_records_prune_yes() {
     assert_eq!(last["command"], "prune");
     assert_eq!(last["outcome"], "ok");
     assert_eq!(last["exit_code"], 0);
+}
+
+#[test]
+fn audit_log_skips_prune_list_only() {
+    // `prune` (list-only, no --yes) is a read operation and must not append an
+    // audit entry.
+    let (repo, _covered, _orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .env("HOME", home.path().as_os_str())
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "prune"),
+        "list-only prune must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_limit_zero_returns_empty() {
+    // `--limit 0` is an explicit "no entries" request and must return an empty
+    // array even when the log has content.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "log", "--limit", "0"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+    let entries = value["data"].as_array().unwrap();
+    assert!(entries.is_empty(), "--limit 0 must return no entries");
 }
 
 #[test]

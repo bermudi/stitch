@@ -501,7 +501,7 @@ pub(crate) fn cmd_remove(
                 links: removed_links,
                 staging: staging_str,
                 dry_run: false,
-                behavior_orphaned: Some(true),
+                behavior_orphaned: Some(loaded.authored.stores.contains_key(name)),
             },
             loaded.warnings,
         );

@@ -217,6 +217,20 @@ impl RecoveryAction {
             vars: Vec::new(),
         }
     }
+
+    /// A recovery that sets environment variables and retries. `vars` lists the
+    /// missing `env()` keys when extractable; empty when extraction is unreliable
+    /// (the prose `hint` carries the detail).
+    fn set_env(vars: Vec<String>) -> Self {
+        Self {
+            kind: "set-env".to_string(),
+            command: None,
+            flags: Vec::new(),
+            args: Vec::new(),
+            reason: None,
+            vars,
+        }
+    }
 }
 
 /// A typed, branchable stitch error. The `exit_code` and `hint` are derived
@@ -562,11 +576,14 @@ impl StitchError {
             Self::ConflictForeign { .. } => vec![RecoveryAction::manual(
                 "foreign symlinks are never auto-clobbered; remove or repoint the symlink manually",
             )],
-            Self::Render { source_path, .. } => vec![RecoveryAction::with_args(
-                "edit-template",
-                "edit",
-                &[source_path.display().to_string()],
-            )],
+            Self::Render { source_path, .. } => vec![
+                RecoveryAction::with_args(
+                    "edit-template",
+                    "edit",
+                    &[source_path.display().to_string()],
+                ),
+                RecoveryAction::set_env(vec![]),
+            ],
             Self::PathValidation { .. } => vec![],
             Self::Hook { name, .. } => vec![RecoveryAction::manual(&format!(
                 "fix or disable the `{name}` hook"
@@ -1055,13 +1072,16 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_via_render_offers_edit_template() {
+    fn recoverable_via_render_offers_edit_template_and_set_env() {
         let err = StitchError::render("/repo/git/gitconfig.tmpl", "missing env");
         let actions = err.recoverable_via();
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
         assert_eq!(actions[0].kind, "edit-template");
         assert_eq!(actions[0].command.as_deref(), Some("edit"));
         assert_eq!(actions[0].args, vec!["/repo/git/gitconfig.tmpl"]);
+        assert_eq!(actions[1].kind, "set-env");
+        assert!(actions[1].command.is_none());
+        assert!(actions[1].vars.is_empty());
     }
 
     #[test]

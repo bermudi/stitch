@@ -25,6 +25,18 @@ pub(crate) fn cmd_explain(
         return Ok(());
     }
 
+    if data.stores.is_empty() && active_only {
+        if loaded.config.stores.is_empty() {
+            println!("no stores configured");
+        } else {
+            println!(
+                "no active stores on this host ({} configured, none matched)",
+                loaded.config.stores.len()
+            );
+        }
+        return Ok(());
+    }
+
     print_explain(&data);
     Ok(())
 }
