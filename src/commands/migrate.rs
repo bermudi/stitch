@@ -190,7 +190,18 @@ pub(crate) fn cmd_migrate(
              (structural conversion drops them). The original is preserved at {}",
             backup_path.display()
         ));
-        report::write("migrate", data, warnings);
+        if !durability_warnings.is_empty() {
+            // Emit a single error envelope with the migrated data so JSON
+            // consumers see exactly one envelope, not a success followed by
+            // a failure.
+            let error = StitchError::internal(format!(
+                "migration completed, but its config directory could not be synced: {}",
+                durability_warnings.join("; ")
+            ));
+            report::write_data_error("migrate", data, &error, warnings);
+        } else {
+            report::write("migrate", data, warnings);
+        }
     } else {
         println!("Migrated v0.2 config:");
         println!("  wrote {}", authored_path.display());

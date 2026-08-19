@@ -186,9 +186,14 @@ pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
                 .strip_prefix("hook failed: ")
                 .and_then(|rest| rest.split(": ").next())
                 .unwrap_or("unknown");
-            Some(format!(
-                r#"{{"hook":"{hook_name}","store":"{store}","scope":"per-store"}}"#
-            ))
+            Some(
+                serde_json::to_string(&serde_json::json!({
+                    "hook": hook_name,
+                    "store": store,
+                    "scope": "per-store",
+                }))
+                .expect("hook details are serializable"),
+            )
         } else {
             None
         }

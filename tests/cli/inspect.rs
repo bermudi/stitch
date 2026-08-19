@@ -3357,6 +3357,7 @@ fn bulk_add_rejects_per_store_flags() {
     let repo = Repo::new();
     let home = tempfile::tempdir().unwrap();
     fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+    fs::write(home.path().join(".zshrc"), "zshrc").unwrap();
 
     let output = repo
         .cmd()
@@ -3374,5 +3375,11 @@ fn bulk_add_rejects_per_store_flags() {
     assert!(
         !output.status.success(),
         "should reject --name in bulk mode"
+    );
+    // In JSON mode the error is in the JSON envelope on stdout, not stderr.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--name") || stdout.contains("bulk"),
+        "error should mention --name or bulk mode: {stdout}"
     );
 }

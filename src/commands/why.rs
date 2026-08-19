@@ -39,20 +39,46 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
         }
     }
 
-    // If no active entry matched but a skipped store covers the path, report
-    // skipped_platform.
+    // If no active entry matched but a skipped store/target covers the path,
+    // report skipped_platform. Mirror status_all's target enumeration: check
+    // both top-level `store.target` and named `targets` entries, including
+    // target-level `when` filters when the store itself is active.
     if matched.is_none() && !skipped_platform {
-        // Also check skipped stores' target paths directly.
-        for (name, store) in &loaded.config.stores {
-            if !platform.matches_when(&store.when)
-                && let Some(ref target_str) = store.target
-                && let Ok(target) = config::expand_home(target_str)
-                && path_matches(&target, &query_canonical, &query_path)
-            {
-                skipped_platform = true;
+        for store in loaded.config.stores.values() {
+            if !platform.matches_when(&store.when) {
+                // Store-level when fails: check all its target paths.
+                if store.is_multi_target() {
+                    for target_entry in store.targets.values() {
+                        if let Ok(target) = config::expand_home(&target_entry.target)
+                            && path_matches(&target, &query_canonical, &query_path)
+                        {
+                            skipped_platform = true;
+                            break;
+                        }
+                    }
+                } else if let Some(ref target_str) = store.target
+                    && let Ok(target) = config::expand_home(target_str)
+                    && path_matches(&target, &query_canonical, &query_path)
+                {
+                    skipped_platform = true;
+                }
+            } else {
+                // Store is active but a named target's when may fail.
+                if store.is_multi_target() {
+                    for target_entry in store.targets.values() {
+                        if !platform.matches_when(&target_entry.when)
+                            && let Ok(target) = config::expand_home(&target_entry.target)
+                            && path_matches(&target, &query_canonical, &query_path)
+                        {
+                            skipped_platform = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if skipped_platform {
                 break;
             }
-            let _ = name;
         }
     }
 
@@ -103,6 +129,11 @@ fn build_why_entry(entry: &store::StatusEntry, _root: &std::path::Path) -> WhyEn
 
 /// Check if a status entry's target path matches the query. Compares both
 /// canonical and literal paths to handle symlinked home dirs.
+///
+/// The target is canonicalized via its *parent* directory only, keeping the
+/// final component literal. This prevents a stitch-managed symlink at the
+/// target from resolving to the repo source — `stitch why /repo/store/file`
+/// must not match a target whose symlink points back at that source.
 fn path_matches(
     target: &std::path::Path,
     query_canonical: &std::path::Path,
@@ -111,14 +142,33 @@ fn path_matches(
     if target == query_literal {
         return true;
     }
-    let target_canonical = canonicalize_or_path(target);
+    let target_canonical = canonicalize_parent_join(target);
     target_canonical == *query_canonical
 }
 
-/// Canonicalize a path, falling back to the literal path if canonicalization
-/// fails (e.g. the path doesn't exist yet).
+/// Canonicalize a path for comparison, falling back to the literal path if
+/// canonicalization fails (e.g. the path doesn't exist yet).
 fn canonicalize_or_path(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    canonicalize_parent_join(path)
+}
+
+/// Canonicalize the parent directory of a path and re-join the final
+/// component literally. This avoids following a symlink at the path itself
+/// (e.g. a stitch-managed target symlink that resolves to the repo source).
+fn canonicalize_parent_join(path: &std::path::Path) -> std::path::PathBuf {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        // No parent (e.g. "/"): the path is its own canonical form.
+        _ => return path.to_path_buf(),
+    };
+    let file_name = match path.file_name() {
+        Some(f) => f,
+        None => return path.to_path_buf(),
+    };
+    match std::fs::canonicalize(parent) {
+        Ok(canon_parent) => canon_parent.join(file_name),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 fn print_why(data: &WhyData) {
@@ -182,14 +232,38 @@ mod tests {
     }
 
     #[test]
-    fn path_matches_canonical_symlink() {
+    fn path_matches_does_not_follow_target_symlink() {
+        // A stitch-managed target symlink at `link` points to `real` (the repo
+        // source). `stitch why /repo/source/file` (query = `real`) must NOT
+        // match the target `link`, because the query is the source, not the
+        // managed target. The target is canonicalized via its parent only,
+        // keeping the final component literal, so the symlink at the target
+        // itself is not followed.
         let tmp = tempdir().unwrap();
         let real = tmp.path().join("a");
         std::fs::write(&real, "").unwrap();
         let link = tmp.path().join("b");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let query_canonical = std::fs::canonicalize(&real).unwrap();
-        assert!(path_matches(&link, &query_canonical, &real));
+        assert!(!path_matches(&link, &query_canonical, &real));
+    }
+
+    #[test]
+    fn path_matches_follows_parent_symlink() {
+        // When the *parent* of the target is a symlink (e.g. ~ → /home/user),
+        // the match should still work: the parent is canonicalized, and the
+        // final component is joined literally.
+        let tmp = tempdir().unwrap();
+        let real_dir = tmp.path().join("real_dir");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link_dir = tmp.path().join("link_dir");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        // Target is link_dir/.bashrc (doesn't need to exist for parent-canonicalization)
+        let target = link_dir.join(".bashrc");
+        // Query is real_dir/.bashrc (canonicalized through the parent)
+        let query = real_dir.join(".bashrc");
+        let query_canonical = std::fs::canonicalize(&real_dir).unwrap().join(".bashrc");
+        assert!(path_matches(&target, &query_canonical, &query));
     }
 
     #[test]

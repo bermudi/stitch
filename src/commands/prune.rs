@@ -15,7 +15,9 @@ pub(crate) fn cmd_prune(
     json: bool,
 ) -> Result<(), StitchError> {
     if json {
-        let audit_root = if yes { Some(root) } else { None };
+        // --dry-run is non-mutating even with --yes: exclude it from audit
+        // logging so dry runs don't produce audit entries.
+        let audit_root = if yes && !dry_run { Some(root) } else { None };
         return report::run_json("prune", audit_root, || {
             let loaded =
                 Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;

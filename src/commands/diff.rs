@@ -39,6 +39,7 @@ pub(crate) fn cmd_diff(
                 store::ApplyOpts {
                     dry_run: true,
                     force,
+                    json: false,
                 },
             );
             if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
@@ -61,6 +62,7 @@ pub(crate) fn cmd_diff(
         store::ApplyOpts {
             dry_run: true,
             force,
+            json: false,
         },
     );
 

@@ -11,8 +11,10 @@
 
 use crate::error::StitchError;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// One audit-log entry. Serialized as one JSON line.
@@ -40,8 +42,17 @@ pub struct AuditEntry {
 /// Append an audit entry to `.stitch/log.jsonl`. Best-effort: a write failure
 /// is reported as a warning on stderr, not a hard error, so the log never
 /// blocks a mutation.
+///
+/// Safety: the `.stitch` directory and an existing `log.jsonl` are validated
+/// with `symlink_metadata` before opening. A symlinked `.stitch` or a
+/// symlinked/non-regular log file is refused so a hostile replacement cannot
+/// redirect audit writes to an arbitrary user-writable file. The final open
+/// uses `O_NOFOLLOW` so a same-UID process cannot swap the log for a symlink
+/// between the metadata check and the open — the open itself fails on a
+/// symlink rather than following it.
 pub fn append(root: &Path, entry: &AuditEntry) {
-    let log_path = root.join(".stitch").join("log.jsonl");
+    let stitch_dir = root.join(".stitch");
+    let log_path = stitch_dir.join("log.jsonl");
     let line = match serde_json::to_string(entry) {
         Ok(s) => s,
         Err(e) => {
@@ -49,9 +60,42 @@ pub fn append(root: &Path, entry: &AuditEntry) {
             return;
         }
     };
+    // Validate the state directory: refuse if it is a symlink or not a dir.
+    match std::fs::symlink_metadata(&stitch_dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            eprintln!(
+                "warning: refusing unsafe audit log directory {} (symlink or not a directory)",
+                stitch_dir.display()
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "warning: could not inspect audit log directory {}: {e}",
+                stitch_dir.display()
+            );
+            return;
+        }
+    }
+    // Refuse to append through a symlinked or non-regular log file.
+    if std::fs::symlink_metadata(&log_path)
+        .is_ok_and(|meta| meta.file_type().is_symlink() || !meta.is_file())
+    {
+        eprintln!(
+            "warning: refusing unsafe audit log file {} (symlink or not a regular file)",
+            log_path.display()
+        );
+        return;
+    }
+    // Open with O_NOFOLLOW so the open itself rejects a symlink at the final
+    // component, closing the TOCTOU gap between the metadata check above and
+    // the open. A same-UID process that swaps the log for a symlink after the
+    // check but before the open gets ELOOP, not a redirected write.
     let result = OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&log_path)
         .and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = result {
@@ -96,23 +140,64 @@ fn now_timestamp() -> String {
 }
 
 /// Read the audit log, returning the last `limit` entries (or all if
-/// `limit` is None). Returns an empty vec if the log doesn't exist.
-pub fn read(root: &Path, limit: Option<usize>) -> Vec<AuditEntry> {
+/// `limit` is None). Returns the entries and any warnings (e.g. malformed
+/// JSON lines, read errors). A missing log is not an error — it returns an
+/// empty vec with no warnings.
+///
+/// When `limit` is set, lines are streamed through a bounded `VecDeque` so
+/// memory usage is proportional to the requested limit, not the full log.
+pub fn read(root: &Path, limit: Option<usize>) -> Result<(Vec<AuditEntry>, Vec<String>), String> {
     let log_path = root.join(".stitch").join("log.jsonl");
     let contents = match std::fs::read_to_string(&log_path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Err(e) => {
+            return Err(format!(
+                "could not read audit log {}: {e}",
+                log_path.display()
+            ));
+        }
     };
-    let mut entries: Vec<AuditEntry> = contents
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    if let Some(limit) = limit {
-        let start = entries.len().saturating_sub(limit);
-        entries = entries.split_off(start);
-    }
-    entries
+    let mut warnings = Vec::new();
+    let mut entries: Vec<AuditEntry> = if let Some(limit) = limit {
+        // Bounded buffer: keep only the last `limit` parsed entries.
+        let mut buf: VecDeque<AuditEntry> = VecDeque::with_capacity(limit + 1);
+        for (i, line) in contents.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<AuditEntry>(line) {
+                Ok(entry) => {
+                    if buf.len() == limit {
+                        buf.pop_front();
+                    }
+                    buf.push_back(entry);
+                }
+                Err(_) => {
+                    warnings.push(format!("malformed JSON at line {} — skipped", i + 1));
+                }
+            }
+        }
+        buf.into_iter().collect()
+    } else {
+        contents
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.is_empty())
+            .filter_map(|(i, line)| match serde_json::from_str::<AuditEntry>(line) {
+                Ok(entry) => Some(entry),
+                Err(_) => {
+                    warnings.push(format!("malformed JSON at line {} — skipped", i + 1));
+                    None
+                }
+            })
+            .collect()
+    };
+    // Suppress unused-mut when limit is None.
+    let _ = &mut entries;
+    Ok((entries, warnings))
 }
 
 #[cfg(test)]
@@ -142,15 +227,17 @@ mod tests {
     }
 
     #[test]
-    fn read_skips_malformed_lines() {
+    fn read_skips_malformed_lines_with_warning() {
         let good = r#"{"timestamp":"unix:1","command":"apply","store":"s","target":"/t","outcome":"ok","exit_code":0}"#;
         let lines = ["not json", good];
         let tmp = tempdir().unwrap();
         write_log(tmp.path(), &lines);
-        let entries = read(tmp.path(), None);
+        let (entries, warnings) = read(tmp.path(), None).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].command, "apply");
         assert_eq!(entries[0].outcome, "ok");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("line 1"));
     }
 
     #[test]
@@ -162,9 +249,10 @@ mod tests {
         ];
         let tmp = tempdir().unwrap();
         write_log(tmp.path(), &lines);
-        let entries = read(tmp.path(), Some(5));
+        let (entries, warnings) = read(tmp.path(), Some(5)).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2].command, "c");
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -176,7 +264,7 @@ mod tests {
         ];
         let tmp = tempdir().unwrap();
         write_log(tmp.path(), &lines);
-        let entries = read(tmp.path(), Some(2));
+        let (entries, _warnings) = read(tmp.path(), Some(2)).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].command, "b");
         assert_eq!(entries[1].command, "c");
@@ -185,8 +273,9 @@ mod tests {
     #[test]
     fn read_missing_log_returns_empty() {
         let tmp = tempdir().unwrap();
-        let entries = read(tmp.path(), None);
+        let (entries, warnings) = read(tmp.path(), None).unwrap();
         assert!(entries.is_empty());
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -195,12 +284,13 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".stitch")).unwrap();
         let entry = sample_entry("unix:10", "add", "ok", 0);
         append(tmp.path(), &entry);
-        let read_back = read(tmp.path(), None);
+        let (read_back, warnings) = read(tmp.path(), None).unwrap();
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].timestamp, "unix:10");
         assert_eq!(read_back[0].command, "add");
         assert_eq!(read_back[0].outcome, "ok");
         assert_eq!(read_back[0].exit_code, 0);
+        assert!(warnings.is_empty());
 
         let log_path = tmp.path().join(".stitch").join("log.jsonl");
         let line = std::fs::read_to_string(log_path).unwrap();
@@ -213,7 +303,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".stitch")).unwrap();
         append_command_result(tmp.path(), "apply", Ok(()));
-        let entries = read(tmp.path(), None);
+        let (entries, _) = read(tmp.path(), None).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].outcome, "ok");
         assert_eq!(entries[0].exit_code, 0);
@@ -227,7 +317,7 @@ mod tests {
 
         let err = StitchError::usage("bad args");
         append_command_result(tmp.path(), "apply", Err(&err));
-        let entries = read(tmp.path(), None);
+        let (entries, _) = read(tmp.path(), None).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].outcome, "error");
         assert_eq!(entries[0].exit_class.as_deref(), Some("usage"));
@@ -235,11 +325,47 @@ mod tests {
 
         let err2 = StitchError::conflict_real("/home/.bashrc");
         append_command_result(tmp.path(), "apply", Err(&err2));
-        let entries = read(tmp.path(), Some(1));
+        let (entries, _) = read(tmp.path(), Some(1)).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].outcome, "error");
         assert_eq!(entries[0].exit_class.as_deref(), Some("conflict-real"));
         assert_eq!(entries[0].exit_code, 6);
+    }
+
+    #[test]
+    fn append_refuses_symlinked_log_file() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".stitch")).unwrap();
+        // Create a symlink at log.jsonl pointing outside .stitch.
+        let outside = tmp.path().join("outside.log");
+        std::fs::write(&outside, "").unwrap();
+        let log_link = tmp.path().join(".stitch").join("log.jsonl");
+        std::os::unix::fs::symlink(&outside, &log_link).unwrap();
+        let entry = sample_entry("unix:10", "add", "ok", 0);
+        append(tmp.path(), &entry); // should refuse, not write through the symlink
+        // The symlink target must not have received the audit line.
+        let outside_contents = std::fs::read_to_string(&outside).unwrap();
+        assert!(
+            outside_contents.is_empty(),
+            "symlinked log must not be written"
+        );
+    }
+
+    #[test]
+    fn append_refuses_symlinked_stitch_dir() {
+        let tmp = tempdir().unwrap();
+        // Create a symlink at .stitch pointing to a real dir outside.
+        let real_dir = tmp.path().join("real_stitch");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let stitch_link = tmp.path().join(".stitch");
+        std::os::unix::fs::symlink(&real_dir, &stitch_link).unwrap();
+        let entry = sample_entry("unix:10", "add", "ok", 0);
+        append(tmp.path(), &entry); // should refuse
+        let log = real_dir.join("log.jsonl");
+        assert!(
+            !log.exists(),
+            "symlinked .stitch must not receive audit writes"
+        );
     }
 
     #[test]

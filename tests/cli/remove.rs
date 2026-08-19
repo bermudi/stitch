@@ -781,7 +781,8 @@ fn remove_dry_run_json_previews_without_removing() {
 }
 
 /// A pre-remove hook that removes the generated state before `remove` runs
-/// produces a graceful already-removed JSON response.
+/// must still clean up the stitch-owned links rather than leaving them as
+/// unmanaged orphans. The JSON response reports the cleaned-up links.
 #[test]
 fn remove_json_already_removed_by_pre_hook() {
     let repo = Repo::new();
@@ -826,19 +827,19 @@ fn remove_json_already_removed_by_pre_hook() {
 
     let data = &value["data"];
     assert_eq!(data["store"], "app");
-    assert_eq!(data["target"], "~");
     assert_eq!(data["dry_run"], false);
     assert!(
         data["behavior_orphaned"].is_null(),
         "behavior_orphaned must be omitted for an already-removed store"
     );
-    assert!(
-        data["links"].is_null(),
-        "links must be omitted when the store was already removed"
-    );
+    // The link must be reported as cleaned up, not omitted.
+    let links = data["links"].as_array().expect("links array");
+    assert_eq!(links.len(), 1, "the stitch-owned link must be cleaned up");
 
-    // The pre-hook removed the state, not the link, and the command returned
-    // success without touching the filesystem.
+    // The pre-hook removed the state; the command cleaned up the link.
     assert!(!repo.path().join(".stitch").join("state.toml").exists());
-    assert!(link.is_symlink());
+    assert!(
+        !link.exists(),
+        "stitch-owned link must be removed, not left as an orphan"
+    );
 }

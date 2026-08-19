@@ -102,10 +102,15 @@ fn explain_store(
     } else {
         let entries = resolve_entries(&store_dir, &store.files, &store.patterns, &store.ignore);
         let has_files = !store.files.is_empty() || !store.patterns.is_empty();
-        let mode = match (store.target.is_some(), has_files) {
-            (false, false) => "none",
-            (true, false) => "whole-dir",
-            _ => "file-mode",
+        // Derive mode from the resolved entries, not just the config fields.
+        // `resolve_target_names` can promote a store to file-mode when it
+        // contains templates or ignored entries even if `files`/`patterns`
+        // are empty — `apply` uses that promoted `LinkTargets::Files` path, so
+        // `explain` must match it to avoid misreporting `whole-dir` with
+        // non-empty entries.
+        let mode = match store.target.is_some() {
+            false => "none",
+            true => mode_for(!has_files, &entries),
         };
         ExplainStore {
             name: name.to_string(),
