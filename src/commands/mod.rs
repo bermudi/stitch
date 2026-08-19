@@ -113,7 +113,16 @@ fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<()
                 }
                 apply::cmd_apply_plan(&root, &plan_file, dry_run, force, json)
             } else {
-                apply::cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
+                apply::cmd_apply(
+                    &root,
+                    &only,
+                    store::ApplyOpts {
+                        dry_run,
+                        force,
+                        json,
+                    },
+                    json,
+                )
             }
         }
         cli::Commands::Plan { only, force } => {

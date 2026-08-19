@@ -31,6 +31,7 @@ pub(crate) fn cmd_plan(
         store::ApplyOpts {
             dry_run: true,
             force,
+            json: false,
         },
     );
     let plan_file = plan_exec::build_plan_file(root, &loaded, &plan, &platform)?;

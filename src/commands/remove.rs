@@ -279,7 +279,7 @@ pub(crate) fn cmd_remove(
             Ok((linked, linked_paths))
         };
 
-    let (_, linked_paths) = classify(&loaded)?;
+    let (pre_hook_linked, linked_paths) = classify(&loaded)?;
     let staging = render::store_render_dir(root, name);
     let staging_str = staging.to_string_lossy().into_owned();
     let state_path = root.join(".stitch/state.toml");
@@ -328,7 +328,7 @@ pub(crate) fn cmd_remove(
             target: target.as_deref(),
             action: "remove",
         };
-        hooks::run_global_hook(root, "pre-remove", &env, &platform)
+        hooks::run_global_hook(root, "pre-remove", &env, &platform, json)
             .map_err(|e| StitchError::hook("pre-remove", e))?;
         home_identity
             .revalidate()
@@ -353,14 +353,56 @@ pub(crate) fn cmd_remove(
     // Reload: the pre-remove hook may have changed state (or even removed the
     // store itself). Removal must act on the state it serializes with.
     let mut loaded = Config::load(root)?;
+    // Recompute the target from the reloaded state so the JSON report matches
+    // what was actually reconciled, not what was captured before the hook.
+    let target = loaded
+        .config
+        .stores
+        .get(name)
+        .and_then(|s| s.target.as_deref())
+        .map(str::to_owned)
+        .or(target);
     if !loaded.config.stores.contains_key(name) {
+        // The pre-remove hook removed the store from state. The stitch-owned
+        // links are still on disk — clean them up using the pre-hook
+        // classification rather than leaving them as unmanaged orphans.
+        // `remove_link_to` re-checks ownership, so a link repointed by the
+        // hook is skipped (foreign), not clobbered.
+        let mut removed_links: Vec<String> = Vec::new();
+        for entry in &pre_hook_linked {
+            match linker::remove_link_to(&entry.target, &entry.link_source, root) {
+                Ok(true) => {
+                    if !json {
+                        println!("  removed {}", entry.target.display());
+                    }
+                    removed_links.push(entry.target.to_string_lossy().into_owned());
+                }
+                Ok(false) => {
+                    // Link was repointed or is no longer repo-owned — skip it.
+                    if !json {
+                        eprintln!(
+                            "  warning: {} no longer points into repo — skipped",
+                            entry.target.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(StitchError::internal(format!(
+                        "could not remove link {} after state was removed by hook: {e}",
+                        entry.target.display()
+                    )));
+                }
+            }
+        }
+        // Clean up staging too, if it still exists.
+        let _ = render::remove_store_staging(root, name);
         if json {
             report::write(
                 "remove",
                 RemoveData {
                     store: name.into(),
                     target,
-                    links: Vec::new(),
+                    links: removed_links,
                     staging: staging_str,
                     dry_run: false,
                     behavior_orphaned: None,
@@ -368,7 +410,10 @@ pub(crate) fn cmd_remove(
                 loaded.warnings,
             );
         } else {
-            println!("Store '{name}' was already removed (e.g. by the pre-remove hook).");
+            println!(
+                "Store '{name}' was already removed (e.g. by the pre-remove hook); cleaned up {} link(s).",
+                removed_links.len()
+            );
         }
         return Ok(());
     }
@@ -442,7 +487,7 @@ pub(crate) fn cmd_remove(
             target: target.as_deref(),
             action: "remove",
         };
-        if let Err(e) = hooks::run_global_hook(root, "post-remove", &env, &platform) {
+        if let Err(e) = hooks::run_global_hook(root, "post-remove", &env, &platform, json) {
             eprintln!("warning: post-remove hook: {e}");
         }
     }

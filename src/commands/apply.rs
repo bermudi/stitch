@@ -145,7 +145,7 @@ pub(crate) fn cmd_apply(
             target: None,
             action: "apply",
         };
-        hooks::run_global_hook(root, "pre-apply", &env, &platform)
+        hooks::run_global_hook(root, "pre-apply", &env, &platform, json)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
         global_ancestors
             .revalidate()
@@ -197,7 +197,7 @@ pub(crate) fn cmd_apply(
             target: None,
             action: "apply",
         };
-        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform) {
+        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform, json) {
             eprintln!("warning: post-apply hook: {e}");
         }
     }
@@ -235,7 +235,7 @@ pub(crate) fn cmd_apply_plan(
         )));
     }
 
-    let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run, force);
+    let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run, force, json);
 
     if json {
         match result {
@@ -366,7 +366,7 @@ fn apply_json(
             target: None,
             action: "apply",
         };
-        hooks::run_global_hook(root, "pre-apply", &env, &platform)
+        hooks::run_global_hook(root, "pre-apply", &env, &platform, true)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
         global_ancestors
             .revalidate()
@@ -404,7 +404,7 @@ fn apply_json(
             target: None,
             action: "apply",
         };
-        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform) {
+        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform, true) {
             warnings.push(format!("post-apply hook: {e}"));
         }
     }
@@ -454,6 +454,11 @@ fn build_apply_result(plan: &plan::Plan) -> report::ApplyResult {
                     plan::PlanOp::Conflict { .. } => conflicts += 1,
                     plan::PlanOp::Error { .. } => errors += 1,
                     plan::PlanOp::SkippedPlatform => skipped += 1,
+                    // StageRender is a staging side-effect, not a link
+                    // mutation. PlanSummary excludes it from all counts, so
+                    // the per-store ok count must too — otherwise per-store
+                    // totals disagree with the top-level totals.
+                    plan::PlanOp::StageRender { .. } => {}
                     _ => ok += 1,
                 }
             }
@@ -681,6 +686,7 @@ files = ["regular", "alias"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -752,6 +758,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -831,6 +838,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: true,
                 force: false,
+                json: false,
             },
         );
         assert_eq!(
@@ -845,6 +853,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         )
@@ -904,6 +913,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         )
@@ -995,6 +1005,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         );
@@ -1045,6 +1056,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             true,
         );
@@ -1112,6 +1124,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         );
@@ -1167,6 +1180,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             true,
         );

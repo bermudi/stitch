@@ -137,6 +137,9 @@ pub struct ApplyOpts {
     /// Rename real-file/dir conflicts to `{target}.bak` and link instead of
     /// stopping. Foreign symlinks remain hard conflicts regardless.
     pub force: bool,
+    /// When true, hook stdout is redirected to stderr so it cannot corrupt
+    /// the JSON envelope.
+    pub json: bool,
 }
 
 /// Apply all stores in the config. Returns the executed (or previewed) plan
@@ -306,7 +309,7 @@ pub fn apply_all(
                 target: store.target.as_deref(),
                 action: "apply",
             };
-            if let Err(msg) = hooks::run_store_hook(pre, &env, platform) {
+            if let Err(msg) = hooks::run_store_hook(pre, &env, platform, opts.json) {
                 results.push(ApplyResult {
                     store_name: name.clone(),
                     actions: vec![ApplyAction::Error(StitchError::hook_store(
@@ -522,7 +525,7 @@ pub fn apply_all(
                 target: locked_store.target.as_deref(),
                 action: "apply",
             };
-            if let Err(msg) = hooks::run_store_hook(post, &env, platform) {
+            if let Err(msg) = hooks::run_store_hook(post, &env, platform, opts.json) {
                 warnings.push(format!("store '{name}' post-hook: {msg}"));
             }
             // Revalidate $HOME identity after the post-hook, using the
@@ -600,6 +603,7 @@ pub fn compute_plan(
     let classify_opts = ApplyOpts {
         dry_run: true,
         force: opts.force,
+        json: opts.json,
     };
     apply_all(repo_root, config, None, &[], platform, classify_opts).0
 }
@@ -1872,6 +1876,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -1933,6 +1938,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -1993,6 +1999,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );
@@ -2063,6 +2070,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );
@@ -2138,6 +2146,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: true,
+                json: false,
             },
             &mut warnings,
         );
@@ -2206,6 +2215,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );
@@ -2259,6 +2269,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );

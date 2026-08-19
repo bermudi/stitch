@@ -65,6 +65,55 @@ pub(crate) fn cmd_add_bulk(
         return Err(error);
     }
 
+    // Detect duplicate derived store names before applying anything. Two
+    // inputs with the same basename (e.g. ~/.config/nvim and ~/nvim) would
+    // both validate against the original state but collide in Phase 2, leaving
+    // a partial bulk add despite the "validate all paths first" contract.
+    {
+        let mut seen: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut dup_error: Option<(String, String, String)> = None; // (store, path1, path2)
+        for path in paths {
+            let expanded =
+                expand_home(path).unwrap_or_else(|_| std::path::PathBuf::from(path.as_str()));
+            let store = derive_store_name(&expanded);
+            if let Some(prev_path) = seen.get(&store) {
+                dup_error = Some((store, prev_path.clone(), path.clone()));
+                break;
+            }
+            seen.insert(store, path.clone());
+        }
+        if let Some((store, p1, p2)) = dup_error {
+            let error = StitchError::usage(format!(
+                "bulk add conflict: paths {p1} and {p2} both derive store name '{store}'"
+            ));
+            if json {
+                let results: Vec<report::BulkAddResult> = paths
+                    .iter()
+                    .map(|p| {
+                        let expanded =
+                            expand_home(p).unwrap_or_else(|_| std::path::PathBuf::from(p.as_str()));
+                        let store_name = derive_store_name(&expanded);
+                        report::BulkAddResult {
+                            path: p.clone(),
+                            store: store_name,
+                            ok: false,
+                            error: Some(error.to_string()),
+                            dry_run,
+                        }
+                    })
+                    .collect();
+                let data = report::BulkAddData {
+                    all_ok: false,
+                    results,
+                };
+                crate::audit::append_command_result(root, "add", Err(&error));
+                report::write_data_error("add", data, &error, Vec::new());
+            }
+            return Err(error);
+        }
+    }
+
     // Phase 2: apply all paths (if not dry-run).
     let mut results: Vec<report::BulkAddResult> = Vec::new();
     let mut all_ok = true;
@@ -104,12 +153,11 @@ pub(crate) fn cmd_add_bulk(
         let data = report::BulkAddData { results, all_ok };
         if all_ok {
             report::write("add", data, Vec::new());
-        } else {
-            let error = StitchError::internal("bulk add: one or more paths failed");
-            crate::audit::append_command_result(root, "add", Err(&error));
-            report::write_data_error("add", data, &error, Vec::new());
+            return Ok(());
         }
-        return Ok(());
+        let error = StitchError::internal("bulk add: one or more paths failed");
+        crate::audit::append_command_result(root, "add", Err(&error));
+        report::write_data_error("add", data, &error, Vec::new());
     }
 
     // Text mode: per-path results already printed by cmd_add calls.
@@ -130,6 +178,11 @@ fn derive_store_name(path: &std::path::Path) -> String {
 
 /// Run a closure with stdout redirected to /dev/null. Used in bulk JSON mode
 /// to suppress per-add text output that would corrupt the JSON envelope.
+///
+/// The saved fd is wrapped in an RAII guard that restores stdout in `Drop`,
+/// so stdout is restored even if the closure panics. Both `dup2` calls are
+/// checked; if either fails the closure runs without suppression rather than
+/// corrupting the process's stdio state.
 fn suppress_stdout<F, T>(f: F) -> T
 where
     F: FnOnce() -> T,
@@ -148,20 +201,48 @@ where
     // Open /dev/null and redirect stdout to it. Keep the file handle alive
     // for the duration of the closure so the fd stays valid.
     let dev_null = std::fs::OpenOptions::new().write(true).open("/dev/null");
-    if let Ok(ref null_file) = dev_null {
-        let null_fd = null_file.as_raw_fd();
-        unsafe {
-            libc::dup2(null_fd, stdout_fd);
+    let null_fd = dev_null.as_ref().map(|f| f.as_raw_fd()).ok();
+
+    // RAII guard: restores stdout in Drop, panic-safe.
+    struct StdoutGuard {
+        saved_fd: i32,
+        stdout_fd: i32,
+        redirected: bool,
+    }
+    impl Drop for StdoutGuard {
+        fn drop(&mut self) {
+            if self.redirected {
+                // Best-effort restore; if dup2 fails there's nothing we can do
+                // but the saved fd is still closed to avoid leaking.
+                unsafe {
+                    libc::dup2(self.saved_fd, self.stdout_fd);
+                    libc::close(self.saved_fd);
+                }
+            } else {
+                unsafe {
+                    libc::close(self.saved_fd);
+                }
+            }
+        }
+    }
+
+    let mut guard = StdoutGuard {
+        saved_fd: saved,
+        stdout_fd,
+        redirected: false,
+    };
+    if let Some(null_fd) = null_fd {
+        // Redirect stdout to /dev/null. Check the return value; if it fails,
+        // run without suppression rather than corrupting stdio.
+        let ret = unsafe { libc::dup2(null_fd, stdout_fd) };
+        if ret >= 0 {
+            guard.redirected = true;
         }
     }
     let result = f();
-    // Flush any buffered output (goes to /dev/null) before restoring.
+    // Flush any buffered output (goes to /dev/null) before the guard restores.
     let _ = std::io::stdout().flush();
-    // Restore stdout.
-    unsafe {
-        libc::dup2(saved, stdout_fd);
-        libc::close(saved);
-    }
+    drop(guard);
     result
 }
 use crate::store;
@@ -1169,6 +1250,7 @@ fn cmd_add_to_store(
         store::ApplyOpts {
             dry_run: false,
             force: false,
+            json: false,
         },
     );
     if matches!(
@@ -1813,6 +1895,7 @@ pub(crate) fn cmd_add(
             store::ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut _warnings,
         );
@@ -2147,6 +2230,7 @@ pub(crate) fn cmd_add(
             store::ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut _warnings,
         );

@@ -1392,9 +1392,9 @@ fn add_create_empty_rolls_back_when_link_creation_fails() {
 
 #[test]
 fn bulk_add_partial_failure_json() {
-    // One path succeeds; the second fails because its derived store name
-    // collides with the first. The envelope must report ok: false and include
-    // per-path results.
+    // Two paths derive the same store name ("bashrc"). The duplicate is
+    // detected before any apply, so neither path is committed — no partial
+    // bulk add despite the "validate all paths first" contract.
     let repo = Repo::new();
     let home = tempfile::tempdir().unwrap();
     let bashrc = home.path().join(".bashrc");
@@ -1416,31 +1416,29 @@ fn bulk_add_partial_failure_json() {
         .unwrap();
     assert!(
         !output.status.success(),
-        "partial bulk add must exit non-zero"
+        "duplicate store name in bulk add must exit non-zero"
     );
-    assert_eq!(output.status.code(), Some(1), "exit code must be 1");
+    assert_eq!(output.status.code(), Some(2), "exit code must be 2 (usage)");
 
     let value = json_output(&output);
     assert_envelope_shape(&value, "add", false);
-    assert_error_shape(&value, "internal", 1);
+    assert_error_shape(&value, "usage", 2);
     assert!(value["data"].is_object(), "data must not be null");
     assert_eq!(value["data"]["all_ok"], false);
     let results = value["data"]["results"].as_array().expect("results array");
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0]["ok"], true);
-    assert_eq!(results[0]["store"], "bashrc");
-    assert!(results[0]["error"].is_null());
+    // Both paths are rejected — no partial commit.
+    assert_eq!(results[0]["ok"], false);
     assert_eq!(results[1]["ok"], false);
-    assert_eq!(results[1]["store"], "bashrc");
-    let err = results[1]["error"].as_str().expect("error string");
+    let err = value["error"]["message"].as_str().expect("error message");
     assert!(
-        err.contains("already exists"),
-        "per-path error should describe the collision: {err}"
+        err.contains("both derive store name"),
+        "error should describe the duplicate store name conflict: {err}"
     );
 
-    // The first path was committed; the second was not.
-    assert!(repo.path().join("bashrc").join(".bashrc").exists());
-    assert!(bashrc.is_symlink());
+    // Neither path was committed.
+    assert!(!repo.path().join("bashrc").exists());
+    assert!(!bashrc.is_symlink());
     assert!(!config_bashrc.is_symlink());
 }
 
@@ -1485,6 +1483,17 @@ fn bulk_add_validation_error_json() {
     assert!(
         err.contains("inside the stitch repository"),
         "per-path error should describe the repo containment violation: {err}"
+    );
+
+    // No filesystem mutation should have occurred: validation failed before
+    // Phase 2 (apply), so the valid path must NOT have been committed.
+    assert!(
+        !repo.path().join("good").exists(),
+        "valid path must not be committed when another path fails validation"
+    );
+    assert!(
+        !good.is_symlink(),
+        "valid path must not be symlinked when another path fails validation"
     );
 }
 

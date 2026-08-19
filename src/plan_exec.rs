@@ -361,6 +361,7 @@ pub fn execute_plan(
     plan: &PlanFile,
     dry_run: bool,
     force: bool,
+    json: bool,
 ) -> Result<PlanExecReport, PlanExecError> {
     if plan.schema != PLAN_SCHEMA {
         return Err(PlanExecError::new(
@@ -622,7 +623,7 @@ pub fn execute_plan(
         target: None,
         action: "apply",
     };
-    if let Err(e) = hooks::run_global_hook(repo_root, "pre-apply", &env, &platform) {
+    if let Err(e) = hooks::run_global_hook(repo_root, "pre-apply", &env, &platform, json) {
         sync_ops_remaining(&mut report, plan, &remaining);
         return Err(PlanExecError::new(
             report,
@@ -746,9 +747,13 @@ pub fn execute_plan(
             ));
         }
 
-        if let Err(e) =
-            run_store_pre_hook(repo_root, store_name, &pre_hook_loaded.config, &platform)
-        {
+        if let Err(e) = run_store_pre_hook(
+            repo_root,
+            store_name,
+            &pre_hook_loaded.config,
+            &platform,
+            json,
+        ) {
             sync_ops_remaining(&mut report, plan, &remaining);
             return Err(PlanExecError::new(report, e));
         }
@@ -881,9 +886,13 @@ pub fn execute_plan(
         }
         drop(_state_lock);
 
-        if let Some(warning) =
-            run_store_post_hook(repo_root, store_name, &locked_loaded.config, &platform)
-        {
+        if let Some(warning) = run_store_post_hook(
+            repo_root,
+            store_name,
+            &locked_loaded.config,
+            &platform,
+            json,
+        ) {
             report.warnings.push(warning);
         }
         // Revalidate $HOME identity after the post-hook, using the
@@ -926,7 +935,7 @@ pub fn execute_plan(
         target: None,
         action: "apply",
     };
-    if let Err(e) = hooks::run_global_hook(repo_root, "post-apply", &env, &platform) {
+    if let Err(e) = hooks::run_global_hook(repo_root, "post-apply", &env, &platform, json) {
         report.warnings.push(format!("post-apply hook: {e}"));
     }
 
@@ -942,6 +951,7 @@ fn run_store_pre_hook(
     store_name: &str,
     config: &Config,
     platform: &Platform,
+    json: bool,
 ) -> Result<(), StitchError> {
     let Some(store) = config.stores.get(store_name) else {
         return Ok(());
@@ -953,7 +963,7 @@ fn run_store_pre_hook(
             target: store.target.as_deref(),
             action: "apply",
         };
-        hooks::run_store_hook(pre, &env, platform)
+        hooks::run_store_hook(pre, &env, platform, json)
             .map_err(|e| StitchError::hook_store("pre", e, store_name))?;
     }
     Ok(())
@@ -964,6 +974,7 @@ fn run_store_post_hook(
     store_name: &str,
     config: &Config,
     platform: &Platform,
+    json: bool,
 ) -> Option<String> {
     let store = config.stores.get(store_name)?;
     if let Some(post) = &store.hooks.post {
@@ -973,7 +984,7 @@ fn run_store_post_hook(
             target: store.target.as_deref(),
             action: "apply",
         };
-        if let Err(e) = hooks::run_store_hook(post, &env, platform) {
+        if let Err(e) = hooks::run_store_hook(post, &env, platform, json) {
             return Some(format!("store '{store_name}' post-hook: {e}"));
         }
     }
@@ -1513,6 +1524,7 @@ mod tests {
             ApplyOpts {
                 dry_run: true,
                 force: false,
+                json: false,
             },
         );
         let plan = build_plan_file(&repo_alias, &loaded, &computed, &platform).unwrap();
@@ -1521,7 +1533,7 @@ mod tests {
         }));
 
         assert!(plan.conflicts.is_empty());
-        execute_plan(&repo_alias, &loaded, &plan, false, false).unwrap();
+        execute_plan(&repo_alias, &loaded, &plan, false, false, false).unwrap();
         assert!(target.is_dir());
         assert!(target.join("profile").is_symlink());
     }
@@ -1589,7 +1601,7 @@ mod tests {
             errors: vec![],
         };
 
-        let result = execute_plan(&repo_root, &stale_loaded, &plan, false, false);
+        let result = execute_plan(&repo_root, &stale_loaded, &plan, false, false, false);
         assert!(
             result.is_err(),
             "stale loaded must not authorize a create_link for a removed store: {result:?}"
@@ -1639,6 +1651,7 @@ mod tests {
             ApplyOpts {
                 dry_run: true,
                 force: false,
+                json: false,
             },
         );
         let plan = build_plan_file(&repo_root, &loaded, &computed, &platform).unwrap();
@@ -1653,7 +1666,7 @@ mod tests {
             fs::write(repo_arc.join("stitch.toml"), malicious).unwrap();
         })));
 
-        let result = execute_plan(&repo_root, &loaded, &plan, false, false);
+        let result = execute_plan(&repo_root, &loaded, &plan, false, false, false);
         set_test_pause_after_global_hash(None);
 
         let err = result.expect_err("config change must abort before pre-hook");

@@ -592,6 +592,9 @@ impl StitchError {
                     "fix the failing template(s); see the source in the plan ops",
                 )],
                 [FailureClass::Drift] => vec![RecoveryAction::command("apply", "apply")],
+                [FailureClass::Hook] => {
+                    vec![RecoveryAction::manual("fix or disable the failing hook")]
+                }
                 _ => vec![],
             },
             Self::Mixed { .. } => vec![],

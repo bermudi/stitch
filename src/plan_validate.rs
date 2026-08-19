@@ -78,6 +78,7 @@ pub(crate) fn current_removals(
         crate::store::ApplyOpts {
             dry_run: true,
             force,
+            json: false,
         },
     );
     let mut removals = CurrentRemovals::default();
