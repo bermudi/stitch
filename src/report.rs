@@ -749,6 +749,13 @@ pub struct WhyEntry {
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolves_to: Option<String>,
+    /// Present only when the query matched via ancestor containment — i.e.
+    /// the query lives *inside* a whole-dir store's target directory rather
+    /// than being the target itself. Gives the subpath relative to the target
+    /// (and equivalently relative to the store source dir), so an agent can
+    /// locate the backing repo file without a second lookup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_subpath: Option<String>,
     /// Which config file owns the inventory for this entry.
     pub owning_config: String,
 }
@@ -1957,6 +1964,10 @@ mod tests {
                     templated: true,
                     state: "broken".into(),
                     resolves_to: Some("/gone".into()),
+                    // Maximal fixture: matched_subpath is only present for
+                    // whole-dir containment matches, but the schema-shape test
+                    // exercises every field, so include it here.
+                    matched_subpath: Some("gitconfig".into()),
                     owning_config: "state.toml".into(),
                 }),
                 skipped_platform: true,

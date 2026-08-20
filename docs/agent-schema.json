@@ -132,14 +132,14 @@
     "StatusRow": {
       "fields": {
         "store": "string",
-        "target_name": "string|null (multi-target name)",
+        "target_name": "string|absent (multi-target name; omitted when none)",
         "target": "string (absolute path)",
         "source": "string (absolute path)",
         "templated": "bool",
-        "staged_path": "string|null",
+        "staged_path": "string|absent (omitted for non-templates and skipped-platform entries)",
         "state": "string (linked|missing|conflict|broken|foreign|store-error|config-error)",
         "skipped_platform": "bool",
-        "resolves_to": "string|null"
+        "resolves_to": "string|absent (omitted for linked/missing/conflict)"
       }
     },
     "ListStore": {
@@ -423,12 +423,13 @@
     "WhyEntry": {
       "fields": {
         "store": "string",
-        "target_name": "string|null (multi-target name)",
+        "target_name": "string|absent (multi-target name; omitted when none)",
         "target": "string (absolute path)",
         "source": "string (absolute path; .tmpl source for templates)",
         "templated": "bool",
         "state": "string (linked|missing|conflict|broken|foreign|store-error|config-error)",
-        "resolves_to": "string|null",
+        "resolves_to": "string|absent (omitted for linked/missing/conflict)",
+        "matched_subpath": "string|absent (present only for ancestor/whole-dir containment matches; subpath relative to target and store source)",
         "owning_config": "string (always 'state.toml')"
       }
     },

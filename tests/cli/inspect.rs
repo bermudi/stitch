@@ -2675,6 +2675,44 @@ files = [".bashrc"]
 }
 
 #[test]
+fn why_json_reports_ancestor_for_path_inside_whole_dir_store() {
+    // A whole-dir store links the *directory*; a query for a file inside it
+    // must resolve to the store via ancestor containment, with matched_subpath
+    // giving the relative path to the backing repo file.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#,
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let query = target.join("init.lua");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "nvim");
+    assert_eq!(entry["target"], target.to_string_lossy().as_ref());
+    assert_eq!(
+        entry["source"].as_str().unwrap(),
+        repo.path().join("nvim").to_str().unwrap()
+    );
+    assert_eq!(entry["state"], "linked");
+    assert_eq!(entry["matched_subpath"], "init.lua");
+}
+
+#[test]
 fn why_json_reports_missing_for_unlinked_target() {
     // Before apply, the target doesn't exist — `why` reports state: missing.
     let repo = Repo::new();
@@ -3146,6 +3184,7 @@ fn audit_log_empty_when_no_mutations() {
 #[test]
 fn audit_log_records_failed_add_json() {
     // A failed `add --json` (store already exists) appends an audit entry.
+    // This is a user collision, classified `usage` (exit 2) — not a tool bug.
     let repo = Repo::new();
     repo.write_state("[stores.bashrc]\ntarget = \"~/.bashrc\"\n");
 
@@ -3160,6 +3199,7 @@ fn audit_log_records_failed_add_json() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     let value = json_output(&output);
     assert_envelope_shape(&value, "add", false);
 
@@ -3170,8 +3210,8 @@ fn audit_log_records_failed_add_json() {
     let last = entries.last().expect("log has an entry");
     assert_eq!(last["command"], "add");
     assert_eq!(last["outcome"], "error");
-    assert_eq!(last["exit_code"], 1);
-    assert!(last["exit_class"].is_string());
+    assert_eq!(last["exit_code"], 2);
+    assert_eq!(last["exit_class"], "usage");
 }
 
 #[test]
