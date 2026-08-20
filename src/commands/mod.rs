@@ -105,15 +105,21 @@ fn command_audit_context(command: &cli::Commands) -> (Option<String>, Option<Str
 }
 
 /// Whether a command mutates state and should be audit-logged.
+///
+/// Dry runs are preview-only — they touch nothing on the filesystem, so they
+/// are not audit-logged. This mirrors the `Prune { yes: true }` gate: list-only
+/// prune is also a preview. SPEC.md §Audit log enumerates the mutating
+/// operations as "apply, add, remove, migrate, import, prune --yes" — dry runs
+/// of the first five are excluded by the `dry_run: false` field match.
 fn is_mutation_command(command: &cli::Commands) -> bool {
     use cli::Commands;
     matches!(
         command,
-        Commands::Apply { .. }
-            | Commands::Add { .. }
-            | Commands::Remove { .. }
-            | Commands::Migrate { .. }
-            | Commands::Import { .. }
+        Commands::Apply { dry_run: false, .. }
+            | Commands::Add { dry_run: false, .. }
+            | Commands::Remove { dry_run: false, .. }
+            | Commands::Migrate { dry_run: false, .. }
+            | Commands::Import { dry_run: false, .. }
             | Commands::Prune { yes: true, .. }
     )
 }

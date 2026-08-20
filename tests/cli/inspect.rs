@@ -3365,6 +3365,149 @@ fn audit_log_skips_prune_list_only() {
     );
 }
 
+// Dry runs of the five mutating commands (apply, add, remove, migrate, import)
+// are preview-only — they touch nothing on the filesystem, so they must not
+// append an audit entry. This mirrors the `prune` list-only gate above.
+// Regression: `is_mutation_command` previously used `{ .. }` patterns that
+// ignored the `dry_run` field, so dry runs were logged as real mutations.
+
+#[test]
+fn audit_log_skips_apply_dry_run() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").arg("--dry-run").assert().success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "apply"),
+        "apply --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_add_dry_run() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args([
+            "add",
+            home.path().join(".bashrc").to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "add"),
+        "add --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_remove_dry_run() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd()
+        .arg("remove")
+        .arg("nvim")
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "remove"),
+        "remove --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_migrate_dry_run() {
+    // migrate needs a legacy v0.2 `.stitch/config.toml` to have something to
+    // migrate; the dry run previews the split without writing.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "log"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "migrate"),
+        "migrate --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_import_dry_run() {
+    let (repo, _covered, _orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("import")
+        .arg("--dry-run")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .env("HOME", home.path().as_os_str())
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "import"),
+        "import --dry-run must not leave an audit entry"
+    );
+}
+
 #[test]
 fn audit_log_limit_zero_returns_empty() {
     // `--limit 0` is an explicit "no entries" request and must return an empty
@@ -3797,6 +3940,186 @@ when = { os = "macos" }
 }
 
 #[test]
+fn schema_plan_file_shape_matches_output() {
+    // `plan --json` emits a PlanFile (not the lean Plan). The schema's
+    // commands.plan.data must reference the PlanFile shape, and the emitted
+    // object must conform to it. Regression for the schema documenting `Plan`
+    // while the code emits `PlanFile`.
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["--json", "plan"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "plan", true);
+
+    // The commands table must point at PlanFile, not Plan.
+    assert_eq!(
+        schema["commands"]["plan"]["data"].as_str(),
+        Some("PlanFile"),
+        "schema commands.plan.data must be PlanFile"
+    );
+    // The PlanFile shape must be documented.
+    let plan_file_shape = schema["shapes"]
+        .get("PlanFile")
+        .expect("schema.shapes must document PlanFile");
+
+    assert_value_matches_schema_shape(&value["data"], plan_file_shape, "PlanFile", &schema);
+
+    // Sub-shapes referenced by PlanFile must exist.
+    for sub in [
+        "PlatformFingerprint",
+        "PlanFileOp",
+        "PlanFileRequires",
+        "PlanConflict",
+        "PlanError",
+    ] {
+        assert!(
+            schema["shapes"].get(sub).is_some(),
+            "schema.shapes missing {sub} (referenced by PlanFile)"
+        );
+    }
+
+    // The platform fingerprint nested in the output must match its shape.
+    assert_value_matches_schema_shape(
+        &value["data"]["platform"],
+        &schema["shapes"]["PlatformFingerprint"],
+        "PlatformFingerprint",
+        &schema,
+    );
+    // Each op must match PlanFileOp (tagged by `op`).
+    let plan_file_op_shape = &schema["shapes"]["PlanFileOp"];
+    for (i, op) in value["data"]["ops"].as_array().unwrap().iter().enumerate() {
+        let tag = op["op"].as_str().expect("plan-file op is tagged by `op`");
+        let variants = plan_file_op_shape["variants"]
+            .as_object()
+            .expect("PlanFileOp has variants");
+        let variant_shape = variants
+            .get(tag)
+            .unwrap_or_else(|| panic!("PlanFileOp variant {tag} not documented"));
+        for (field, _) in variant_shape.as_object().unwrap() {
+            assert!(
+                op.get(field).is_some(),
+                "PlanFileOp::{tag} missing field {field} at ops[{i}]"
+            );
+        }
+    }
+}
+
+#[test]
+fn schema_plan_exec_report_shape_matches_output() {
+    // `apply --plan --json` emits a PlanExecReport (not the composite
+    // ApplyData). The schema must document the PlanExecReport shape and the
+    // apply command must reference it. Regression for the shape being
+    // undocumented.
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    // The apply command must advertise PlanExecReport as a possible data shape.
+    let apply_data = schema["commands"]["apply"]["data"]
+        .as_str()
+        .expect("apply data type documented");
+    assert!(
+        apply_data.split('|').any(|p| p.trim() == "PlanExecReport"),
+        "schema commands.apply.data must include PlanExecReport, got: {apply_data}"
+    );
+    let report_shape = schema["shapes"]
+        .get("PlanExecReport")
+        .expect("schema.shapes must document PlanExecReport");
+
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    // Capture a plan, then execute it via apply --plan --json.
+    let plan_path = repo.path().join("plan.json");
+    let plan_out = repo.cmd().arg("plan").output().unwrap();
+    assert!(plan_out.status.success(), "plan capture must succeed");
+    fs::write(&plan_path, &String::from_utf8(plan_out.stdout).unwrap()).unwrap();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--plan", plan_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "apply --plan must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    assert_value_matches_schema_shape(&value["data"], report_shape, "PlanExecReport", &schema);
+
+    // ops_executed is a string[] in PlanExecReport (descriptions), not the
+    // usize count used in ApplyResult. Lock that distinction in.
+    let ops_executed = &value["data"]["ops_executed"];
+    assert!(
+        ops_executed.is_array(),
+        "PlanExecReport.ops_executed must be an array (string[]), not a usize"
+    );
+}
+
+#[test]
+fn schema_absent_array_fields_omitted_when_empty() {
+    // Eleven array fields serialize with skip_serializing_if = "Vec::is_empty",
+    // so they are absent when empty — not `[]`. The schema must document them
+    // as `...|absent`, matching the ExplainStore.entries convention. An agent
+    // doing `data.files.length` on an absent field gets TypeError otherwise.
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    let cases: &[(&str, &str)] = &[
+        ("ListStore", "files"),
+        ("ListStore", "patterns"),
+        ("ListTarget", "files"),
+        ("ListTarget", "patterns"),
+        ("ExplainTarget", "entries"),
+        ("ExplainTarget", "ignore"),
+        ("ImportedStore", "files"),
+        ("ImportedTarget", "files"),
+        ("RemoveData", "links"),
+        ("AddData", "files"),
+        ("AddData", "patterns"),
+    ];
+    for (shape, field) in cases {
+        let field_schema = &schema["shapes"][shape]["fields"][field];
+        let type_str = schema_field_type(field_schema)
+            .unwrap_or_else(|| panic!("{shape}.{field} type must be a string"));
+        assert!(
+            schema_type_allows(type_str, "absent"),
+            "{shape}.{field} must be documented as `...|absent` (it serializes with skip_serializing_if = Vec::is_empty), got: {type_str}"
+        );
+    }
+}
+
+#[test]
 fn why_active_store_omits_skipped_platform() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
@@ -3981,6 +4304,12 @@ fn assert_value_matches_schema_shape(value: &Value, shape: &Value, path: &str, s
             && let Some(base) = schema_base_shape_name(t)
             && let Some(nested) = schema["shapes"].get(base)
         {
+            // Tagged-variant shapes (e.g. PlanFileOp, PlanOp, TargetState) are
+            // validated by tag, not by a flat field set — skip recursion and
+            // let the caller do tag-specific checks.
+            if nested.get("fields").is_none() {
+                continue;
+            }
             match field_value {
                 Value::Object(_) => assert_value_matches_schema_shape(
                     field_value,

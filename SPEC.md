@@ -599,9 +599,12 @@ symlinks are never auto-clobbered (red line).
 
 For `apply` with a single failure class, `recoverable_via` delegates to that
 class's generic recovery (without target-specific args — the agent should
-consult the plan's `conflict`/`error` ops in `data` for per-entry targets).
-`apply` with multiple classes and `mixed` return `[]`; per-entry detail is in
-the plan ops.
+consult the plan's `conflict`/`error` ops in `data` for per-entry targets),
+with one exception: a single `render` class returns `manual` rather than
+`edit-template`, because the aggregate does not record which source path
+failed and `edit-template` requires one. The agent should read the failing
+source from the plan ops in `data` and open it directly. `apply` with multiple
+classes and `mixed` return `[]`; per-entry detail is in the plan ops.
 
 ### Per-command JSON shapes
 
