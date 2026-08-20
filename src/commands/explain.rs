@@ -120,9 +120,10 @@ fn explain_store(
         // are empty — `apply` uses that promoted `LinkTargets::Files` path, so
         // `explain` must match it to avoid misreporting `whole-dir` with
         // non-empty entries.
-        let mode = match store.target.is_some() {
-            false => "none",
-            true => mode_for(!has_files, &entries),
+        let mode = if store.target.is_some() {
+            mode_for(!has_files, &entries)
+        } else {
+            "none"
         };
         ExplainStore {
             name: name.to_string(),

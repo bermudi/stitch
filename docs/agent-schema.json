@@ -146,7 +146,7 @@
       "fields": {
         "name": "string",
         "mode": "string (whole-dir|file-mode|multi-target|none)",
-        "target": "string|null",
+        "target": "string|absent",
         "targets": "ListTarget[]|absent",
         "files": "string[]",
         "patterns": "string[]",
@@ -208,7 +208,7 @@
       "description": "Precondition for an op. `target` is a TargetState; `backup` is present when a backup target must also be verified.",
       "fields": {
         "target": "TargetState",
-        "backup": "TargetState|null"
+        "backup": "TargetState|absent"
       }
     },
     "TargetState": {
@@ -266,8 +266,8 @@
         "id": "string",
         "severity": "string (error|warning|info)",
         "message": "string",
-        "path": "string|null",
-        "hint": "string|null"
+        "path": "string|absent",
+        "hint": "string|absent"
       }
     },
     "PruneData": {
@@ -308,7 +308,7 @@
     "RemoveData": {
       "fields": {
         "store": "string",
-        "target": "string|null (multi-target name)",
+        "target": "string|absent (multi-target name)",
         "links": "string[]",
         "staging": "string",
         "dry_run": "bool",
@@ -319,11 +319,11 @@
     },
     "MigrateData": {
       "fields": {
-        "authored_path": "string|null",
-        "authored": "string|null",
-        "state_path": "string|null",
-        "state": "string|null",
-        "backup_path": "string|null (real migrations only; omitted on dry-run)",
+        "authored_path": "string|absent",
+        "authored": "string|absent",
+        "state_path": "string|absent",
+        "state": "string|absent",
+        "backup_path": "string|absent (real migrations only; omitted on dry-run)",
         "stores_split": "usize (number of v0.2 stores split; 0 when nothing to migrate)",
         "comment_loss_note": "bool|absent (true when a comment-loss note is in warnings)"
       }
@@ -362,7 +362,7 @@
       "fields": {
         "os": "string",
         "arch": "string",
-        "distro": "string|null",
+        "distro": "string|absent",
         "hostname": "string",
         "shell": "string"
       }
@@ -373,7 +373,7 @@
         "active": "bool",
         "when": "WhenClause|absent",
         "mode": "string (whole-dir|file-mode|multi-target|none)",
-        "target": "string|null",
+        "target": "string|absent",
         "entries": "ExplainEntry[]|absent (omitted when empty, e.g. whole-dir or multi-target stores)",
         "targets": "ExplainTarget[]|absent (multi-target only)",
         "hooks": "Hooks|absent",
@@ -400,11 +400,11 @@
     },
     "WhenClause": {
       "fields": {
-        "os": "string|null",
-        "arch": "string|null",
-        "distro": "string|null",
-        "hostname": "string|null",
-        "shell": "string|null"
+        "os": "string|absent",
+        "arch": "string|absent",
+        "distro": "string|absent",
+        "hostname": "string|absent",
+        "shell": "string|absent"
       }
     },
     "Hooks": {
@@ -416,7 +416,7 @@
     "WhyData": {
       "fields": {
         "query": "string",
-        "entry": "WhyEntry|null",
+        "entry": "WhyEntry|absent",
         "skipped_platform": "bool|absent (omitted when false)"
       }
     },
@@ -437,10 +437,10 @@
       "fields": {
         "timestamp": "string (unix:SECONDS timestamp, UTC)",
         "command": "string (apply|add|remove|migrate|import|prune)",
-        "store": "string|null (omitted when not applicable)",
-        "target": "string|null (omitted when not applicable)",
+        "store": "string|absent (omitted when not applicable)",
+        "target": "string|absent (omitted when not applicable)",
         "outcome": "string (ok|error)",
-        "exit_class": "string|null (omitted on success)",
+        "exit_class": "string|absent (omitted on success)",
         "exit_code": "i32"
       }
     },
@@ -455,7 +455,7 @@
         "path": "string",
         "store": "string (derived from basename)",
         "ok": "bool",
-        "error": "string|null (omitted on success)",
+        "error": "string|absent (omitted on success)",
         "dry_run": "bool"
       }
     }
