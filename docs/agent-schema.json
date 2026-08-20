@@ -65,12 +65,12 @@
       "description": "What apply would do. Lean — not the composite."
     },
     "plan": {
-      "data": "Plan",
-      "description": "Captured executable plan for `apply --plan`."
+      "data": "PlanFile",
+      "description": "Captured executable plan for `apply --plan`. A versioned, self-describing artifact (schema 2, kind `stitch/plan`) carrying staged-render hashes and a config+platform fingerprint. Distinct from the lean `Plan` shape used by `diff`/`apply`."
     },
     "apply": {
-      "data": "ApplyData",
-      "description": "Composite: desired + plan + result + post_status. Direct apply only; `apply --plan` emits PlanExecReport instead."
+      "data": "ApplyData|PlanExecReport",
+      "description": "Direct `apply` emits the composite ApplyData (desired + plan + result + post_status). `apply --plan` emits PlanExecReport instead — the desired state is already pinned in the plan file, so the composite is not needed."
     },
     "doctor": {
       "data": "DoctorData",
@@ -148,8 +148,8 @@
         "mode": "string (whole-dir|file-mode|multi-target|none)",
         "target": "string|absent",
         "targets": "ListTarget[]|absent",
-        "files": "string[]",
-        "patterns": "string[]",
+        "files": "string[]|absent (omitted when empty)",
+        "patterns": "string[]|absent (omitted when empty)",
         "when": "WhenClause|absent"
       }
     },
@@ -158,8 +158,8 @@
         "name": "string",
         "target": "string",
         "mode": "string",
-        "files": "string[]",
-        "patterns": "string[]",
+        "files": "string[]|absent (omitted when empty)",
+        "patterns": "string[]|absent (omitted when empty)",
         "when": "WhenClause|absent"
       }
     },
@@ -202,6 +202,78 @@
         "conflicts": "usize",
         "errors": "usize",
         "skipped": "usize"
+      }
+    },
+    "PlanFile": {
+      "description": "The on-disk plan file format emitted by `plan --json` (and text-mode `plan`). Versioned and self-describing; `apply --plan` validates `schema`, `kind`, `config_sha256`, `platform`, and every `stage_render` hash before executing. See SPEC.md §Plan file format.",
+      "fields": {
+        "schema": "u32 (plan schema version; currently 2)",
+        "kind": "string (always `stitch/plan`)",
+        "repo": "string (absolute path to the repo root at capture time)",
+        "config_sha256": "string (domain-separated SHA-256 of stitch.toml + .stitch/state.toml)",
+        "platform": "PlatformFingerprint",
+        "ops": "PlanFileOp[]",
+        "stores": "string[]|absent (stores owning executable ops; omitted when empty — controls per-store hooks, must match ops exactly)",
+        "conflicts": "PlanConflict[]",
+        "errors": "PlanError[]"
+      }
+    },
+    "PlatformFingerprint": {
+      "description": "Capture-time platform fingerprint. Plans are single-machine artifacts; `apply --plan` refuses a mismatch.",
+      "fields": {
+        "os": "string",
+        "arch": "string",
+        "distro": "string|absent",
+        "hostname": "string",
+        "shell": "string"
+      }
+    },
+    "PlanFileOp": {
+      "description": "An executable op in the plan file. Tagged by `op` (snake_case). Distinct from the lean `PlanOp` (tagged by `action`) used in `diff`/`apply`.",
+      "tag": "op",
+      "variants": {
+        "stage_render": { "store": "string", "source_rel": "string", "staged": "string", "sha256": "string" },
+        "create_link": { "target": "string", "source": "string", "requires": "PlanFileRequires" },
+        "replace_link": { "target": "string", "source": "string", "requires": "PlanFileRequires" },
+        "backup_and_link": { "target": "string", "backup": "string", "source": "string", "requires": "PlanFileRequires" },
+        "remove_link": { "store": "string", "target": "string", "source": "string|absent", "requires": "PlanFileRequires" },
+        "remove_staged": { "store": "string", "rel": "string" }
+      }
+    },
+    "PlanFileRequires": {
+      "description": "Flat precondition form used by plan-file ops. `target`/`backup` are state names (absent|real_entry|symlink_to|symlink_into_repo); `value`/`backup_value` accompany `symlink_to`.",
+      "fields": {
+        "target": "string (absent|real_entry|symlink_to|symlink_into_repo)",
+        "value": "string|absent (required when target is symlink_to)",
+        "backup": "string|absent (backup precondition state, for backup_and_link)",
+        "backup_value": "string|absent (required when backup is symlink_to)"
+      }
+    },
+    "PlanConflict": {
+      "description": "A conflict recorded in a plan file (capture-time) or a PlanExecReport (execution-time). `kind` is `foreign_symlink` when `resolves_to` is present, `real_entry` otherwise; `symlink_ancestor` flags a symlinked target ancestor that an editable pathname plan cannot safely pin.",
+      "fields": {
+        "target": "string",
+        "kind": "string (foreign_symlink|real_entry|symlink_ancestor)",
+        "resolves_to": "string|absent"
+      }
+    },
+    "PlanError": {
+      "description": "An op-level error recorded in a plan file. `target` may be absent when the error is not tied to a single target.",
+      "fields": {
+        "target": "string|absent",
+        "message": "string",
+        "class": "string (failure class id)"
+      }
+    },
+    "PlanExecReport": {
+      "description": "Result of executing (or preflighting) a plan file via `apply --plan`. Emitted in the envelope's `data` field with command `apply`. On abort, the same shape is carried in `data` alongside a non-null `error`. Note: `ops_executed` here is a `string[]` of executed op descriptions, unlike `ApplyResult.ops_executed` which is a `usize` count — same field name, different type depending on the apply path.",
+      "fields": {
+        "ops_total": "usize",
+        "ops_executed": "string[] (descriptions of ops that ran; empty on preflight-only abort)",
+        "ops_remaining": "string[] (descriptions of ops that did not run after an abort)",
+        "conflicts": "PlanConflict[]",
+        "staged": "string[] (staged-render paths written by stage_render ops)",
+        "warnings": "string[]|absent (non-fatal notices; omitted when empty)"
       }
     },
     "LinkRequires": {
@@ -298,8 +370,8 @@
         "target": "string",
         "mode": "string",
         "source": "string|absent (repo source path; omitted for create modes and on dry-run)",
-        "files": "string[]",
-        "patterns": "string[]",
+        "files": "string[]|absent (omitted when empty)",
+        "patterns": "string[]|absent (omitted when empty)",
         "link_created": "string|absent (real mutations only; omitted on dry-run)",
         "moved_from": "string|absent (original path for adopt modes; omitted for create modes and on dry-run)",
         "state_entry": "string|absent (the [stores.<name>] slice written to state.toml; omitted on dry-run)"
@@ -309,7 +381,7 @@
       "fields": {
         "store": "string",
         "target": "string|absent (multi-target name)",
-        "links": "string[]",
+        "links": "string[]|absent (omitted when empty)",
         "staging": "string",
         "dry_run": "bool",
         "behavior_orphaned": "bool|absent (real mutations only; omitted on dry-run)",
@@ -341,7 +413,7 @@
         "store": "string",
         "target": "string",
         "mode": "string",
-        "files": "string[]",
+        "files": "string[]|absent (omitted when empty)",
         "targets": "ImportedTarget[]|absent"
       }
     },
@@ -349,7 +421,7 @@
       "fields": {
         "name": "string",
         "target": "string",
-        "files": "string[]"
+        "files": "string[]|absent (omitted when empty)"
       }
     },
     "ExplainData": {
@@ -387,8 +459,8 @@
         "when": "WhenClause|absent",
         "target": "string",
         "mode": "string",
-        "entries": "ExplainEntry[]",
-        "ignore": "string[]"
+        "entries": "ExplainEntry[]|absent (omitted when empty)",
+        "ignore": "string[]|absent (omitted when empty)"
       }
     },
     "ExplainEntry": {

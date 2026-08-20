@@ -1759,6 +1759,58 @@ target = "{target_str}"
 }
 
 #[test]
+fn apply_json_single_render_class_returns_manual_not_edit_template() {
+    // A single `render` failure class in an Apply aggregate returns `manual`,
+    // not `edit-template` — the aggregate does not record which source path
+    // failed, and `edit-template` requires one. The agent should read the
+    // failing source from the plan ops in `data`. This locks in the SPEC
+    // wording (the single-class delegation has a Render exception).
+    let repo = Repo::new();
+    let store = repo.make_store("git", &["config"]);
+    // A broken template triggers a render failure on apply.
+    fs::write(store.join("broken.tmpl"), "{{").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target}"
+"#,
+        target = target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    let err = &v["error"];
+    assert_eq!(err["class"], "render");
+    assert_eq!(err["code"], 8);
+    let actions = err["recoverable_via"]
+        .as_array()
+        .expect("recoverable_via array");
+    // Single Render class → manual (not edit-template), because the aggregate
+    // lacks the source path that edit-template requires.
+    assert_eq!(actions.len(), 1, "single render class yields one action");
+    assert_eq!(actions[0]["kind"], "manual");
+    assert!(
+        actions[0].get("command").is_none() || actions[0]["command"].is_null(),
+        "render recovery must not offer a stitch command (no source path at aggregate level)"
+    );
+    assert!(
+        actions[0]["reason"].as_str().unwrap().contains("template"),
+        "render manual reason should reference the template/plan ops: {}",
+        actions[0]["reason"]
+    );
+}
+
+#[test]
 fn apply_json_result_happy_path() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);
