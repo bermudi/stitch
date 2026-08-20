@@ -295,6 +295,15 @@ fn add_rejects_existing_symlink_at_target() {
         .assert()
         .failure()
         .stderr(contains("already a symlink"));
+
+    // Foreign symlinks are conflicts, not replacements: the source must remain
+    // an untouched symlink pointing at the original foreign target.
+    assert!(src.is_symlink(), "foreign symlink must not be clobbered");
+    assert_eq!(
+        fs::read_link(&src).unwrap(),
+        PathBuf::from("/elsewhere"),
+        "foreign symlink must still point where it pointed"
+    );
 }
 
 #[test]
@@ -1706,4 +1715,43 @@ fn bulk_add_phase2_partial_failure_json() {
     );
     assert!(config_dir.is_symlink());
     assert!(!repo.path().join("init.lua").exists());
+}
+
+/// Red line: `add` must never rewrite the authored `stitch.toml`.
+/// Mutations write `.stitch/state.toml` only, preserving user comments and
+/// hand-formatting byte-for-byte.
+#[test]
+fn add_preserves_authored_stitch_toml_bytes() {
+    let repo = Repo::new();
+    let authored = r#"# Authored config for stitch.
+# This file is hand-edited and must never be rewritten by the tool.
+
+[stores.legacy]
+# A store I configured by hand.
+ignore = ["*.bak"]
+"#;
+    repo.write_authored(authored);
+    let before = fs::read_to_string(repo.path().join("stitch.toml")).unwrap();
+
+    // Add a different store. The target is inside the test $HOME.
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".myapp");
+
+    repo.cmd()
+        .args(["add", target.to_str().unwrap(), "--name", "myapp"])
+        .assert()
+        .success()
+        .stdout(contains("Added store 'myapp'"));
+
+    // The new store should be recorded in generated state only.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("[stores.myapp]"),
+        "state must record the new store:\n{state}"
+    );
+
+    // Authored config must be byte-for-byte identical.
+    let after = fs::read_to_string(repo.path().join("stitch.toml")).unwrap();
+    assert_eq!(before, after, "add must not rewrite stitch.toml");
 }

@@ -4,6 +4,7 @@
 
 #![allow(unused_imports)]
 #![allow(clippy::all)]
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -3174,6 +3175,11 @@ target = "{}/.config/nvim"
 fn audit_log_empty_when_no_mutations() {
     // A fresh repo with no mutations has an empty log.
     let repo = Repo::new();
+    let log_path = repo.path().join(".stitch").join("log.jsonl");
+    assert!(
+        !log_path.exists(),
+        "log.jsonl must not exist before any mutation"
+    );
     let output = repo.cmd().args(["--json", "log"]).output().unwrap();
     assert!(output.status.success());
     let value = json_output(&output);
@@ -3493,4 +3499,509 @@ fn bulk_add_rejects_per_store_flags() {
         stdout.contains("--name") || stdout.contains("bulk"),
         "error should mention --name or bulk mode: {stdout}"
     );
+}
+
+#[test]
+fn why_deepest_owner_wins_for_nested_whole_dir_stores() {
+    // Whole-directory stores with overlapping targets: the deepest matching
+    // owner should win. `apply` refuses to create nested whole-dir links, so
+    // we set up the symlinks manually; `why` is read-only and still resolves.
+    let repo = Repo::new();
+    repo.make_store("outer", &[]);
+    repo.make_store("inner", &["init.lua"]);
+
+    repo.write_state(
+        r#"
+[stores.outer]
+target = "~/.config"
+
+[stores.inner]
+target = "~/.config/nvim"
+"#,
+    );
+
+    let outer_target = repo.path().join(".config");
+    std::os::unix::fs::symlink(&repo.path().join("outer"), &outer_target).unwrap();
+    std::os::unix::fs::symlink(&repo.path().join("inner"), &outer_target.join("nvim")).unwrap();
+
+    let query_inner = outer_target.join("nvim").join("init.lua");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query_inner.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "inner");
+    assert_eq!(entry["matched_subpath"], "init.lua");
+
+    let query_outer = outer_target.join("something");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query_outer.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "outer");
+}
+
+#[test]
+fn audit_log_write_failure_is_warning_not_hard_error() {
+    if is_root() {
+        eprintln!("note: audit_log_write_failure_is_warning_not_hard_error skipped under root");
+        return;
+    }
+
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let log = repo.path().join(".stitch").join("log.jsonl");
+    assert!(log.exists(), "log.jsonl must exist after first apply");
+
+    let original = fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+    let _guard = RestoreMode {
+        path: &log,
+        mode: original,
+    };
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "apply must succeed even when audit log is unwritable"
+    );
+    let value = json_output(&output);
+    assert!(value["ok"].as_bool().unwrap());
+
+    let target = repo.path().join(".config").join("nvim");
+    assert!(target.is_symlink(), "target link must remain in place");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not append to audit log"),
+        "audit write failure should warn on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn log_limit_returns_tail() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+
+    let alpha = home.path().join("alpha");
+    let beta = home.path().join("beta");
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", alpha.to_str().unwrap(), "--name", "alpha"])
+        .assert()
+        .success();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", beta.to_str().unwrap(), "--name", "beta"])
+        .assert()
+        .success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "log", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+
+    let entries = value["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "--limit 1 must return exactly one entry");
+    assert_eq!(
+        entries[0]["store"], "beta",
+        "tail must be the second mutation"
+    );
+}
+
+#[test]
+fn schema_shapes_match_command_outputs() {
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    repo.make_store("git", &["gitconfig"]);
+    repo.make_store("nvim", &[]);
+    fs::create_dir_all(repo.path().join("nvim").join("lua")).unwrap();
+    fs::write(
+        repo.path().join("nvim").join("lua").join("init.lua"),
+        "contents of init.lua",
+    )
+    .unwrap();
+    repo.make_store("macos-only", &[]);
+
+    repo.write_state(
+        r#"
+[stores.shells]
+target = "~"
+files = [".bashrc"]
+
+[stores.git.targets.work]
+target = "~/.config/git"
+files = ["gitconfig"]
+
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+
+    repo.write_authored(
+        r#"
+[stores.shells]
+when = { os = "linux" }
+ignore = ["*.bak"]
+hooks = { post = "echo done" }
+
+[stores.git]
+when = { os = "linux" }
+ignore = ["*.log"]
+hooks = { post = "echo git" }
+
+[stores.git.targets.work]
+when = { os = "linux" }
+ignore = ["*.log"]
+
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let explain = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(explain.status.success());
+    let explain_value = json_output(&explain);
+    assert_envelope_shape(&explain_value, "explain", true);
+
+    assert_value_matches_schema_shape(
+        &explain_value["data"],
+        &schema["shapes"]["ExplainData"],
+        "ExplainData",
+        &schema,
+    );
+    assert_value_matches_schema_shape(
+        &explain_value["data"]["platform"],
+        &schema["shapes"]["ExplainPlatform"],
+        "ExplainPlatform",
+        &schema,
+    );
+    for store in explain_value["data"]["stores"].as_array().unwrap() {
+        let name = store["name"].as_str().unwrap();
+        assert_value_matches_schema_shape(
+            store,
+            &schema["shapes"]["ExplainStore"],
+            &format!("ExplainStore({name})"),
+            &schema,
+        );
+    }
+
+    let query_nvim = "~/.config/nvim/lua/init.lua";
+    let why_nvim = repo
+        .cmd()
+        .args(["--json", "why", query_nvim])
+        .output()
+        .unwrap();
+    assert!(why_nvim.status.success());
+    let why_nvim_value = json_output(&why_nvim);
+    assert_envelope_shape(&why_nvim_value, "why", true);
+    assert_value_matches_schema_shape(
+        &why_nvim_value["data"],
+        &schema["shapes"]["WhyData"],
+        "WhyData(nvim)",
+        &schema,
+    );
+    assert_value_matches_schema_shape(
+        &why_nvim_value["data"]["entry"],
+        &schema["shapes"]["WhyEntry"],
+        "WhyEntry(nvim)",
+        &schema,
+    );
+
+    let query_skipped = "~/.config/macos";
+    let why_skipped = repo
+        .cmd()
+        .args(["--json", "why", query_skipped])
+        .output()
+        .unwrap();
+    assert!(why_skipped.status.success());
+    let why_skipped_value = json_output(&why_skipped);
+    assert_value_matches_schema_shape(
+        &why_skipped_value["data"],
+        &schema["shapes"]["WhyData"],
+        "WhyData(skipped)",
+        &schema,
+    );
+
+    let query_git = "~/.config/git/gitconfig";
+    let why_git = repo
+        .cmd()
+        .args(["--json", "why", query_git])
+        .output()
+        .unwrap();
+    assert!(why_git.status.success());
+    let why_git_value = json_output(&why_git);
+    if !why_git_value["data"]["entry"].is_null() {
+        assert_value_matches_schema_shape(
+            &why_git_value["data"]["entry"],
+            &schema["shapes"]["WhyEntry"],
+            "WhyEntry(git)",
+            &schema,
+        );
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let add_target = home.path().join("extra");
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", add_target.to_str().unwrap(), "--name", "extra"])
+        .assert()
+        .success();
+
+    let log = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(log.status.success());
+    let log_value = json_output(&log);
+    assert_envelope_shape(&log_value, "log", true);
+    for (i, entry) in log_value["data"].as_array().unwrap().iter().enumerate() {
+        assert_value_matches_schema_shape(
+            entry,
+            &schema["shapes"]["AuditEntry"],
+            &format!("AuditEntry[{i}]"),
+            &schema,
+        );
+    }
+}
+
+#[test]
+fn why_active_store_omits_skipped_platform() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", "~/.config/nvim/init.lua"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    assert!(
+        value["data"].get("skipped_platform").is_none(),
+        "skipped_platform must be omitted when the store is active"
+    );
+}
+
+#[test]
+fn why_matched_subpath_multi_component() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &[]);
+    fs::create_dir_all(repo.path().join("nvim").join("lua")).unwrap();
+    fs::write(
+        repo.path().join("nvim").join("lua").join("init.lua"),
+        "contents of init.lua",
+    )
+    .unwrap();
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", "~/.config/nvim/lua/init.lua"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["matched_subpath"], "lua/init.lua");
+}
+
+#[test]
+fn log_text_mode() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo.cmd().arg("log").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("unix:"),
+        "text log must include a timestamp"
+    );
+    assert!(
+        stdout.contains("apply"),
+        "text log must include the command"
+    );
+    assert!(stdout.contains("ok"), "text log must include the outcome");
+    assert!(
+        stdout.contains("exit_code=0"),
+        "text log must include the exit code"
+    );
+}
+
+#[test]
+fn audit_log_records_store_and_target_fields() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join("mystore");
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", target.to_str().unwrap(), "--name", "mystore"])
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+
+    let last = value["data"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["store"], "mystore");
+    assert!(
+        last["target"].is_string(),
+        "audit entry target must be a string"
+    );
+}
+
+fn schema_field_type(field_schema: &Value) -> Option<&str> {
+    field_schema
+        .as_str()
+        .or_else(|| field_schema.get("type").and_then(Value::as_str))
+}
+
+fn schema_type_main(type_str: &str) -> &str {
+    if let Some(i) = type_str.find(" (") {
+        return type_str[..i].trim();
+    }
+    type_str.trim()
+}
+
+fn schema_type_allows(type_str: &str, variant: &str) -> bool {
+    schema_type_main(type_str)
+        .split('|')
+        .any(|p| p.trim() == variant)
+}
+
+fn schema_base_shape_name(type_str: &str) -> Option<&str> {
+    let delimiters = ['|', '(', ' ', '['];
+    let end = type_str
+        .char_indices()
+        .find(|(_, c)| delimiters.contains(c))
+        .map(|(i, _)| i)
+        .unwrap_or(type_str.len());
+    let base = type_str[..end].trim();
+    if base.is_empty() { None } else { Some(base) }
+}
+
+fn assert_value_matches_schema_shape(value: &Value, shape: &Value, path: &str, schema: &Value) {
+    let obj = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{path}: expected a JSON object"));
+    let fields = shape
+        .get("fields")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("{path}: schema shape has no fields"));
+
+    let allowed: BTreeSet<String> = fields.keys().cloned().collect();
+    let actual: BTreeSet<String> = obj.keys().cloned().collect();
+    assert!(
+        actual.is_subset(&allowed),
+        "{path}: unexpected keys: {actual:?} not in {allowed:?}"
+    );
+
+    let required: BTreeSet<String> = fields
+        .iter()
+        .filter(|(_, v)| {
+            let Some(t) = schema_field_type(v) else {
+                return true;
+            };
+            !schema_type_allows(t, "absent") && !schema_type_allows(t, "null")
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    assert!(
+        required.is_subset(&actual),
+        "{path}: missing required keys: {required:?} not in {actual:?}"
+    );
+
+    for (key, field_value) in obj {
+        let field_schema = &fields[key];
+        let type_str = schema_field_type(field_schema);
+        if field_value.is_null() && type_str.is_some_and(|t| schema_type_allows(t, "null")) {
+            continue;
+        }
+        if let Some(t) = type_str
+            && let Some(base) = schema_base_shape_name(t)
+            && let Some(nested) = schema["shapes"].get(base)
+        {
+            match field_value {
+                Value::Object(_) => assert_value_matches_schema_shape(
+                    field_value,
+                    nested,
+                    &format!("{path}.{key}"),
+                    schema,
+                ),
+                Value::Array(arr) => {
+                    for (i, item) in arr.iter().enumerate() {
+                        if !item.is_null() {
+                            assert_value_matches_schema_shape(
+                                item,
+                                nested,
+                                &format!("{path}.{key}[{i}]"),
+                                schema,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }

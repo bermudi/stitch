@@ -905,6 +905,38 @@ fn add_json_post_op_adopt_reports_moved_source() {
         value["data"]["link_created"].is_string(),
         "link_created must be present"
     );
+
+    let data = &value["data"];
+    let raw_name = target.file_name().unwrap().to_string_lossy().into_owned();
+    let store_name = raw_name.strip_prefix('.').unwrap_or(&raw_name).to_string();
+    assert_eq!(data["store"].as_str().unwrap(), store_name);
+
+    // `moved_from` is the original adopted path, collapsed to `~` because
+    // the test set HOME to the temp home dir.
+    let moved_from = data["moved_from"]
+        .as_str()
+        .expect("moved_from must be present for adopt");
+    let rel = target
+        .strip_prefix(home.path())
+        .expect("target must be under HOME");
+    let expected_moved_from = if rel.as_os_str().is_empty() {
+        "~".to_string()
+    } else {
+        let mut s = "~/".to_string();
+        s.push_str(&*rel.to_string_lossy());
+        s
+    };
+    assert_eq!(moved_from, expected_moved_from);
+
+    // `state_entry` is the [stores.<name>] slice written to .stitch/state.toml.
+    let state_entry = data["state_entry"]
+        .as_str()
+        .expect("state_entry must be present for adopt");
+    assert!(
+        state_entry.contains("[stores.gitconfig]"),
+        "state_entry must contain the [stores.<name>] slice: {state_entry}"
+    );
+
     // The target is now a symlink.
     assert!(target.is_symlink(), "target must be a symlink after adopt");
 }
@@ -2939,5 +2971,153 @@ hooks = { pre = "rm -rf $HOME/.config && mv $HOME/.ssh $HOME/.config" }
     assert!(
         !repo.path().join(".config").join("app").join("f").exists(),
         "apply --plan must not write through the per-store hook redirect"
+    );
+}
+
+#[test]
+fn json_apply_only_platform_skipped_store_is_reported() {
+    // `apply --json --only <store>` with a platform-skipped store must
+    // succeed, report the skip in the composite result/post_status, and not
+    // create any link.
+    let repo = Repo::new();
+    repo.make_store("skipped", &["profile"]);
+    let home = repo.path().join("home");
+    let target = home.join("skipped");
+    let other_os = if std::env::consts::OS == "linux" {
+        "macos"
+    } else {
+        "linux"
+    };
+    repo.write_state(&format!(
+        r#"
+[stores.skipped]
+target = "{}"
+files = ["profile"]
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.write_authored(&format!(
+        r#"
+[stores.skipped]
+when = {{ os = "{other_os}" }}
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--only", "skipped"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply --only skipped should succeed for platform-skipped store"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    let data = &value["data"];
+    let desired_stores = data["desired"]["stores"]
+        .as_array()
+        .expect("desired stores");
+    assert_eq!(desired_stores.len(), 1);
+    assert_eq!(desired_stores[0]["name"], "skipped");
+    assert_eq!(desired_stores[0]["active"], false);
+
+    let plan_stores = data["plan"]["stores"].as_array().expect("plan stores");
+    assert_eq!(plan_stores.len(), 1);
+    assert_eq!(plan_stores[0]["store_name"], "skipped");
+    let ops = plan_stores[0]["ops"].as_array().expect("plan ops");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["action"], "skipped_platform");
+
+    let result = data["result"].as_object().expect("result object");
+    let result_stores = result["stores"].as_array().expect("result stores");
+    assert_eq!(result_stores.len(), 1);
+    assert_eq!(result_stores[0]["store"], "skipped");
+    assert_eq!(result_stores[0]["skipped"], 1);
+    assert_eq!(result_stores[0]["ok"], 0);
+    assert_eq!(result_stores[0]["conflicts"], 0);
+    assert_eq!(result_stores[0]["errors"], 0);
+
+    let post_status = data["post_status"].as_array().expect("post_status");
+    assert_eq!(post_status.len(), 1);
+    assert_eq!(post_status[0]["store"], "skipped");
+    assert_eq!(post_status[0]["state"], "missing");
+    assert_eq!(post_status[0]["skipped_platform"], true);
+
+    // The store should not have been linked.
+    assert!(
+        !target.is_symlink(),
+        "platform-skipped store must not create a link"
+    );
+    assert!(!target.join("profile").exists());
+}
+
+#[test]
+fn json_apply_dry_run_only_filters_composite_data() {
+    // `apply --json --dry-run --only foo` should only include store `foo` in
+    // the composite desired/plan/post_status fields and leave `result` null.
+    let repo = Repo::new();
+    repo.make_store("foo", &[".foorc"]);
+    repo.make_store("bar", &[".barrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.foo]
+target = "{home}"
+files = [".foorc"]
+
+[stores.bar]
+target = "{home}"
+files = [".barrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--dry-run", "--only", "foo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply --json --dry-run --only foo should succeed"
+    );
+
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    let data = &value["data"];
+    let desired_stores = data["desired"]["stores"]
+        .as_array()
+        .expect("desired stores");
+    assert_eq!(desired_stores.len(), 1, "desired should only contain foo");
+    assert_eq!(desired_stores[0]["name"], "foo");
+
+    let plan_stores = data["plan"]["stores"].as_array().expect("plan stores");
+    assert_eq!(plan_stores.len(), 1, "plan should only contain foo");
+    assert_eq!(plan_stores[0]["store_name"], "foo");
+    let ops = plan_stores[0]["ops"].as_array().expect("plan ops");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["action"], "create_link");
+
+    assert!(data["result"].is_null(), "result is null on dry-run");
+
+    let post_status = data["post_status"].as_array().expect("post_status");
+    assert!(
+        post_status.iter().all(|row| row["store"] == "foo"),
+        "post_status must only contain store foo"
+    );
+    assert_eq!(post_status[0]["state"], "missing");
+
+    // Neither store should have been linked.
+    assert!(
+        !home.join(".foorc").exists(),
+        "foo must not be linked on dry-run"
+    );
+    assert!(
+        !home.join(".barrc").exists(),
+        "bar must not be linked on dry-run"
     );
 }

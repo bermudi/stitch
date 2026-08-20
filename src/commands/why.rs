@@ -148,7 +148,7 @@ fn build_why_entry(
         templated: entry.is_template,
         state,
         resolves_to,
-        matched_subpath: matched_subpath.and_then(|p| p.to_str()).map(str::to_owned),
+        matched_subpath: matched_subpath.map(|p| p.to_string_lossy().into_owned()),
         owning_config: "state.toml".to_string(),
     }
 }
