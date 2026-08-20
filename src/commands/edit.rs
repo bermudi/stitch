@@ -28,9 +28,9 @@ pub(crate) fn cmd_edit(
         }
         Some(e) => {
             let loaded = Config::load(root)?;
-            if !print_path {
-                print_warnings(&loaded);
-            }
+            // Warnings go to stderr, so they don't corrupt the stdout path
+            // emitted by --print-path. Keep them in both modes.
+            print_warnings(&loaded);
             render::resolve_edit_source(root, &loaded.config, e).map_err(StitchError::internal)?
         }
     };

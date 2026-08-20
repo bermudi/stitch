@@ -249,6 +249,12 @@ investigating a broken dotfile. Read-only.
 - `entry`: the matched status entry, or `null` when no store owns the path.
 - `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`,
   `store-error`, or `config-error` (same states as `status --json`).
+- `matched_subpath`: present only when the query was matched via ancestor
+  containment — i.e. the query lives *inside* a whole-dir store's target
+  directory rather than being a target itself. Gives the subpath relative to
+  the target (and equivalently relative to the store source dir), so an agent
+  can locate the backing repo file without a second lookup. Omitted for exact
+  target matches. If multiple whole-dir stores nest, the deepest owner wins.
 - `skipped_platform`: present and `true` when the query is under a store's
   target but the store is skipped on this host (when mismatch). In that case
   `entry` is `null` (no active entry exists).

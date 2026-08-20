@@ -51,7 +51,7 @@ pub(crate) fn cmd_add_bulk(
                         store,
                         ok: err.is_none(),
                         error: err,
-                        dry_run: true,
+                        dry_run,
                     }
                 })
                 .collect();
@@ -59,6 +59,11 @@ pub(crate) fn cmd_add_bulk(
                 all_ok: false,
                 results,
             };
+            // `write_data_error` calls `process::exit`, so in JSON mode
+            // control never returns from this call. Audit inline (matching
+            // the central runner's context for `Add`) because the runner
+            // never sees the result; the `return Err` below is the text-mode
+            // path only.
             crate::audit::append_with_context(
                 root,
                 "add",
@@ -113,6 +118,11 @@ pub(crate) fn cmd_add_bulk(
                     all_ok: false,
                     results,
                 };
+                // `write_data_error` calls `process::exit`, so in JSON mode
+                // control never returns from this call. Audit inline (matching
+                // the central runner's context for `Add`) because the runner
+                // never sees the result; the `return Err` below is the
+                // text-mode path only.
                 crate::audit::append_with_context(
                     root,
                     "add",
@@ -1279,7 +1289,7 @@ fn cmd_add_to_store(
         store::ApplyOpts {
             dry_run: false,
             force: false,
-            json: false,
+            json,
         },
     );
     if matches!(
@@ -1553,15 +1563,17 @@ pub(crate) fn cmd_add(
     }
     let store_dir = root.join(&store_name);
 
-    // Pre-checks: reject any collision BEFORE mutating anything.
+    // Pre-checks: reject any collision BEFORE mutating anything. These are
+    // user collisions (the request conflicts with existing state), not tool
+    // bugs — classify as `usage` so the exit code and hint are honest.
     if loaded.config.stores.contains_key(&store_name) {
-        return Err(StitchError::internal(format!(
+        return Err(StitchError::usage(format!(
             "store '{}' already exists",
             store_name
         )));
     }
     if store_dir.symlink_metadata().is_ok() {
-        return Err(StitchError::internal(format!(
+        return Err(StitchError::usage(format!(
             "store path '{}' already exists",
             store_dir.display()
         )));
@@ -1939,7 +1951,7 @@ pub(crate) fn cmd_add(
             store::ApplyOpts {
                 dry_run: false,
                 force: false,
-                json: false,
+                json,
             },
             &mut _warnings,
         );
@@ -2278,7 +2290,7 @@ pub(crate) fn cmd_add(
             store::ApplyOpts {
                 dry_run: false,
                 force: false,
-                json: false,
+                json,
             },
             &mut _warnings,
         );

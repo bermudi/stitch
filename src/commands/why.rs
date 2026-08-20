@@ -36,10 +36,35 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
         }
     }
 
+    // Whole-dir containment: if no entry's target *is* the query, a path may
+    // still live *inside* a whole-dir store's target directory (the directory
+    // itself is the stitch-managed symlink, so there are no per-file entries).
+    // Pick the deepest matching ancestor so nested whole-dir stores resolve to
+    // the closest owner.
+    let mut matched_subpath: Option<std::path::PathBuf> = None;
+    if matched.is_none() {
+        let mut best_len = 0usize;
+        for entry in &entries {
+            if entry.skipped_platform {
+                continue;
+            }
+            if let Some(rel) = path_inside(&entry.target, &query_canonical, &query_path) {
+                let len = entry.target.as_os_str().len();
+                if len > best_len {
+                    best_len = len;
+                    matched = Some(entry);
+                    matched_subpath = Some(rel);
+                }
+            }
+        }
+    }
+
     // If no active entry matched but a skipped store/target covers the path,
     // report skipped_platform. Mirror status_all's target enumeration: check
     // both top-level `store.target` and named `targets` entries, including
-    // target-level `when` filters when the store itself is active.
+    // target-level `when` filters when the store itself is active. Coverage
+    // includes whole-dir containment (a path inside a skipped whole-dir
+    // target), not just exact target equality.
     if matched.is_none() && !skipped_platform {
         for store in loaded.config.stores.values() {
             if !platform.matches_when(&store.when) {
@@ -47,7 +72,7 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
                 if store.is_multi_target() {
                     for target_entry in store.targets.values() {
                         if let Ok(target) = config::expand_home(&target_entry.target)
-                            && path_matches(&target, &query_canonical, &query_path)
+                            && path_covers(&target, &query_canonical, &query_path)
                         {
                             skipped_platform = true;
                             break;
@@ -55,7 +80,7 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
                     }
                 } else if let Some(ref target_str) = store.target
                     && let Ok(target) = config::expand_home(target_str)
-                    && path_matches(&target, &query_canonical, &query_path)
+                    && path_covers(&target, &query_canonical, &query_path)
                 {
                     skipped_platform = true;
                 }
@@ -65,7 +90,7 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
                     for target_entry in store.targets.values() {
                         if !platform.matches_when(&target_entry.when)
                             && let Ok(target) = config::expand_home(&target_entry.target)
-                            && path_matches(&target, &query_canonical, &query_path)
+                            && path_covers(&target, &query_canonical, &query_path)
                         {
                             skipped_platform = true;
                             break;
@@ -79,7 +104,7 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
         }
     }
 
-    let entry = matched.map(build_why_entry);
+    let entry = matched.map(|e| build_why_entry(e, matched_subpath.as_deref()));
 
     let data = WhyData {
         query: query.to_string(),
@@ -96,7 +121,10 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
     Ok(())
 }
 
-fn build_why_entry(entry: &store::StatusEntry) -> WhyEntry {
+fn build_why_entry(
+    entry: &store::StatusEntry,
+    matched_subpath: Option<&std::path::Path>,
+) -> WhyEntry {
     let (state, resolves_to) = match &entry.status {
         LinkStatus::Linked => ("linked".to_string(), None),
         LinkStatus::Missing => ("missing".to_string(), None),
@@ -120,6 +148,7 @@ fn build_why_entry(entry: &store::StatusEntry) -> WhyEntry {
         templated: entry.is_template,
         state,
         resolves_to,
+        matched_subpath: matched_subpath.and_then(|p| p.to_str()).map(str::to_owned),
         owning_config: "state.toml".to_string(),
     }
 }
@@ -141,6 +170,49 @@ fn path_matches(
     }
     let target_canonical = canonicalize_parent_join(target);
     target_canonical == *query_canonical
+}
+
+/// True if `target` owns the query either exactly (`path_matches`) or by
+/// whole-dir containment (`path_inside`). Used for skipped-platform detection
+/// where a path may sit inside a skipped whole-dir store's target directory.
+fn path_covers(
+    target: &std::path::Path,
+    query_canonical: &std::path::Path,
+    query_literal: &std::path::Path,
+) -> bool {
+    path_matches(target, query_canonical, query_literal)
+        || path_inside(target, query_canonical, query_literal).is_some()
+}
+
+/// If `target` is a proper ancestor directory of the query, return the
+/// subpath of the query relative to `target`. Used to detect that a path
+/// lives *inside* a whole-dir store's target directory (the directory itself
+/// is the stitch-managed symlink, so per-file entries don't exist).
+///
+/// Mirrors `path_matches`'s canonicalization strategy: literal component
+/// prefix first, then canonical (following the target symlink so a query
+/// inside a linked whole-dir target resolves through it). The empty relative
+/// path (query *is* the target) is rejected — that case is `path_matches`.
+fn path_inside(
+    target: &std::path::Path,
+    query_canonical: &std::path::Path,
+    query_literal: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    // Literal component-prefix: target must be a directory ancestor.
+    if let Ok(rel) = query_literal.strip_prefix(target)
+        && !rel.as_os_str().is_empty()
+    {
+        return Some(rel.to_path_buf());
+    }
+    // Canonical: follow the target symlink (a whole-dir target is itself the
+    // link) so a query inside it resolves through to the repo source dir.
+    let target_canonical = std::fs::canonicalize(target).ok()?;
+    let rel = query_canonical.strip_prefix(&target_canonical).ok()?;
+    if !rel.as_os_str().is_empty() {
+        Some(rel.to_path_buf())
+    } else {
+        None
+    }
 }
 
 /// Canonicalize a path for comparison, falling back to the literal path if
@@ -186,6 +258,9 @@ fn print_why(data: &WhyData) {
             if let Some(ref r) = e.resolves_to {
                 println!("resolves_to: {r}");
             }
+            if let Some(ref sub) = e.matched_subpath {
+                println!("matched_subpath: {sub}");
+            }
             println!("owning_config: {}", e.owning_config);
         }
         None => {
@@ -216,7 +291,7 @@ mod tests {
             skipped_platform: false,
             is_template: true,
         };
-        build_why_entry(&entry)
+        build_why_entry(&entry, None)
     }
 
     #[test]
@@ -351,5 +426,75 @@ mod tests {
         assert_eq!(e.source, "/repo/bash/.bashrc");
         assert!(e.templated);
         assert_eq!(e.owning_config, "state.toml");
+    }
+
+    #[test]
+    fn build_why_entry_records_matched_subpath() {
+        let entry = StatusEntry {
+            store_name: "nvim".to_string(),
+            target_name: None,
+            source: PathBuf::from("/repo/nvim"),
+            link_source: PathBuf::from("/repo/nvim"),
+            target: PathBuf::from("/home/.config"),
+            status: LinkStatus::Linked,
+            skipped_platform: false,
+            is_template: false,
+        };
+        let e = build_why_entry(&entry, Some(Path::new("init.lua")));
+        assert_eq!(e.matched_subpath.as_deref(), Some("init.lua"));
+        // Exact-match entries (no subpath arg) omit the field.
+        let e2 = build_why_entry(&entry, None);
+        assert!(e2.matched_subpath.is_none());
+    }
+
+    #[test]
+    fn path_inside_literal_subpath() {
+        let target = Path::new("/home/.config");
+        let query = Path::new("/home/.config/init.lua");
+        let rel = path_inside(target, &canonicalize_or_path(query), query);
+        assert_eq!(rel.as_deref(), Some(Path::new("init.lua")));
+    }
+
+    #[test]
+    fn path_inside_rejects_exact_match() {
+        // Query *is* the target — that's path_matches, not containment.
+        let target = Path::new("/home/.config");
+        let rel = path_inside(target, &canonicalize_or_path(target), target);
+        assert!(rel.is_none());
+    }
+
+    #[test]
+    fn path_inside_rejects_unrelated() {
+        let target = Path::new("/home/.config");
+        let query = Path::new("/home/.config-other/x");
+        // Component boundary: ".config" != ".config-other".
+        let rel = path_inside(target, &canonicalize_or_path(query), query);
+        assert!(rel.is_none());
+    }
+
+    #[test]
+    fn path_inside_follows_target_symlink() {
+        // Whole-dir target `link` is a symlink to real_dir; a query inside it
+        // resolves through the symlink and matches the canonicalized target.
+        let tmp = tempdir().unwrap();
+        let real_dir = tmp.path().join("real_dir");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        std::fs::write(real_dir.join("init.lua"), "").unwrap();
+
+        let target = link.clone();
+        let query = link.join("init.lua");
+        let query_canonical = std::fs::canonicalize(&real_dir).unwrap().join("init.lua");
+        let rel = path_inside(&target, &query_canonical, &query);
+        assert_eq!(rel.as_deref(), Some(Path::new("init.lua")));
+    }
+
+    #[test]
+    fn path_inside_nested_subpath() {
+        let target = Path::new("/home/.config");
+        let query = Path::new("/home/.config/nvim/lua/opts.lua");
+        let rel = path_inside(target, &canonicalize_or_path(query), query);
+        assert_eq!(rel.as_deref(), Some(Path::new("nvim/lua/opts.lua")));
     }
 }
