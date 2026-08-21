@@ -289,7 +289,8 @@ mod tests {
             target: PathBuf::from("/home/.bashrc"),
             status,
             skipped_platform: false,
-            is_template: true,
+            is_template: true,            source_name: String::new(),
+            from_sources: false,
         };
         build_why_entry(&entry, None)
     }
@@ -438,7 +439,8 @@ mod tests {
             target: PathBuf::from("/home/.config"),
             status: LinkStatus::Linked,
             skipped_platform: false,
-            is_template: false,
+            is_template: false,            source_name: String::new(),
+            from_sources: false,
         };
         let e = build_why_entry(&entry, Some(Path::new("init.lua")));
         assert_eq!(e.matched_subpath.as_deref(), Some("init.lua"));

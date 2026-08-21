@@ -149,6 +149,7 @@ pub(crate) fn cmd_remove(
                 let mut add = |target: &std::path::Path,
                                source: std::path::PathBuf,
                                link_source: std::path::PathBuf,
+                               source_name: String,
                                is_template: bool,
                                target_name: Option<&str>,
                                allow_dir: bool|
@@ -165,10 +166,12 @@ pub(crate) fn cmd_remove(
                                     target_name: target_name.map(str::to_owned),
                                     source,
                                     link_source,
+                                    source_name,
                                     target: target.to_path_buf(),
                                     status: linker::LinkStatus::Linked,
                                     skipped_platform: false,
                                     is_template,
+                                    from_sources: false,
                                 });
                                 Ok(())
                             } else {
@@ -187,22 +190,24 @@ pub(crate) fn cmd_remove(
                 let mut process_target = |target_path: &std::path::Path,
                                           files: &[String],
                                           patterns: &[String],
+                                          sources: &std::collections::BTreeMap<String, String>,
                                           ignore: &[String],
                                           target_name: Option<&str>|
                  -> Result<(), StitchError> {
                     if home.as_ref().is_some_and(|h| h == target_path) {
                         return Ok(());
                     }
-                    match store::resolve_target_names(&store_dir, files, patterns, ignore) {
+                    match store::resolve_target_names(root, &store_dir, files, patterns, sources, ignore) {
                         store::LinkTargets::WholeDir => add(
                             target_path,
                             store_dir.clone(),
                             store_dir.clone(),
+                            String::new(),
                             false,
                             target_name,
                             false,
                         ),
-                        store::LinkTargets::Files(names) => {
+                        store::LinkTargets::Files(links) => {
                             // A former whole-directory root may be awaiting
                             // promotion to per-file links. A real directory at
                             // the root is a valid file-mode parent and not a
@@ -211,6 +216,7 @@ pub(crate) fn cmd_remove(
                                 target_path,
                                 store_dir.clone(),
                                 store_dir.clone(),
+                                String::new(),
                                 false,
                                 target_name,
                                 true,
@@ -222,20 +228,18 @@ pub(crate) fn cmd_remove(
                             let root_is_link = std::fs::symlink_metadata(target_path)
                                 .is_ok_and(|m| m.file_type().is_symlink());
                             if !root_is_link {
-                                for source_name in &names {
-                                    let entry = render::resolve_entry(source_name);
-                                    let repo_source = store_dir.join(&entry.source_rel);
-                                    let target = target_path.join(&entry.link_rel);
-                                    let link_source = if entry.is_template {
-                                        render::staging_path(root, name, &entry.link_rel)
+                                for link in &links {
+                                    let link_source = if link.is_template() {
+                                        render::staging_path(root, name, &link.name)
                                     } else {
-                                        repo_source.clone()
+                                        link.source.clone()
                                     };
                                     add(
-                                        &target,
-                                        repo_source,
+                                        &target_path.join(&link.name),
+                                        link.source.clone(),
                                         link_source,
-                                        entry.is_template,
+                                        link.source_rel.clone(),
+                                        link.is_template(),
                                         target_name,
                                         false,
                                     )?;
@@ -254,6 +258,7 @@ pub(crate) fn cmd_remove(
                             &target_path,
                             &target_entry.files,
                             &target_entry.patterns,
+                            &target_entry.sources,
                             &target_entry.ignore,
                             Some(target_name),
                         )?;
@@ -265,6 +270,7 @@ pub(crate) fn cmd_remove(
                         &target_path,
                         &store.files,
                         &store.patterns,
+                        &store.sources,
                         &store.ignore,
                         None,
                     )?;

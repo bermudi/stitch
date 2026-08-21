@@ -234,6 +234,9 @@ pub struct ListStore {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// v0.14: link name → repo-relative source (outside the store dir).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "WhenClause::is_default")]
     pub when: WhenClause,
 }
@@ -247,6 +250,9 @@ pub struct ListTarget {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// v0.14: link name → repo-relative source (outside the store dir).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "WhenClause::is_default")]
     pub when: WhenClause,
 }
@@ -268,9 +274,14 @@ fn list_store(name: &str, store: &crate::config::Store) -> ListStore {
                 .map(|(target_name, target)| ListTarget {
                     name: target_name.clone(),
                     target: target.target.clone(),
-                    mode: mode_for(target.files.is_empty() && target.patterns.is_empty()),
+                    mode: mode_for(
+                        target.files.is_empty()
+                            && target.patterns.is_empty()
+                            && target.sources.is_empty(),
+                    ),
                     files: target.files.clone(),
                     patterns: target.patterns.clone(),
+                    sources: target.sources.clone(),
                     when: target.when.clone(),
                 })
                 .collect(),
@@ -282,10 +293,12 @@ fn list_store(name: &str, store: &crate::config::Store) -> ListStore {
             targets,
             files: Vec::new(),
             patterns: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
             when: store.when.clone(),
         }
     } else {
-        let has_files = !store.files.is_empty() || !store.patterns.is_empty();
+        let has_files =
+            !store.files.is_empty() || !store.patterns.is_empty() || !store.sources.is_empty();
         let mode = match (store.target.is_some(), has_files) {
             (false, false) => "none",
             (true, false) => "whole-dir",
@@ -298,6 +311,7 @@ fn list_store(name: &str, store: &crate::config::Store) -> ListStore {
             targets: None,
             files: store.files.clone(),
             patterns: store.patterns.clone(),
+            sources: store.sources.clone(),
             when: store.when.clone(),
         }
     }
@@ -557,6 +571,10 @@ pub struct ImportedStore {
     pub mode: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// v0.14: link name → repo-relative source, for links whose source lives
+    /// outside this store (the hub fan-in shape).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
     /// Present only for `multi-target` imports (stow-style fan-in: one store's
     /// file links span several target dirs). Each entry is one named target
     /// with its own file set. Empty for whole-dir and single-target file-mode
@@ -571,6 +589,8 @@ pub struct ImportedTarget {
     pub target: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -708,12 +728,19 @@ pub struct ExplainTarget {
 
 #[derive(Serialize)]
 pub struct ExplainEntry {
-    /// Source path relative to the store directory (may end in `.tmpl`).
+    /// Source path relative to the store directory for `files`/`patterns`
+    /// entries, or relative to the repo root for `sources` entries (may end
+    /// in `.tmpl`).
     pub source: String,
     /// `true` when the source ends in `.tmpl`.
     pub templated: bool,
-    /// Link name under the target (`.tmpl` stripped).
+    /// Link name under the target (`.tmpl` stripped for in-store entries;
+    /// verbatim key for `sources` entries).
     pub link_name: String,
+    /// `true` when this entry comes from a `sources` declaration: the link
+    /// name is decoupled from a repo path outside the store dir.
+    #[serde(skip_serializing_if = "skip_bool_false")]
+    pub from_sources: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -823,10 +850,12 @@ mod tests {
             target_name: None,
             source: PathBuf::from(source),
             link_source: PathBuf::from(source),
+            source_name: String::new(),
             target: PathBuf::from(target),
             status,
             skipped_platform: skipped,
             is_template,
+            from_sources: false,
         }
     }
 
@@ -952,7 +981,8 @@ mod tests {
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Linked,
             skipped_platform: false,
-            is_template: true,
+            is_template: true,            source_name: String::new(),
+            from_sources: false,
         };
         let rows = super::status(&repo, &[entry]);
         assert!(rows[0].staged_path.is_some());
@@ -975,7 +1005,8 @@ mod tests {
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Linked,
             skipped_platform: true,
-            is_template: true,
+            is_template: true,            source_name: String::new(),
+            from_sources: false,
         };
         let rows2 = super::status(&repo, &[entry2]);
         assert!(rows2[0].staged_path.is_none());
@@ -1026,6 +1057,7 @@ mod tests {
             target: target.map(|t| t.to_string()),
             files: files.iter().map(|s| s.to_string()).collect(),
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            sources: std::collections::BTreeMap::new(),
             ignore: vec![],
             when: WhenClause::default(),
             hooks: Hooks::default(),
@@ -1080,6 +1112,7 @@ mod tests {
                 target: "~/.config/helix".to_string(),
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
             },
@@ -1090,6 +1123,7 @@ mod tests {
                 target: None,
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1459,7 +1493,8 @@ mod tests {
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Broken(PathBuf::from("/gone")),
             skipped_platform: false,
-            is_template: true,
+            is_template: true,            source_name: String::new(),
+            from_sources: false,
         };
         let rows = super::status(&repo, &[entry]);
         let v = serde_json::to_value(&rows[0]).unwrap();
@@ -1496,7 +1531,8 @@ mod tests {
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Missing,
             skipped_platform: true,
-            is_template: true,
+            is_template: true,            source_name: String::new(),
+            from_sources: false,
         };
         let rows = super::status(&repo, &[entry]);
         let v = serde_json::to_value(&rows[0]).unwrap();
@@ -1549,6 +1585,7 @@ mod tests {
                 target: "~/.config/helix".to_string(),
                 files: vec!["config.toml".to_string()],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause {
                     hostname: Some("laptop".to_string()),
@@ -1562,6 +1599,7 @@ mod tests {
                 target: None,
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1730,10 +1768,12 @@ mod tests {
                     mode: "file-mode".into(),
                     files: vec!["config.toml".into()],
                     patterns: vec!["*.bak".into()],
+                    sources: std::collections::BTreeMap::new(),
                     when: wc.clone(),
                 }]),
                 files: vec![".bashrc".into()],
                 patterns: vec!["*.bak".into()],
+                sources: std::collections::BTreeMap::new(),
                 when: wc.clone(),
             })
             .unwrap(),
@@ -1772,6 +1812,7 @@ mod tests {
                     source: "gitconfig.tmpl".into(),
                     templated: true,
                     link_name: "gitconfig".into(),
+                    from_sources: false,
                 }],
                 targets: vec![ExplainTarget {
                     name: "laptop".into(),
@@ -1783,6 +1824,7 @@ mod tests {
                         source: "config.toml".into(),
                         templated: false,
                         link_name: "config.toml".into(),
+                        from_sources: false,
                     }],
                     ignore: vec!["*.bak".into()],
                 }],
@@ -1925,10 +1967,12 @@ mod tests {
                     target: "~".into(),
                     mode: "file-mode".into(),
                     files: vec![".bashrc".into()],
+                    sources: std::collections::BTreeMap::new(),
                     targets: vec![ImportedTarget {
                         name: "laptop".into(),
                         target: "~/.config/helix".into(),
                         files: vec![".bashrc".into()],
+                        sources: std::collections::BTreeMap::new(),
                     }],
                 }],
             })

@@ -1242,7 +1242,7 @@ fn cmd_add_to_store(
             ),
         ));
     }
-    if !store::store_resolves_source(&store_dir, &candidate_store, relative) {
+    if !store::store_resolves_source(root, &store_dir, &candidate_store, relative) {
         let primary = StitchError::path_validation(format!(
             "adopted source '{relative}' is ignored or otherwise does not resolve in store '{store_name}'"
         ));
@@ -1778,6 +1778,7 @@ pub(crate) fn cmd_add(
             target: Some(target_str.clone()),
             files: adopt_files.clone(),
             patterns: vec![],
+            sources: std::collections::BTreeMap::new(),
             ignore: vec![],
             when: config::WhenClause::default(),
             hooks: config::Hooks::default(),
@@ -2003,6 +2004,7 @@ pub(crate) fn cmd_add(
                 target: Some(target_str.clone()),
                 files: adopt_files.clone(),
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 targets: std::collections::BTreeMap::new(),
             },
         );
@@ -2142,6 +2144,7 @@ pub(crate) fn cmd_add(
             target: Some(target_str.clone()),
             files: create_files.clone(),
             patterns: patterns.to_vec(),
+            sources: std::collections::BTreeMap::new(),
             ignore: vec![],
             when: config::WhenClause::default(),
             hooks: config::Hooks::default(),
@@ -2352,6 +2355,7 @@ pub(crate) fn cmd_add(
                 target: Some(target_str.clone()),
                 files: create_files.clone(),
                 patterns: patterns.to_vec(),
+                sources: std::collections::BTreeMap::new(),
                 targets: std::collections::BTreeMap::new(),
             },
         );

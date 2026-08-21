@@ -202,6 +202,7 @@ mod tests {
                 target: Some(target.to_string()),
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -320,6 +321,7 @@ mod tests {
                     target: Some(target.to_string_lossy().into_owned()),
                     files: vec![],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: WhenClause {
                         os: Some("macos".to_string()),
@@ -423,6 +425,7 @@ mod tests {
                     target: Some(cfg_dir.to_string_lossy().into_owned()),
                     files: vec!["init.lua".into()],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: WhenClause::default(),
                     hooks: Hooks::default(),
