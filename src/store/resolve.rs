@@ -31,7 +31,43 @@ const GLOBAL_IGNORES: &[&str] = &[
 /// file mode because it contains ignored content).
 pub(crate) enum LinkTargets {
     WholeDir,
-    Files(Vec<String>),
+    Files(Vec<FileLink>),
+}
+
+/// One resolved file-mode entry: the link name under the target directory,
+/// decoupled from the repo file it comes from (v0.14 `sources`).
+///
+/// For `files`/`patterns` entries the source is `store_dir/<name>`; for a
+/// `sources` entry the source is the declared repo-relative path and `name`
+/// is the key. `name` still drives everything downstream: the target link
+/// path, sweep keep-set membership, diff identity, and report fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileLink {
+    /// Relative link path in the target directory (`.tmpl`-stripped for
+    /// in-store template entries; verbatim key for `sources` entries).
+    pub name: String,
+    /// Absolute source path in the repo.
+    pub source: PathBuf,
+    /// Source identity relative to the root it resolves against: the store
+    /// dir for `files`/`patterns` entries, the repo root for `sources`
+    /// entries. Used as the template name in render errors and staging.
+    pub source_rel: String,
+    /// True when this entry came from a `sources` declaration.
+    pub from_sources: bool,
+}
+
+impl FileLink {
+    /// Template sources are detected by a trailing `.tmpl` on the *source*.
+    /// For in-store entries that matches the legacy `resolve_entry` behavior
+    /// (the link name drops the suffix); a `sources` key keeps its literal
+    /// spelling and only the source's suffix decides.
+    pub fn is_template(&self) -> bool {
+        self.source
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(render::is_template)
+            .unwrap_or(false)
+    }
 }
 
 /// Merge global ignores (always active) with a store's own `ignore` patterns.
@@ -72,16 +108,20 @@ fn build_globset(patterns: &[String]) -> Option<GlobSet> {
 /// apply reports the resolution error. It also runs before `when` filtering so
 /// a skipped target cannot make a shared target directory or staged render
 /// look stale.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_reconciliation_keeps(
+    repo_root: &Path,
     store_dir: &Path,
     target_path: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     store_ignore: &[String],
     staging_keep_links: &mut BTreeSet<String>,
     target_keep_links: &mut BTreeMap<PathBuf, BTreeSet<String>>,
 ) {
-    let LinkTargets::Files(names) = resolve_target_names(store_dir, files, patterns, store_ignore)
+    let LinkTargets::Files(links) =
+        resolve_target_names(repo_root, store_dir, files, patterns, sources, store_ignore)
     else {
         return;
     };
@@ -89,31 +129,32 @@ pub(crate) fn collect_reconciliation_keeps(
     let target_links = target_keep_links
         .entry(target_path.to_path_buf())
         .or_default();
-    for source_name in names {
-        let entry = render::resolve_entry(&source_name);
-        let source_path = store_dir.join(&entry.source_rel);
+    for link in links {
         // A vanished configured source is stale by definition and therefore
         // must not retain its old target link/render. Existing templates stay
         // live even when their render or resolution subsequently fails.
         // Use `symlink_metadata` (which does not follow symlinks) so a dangling
         // symlink source is still considered present.
-        if let Ok(meta) = std::fs::symlink_metadata(&source_path)
+        if let Ok(meta) = std::fs::symlink_metadata(&link.source)
             && !meta.is_dir()
         {
-            target_links.insert(entry.link_rel.clone());
-            if entry.is_template {
-                staging_keep_links.insert(entry.link_rel);
+            target_links.insert(link.name.clone());
+            if link.is_template() {
+                staging_keep_links.insert(link.name);
             }
         }
     }
 }
 
-/// Resolve what to link for one store/target, rejecting source names that
-/// collapse to the same link name (`foo` + `foo.tmpl`).
+/// Resolve what to link for one store/target, rejecting entries that collapse
+/// to the same link name (`foo` + `foo.tmpl`, or a `sources` key colliding
+/// with a pattern-produced name).
 pub(super) fn resolve_targets(
+    repo_root: &Path,
     store_dir: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     store_ignore: &[String],
 ) -> Result<LinkTargets, String> {
     if let Some(path) = render::unsupported_template_source(store_dir)? {
@@ -122,9 +163,9 @@ pub(super) fn resolve_targets(
             path.display()
         ));
     }
-    let targets = resolve_target_names(store_dir, files, patterns, store_ignore);
-    if let LinkTargets::Files(ref names) = targets {
-        render::check_name_collisions(names)?;
+    let targets = resolve_target_names(repo_root, store_dir, files, patterns, sources, store_ignore);
+    if let LinkTargets::Files(ref links) = targets {
+        check_link_name_collisions(links)?;
     }
     Ok(targets)
 }
@@ -203,29 +244,99 @@ fn has_ignored_entry(store_dir: &Path, ignore: &[String]) -> bool {
 /// Resolve the desired mode and source names without collision validation.
 /// Kept separate so reconciliation can conservatively preserve a live template
 /// when normal resolution reports an error.
+///
+/// `sources` entries (v0.14) join the resolved set after glob expansion: a
+/// `sources` key bypasses `ignore` (an exact declaration beats a pattern) and
+/// points at `repo_root/<value>` instead of `store_dir/<name>`. Sorted by
+/// link name.
 pub(crate) fn resolve_target_names(
+    repo_root: &Path,
     store_dir: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     store_ignore: &[String],
 ) -> LinkTargets {
     let ignore = merge_ignores(store_ignore);
-    let explicit = !files.is_empty() || !patterns.is_empty();
-    let names = if !explicit {
+    let explicit = !files.is_empty() || !patterns.is_empty() || !sources.is_empty();
+    if !explicit {
         let has_templates = render::store_has_templates(store_dir);
         if has_templates || has_ignored_entry(store_dir, &ignore) {
             // Promote: expand to every non-ignored file (full tree), so nested
             // `.tmpl` files become individual links rather than riding inside a
             // whole-dir symlink as literal `.tmpl` sources.
-            resolve_files(store_dir, &[], &["**/*".into(), "*".into()], &ignore)
-        } else {
-            return LinkTargets::WholeDir;
+            let mut links = file_links(store_dir, &resolve_files(store_dir, &[], &["**/*".into(), "*".into()], &ignore));
+            apply_sources(repo_root, &mut links, sources);
+            return LinkTargets::Files(links);
         }
-    } else {
-        resolve_files(store_dir, files, patterns, &ignore)
-    };
+        return LinkTargets::WholeDir;
+    }
+    let mut links = file_links(store_dir, &resolve_files(store_dir, files, patterns, &ignore));
+    apply_sources(repo_root, &mut links, sources);
+    LinkTargets::Files(links)
+}
 
-    LinkTargets::Files(names)
+/// Convert store-relative source names (`.tmpl` suffix included) into
+/// `FileLink`s: link name is the suffix-stripped path, source is the store
+/// path.
+fn file_links(store_dir: &Path, names: &[String]) -> Vec<FileLink> {
+    names
+        .iter()
+        .map(|name| {
+            let entry = render::resolve_entry(name);
+            FileLink {
+                name: entry.link_rel,
+                source: store_dir.join(&entry.source_rel),
+                source_rel: entry.source_rel,
+                from_sources: false,
+            }
+        })
+        .collect()
+}
+
+/// Append `sources` entries to a resolved in-store name list, converting each
+/// to a [`FileLink`] rooted at the repo. Keys keep their literal spelling (the
+/// link name); template-ness comes from the source's `.tmpl` suffix.
+fn apply_sources(
+    repo_root: &Path,
+    links: &mut Vec<FileLink>,
+    sources: &BTreeMap<String, String>,
+) {
+    for (key, value) in sources {
+        links.push(FileLink {
+            name: key.clone(),
+            source: repo_root.join(value),
+            source_rel: value.clone(),
+            from_sources: true,
+        });
+    }
+    links.sort_by(|a, b| a.name.cmp(&b.name));
+    // No dedup: a `sources` key colliding with a files/pattern-produced name
+    // must surface as an error (`check_link_name_collisions`), not be
+    // silently resolved by insertion order.
+}
+
+/// Reject entries that collapse to the same link name: `foo` + `foo.tmpl`,
+/// or a `sources` key colliding with a `files`/pattern-produced name. The
+/// error names both claiming sources so the user can see the disagreement.
+pub(crate) fn check_link_name_collisions(links: &[FileLink]) -> Result<(), String> {
+    let mut by_name: BTreeMap<&str, Vec<&FileLink>> = BTreeMap::new();
+    for link in links {
+        by_name.entry(link.name.as_str()).or_default().push(link);
+    }
+    for (name, claims) in by_name {
+        if claims.len() > 1 {
+            let sources: Vec<String> = claims
+                .iter()
+                .map(|link| link.source.display().to_string())
+                .collect();
+            return Err(format!(
+                "name collision for '{name}': {} — remove or rename one",
+                sources.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Collect the link target paths a store will write through, plus the set of
@@ -253,11 +364,12 @@ pub(crate) fn collect_store_link_targets(
             let target_path = config::expand_home(&target_entry.target)
                 .map_err(|e| format!("could not expand target: {e}"))?;
             collect_link_targets_for_target(
+                repo_root,
                 &store_dir,
                 &target_path,
-                repo_root,
                 &target_entry.files,
                 &target_entry.patterns,
+                &target_entry.sources,
                 &target_entry.ignore,
                 &mut targets,
                 &mut removed,
@@ -267,11 +379,12 @@ pub(crate) fn collect_store_link_targets(
         let target_path =
             config::expand_home(target).map_err(|e| format!("could not expand target: {e}"))?;
         collect_link_targets_for_target(
+            repo_root,
             &store_dir,
             &target_path,
-            repo_root,
             &store.files,
             &store.patterns,
+            &store.sources,
             &store.ignore,
             &mut targets,
             &mut removed,
@@ -368,6 +481,7 @@ pub(crate) fn check_link_path_collisions(
                 }
                 let target_path = config::expand_home(&tentry.target)?;
                 collect_link_claims_for_target(
+                    repo_root,
                     &store_dir,
                     &target_path,
                     name,
@@ -376,6 +490,7 @@ pub(crate) fn check_link_path_collisions(
                     Some(&tentry.when),
                     &tentry.files,
                     &tentry.patterns,
+                    &tentry.sources,
                     &tentry.ignore,
                     &mut claims,
                 )?;
@@ -383,6 +498,7 @@ pub(crate) fn check_link_path_collisions(
         } else if let Some(target_str) = &store.target {
             let target_path = config::expand_home(target_str)?;
             collect_link_claims_for_target(
+                repo_root,
                 &store_dir,
                 &target_path,
                 name,
@@ -391,6 +507,7 @@ pub(crate) fn check_link_path_collisions(
                 None,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.ignore,
                 &mut claims,
             )?;
@@ -430,6 +547,7 @@ pub(crate) fn check_link_path_collisions(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_link_claims_for_target(
+    repo_root: &Path,
     store_dir: &Path,
     target_path: &Path,
     store_name: &str,
@@ -438,6 +556,7 @@ fn collect_link_claims_for_target(
     target_when: Option<&WhenClause>,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     ignore: &[String],
     claims: &mut Vec<LinkClaim>,
 ) -> Result<(), ConfigError> {
@@ -446,21 +565,20 @@ fn collect_link_claims_for_target(
     if let Some(w) = target_when {
         whens.push(w.clone());
     }
-    match resolve_target_names(store_dir, files, patterns, ignore) {
+    match resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore) {
         LinkTargets::WholeDir => claims.push(LinkClaim {
             store: store_name.to_string(),
             tname: tname.map(|s| s.to_string()),
             whens,
             path: target_path.to_path_buf(),
         }),
-        LinkTargets::Files(names) => {
-            for source_name in names {
-                let entry = render::resolve_entry(&source_name);
+        LinkTargets::Files(links) => {
+            for link in links {
                 claims.push(LinkClaim {
                     store: store_name.to_string(),
                     tname: tname.map(|s| s.to_string()),
                     whens: whens.clone(),
-                    path: target_path.join(&entry.link_rel),
+                    path: target_path.join(&link.name),
                 });
             }
         }
@@ -470,20 +588,21 @@ fn collect_link_claims_for_target(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_link_targets_for_target(
+    repo_root: &Path,
     store_dir: &Path,
     target_path: &Path,
-    repo_root: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     ignore: &[String],
     targets: &mut Vec<PathBuf>,
     removed: &mut BTreeSet<PathBuf>,
 ) -> Result<(), String> {
-    match resolve_target_names(store_dir, files, patterns, ignore) {
+    match resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore) {
         LinkTargets::WholeDir => {
             targets.push(target_path.to_path_buf());
         }
-        LinkTargets::Files(names) => {
+        LinkTargets::Files(links) => {
             // Whole-directory → file-mode promotion removes the whole-dir link
             // at `target_path` before creating child links.
             if std::fs::symlink_metadata(target_path).is_ok_and(|m| m.file_type().is_symlink())
@@ -491,9 +610,8 @@ fn collect_link_targets_for_target(
             {
                 removed.insert(target_path.to_path_buf());
             }
-            for name in names {
-                let entry = render::resolve_entry(&name);
-                targets.push(target_path.join(&entry.link_rel));
+            for link in links {
+                targets.push(target_path.join(&link.name));
             }
         }
     }
@@ -606,6 +724,7 @@ pub(crate) fn resolve_link_source(
             &config::expand_home(target_str).ok()?,
             &store_config.files,
             &store_config.patterns,
+            &store_config.sources,
             &store_config.ignore,
         )
     {
@@ -624,6 +743,7 @@ pub(crate) fn resolve_link_source(
             &config::expand_home(&target_entry.target).ok()?,
             &target_entry.files,
             &target_entry.patterns,
+            &target_entry.sources,
             &target_entry.ignore,
         ) {
             return Some(source);
@@ -641,9 +761,10 @@ fn resolve_link_source_for_target(
     target_path: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     ignore: &[String],
 ) -> Option<String> {
-    let resolved = resolve_target_names(store_dir, files, patterns, ignore);
+    let resolved = resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore);
 
     // A target root is desired only in whole-directory mode. File mode may
     // still need to remove a former whole-directory link at this path.
@@ -653,18 +774,17 @@ fn resolve_link_source_for_target(
 
     let rel = target.strip_prefix(target_path).ok()?;
     let link_rel = rel.to_string_lossy().into_owned();
-    let LinkTargets::Files(source_names) = resolved else {
+    let LinkTargets::Files(links) = resolved else {
         return None;
     };
-    for source_name in source_names {
-        let entry = render::resolve_entry(&source_name);
-        if entry.link_rel == link_rel {
-            if entry.is_template {
+    for link in links {
+        if link.name == link_rel {
+            if link.is_template() {
                 return Some(path_to_string(&render::staging_path(
-                    repo_root, store_name, &link_rel,
+                    repo_root, store_name, &link.name,
                 )));
             }
-            return Some(path_to_string(&store_dir.join(&entry.source_rel)));
+            return Some(path_to_string(&link.source));
         }
     }
     None

@@ -118,6 +118,7 @@ impl ConfigSnapshot {
         warnings.extend(merge_warnings);
         config.validate()?;
         config.normalize();
+        validate_source_components(repo_root, &config)?;
 
         let hash = hash_config_bytes(authored_bytes.as_deref(), state_bytes.as_deref());
 
@@ -376,6 +377,7 @@ impl Config {
         warnings.extend(merge_warnings);
         config.validate()?;
         config.normalize();
+        validate_source_components(repo_root, &config)?;
 
         Ok(Loaded {
             authored,
@@ -394,7 +396,10 @@ impl Config {
             // Mixed modes: store with top-level target/files plus named targets
             // must error — otherwise top-level inventory silently disappears.
             if !store.targets.is_empty()
-                && (store.target.is_some() || !store.files.is_empty() || !store.patterns.is_empty())
+                && (store.target.is_some()
+                    || !store.files.is_empty()
+                    || !store.patterns.is_empty()
+                    || !store.sources.is_empty())
             {
                 return Err(ConfigError::InvalidPath(format!(
                     "invalid store '{name}' in merged config: cannot mix top-level target/files with named targets"
@@ -404,6 +409,7 @@ impl Config {
                 name,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.target,
                 !store.targets.is_empty(),
                 "merged config",
@@ -412,22 +418,17 @@ impl Config {
                 validate_target(target, &format!("store '{name}'"))?;
             }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            validate_sources(&store.sources, &store.files, &format!("store '{name}'"))?;
             validate_globs(&store.patterns, &store.ignore, &format!("store '{name}'"))?;
             for te in store.targets.values() {
                 validate_target(
                     &te.target,
                     &format!("store '{name}' (target '{}')", te.target),
                 )?;
-                validate_fragments(
-                    &te.files,
-                    &te.patterns,
-                    &format!("store '{name}' (target '{}')", te.target),
-                )?;
-                validate_globs(
-                    &te.patterns,
-                    &te.ignore,
-                    &format!("store '{name}' (target '{}')", te.target),
-                )?;
+                let context = format!("store '{name}' (target '{}')", te.target);
+                validate_fragments(&te.files, &te.patterns, &context)?;
+                validate_sources(&te.sources, &te.files, &context)?;
+                validate_globs(&te.patterns, &te.ignore, &context)?;
             }
         }
         validate_non_overlapping_targets(&self.stores)?;
@@ -441,9 +442,11 @@ impl Config {
         for store in self.stores.values_mut() {
             normalize_fragment_lists(&mut store.files, &mut store.patterns);
             normalize_ignores(&mut store.ignore);
+            normalize_sources(&mut store.sources);
             for target in store.targets.values_mut() {
                 normalize_fragment_lists(&mut target.files, &mut target.patterns);
                 normalize_ignores(&mut target.ignore);
+                normalize_sources(&mut target.sources);
             }
         }
     }
@@ -517,7 +520,10 @@ impl GeneratedState {
         validate_store_names(self.stores.keys(), "generated state")?;
         for (name, store) in &self.stores {
             if !store.targets.is_empty()
-                && (store.target.is_some() || !store.files.is_empty() || !store.patterns.is_empty())
+                && (store.target.is_some()
+                    || !store.files.is_empty()
+                    || !store.patterns.is_empty()
+                    || !store.sources.is_empty())
             {
                 return Err(ConfigError::InvalidPath(format!(
                     "invalid store '{name}' in generated state: cannot mix top-level target/files with named targets"
@@ -527,6 +533,7 @@ impl GeneratedState {
                 name,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.target,
                 !store.targets.is_empty(),
                 "generated state",
@@ -535,6 +542,7 @@ impl GeneratedState {
                 validate_target(target, &format!("store '{name}'"))?;
             }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            validate_sources(&store.sources, &store.files, &format!("store '{name}'"))?;
             validate_globs(&store.patterns, &[], &format!("store '{name}'"))?;
             for target in store.targets.values() {
                 validate_target(
@@ -543,6 +551,7 @@ impl GeneratedState {
                 )?;
                 let context = format!("store '{name}' (target '{}')", target.target);
                 validate_fragments(&target.files, &target.patterns, &context)?;
+                validate_sources(&target.sources, &target.files, &context)?;
                 validate_globs(&target.patterns, &[], &context)?;
             }
         }
@@ -596,6 +605,7 @@ fn merge_store(
         target: g.and_then(|g| g.target.clone()),
         files: g.map(|g| g.files.clone()).unwrap_or_default(),
         patterns: g.map(|g| g.patterns.clone()).unwrap_or_default(),
+        sources: g.map(|g| g.sources.clone()).unwrap_or_default(),
         ignore: a.map(|a| a.ignore.clone()).unwrap_or_default(),
         when: a.map(|a| a.when.clone()).unwrap_or_default(),
         hooks: a.map(|a| a.hooks.clone()).unwrap_or_default(),
@@ -630,6 +640,7 @@ fn merge_targets(
                         target: gt.target.clone(),
                         files: gt.files.clone(),
                         patterns: gt.patterns.clone(),
+                        sources: gt.sources.clone(),
                         ignore: at.map(|a| a.ignore.clone()).unwrap_or_default(),
                         when: at.map(|a| a.when.clone()).unwrap_or_default(),
                     },
@@ -684,6 +695,24 @@ fn normalize_ignores(ignore: &mut [String]) {
     for pattern in ignore.iter_mut().filter(|p| is_safe_fragment(p)) {
         *pattern = normalize_fragment(pattern, true);
     }
+}
+
+/// Normalize `sources` keys and values in the merged, in-memory view. Keys
+/// are target-relative names; values are repo-relative source paths (a
+/// trailing `.tmpl` on a value is a template source, so no separator
+/// handling is involved).
+fn normalize_sources(sources: &mut BTreeMap<String, String>) {
+    let normalized: BTreeMap<String, String> = sources
+        .iter()
+        .filter(|(k, v)| is_safe_fragment(k) && is_safe_fragment(v))
+        .map(|(k, v)| {
+            (
+                normalize_fragment(k, false),
+                normalize_fragment(v, false),
+            )
+        })
+        .collect();
+    *sources = normalized;
 }
 
 pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
@@ -827,20 +856,121 @@ pub fn validate_globs(
     Ok(())
 }
 
-/// Reject a store that declares `files`/`patterns` but has no target to
-/// link them into. Whole-directory stores and authored-only behavior are
-/// still allowed to have no target, but file/pattern mode requires one.
+/// Validate `sources` entries (v0.14): keys are safe target-relative
+/// fragments, values are safe repo-relative fragments that do not live under
+/// `.stitch/`, and a key must not also appear in `files` — the two would
+/// disagree about which source wins.
+///
+/// The lexical-only checks live here so they fire for every load path
+/// (authored preview, `migrate`, `add`'s candidate validation). The
+/// filesystem check (no symlinked component) is
+/// [`validate_source_components`], which needs the repo root.
+pub fn validate_sources(
+    sources: &BTreeMap<String, String>,
+    files: &[String],
+    context: &str,
+) -> Result<(), ConfigError> {
+    for (key, value) in sources {
+        if !is_safe_fragment(key) {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid sources key '{key}' in {context}: keys must be relative to the target and contain no '.', '..' or leading '/'"
+            )));
+        }
+        if !is_safe_fragment(value) {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid source '{value}' for '{key}' in {context}: sources must be repo-relative paths with no '.', '..' or leading '/'"
+            )));
+        }
+        if value == ".stitch" || value.starts_with(".stitch/") {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid source '{value}' for '{key}' in {context}: sources must not live under .stitch/"
+            )));
+        }
+        if files.iter().any(|f| f == key) {
+            return Err(ConfigError::InvalidPath(format!(
+                "sources key '{key}' in {context} is also listed in files; remove one — the two disagree about the source"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the filesystem shape of every declared source (v0.14): no
+/// component from the repo root down to the source may be a symlink.
+///
+/// The feature exists to delete repo-internal indirection, so a source that
+/// *is* a symlink (or is reached through one) is a load error — one hop only.
+/// Chained sources would rebuild the alias-symlink workaround in state form,
+/// with worse debugging. A missing source is fine here: `SourceMissing`
+/// fires at apply time with the repo-relative path in the error.
+pub fn validate_source_components(repo_root: &Path, config: &Config) -> Result<(), ConfigError> {
+    for (name, store) in &config.stores {
+        let store_ctx = format!("store '{name}'");
+        if !store.targets.is_empty() {
+            for (tname, target) in &store.targets {
+                let ctx = format!("{store_ctx} (target '{tname}')");
+                for (key, value) in &target.sources {
+                    validate_one_source_component(repo_root, value, key, &ctx)?;
+                }
+            }
+        } else {
+            for (key, value) in &store.sources {
+                validate_one_source_component(repo_root, value, key, &store_ctx)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_one_source_component(
+    repo_root: &Path,
+    value: &str,
+    key: &str,
+    context: &str,
+) -> Result<(), ConfigError> {
+    let mut current = repo_root.to_path_buf();
+    for component in Path::new(value).components() {
+        // `validate_sources` already rejected every non-normal component.
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ConfigError::InvalidPath(format!(
+                    "invalid source '{value}' for '{key}' in {context}: a source must be a real \
+                     repo file, not a symlink or a path through one (one hop only)"
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(ConfigError::Read(e, current));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a store that declares `files`/`patterns`/`sources` but has no
+/// target to link them into. Whole-directory stores and authored-only
+/// behavior are still allowed to have no target, but file/pattern/source mode
+/// requires one.
 fn validate_store_has_target(
     name: &str,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     target: &Option<String>,
     has_targets: bool,
     source: &str,
 ) -> Result<(), ConfigError> {
-    if (!files.is_empty() || !patterns.is_empty()) && target.is_none() && !has_targets {
+    if (!files.is_empty() || !patterns.is_empty() || !sources.is_empty())
+        && target.is_none()
+        && !has_targets
+    {
         return Err(ConfigError::InvalidPath(format!(
-            "invalid store '{name}' in {source}: store with files/patterns must have a target"
+            "invalid store '{name}' in {source}: store with files/patterns/sources must have a target"
         )));
     }
     Ok(())
@@ -879,6 +1009,7 @@ mod tests {
                     target: Some("~/.config/nvim".into()),
                     files: vec![],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     targets: BTreeMap::new(),
                 },
             )]),
@@ -911,6 +1042,7 @@ mod tests {
             target: g.target,
             files: g.files,
             patterns: g.patterns,
+            sources: std::collections::BTreeMap::new(),
             ignore: a.ignore,
             when: a.when,
             hooks: a.hooks,
@@ -935,6 +1067,7 @@ mod tests {
                 target: Some("~/.config/nvim".into()),
                 files: vec!["init.lua".into()],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 targets: BTreeMap::new(),
             },
         );
@@ -954,6 +1087,7 @@ mod tests {
                 target: Some("~".into()),
                 files: vec![".bashrc".into()],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 targets: BTreeMap::new(),
             },
         );
@@ -1015,6 +1149,7 @@ mod tests {
                 target: "~/.config/h".into(),
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
             },
         )]);
         let mut warnings = Vec::new();
@@ -1303,6 +1438,7 @@ patterns = ["./work*//"]
                 target: None,
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1312,6 +1448,7 @@ patterns = ["./work*//"]
                         target: "~/.config/x".into(),
                         files: vec!["../escape".into()],
                         patterns: vec![],
+                        sources: std::collections::BTreeMap::new(),
                         ignore: vec![],
                         when: WhenClause::default(),
                     },
@@ -1341,6 +1478,7 @@ patterns = ["./work*//"]
                 target: Some("~".into()),
                 files,
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1358,6 +1496,7 @@ patterns = ["./work*//"]
                 target: Some("~".into()),
                 files: vec![],
                 patterns,
+                sources: BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),

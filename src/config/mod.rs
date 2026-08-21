@@ -18,9 +18,7 @@ mod types;
 
 pub use error::ConfigError;
 pub use legacy::{LegacyConfig, split_legacy};
-pub use load::{
-    ConfigSnapshot, validate_fragments, validate_globs, validate_merged, validate_target,
-};
+pub use load::{ConfigSnapshot, validate_fragments, validate_globs, validate_merged, validate_target};
 pub use paths::{expand_home, find_root, is_safe_fragment, is_store_name};
 pub use state::{StateLock, atomic_write, validate_atomic_write_target};
 pub use types::{

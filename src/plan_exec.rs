@@ -213,7 +213,7 @@ impl<'a> PreflightState<'a> {
                 render::preflight_staged_path(
                     self.repo_root,
                     store,
-                    &render::resolve_entry(source_rel).link_rel,
+                    &staged_link_identity(self.repo_root, store, staged)?,
                 )?;
                 Ok(())
             }
@@ -1155,7 +1155,7 @@ fn preflight_op(
             render::preflight_staged_path(
                 repo_root,
                 store,
-                &render::resolve_entry(source_rel).link_rel,
+                &staged_link_identity(repo_root, store, staged)?,
             )
         }
         PlanFileOp::CreateLink {
@@ -1340,6 +1340,19 @@ fn is_symlink_source(source: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The staging identity (link name under `.stitch/render/<store>/`) of a
+/// staged path. v0.14: this is *not* derivable from the template's source
+/// name — a `sources` template stages under its declared key.
+fn staged_link_identity(repo_root: &Path, store: &str, staged: &str) -> Result<String, String> {
+    Path::new(staged)
+        .strip_prefix(&render::store_render_dir(repo_root, store))
+        .map_err(|_| format!("staged path outside render tree: {staged}"))?
+        .to_str()
+        .map(str::to_owned)
+        .filter(|rel| !rel.is_empty())
+        .ok_or_else(|| format!("staged path has no link identity: {staged}"))
+}
+
 fn create_link_for_plan(repo_root: &Path, target: &Path, source: &Path) -> Result<(), String> {
     // Re-derive and validate the configured source root at the mutation
     // boundary so a hook cannot install a gateway after plan preflight.
@@ -1370,11 +1383,13 @@ fn execute_op(
             let source_path = verify_stage_render(
                 repo_root, loaded, platform, store, source_rel, staged, sha256,
             )?;
+            let link_identity = staged_link_identity(repo_root, store, staged)?;
             render::stage_template(
                 repo_root,
                 store,
                 source_rel,
                 &source_path,
+                &link_identity,
                 platform,
                 &loaded.config.vars,
             )

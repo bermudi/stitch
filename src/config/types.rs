@@ -72,6 +72,15 @@ pub struct GeneratedStore {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// Decoupled sources (v0.14): target-relative name → repo-relative source.
+    /// `files` stays sugar for "name is both target name and store-relative
+    /// source"; a `sources` entry says "this target path's content lives
+    /// elsewhere in the repo" — the hub fan-in without repo-internal alias
+    /// symlinks. Sources may point into another store's directory or at a
+    /// non-store path; they are validated at load (safe fragment, not under
+    /// `.stitch/`, no symlinked component).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sources: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub targets: BTreeMap<String, GeneratedTarget>,
 }
@@ -84,6 +93,9 @@ pub struct GeneratedTarget {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// Per-target decoupled sources; see [`GeneratedStore::sources`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sources: BTreeMap<String, String>,
 }
 
 // ===========================================================================
@@ -106,6 +118,9 @@ pub struct Store {
     pub target: Option<String>,
     pub files: Vec<String>,
     pub patterns: Vec<String>,
+    /// Decoupled sources, merged from the generated half; see
+    /// [`GeneratedStore::sources`].
+    pub sources: BTreeMap<String, String>,
     pub ignore: Vec<String>,
     pub when: WhenClause,
     pub hooks: Hooks,
@@ -119,6 +134,7 @@ pub struct TargetEntry {
     pub target: String,
     pub files: Vec<String>,
     pub patterns: Vec<String>,
+    pub sources: BTreeMap<String, String>,
     pub ignore: Vec<String>,
     pub when: WhenClause,
 }
@@ -330,6 +346,7 @@ mod tests {
                     target: Some("~/.config/nvim".into()),
                     files: vec!["init.lua".into()],
                     patterns: vec![],
+                    sources: BTreeMap::new(),
                     targets: BTreeMap::new(),
                 },
             )]),
