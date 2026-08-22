@@ -18,8 +18,8 @@ If you've ever wanted to back up your dotfiles, move them to a new machine, or j
 
 No Rust needed. Go to the **[Releases page](https://github.com/bermudi/stitch/releases)** and download the file for your computer.
 
-- Intel/AMD PC or laptop → `stitch-v0.10.0-x86_64-unknown-linux-gnu.tar.gz`
-- Raspberry Pi / ARM server → `stitch-v0.10.0-aarch64-unknown-linux-gnu.tar.gz`
+- Intel/AMD PC or laptop → `stitch-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`
+- Raspberry Pi / ARM server → `stitch-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`
 
 > Tip: Not sure which you need? Run `uname -m` — it prints `x86_64` for most desktops, `aarch64` for ARM.
 
@@ -28,13 +28,25 @@ Then install it:
 ```sh
 # example for x86_64 — swap the filename if you grabbed the ARM one
 # (check the Releases page for the latest version number)
-curl -LO https://github.com/bermudi/stitch/releases/download/v0.10.0/stitch-v0.10.0-x86_64-unknown-linux-gnu.tar.gz
-tar xzf stitch-v0.10.0-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/bermudi/stitch/releases/download/vX.Y.Z/stitch-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+tar xzf stitch-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
 sudo mv stitch /usr/local/bin/
 stitch --help
 ```
 
 Each download has a `.sha256` file next to it if you want to verify it. You can always find the newest version at **https://github.com/bermudi/stitch/releases/latest**.
+
+Once installed, stitch can update itself:
+
+```sh
+stitch self-update --check
+stitch self-update
+```
+
+If the binary is in a root-owned directory such as `/usr/local/bin`, run the
+second command with the same permissions you used to install it. The updater
+checks the published SHA-256 and replaces the executable atomically. The
+checksum detects corruption; release authenticity relies on HTTPS and GitHub.
 
 ### Option 2 — Build from source
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **`stitch self-update`** — checks the latest stable GitHub release, verifies
+  the matching SHA-256 sidecar, narrowly validates the archive and ELF target,
+  runs the staged binary's `--version` to catch incompatible builds, then
+  atomically replaces the running executable without dropping ordinary
+  ownership/mode metadata. `--check` is metadata-only, and JSON output reports
+  `up-to-date`, `newer`, `update-available`, or `updated`.
+
 ## 0.14.2 — 2026-08-22
 
 ### Fixed

@@ -15,12 +15,15 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    # Pin the oldest supported glibc build baseline. The updater also runs the
+    # staged binary before replacement, so an incompatible artifact cannot
+    # displace a working install.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -28,7 +31,30 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag and package version
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "error: release tag must be exactly vX.Y.Z" >&2
+            exit 1
+          }
+          [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag ] || {
+            echo "error: $GITHUB_REF_NAME must be an annotated tag" >&2
+            exit 1
+          }
+          package_version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "stitch") | .version'
+          )"
+          [ "$GITHUB_REF_NAME" = "v$package_version" ] || {
+            echo "error: tag $GITHUB_REF_NAME does not match Cargo version v$package_version" >&2
+            exit 1
+          }
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
@@ -59,7 +85,7 @@ jobs:
           sha256sum "stitch-${GITHUB_REF_NAME}-${target}.tar.gz" \
             > "stitch-${GITHUB_REF_NAME}-${target}.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: stitch-${{ matrix.target }}
           path: |
@@ -74,13 +100,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # Full history + tag refs so `git tag -l` can read the annotated
           # tag's subject for the release title.
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           path: dist
           merge-multiple: true
@@ -94,12 +121,12 @@ jobs:
             /^## / { if (insec) exit; insec = ($2 == v); next }
             insec { print }
           ' CHANGELOG.md > "$notes"
-          # Command substitution strips trailing newlines; add exactly one back.
-          printf '%s\n' "$(cat "$notes")" > "$notes"
-          if [ ! -s "$notes" ]; then
+          if ! grep -q '[^[:space:]]' "$notes"; then
             echo "error: no CHANGELOG section for $GITHUB_REF_NAME (expected \"## $ver — <date>\")" >&2
             exit 1
           fi
+          # Command substitution strips trailing newlines; add exactly one back.
+          printf '%s\n' "$(cat "$notes")" > "$notes"
           echo "NOTES_PATH=$notes" >> "$GITHUB_ENV"
 
       - name: Read one-line summary from the annotated tag
@@ -111,23 +138,74 @@ jobs:
           [ -n "$summary" ] || summary="$GITHUB_REF_NAME"
           echo "SUMMARY=$summary" >> "$GITHUB_ENV"
 
-      - name: Create or update release with artifacts
+      - name: Stage, verify, and publish immutable release
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          files=(dist/stitch-*.tar.gz dist/stitch-*.tar.gz.sha256)
+          files=()
+          expected_names=()
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="dist/stitch-${GITHUB_REF_NAME}-${target}.tar.gz"
+            checksum="$archive.sha256"
+            [ -f "$archive" ] || {
+              echo "error: missing release artifact $archive" >&2
+              exit 1
+            }
+            [ -f "$checksum" ] || {
+              echo "error: missing release checksum $checksum" >&2
+              exit 1
+            }
+            (cd dist && sha256sum -c "$(basename "$checksum")")
+            files+=("$archive" "$checksum")
+            expected_names+=("$(basename "$archive")" "$(basename "$checksum")")
+          done
+
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            # Release already exists (e.g. re-run, or manual gh-release.sh);
-            # just refresh artifacts and notes.
-            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+            is_draft="$(
+              gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft'
+            )"
+            [ "$is_draft" = true ] || {
+              echo "error: published release $GITHUB_REF_NAME already exists; refusing to replace its assets" >&2
+              exit 1
+            }
+            # A previous attempt may have left a partial draft. Draft assets
+            # are not visible to self-update, so refreshing them is safe.
             gh release edit "$GITHUB_REF_NAME" \
-              --notes-file "$NOTES_PATH" \
-              --title "$GITHUB_REF_NAME — $SUMMARY"
+              --title "$GITHUB_REF_NAME — $SUMMARY" \
+              --notes-file "$NOTES_PATH"
           else
             gh release create "$GITHUB_REF_NAME" \
+              --draft \
               --title "$GITHUB_REF_NAME — $SUMMARY" \
-              --notes-file "$NOTES_PATH" \
-              "${files[@]}"
+              --notes-file "$NOTES_PATH"
           fi
+
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+
+          expected="$(
+            printf '%s\n' "${expected_names[@]}" | sort
+          )"
+          actual="$(
+            gh release view "$GITHUB_REF_NAME" --json assets \
+              --jq '.assets[].name' | sort
+          )"
+          [ "$actual" = "$expected" ] || {
+            echo "error: draft release assets differ from the expected four files" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          }
+
+          verify_dir="$RUNNER_TEMP/stitch-release-verify"
+          mkdir "$verify_dir"
+          gh release download "$GITHUB_REF_NAME" --dir "$verify_dir"
+          (
+            cd "$verify_dir"
+            for checksum in *.sha256; do
+              sha256sum -c "$checksum"
+            done
+          )
+
+          # Publishing is the final state transition. Before this line a
+          # failure leaves only a resumable draft, never a broken "latest".
+          gh release edit "$GITHUB_REF_NAME" --draft=false
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

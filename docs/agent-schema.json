@@ -162,6 +162,10 @@
     "schema": {
       "data": "object",
       "description": "This document, echoed in the envelope's data field."
+    },
+    "self-update": {
+      "data": "SelfUpdateData",
+      "description": "Latest stable release check or verified atomic executable replacement. Repo-independent; --check never downloads an artifact or mutates the executable."
     }
   },
   "shapes": {
@@ -666,6 +670,17 @@
         "error": "string|absent (omitted on success)",
         "dry_run": "bool"
       }
+    },
+    "SelfUpdateData": {
+      "fields": {
+        "status": "string (up-to-date|newer|update-available|updated)",
+        "current_version": "string",
+        "latest_version": "string",
+        "target": "string (published Rust target triple)",
+        "artifact": "string",
+        "sha256": "string|absent (present after a verified installation)",
+        "installed_path": "string|absent (present after installation)"
+      }
     }
   },
   "exit_codes": [
@@ -743,6 +758,11 @@
       "code": 14,
       "class": "drift",
       "description": "diff --exit-code: safe pending changes"
+    },
+    {
+      "code": 15,
+      "class": "self-update",
+      "description": "Release check, download, verification, or installation failed"
     }
   ]
 }

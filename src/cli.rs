@@ -208,6 +208,13 @@ pub enum Commands {
     /// Emit the canonical agent JSON schema (docs/agent-schema.json)
     Schema,
 
+    /// Check for or install the latest stitch release
+    SelfUpdate {
+        /// Only report whether an update is available
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Investigate a single target path: what owns it, its source, link state
     Why {
         /// Target path to investigate (e.g. ~/.bashrc or /home/user/.config/nvim)
@@ -573,6 +580,14 @@ mod tests {
     fn schema_parses() {
         let cli = parse(&["stitch", "schema"]).unwrap();
         assert!(matches!(cli.command, Commands::Schema));
+    }
+
+    #[test]
+    fn self_update_parses() {
+        let cli = parse(&["stitch", "self-update"]).unwrap();
+        assert!(matches!(cli.command, Commands::SelfUpdate { check: false }));
+        let cli = parse(&["stitch", "self-update", "--check"]).unwrap();
+        assert!(matches!(cli.command, Commands::SelfUpdate { check: true }));
     }
 
     #[test]

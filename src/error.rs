@@ -43,6 +43,9 @@ pub enum FailureClass {
     /// `diff --exit-code` found safe operations required for convergence
     /// (exit 14). Conflicts and errors retain their more specific classes.
     Drift,
+    /// Checking, downloading, verifying, or installing a stitch release failed
+    /// (exit 15).
+    SelfUpdate,
 }
 
 impl FailureClass {
@@ -62,6 +65,7 @@ impl FailureClass {
             FailureClass::PlanStale => 12,
             FailureClass::Doctor => 13,
             FailureClass::Drift => 14,
+            FailureClass::SelfUpdate => 15,
         }
     }
 
@@ -81,6 +85,7 @@ impl FailureClass {
             FailureClass::PlanStale => "plan-stale",
             FailureClass::Doctor => "doctor",
             FailureClass::Drift => "drift",
+            FailureClass::SelfUpdate => "self-update",
         }
     }
 
@@ -100,6 +105,7 @@ impl FailureClass {
             "plan-stale" => Some(FailureClass::PlanStale),
             "doctor" => Some(FailureClass::Doctor),
             "drift" => Some(FailureClass::Drift),
+            "self-update" => Some(FailureClass::SelfUpdate),
             _ => None,
         }
     }
@@ -134,6 +140,9 @@ impl FailureClass {
                 Some("address the findings above (per-finding hints in JSON)".into())
             }
             FailureClass::Drift => Some("run `stitch apply` to reconcile the filesystem".into()),
+            FailureClass::SelfUpdate => {
+                Some("retry later or install the release manually from GitHub Releases".into())
+            }
         }
     }
 }
@@ -316,6 +325,9 @@ pub enum StitchError {
 
     #[error("filesystem differs from desired state: {changes} change(s) needed")]
     Drift { changes: usize },
+
+    #[error("self-update failed: {message}")]
+    SelfUpdate { message: String },
 }
 
 #[allow(dead_code)]
@@ -446,6 +458,12 @@ impl StitchError {
         Self::Drift { changes }
     }
 
+    pub fn self_update(message: impl Into<String>) -> Self {
+        Self::SelfUpdate {
+            message: message.into(),
+        }
+    }
+
     pub fn class(&self) -> FailureClass {
         match self {
             Self::Internal { .. } | Self::Io { .. } | Self::IoContext { .. } => {
@@ -464,6 +482,7 @@ impl StitchError {
             Self::PlanStale { .. } => FailureClass::PlanStale,
             Self::Doctor { .. } => FailureClass::Doctor,
             Self::Drift { .. } => FailureClass::Drift,
+            Self::SelfUpdate { .. } => FailureClass::SelfUpdate,
             Self::Apply { classes, .. } => match classes.as_slice() {
                 [] => FailureClass::Internal,
                 [c] => *c,
@@ -532,6 +551,7 @@ impl StitchError {
             Self::PlanStale { .. } => FailureClass::PlanStale.hint(),
             Self::Doctor { .. } => FailureClass::Doctor.hint(),
             Self::Drift { .. } => FailureClass::Drift.hint(),
+            Self::SelfUpdate { .. } => FailureClass::SelfUpdate.hint(),
         }
     }
 
@@ -631,6 +651,9 @@ impl StitchError {
             Self::PlanStale { .. } => vec![RecoveryAction::command("replan", "plan")],
             Self::Doctor { .. } => vec![],
             Self::Drift { .. } => vec![RecoveryAction::command("apply", "apply")],
+            Self::SelfUpdate { .. } => vec![RecoveryAction::manual(
+                "retry later or install the release manually from GitHub Releases",
+            )],
         }
     }
 }
@@ -697,6 +720,7 @@ mod tests {
             (FailureClass::PlanStale, 12, "plan-stale"),
             (FailureClass::Doctor, 13, "doctor"),
             (FailureClass::Drift, 14, "drift"),
+            (FailureClass::SelfUpdate, 15, "self-update"),
         ];
         for (class, code, id) in cases {
             assert_eq!(class.code(), code, "code for {id}");
@@ -724,6 +748,7 @@ mod tests {
             FailureClass::PlanStale,
             FailureClass::Doctor,
             FailureClass::Drift,
+            FailureClass::SelfUpdate,
         ] {
             let id = class.id();
             assert_eq!(FailureClass::from_id(id), Some(class));
@@ -766,6 +791,12 @@ mod tests {
         assert!(FailureClass::PlanStale.hint().unwrap().contains("plan"));
         assert!(FailureClass::Doctor.hint().unwrap().contains("findings"));
         assert!(FailureClass::Drift.hint().unwrap().contains("apply"));
+        assert!(
+            FailureClass::SelfUpdate
+                .hint()
+                .unwrap()
+                .contains("GitHub Releases")
+        );
     }
 
     #[test]
@@ -812,6 +843,10 @@ mod tests {
         );
         assert_eq!(StitchError::doctor(1).class(), FailureClass::Doctor);
         assert_eq!(StitchError::drift(2).class(), FailureClass::Drift);
+        assert_eq!(
+            StitchError::self_update("x").class(),
+            FailureClass::SelfUpdate
+        );
     }
 
     #[test]

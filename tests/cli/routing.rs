@@ -48,6 +48,20 @@ fn list_outside_repo_errors() {
         .stderr(contains("does not point at a stitch repo"));
 }
 
+#[test]
+fn self_update_rejects_irrelevant_repo_flag_before_network_access() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--repo", "/does/not/matter", "self-update", "--check"])
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "--repo does not apply to the repo-independent self-update command",
+        ));
+}
+
 /// Run `stitch --repo <path> list` from an unrelated cwd and confirm it
 /// operates on the referenced repo.
 #[test]

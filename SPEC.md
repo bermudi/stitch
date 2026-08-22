@@ -141,6 +141,29 @@ Most read/plan commands support a global `--json` flag. See [Agent interface (v0
 
 Create `stitch.toml` (empty, with a header documenting it is authored/read-only to the tool) and `.stitch/state.toml` (empty, generated) in the current directory. Also appends `.stitch/render/` to the repo's `.gitignore` (creating the file if needed) and pre-creates `.stitch/render/` at mode `0700`. Refuses if either config file exists, or if a v0.2 `.stitch/config.toml` is present (pointing at `migrate` instead).
 
+### `stitch self-update`
+
+Check GitHub's latest stable `bermudi/stitch` release and, when newer, replace
+the running executable. This command is repo-independent: it does not read
+`$HOME`, discover a stitch repo, run hooks, or write the repo audit log.
+`--repo` is rejected because it has no meaning here.
+
+Only the two published Linux GNU targets are accepted (`x86_64` and
+`aarch64`). The updater requires an exact release artifact and `.sha256`
+sidecar, checks the SHA-256 before extraction, accepts exactly one regular
+root archive entry named `stitch`, validates the ELF architecture, writes an
+exclusive temporary file beside the current executable, and runs the staged
+binary's `--version` with a timeout before atomically renaming it into place.
+The probe catches malformed binaries, version/tag mismatches, and binaries
+that cannot run against the host's C library. Ordinary mode and group ownership
+are preserved; executables carrying ACLs, capabilities, security labels, or
+other extended attributes are refused rather than silently losing metadata.
+Equal versions are a no-op; a locally newer version is never downgraded.
+`--check` fetches metadata only and never downloads or writes the binary.
+
+The checksum detects corruption. Authenticity relies on HTTPS and the GitHub
+release account/workflow; the checksum is not an independent signature.
+
 ### `stitch apply`
 
 Reconcile all stores. Creates missing symlinks, replaces broken ones, reports conflicts.
@@ -553,7 +576,8 @@ exact op list with preflight and fingerprint checks.
 ### Global `--json` flag
 
 `--json` is global. It is supported for `status`, `list`, `diff`, `apply`,
-`plan`, `doctor`, `prune`, `render`, `explain`, `schema`, `why`, and `log`.
+`plan`, `doctor`, `prune`, `render`, `explain`, `schema`, `why`, `log`, and
+`self-update`.
 `add`, `remove`, and `migrate` support it for both dry-run previews and real
 mutations; `import` supports it for its report. It is not supported for
 `init` or `edit`; those combinations exit with code 2.
@@ -892,6 +916,7 @@ error object carries `class` (the stable id) and `code`; text mode prints a
 | 12 | `plan-stale` | Plan is stale or invalid | re-run `stitch plan` |
 | 13 | `doctor` | `doctor` reported error-severity findings | address the findings (per-finding hints in JSON) |
 | 14 | `drift` | `diff --exit-code` found safe pending changes | run `stitch apply` |
+| 15 | `self-update` | Release check, download, verification, or installation failed | retry later or install manually from GitHub Releases |
 
 Aggregation rule: for `apply`, `diff`, and `plan`, a single failure class
 present → that class's code; multiple classes → 11. Drift is considered only

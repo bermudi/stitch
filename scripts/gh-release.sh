@@ -9,8 +9,9 @@
 #
 # As of the release workflow (.github/workflows/release.yml), pushing a `v*`
 # tag already creates the release with notes + build artifacts. This script is
-# now a manual fallback for re-publishing notes; it is idempotent — if the
-# release already exists, it edits the title/notes in place instead of failing.
+# now a manual fallback for re-publishing notes on an existing release. Asset
+# publication belongs to the workflow so this script cannot accidentally
+# create an assetless release that self-update would reject.
 set -euo pipefail
 
 ver="${1:-}"
@@ -38,17 +39,17 @@ awk -v v="${ver#v}" '
     }
     insec { print }
 ' CHANGELOG.md > "$notes"
+grep -q '[^[:space:]]' "$notes" || {
+    echo "error: no CHANGELOG section for $ver (expected \"## ${ver#v} — <date>\")" >&2
+    exit 1
+}
 # Command substitution strips the trailing newlines (incl. the blank line
 # before the next section header); printf adds back exactly one.
 printf '%s\n' "$(cat "$notes")" > "$notes"
 
-[ -s "$notes" ] || {
-    echo "error: no CHANGELOG section for $ver (expected \"## ${ver#v} — <date>\")" >&2
-    exit 1
-}
-
 if gh release view "$ver" >/dev/null 2>&1; then
     gh release edit "$ver" --title "$ver — $summary" --notes-file "$notes"
 else
-    gh release create "$ver" --title "$ver — $summary" --notes-file "$notes"
+    echo "error: release $ver does not exist; publish its artifacts with the release workflow first" >&2
+    exit 1
 fi

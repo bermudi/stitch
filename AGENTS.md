@@ -92,10 +92,18 @@ attaches the artifacts. Supported build targets: `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu` (Linux only — macOS is not officially supported).
 Artifacts: `stitch-vX.Y.Z-<target>.tar.gz` plus a `.sha256` sidecar.
 
+`stitch self-update` depends on that exact asset naming and treats published
+assets as immutable. The release workflow must never clobber a published
+asset (a partial draft may be resumed). It validates tag/package-version
+agreement, builds on the pinned Ubuntu 22.04 glibc baseline, and publishes the
+archive + checksum together.
+The updater checks the checksum, archive shape, ELF architecture, and staged
+`stitch --version` before atomic replacement.
+
 `scripts/gh-release.sh` is now a manual fallback for re-publishing notes; it is
-idempotent (edits an existing release instead of failing). The workflow reads
-the one-line summary from the annotated tag's subject, so the tag message
-format above matters.
+idempotent for an existing release and never creates an assetless release. The
+workflow reads the one-line summary from the annotated tag's subject, so the
+tag message format above matters.
 
 Existing tags: `v0.2.0` (d35496a), `v0.3.0` (76fc01f), `v0.3.1` (6d10de3),
 `v0.4.0`, `v0.4.1`, `v0.5.0`, `v0.6.0` (23f2dbd), `v0.7.0`, `v0.7.1`

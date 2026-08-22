@@ -15,6 +15,7 @@ pub(crate) mod prune;
 pub(crate) mod remove;
 pub(crate) mod render;
 pub(crate) mod schema;
+pub(crate) mod self_update;
 pub(crate) mod status;
 pub(crate) mod why;
 
@@ -44,6 +45,7 @@ pub(crate) fn command_name(command: &cli::Commands) -> &'static str {
         Commands::Render { .. } => "render",
         Commands::Explain { .. } => "explain",
         Commands::Schema => "schema",
+        Commands::SelfUpdate { .. } => "self-update",
         Commands::Why { .. } => "why",
         Commands::Log { .. } => "log",
     }
@@ -313,6 +315,14 @@ fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<()
             explain::cmd_explain(&root, active_only, json)
         }
         cli::Commands::Schema => schema::cmd_schema(json),
+        cli::Commands::SelfUpdate { check } => {
+            if repo.is_some() {
+                return Err(StitchError::usage(
+                    "--repo does not apply to the repo-independent self-update command",
+                ));
+            }
+            self_update::cmd_self_update(check, json)
+        }
         cli::Commands::Why { target } => {
             let root = resolve_root(repo)?;
             why::cmd_why(&root, &target, json)

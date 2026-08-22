@@ -2532,8 +2532,23 @@ fn schema_json_emits_canonical_schema() {
     // Every command documented in the schema.
     let commands = data["commands"].as_object().unwrap();
     for cmd in [
-        "status", "list", "diff", "plan", "apply", "doctor", "prune", "render", "add", "remove",
-        "migrate", "import", "explain", "schema", "why", "log",
+        "status",
+        "list",
+        "diff",
+        "plan",
+        "apply",
+        "doctor",
+        "prune",
+        "render",
+        "add",
+        "remove",
+        "migrate",
+        "import",
+        "explain",
+        "schema",
+        "why",
+        "log",
+        "self-update",
     ] {
         assert!(commands.contains_key(cmd), "schema.commands missing {cmd}");
     }

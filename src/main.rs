@@ -16,6 +16,7 @@ mod render;
 mod report;
 mod safety;
 mod scan;
+mod self_update;
 mod store;
 
 use clap::Parser;
