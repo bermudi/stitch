@@ -1,4 +1,5 @@
 use super::common::print_warnings;
+use crate::ancestor::TargetAncestorSnapshot;
 use crate::config::{self, Config, Loaded};
 use crate::error::StitchError;
 use crate::fsutil::{ensure_filesystem_identity, filesystem_identity};
@@ -10,11 +11,13 @@ use crate::report::{self, RemoveData};
 use crate::safety;
 use crate::store;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn cmd_remove(
     root: &std::path::Path,
     name: &str,
     dry_run: bool,
+    force: bool,
     json: bool,
 ) -> Result<(), StitchError> {
     // No lock yet: the pre-remove hook runs first and may itself invoke a
@@ -150,6 +153,7 @@ pub(crate) fn cmd_remove(
                                source: std::path::PathBuf,
                                link_source: std::path::PathBuf,
                                source_name: String,
+                               link_name: String,
                                is_template: bool,
                                target_name: Option<&str>,
                                allow_dir: bool|
@@ -167,6 +171,7 @@ pub(crate) fn cmd_remove(
                                     source,
                                     link_source,
                                     source_name,
+                                    link_name,
                                     target: target.to_path_buf(),
                                     status: linker::LinkStatus::Linked,
                                     skipped_platform: false,
@@ -197,11 +202,14 @@ pub(crate) fn cmd_remove(
                     if home.as_ref().is_some_and(|h| h == target_path) {
                         return Ok(());
                     }
-                    match store::resolve_target_names(root, &store_dir, files, patterns, sources, ignore) {
+                    match store::resolve_target_names(
+                        root, &store_dir, files, patterns, sources, ignore,
+                    ) {
                         store::LinkTargets::WholeDir => add(
                             target_path,
                             store_dir.clone(),
                             store_dir.clone(),
+                            String::new(),
                             String::new(),
                             false,
                             target_name,
@@ -216,6 +224,7 @@ pub(crate) fn cmd_remove(
                                 target_path,
                                 store_dir.clone(),
                                 store_dir.clone(),
+                                String::new(),
                                 String::new(),
                                 false,
                                 target_name,
@@ -239,6 +248,7 @@ pub(crate) fn cmd_remove(
                                         link.source.clone(),
                                         link_source,
                                         link.source_rel.clone(),
+                                        link.name.clone(),
                                         link.is_template(),
                                         target_name,
                                         false,
@@ -290,6 +300,47 @@ pub(crate) fn cmd_remove(
     let staging_str = staging.to_string_lossy().into_owned();
     let state_path = root.join(".stitch/state.toml");
 
+    // v0.14 red line: `remove` never destroys a source another store still
+    // references. Scan every other store's `sources` for values that resolve
+    // inside this store's directory; refuse unless --force, and with --force
+    // report the retained files so the dangling references are visible.
+    // Store `inbound` messages and `retained` paths separately to avoid
+    // corruption when a store name itself contains ": ".
+    let (inbound, retained): (Vec<String>, Vec<String>) = {
+        let mut inbound = Vec::new();
+        let mut retained = Vec::new();
+        for (other, store) in &loaded.config.stores {
+            if other.as_str() == name {
+                continue;
+            }
+            let values: Box<dyn Iterator<Item = &String>> = if store.is_multi_target() {
+                Box::new(store.targets.values().flat_map(|te| te.sources.values()))
+            } else {
+                Box::new(store.sources.values())
+            };
+            for value in values {
+                if Path::new(value)
+                    .components()
+                    .next()
+                    .is_some_and(|c| c.as_os_str() == std::ffi::OsStr::new(name))
+                {
+                    inbound.push(format!("{other}: {value}"));
+                    retained.push(value.clone());
+                }
+            }
+        }
+        (inbound, retained)
+    };
+    if !inbound.is_empty() && !force {
+        return Err(StitchError::conflict_real_msg(format!(
+            "refusing to remove store '{name}': other stores reference files inside its directory \
+             via `sources`:\n  {}\n\
+             remove those entries first, or pass --force to remove this store's links and state \
+             while retaining the referenced source files in place",
+            inbound.join("\n  ")
+        )));
+    }
+
     if dry_run {
         let data = RemoveData {
             store: name.into(),
@@ -300,6 +351,7 @@ pub(crate) fn cmd_remove(
             behavior_orphaned: None,
             removed_staging: Vec::new(),
             state_entry_removed: None,
+            retained_sources: retained.clone(),
         };
         if json {
             report::write("remove", data, loaded.warnings);
@@ -314,9 +366,47 @@ pub(crate) fn cmd_remove(
                 println!("  no links to remove");
             }
             println!("  remove staging {}", data.staging);
+            if !data.retained_sources.is_empty() {
+                println!("  retain referenced source files (--force):",);
+                for src in &data.retained_sources {
+                    println!("    {src}");
+                }
+            }
         }
         return Ok(());
     }
+
+    // Pin target ancestors across the hook: a hook must not replace a
+    // nested target directory with a symlink that would cause removal to follow
+    // it outside the configured target.
+    let home_path = config::expand_home("~").map_err(StitchError::from)?;
+    let pre_hook_targets: Vec<std::path::PathBuf> =
+        pre_hook_linked.iter().map(|e| e.target.clone()).collect();
+    for target in &pre_hook_targets {
+        for ancestor in target.ancestors().skip(1) {
+            if ancestor == home_path {
+                continue;
+            }
+            if !ancestor.starts_with(&home_path) {
+                break;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(ancestor)
+                && meta.file_type().is_symlink()
+            {
+                return Err(StitchError::internal(format!(
+                    "target ancestor {} is a symlink; refusing to remove",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    let pre_hook_snapshot = TargetAncestorSnapshot::capture(
+        root,
+        pre_hook_targets.clone(),
+        &BTreeSet::new(),
+        &home_path,
+    )
+    .map_err(|e| StitchError::internal(e.to_string()))?;
 
     // Global pre-remove hook — runs WITHOUT the state lock; a hook that
     // invokes a mutating stitch command acquires the lock itself. Pin both the
@@ -338,6 +428,9 @@ pub(crate) fn cmd_remove(
         };
         hooks::run_global_hook(root, "pre-remove", &env, &platform, json)
             .map_err(|e| StitchError::hook("pre-remove", e))?;
+        pre_hook_snapshot
+            .revalidate()
+            .map_err(|e| StitchError::internal(e.to_string()))?;
         home_identity
             .revalidate()
             .map_err(|e| StitchError::internal(e.to_string()))?;
@@ -361,6 +454,43 @@ pub(crate) fn cmd_remove(
     // Reload: the pre-remove hook may have changed state (or even removed the
     // store itself). Removal must act on the state it serializes with.
     let mut loaded = Config::load(root)?;
+    // Recompute inbound references from post-hook state: the hook may have
+    // added a `sources` entry referencing this store, which must still require
+    // --force.
+    let (inbound, retained): (Vec<String>, Vec<String>) = {
+        let mut inbound = Vec::new();
+        let mut retained = Vec::new();
+        for (other, store) in &loaded.config.stores {
+            if other.as_str() == name {
+                continue;
+            }
+            let values: Box<dyn Iterator<Item = &String>> = if store.is_multi_target() {
+                Box::new(store.targets.values().flat_map(|te| te.sources.values()))
+            } else {
+                Box::new(store.sources.values())
+            };
+            for value in values {
+                if Path::new(value)
+                    .components()
+                    .next()
+                    .is_some_and(|c| c.as_os_str() == std::ffi::OsStr::new(name))
+                {
+                    inbound.push(format!("{other}: {value}"));
+                    retained.push(value.clone());
+                }
+            }
+        }
+        (inbound, retained)
+    };
+    if !inbound.is_empty() && !force {
+        return Err(StitchError::conflict_real_msg(format!(
+            "refusing to remove store '{name}': other stores reference files inside its directory \
+             via `sources`:\n  {}\n\
+             remove those entries first, or pass --force to remove this store's links and state \
+             while retaining the referenced source files in place",
+            inbound.join("\n  ")
+        )));
+    }
     // Recompute the target from the reloaded state so the JSON report matches
     // what was actually reconciled, not what was captured before the hook.
     let target = loaded
@@ -417,6 +547,7 @@ pub(crate) fn cmd_remove(
                     links: removed_links,
                     staging: staging_str,
                     dry_run: false,
+                    retained_sources: retained.clone(),
                     behavior_orphaned: None,
                     removed_staging,
                     state_entry_removed: Some(true),
@@ -428,10 +559,110 @@ pub(crate) fn cmd_remove(
                 "Store '{name}' was already removed (e.g. by the pre-remove hook); cleaned up {} link(s).",
                 removed_links.len()
             );
+            if !retained.is_empty() {
+                println!("  retained referenced source files (--force):");
+                for src in &retained {
+                    println!("    {src}");
+                }
+            }
         }
         return Ok(());
     }
-    let (linked, _) = classify(&loaded)?;
+    let (mut linked, _) = classify(&loaded)?;
+    // Pin target ancestors for the post-hook inventory as well: the hook may
+    // have changed the target to introduce a gateway symlink. Check immediately
+    // under lock before any unlink.
+    for target in linked.iter().map(|e| &e.target) {
+        for ancestor in target.ancestors().skip(1) {
+            if ancestor == home_path {
+                continue;
+            }
+            if !ancestor.starts_with(&home_path) {
+                break;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(ancestor)
+                && meta.file_type().is_symlink()
+            {
+                return Err(StitchError::internal(format!(
+                    "target ancestor {} is a symlink; refusing to remove",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    // If the pre-remove hook changed the store's inventory (e.g. from `a` to
+    // `b`), the new classification no longer knows about the old `a` link. It
+    // would be left behind as an orphan while removal reports success. Include
+    // any pre-hook repo-owned link whose target is not in the new inventory so
+    // the stale link is cleaned up as part of the store removal.
+    {
+        let new_targets: BTreeSet<PathBuf> = linked.iter().map(|e| e.target.clone()).collect();
+        for entry in &pre_hook_linked {
+            if new_targets.contains(&entry.target) {
+                continue;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(&entry.target)
+                && meta.file_type().is_symlink()
+                && linker::points_to_source(&entry.target, &entry.link_source, root)
+            {
+                // Also verify the orphan's ancestors are not symlinked (hook could
+                // have introduced a gateway for the old target's directory).
+                let mut ok = true;
+                for ancestor in entry.target.ancestors().skip(1) {
+                    if ancestor == home_path {
+                        continue;
+                    }
+                    if !ancestor.starts_with(&home_path) {
+                        break;
+                    }
+                    if let Ok(meta) = std::fs::symlink_metadata(ancestor)
+                        && meta.file_type().is_symlink()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    linked.push(entry.clone());
+                }
+            } else if let Ok(meta) = std::fs::symlink_metadata(&entry.target)
+                && meta.file_type().is_symlink()
+                && linker::points_into_repo(&entry.target, root)
+            {
+                let mut ok = true;
+                for ancestor in entry.target.ancestors().skip(1) {
+                    if ancestor == home_path {
+                        continue;
+                    }
+                    if !ancestor.starts_with(&home_path) {
+                        break;
+                    }
+                    if let Ok(meta) = std::fs::symlink_metadata(ancestor)
+                        && meta.file_type().is_symlink()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    linked.push(entry.clone());
+                }
+            }
+        }
+    }
+    // Snapshot final targets (including any orphan-expanded links) to pin
+    // ancestors against a concurrent same-UID race between this check and the
+    // unlink. A race that wins after revalidation is out of scope.
+    let post_hook_snapshot = TargetAncestorSnapshot::capture(
+        root,
+        linked.iter().map(|e| e.target.clone()).collect::<Vec<_>>(),
+        &BTreeSet::new(),
+        &home_path,
+    )
+    .map_err(|e| StitchError::internal(e.to_string()))?;
+    post_hook_snapshot
+        .revalidate()
+        .map_err(|e| StitchError::internal(e.to_string()))?;
 
     // Remove links before deleting state. If a link that was repo-owned when
     // status_all ran can no longer be removed (e.g. it was repointed to a
@@ -520,6 +751,7 @@ pub(crate) fn cmd_remove(
                 links: removed_links,
                 staging: staging_str,
                 dry_run: false,
+                retained_sources: retained.clone(),
                 behavior_orphaned: Some(loaded.authored.stores.contains_key(name)),
                 removed_staging,
                 state_entry_removed: Some(state_existed),
@@ -528,6 +760,12 @@ pub(crate) fn cmd_remove(
         );
     } else {
         println!("Removed store '{}' (directory left untouched)", name);
+        if !retained.is_empty() {
+            println!("  retained referenced source files (--force):");
+            for src in &retained {
+                println!("    {src}");
+            }
+        }
     }
     Ok(())
 }

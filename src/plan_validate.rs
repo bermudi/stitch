@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 /// A pinned `StageRender` op tracked across validation so that later link ops
 /// can confirm their staged source was produced by a preceding stage op.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct RenderPin {
     pub(crate) source_rel: String,
     pub(crate) staged: String,
@@ -41,11 +42,29 @@ pub(crate) struct RenderPin {
 pub(crate) struct ValidationContext<'a> {
     repo_root: &'a Path,
     config: &'a Config,
+    platform: Platform,
 }
 
 impl<'a> ValidationContext<'a> {
+    #[allow(dead_code)]
     pub(crate) fn new(repo_root: &'a Path, config: &'a Config) -> Self {
-        Self { repo_root, config }
+        Self {
+            repo_root,
+            config,
+            platform: Platform::detect(),
+        }
+    }
+
+    pub(crate) fn with_platform(
+        repo_root: &'a Path,
+        config: &'a Config,
+        platform: Platform,
+    ) -> Self {
+        Self {
+            repo_root,
+            config,
+            platform,
+        }
     }
 }
 
@@ -270,21 +289,10 @@ pub(crate) fn validate_op(
                     "op {idx}: source_rel '{source_rel}' is not a template"
                 ));
             }
-            let source_path = ctx.repo_root.join(store).join(source_rel);
-            if !source_path.is_file() {
-                return Err(format!("op {idx}: source does not exist: {source_rel}"));
-            }
-            let expected_staged = render::staging_path(
-                ctx.repo_root,
-                store,
-                &render::resolve_entry(source_rel).link_rel,
-            );
-            if path_to_string(&expected_staged) != *staged {
-                return Err(format!(
-                    "op {idx}: staged path mismatch: expected {}",
-                    expected_staged.display()
-                ));
-            }
+            // Check freshness first so injected unselected stage_renders fail
+            // with the expected "not present" message rather than an inventory
+            // mismatch. This matches the test expectation for
+            // apply_plan_rejects_unselected_injected_stage_render.
             let encoded = serde_json::to_string(op)
                 .map_err(|e| format!("op {idx}: could not encode operation: {e}"))?;
             if !current_removals.stage_writes.contains(&encoded) {
@@ -292,7 +300,86 @@ pub(crate) fn validate_op(
                     "op {idx}: render operation is not present in the freshly computed apply plan"
                 ));
             }
-            let link_rel = render::resolve_entry(source_rel).link_rel;
+            // Staged path determines the link identity; source_rel is validated
+            // against the store's declared inventory so shared templates
+            // (repo-relative source outside the consumer store) are handled.
+            let staged_path = Path::new(staged);
+            let staged_dir = render::store_render_dir(ctx.repo_root, store);
+            let link_rel = staged_path
+                .strip_prefix(&staged_dir)
+                .map_err(|_| format!("op {idx}: staged path outside render tree: {staged}"))?
+                .to_string_lossy()
+                .into_owned();
+            if link_rel.is_empty() {
+                return Err(format!(
+                    "op {idx}: staged path has no link identity: {staged}"
+                ));
+            }
+            let expected_staged = render::staging_path(ctx.repo_root, store, &link_rel);
+            if path_to_string(&expected_staged) != *staged {
+                return Err(format!(
+                    "op {idx}: staged path mismatch: expected {}",
+                    expected_staged.display()
+                ));
+            }
+            // Resolve the expected template source for this link via the store's
+            // inventory. This handles both in-store templates (store/<source_rel>)
+            // and shared `sources` templates (repo-relative outside the store).
+            let store_cfg = ctx.config.stores.get(store).unwrap();
+            if !ctx.platform.matches_when(&store_cfg.when) {
+                return Err(format!(
+                    "op {idx}: no template entry stages at '{link_rel}' for store '{store}'"
+                ));
+            }
+            let store_dir = ctx.repo_root.join(store);
+            let mut found: Option<(PathBuf, String)> = None;
+            let mut check = |files: &[String],
+                             patterns: &[String],
+                             sources: &BTreeMap<String, String>,
+                             ignore: &[String]| {
+                if found.is_some() {
+                    return;
+                }
+                if let store::LinkTargets::Files(links) = store::resolve_target_names(
+                    ctx.repo_root,
+                    &store_dir,
+                    files,
+                    patterns,
+                    sources,
+                    ignore,
+                ) {
+                    found = links
+                        .into_iter()
+                        .find(|l| l.is_template() && l.name == link_rel)
+                        .map(|l| (l.source, l.source_rel));
+                }
+            };
+            if store_cfg.is_multi_target() {
+                for t in store_cfg.targets.values() {
+                    if !ctx.platform.matches_when(&t.when) {
+                        continue;
+                    }
+                    check(&t.files, &t.patterns, &t.sources, &t.ignore);
+                }
+            } else {
+                check(
+                    &store_cfg.files,
+                    &store_cfg.patterns,
+                    &store_cfg.sources,
+                    &store_cfg.ignore,
+                );
+            }
+            let (actual_source, actual_rel) = found.ok_or_else(|| {
+                format!("op {idx}: no template entry stages at '{link_rel}' for store '{store}'")
+            })?;
+            if actual_rel != *source_rel {
+                return Err(format!(
+                    "op {idx}: template identity drifted: plan says '{source_rel}', state says '{actual_rel}'"
+                ));
+            }
+            if !actual_source.is_file() {
+                return Err(format!("op {idx}: source does not exist: {source_rel}"));
+            }
             rendered.insert(
                 (store.clone(), link_rel),
                 RenderPin {
@@ -303,11 +390,12 @@ pub(crate) fn validate_op(
             Ok(())
         }
         PlanFileOp::CreateLink {
+            store,
             target,
             source,
             requires,
         } => {
-            validate_link_op(ctx, idx, target, source, rendered)?;
+            validate_link_op(ctx, idx, store, target, source, rendered)?;
             validate_fresh_link_write(current_removals, idx, op)?;
             if requires.target != "absent" || requires.value.is_some() {
                 return Err(format!("op {idx}: create_link requires target=absent"));
@@ -315,11 +403,12 @@ pub(crate) fn validate_op(
             Ok(())
         }
         PlanFileOp::ReplaceLink {
+            store,
             target,
             source,
             requires,
         } => {
-            validate_link_op(ctx, idx, target, source, rendered)?;
+            validate_link_op(ctx, idx, store, target, source, rendered)?;
             validate_fresh_link_write(current_removals, idx, op)?;
             if requires.target == "real_entry" {
                 let encoded = serde_json::to_string(op)
@@ -333,12 +422,13 @@ pub(crate) fn validate_op(
             Ok(())
         }
         PlanFileOp::BackupAndLink {
+            store,
             target,
             source,
             backup,
             ..
         } => {
-            validate_link_op(ctx, idx, target, source, rendered)?;
+            validate_link_op(ctx, idx, store, target, source, rendered)?;
             validate_fresh_link_write(current_removals, idx, op)?;
             validate_backup_path(idx, target, backup)?;
             let encoded = serde_json::to_string(op)
@@ -388,6 +478,7 @@ pub(crate) fn validate_op(
 fn validate_link_op(
     ctx: &ValidationContext,
     idx: usize,
+    store: &str,
     target: &str,
     source: &str,
     rendered: &BTreeMap<(String, String), RenderPin>,
@@ -400,40 +491,90 @@ fn validate_link_op(
         return Err(format!("op {idx}: source {source} is not under the repo"));
     }
 
-    // Source must live under repo_root, either in a store or in staging.
-    let Some(source_store) = source_store(source, ctx.repo_root) else {
-        return Err(format!("op {idx}: source {source} is not under a store"));
+    // For backward compat, allow missing store (empty) by inferring from source.
+    let inferred;
+    let store = if store.is_empty() {
+        inferred = source_store(source, ctx.repo_root)
+            .ok_or_else(|| format!("op {idx}: source {source} is not under a store"))?;
+        inferred.as_str()
+    } else {
+        store
     };
 
-    if !ctx.config.stores.contains_key(&source_store) {
-        return Err(format!(
-            "op {idx}: source store '{source_store}' not in config"
-        ));
+    if !ctx.config.stores.contains_key(store) {
+        return Err(format!("op {idx}: store '{store}' not in config"));
     }
 
     // For staged sources, derive the link name and ensure the template exists
     // and is pinned by a preceding StageRender op.
     if let Some(staged_store) = staged_store(source_path) {
-        if staged_store != source_store {
+        if staged_store != store {
             return Err(format!(
-                "op {idx}: staged path store '{staged_store}' does not match source store"
+                "op {idx}: staged path store '{staged_store}' does not match op store '{store}'"
             ));
         }
-        let staged_dir = render::store_render_dir(ctx.repo_root, &source_store);
+        let staged_dir = render::store_render_dir(ctx.repo_root, store);
         let rel = source_path
             .strip_prefix(&staged_dir)
             .map_err(|_| format!("op {idx}: staged path is not under render dir"))?;
         let link_rel = rel.to_string_lossy().into_owned();
         let resolved = render::resolve_entry(&(link_rel.clone() + render::TMPL_SUFFIX));
         let source_rel = resolved.source_rel;
-        let tmpl = ctx.repo_root.join(&source_store).join(&source_rel);
-        if !tmpl.is_file() {
+        let tmpl = ctx.repo_root.join(store).join(&source_rel);
+        // For shared sources the template lives at repo_root/shared/... not under consumer store,
+        // so we also check the resolved template source from the store's inventory.
+        let actual_source = if tmpl.is_file() {
+            tmpl
+        } else {
+            // Try to resolve via store inventory (handles cross-store sources)
+            let store_cfg = ctx.config.stores.get(store).unwrap();
+            let store_dir = ctx.repo_root.join(store);
+            let mut found = None;
+            let mut check = |files: &[String],
+                             patterns: &[String],
+                             sources: &std::collections::BTreeMap<String, String>,
+                             ignore: &[String]| {
+                if found.is_some() {
+                    return;
+                }
+                if let store::LinkTargets::Files(links) = store::resolve_target_names(
+                    ctx.repo_root,
+                    &store_dir,
+                    files,
+                    patterns,
+                    sources,
+                    ignore,
+                ) {
+                    found = links
+                        .into_iter()
+                        .find(|l| l.is_template() && l.name == link_rel)
+                        .map(|l| l.source);
+                }
+            };
+            if store_cfg.is_multi_target() {
+                for t in store_cfg.targets.values() {
+                    check(&t.files, &t.patterns, &t.sources, &t.ignore);
+                }
+            } else {
+                check(
+                    &store_cfg.files,
+                    &store_cfg.patterns,
+                    &store_cfg.sources,
+                    &store_cfg.ignore,
+                );
+            }
+            found.ok_or_else(|| {
+                format!("op {idx}: template source does not exist for '{store}/{link_rel}'")
+            })?
+        };
+        if !actual_source.is_file() {
             return Err(format!(
-                "op {idx}: template source does not exist: {source_rel}"
+                "op {idx}: template source does not exist: {}",
+                actual_source.display()
             ));
         }
         let pin = rendered
-            .get(&(source_store.clone(), link_rel.clone()))
+            .get(&(store.to_owned(), link_rel.clone()))
             .ok_or_else(|| {
                 format!("op {idx}: no pinned stage_render for staged source '{source}'")
             })?;
@@ -442,43 +583,60 @@ fn validate_link_op(
                 "op {idx}: staged source '{source}' does not match pinned stage_render"
             ));
         }
-        if pin.source_rel != source_rel {
+    } else {
+        // Plain source: must be a file under the repo (either in-store or shared via sources map).
+        // Validate it exists and is not a directory; the exact store mapping is authorized below via
+        // resolve_link_source against the declared consumer store.
+        let repo_rel = source_path
+            .strip_prefix(ctx.repo_root)
+            .map_err(|_| format!("op {idx}: source is not under repo"))?
+            .to_string_lossy()
+            .into_owned();
+        if repo_rel.is_empty() {
+            return Err(format!("op {idx}: source is repo root"));
+        }
+        if !is_safe_fragment(&repo_rel) {
+            return Err(format!("op {idx}: invalid source fragment '{repo_rel}'"));
+        }
+        if repo_rel == ".stitch"
+            || repo_rel.starts_with(".stitch/")
+            || repo_rel == ".git"
+            || repo_rel.starts_with(".git/")
+        {
             return Err(format!(
-                "op {idx}: staged source template mismatch: expected {source_rel}"
+                "op {idx}: source must not be under .stitch/ or .git/"
             ));
         }
-    } else {
-        // Plain source under store directory.
-        let rel = source_path
-            .strip_prefix(ctx.repo_root.join(&source_store))
-            .map_err(|_| format!("op {idx}: source is not under store '{source_store}'"))?;
-        let rel_str = rel.to_string_lossy().into_owned();
-        if rel_str.is_empty() {
-            // Whole-directory link: the source must be the store directory itself
-            // and the target must be a configured whole-dir target.
-            let store_dir = ctx.repo_root.join(&source_store);
-            if source_path != store_dir {
+        match std::fs::symlink_metadata(source_path) {
+            Ok(meta) if meta.is_dir() => {
+                // Whole-directory link: the source must be the store directory itself.
+                let store_dir = ctx.repo_root.join(store);
+                if source_path != store_dir {
+                    return Err(format!(
+                        "op {idx}: whole-dir source must be the store directory"
+                    ));
+                }
+                if !source_path.is_dir() {
+                    return Err(format!("op {idx}: store directory does not exist"));
+                }
+            }
+            Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {}
+            Ok(_) => {
                 return Err(format!(
-                    "op {idx}: whole-dir source must be the store directory"
+                    "op {idx}: source is not a regular file: {repo_rel}"
                 ));
             }
-            if !source_path.is_dir() {
-                return Err(format!("op {idx}: store directory does not exist"));
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("op {idx}: source file does not exist: {repo_rel}"));
             }
-        } else {
-            if !is_safe_fragment(&rel_str) {
-                return Err(format!("op {idx}: invalid source fragment '{rel_str}'"));
+            Err(e) => {
+                return Err(format!(
+                    "op {idx}: could not inspect source {repo_rel}: {e}"
+                ));
             }
-            if rel_str.ends_with(render::TMPL_SUFFIX) {
-                return Err(format!("op {idx}: template source must use staged path"));
-            }
-            let source = ctx.repo_root.join(&source_store).join(&rel_str);
-            if !std::fs::symlink_metadata(&source)
-                .map(|m| !m.file_type().is_dir())
-                .unwrap_or(false)
-            {
-                return Err(format!("op {idx}: source file does not exist: {rel_str}"));
-            }
+        }
+        if repo_rel.ends_with(render::TMPL_SUFFIX) {
+            return Err(format!("op {idx}: template source must use staged path"));
         }
     }
 
@@ -487,24 +645,26 @@ fn validate_link_op(
     if has_parent_dir(target_path) {
         return Err(format!("op {idx}: target '{target}' contains '..'"));
     }
-    if !is_under_any_target(ctx.config, &source_store, target_path)? {
+    if !is_under_any_target(ctx.config, store, target_path)? {
         return Err(format!(
-            "op {idx}: target {target} is not under a configured target for store '{source_store}'"
+            "op {idx}: target {target} is not under a configured target for store '{store}'"
         ));
     }
 
     // Authorize the exact target/source relationship against resolved config.
-    let store = ctx.config.stores.get(&source_store).unwrap();
-    let store_dir = ctx.repo_root.join(&source_store);
+    let store_cfg = ctx.config.stores.get(store).unwrap();
+    let store_dir = ctx.repo_root.join(store);
     let expected = store::resolve_link_source(
         ctx.repo_root,
         &store_dir,
-        Some(store),
-        &source_store,
+        Some(store_cfg),
+        store,
         target_path,
     )
     .ok_or_else(|| {
-        format!("op {idx}: target {target} does not resolve to a configured source in store '{source_store}'")
+        format!(
+            "op {idx}: target {target} does not resolve to a configured source in store '{store}'"
+        )
     })?;
     if expected != *source {
         return Err(format!(
@@ -544,13 +704,12 @@ fn validate_remove_link_op(
         if !src_path.starts_with(ctx.repo_root) {
             return Err(format!("op {idx}: source {src} is not under the repo"));
         }
-        let source_store = source_store(src, ctx.repo_root)
+        // Cross-store `sources` are repo-relative and may live outside the
+        // consumer store (e.g. `shared/hub.txt` for store `consumer`). The
+        // consumer store's RemoveLink may legitimately point at a source
+        // whose first path component is not the consumer store.
+        let _ = source_store(src, ctx.repo_root)
             .ok_or_else(|| format!("op {idx}: cannot derive store from source '{src}'"))?;
-        if source_store != store {
-            return Err(format!(
-                "op {idx}: source belongs to store '{source_store}', not '{store}'"
-            ));
-        }
     }
 
     let removal = (

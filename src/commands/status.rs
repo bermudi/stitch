@@ -6,6 +6,14 @@ use crate::platform::Platform;
 use crate::report;
 use crate::store;
 
+/// Final path component of a link target, lossily.
+fn link_name_of(target: &std::path::Path) -> String {
+    target
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 pub(crate) fn cmd_status(
     root: &std::path::Path,
     name: &Option<String>,
@@ -79,11 +87,17 @@ pub(crate) fn cmd_status(
             }
         };
 
-        let source_name = entry
-            .source
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let source_name = if entry.from_sources {
+            // v0.14 marker: `AGENTS.md ← agents/AGENTS.md` so shared files are
+            // visible in the plain-text tree, not only in JSON.
+            format!("{} ← {}", link_name_of(&entry.target), entry.source_name)
+        } else {
+            entry
+                .source
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
 
         if source_name.is_empty() {
             println!(

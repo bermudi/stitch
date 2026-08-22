@@ -191,6 +191,7 @@ fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<()
             patterns,
             file,
             to,
+            source,
             dry_run,
         } => {
             let root = match resolve_root(repo) {
@@ -203,15 +204,17 @@ fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<()
             };
             if paths.len() > 1 {
                 // Bulk add: multiple paths, simple adds only. Per-store flags
-                // (--name, --files, --patterns, --file, --to) are rejected.
+                // (--name, --files, --patterns, --file, --to, --source) are
+                // rejected.
                 if name.is_some()
                     || !files.is_empty()
                     || !patterns.is_empty()
                     || file
                     || to.is_some()
+                    || source.is_some()
                 {
                     let error = StitchError::usage(
-                        "--name, --files, --patterns, --file, and --to are not supported with multiple paths (bulk mode)",
+                        "--name, --files, --patterns, --file, --to, and --source are not supported with multiple paths (bulk mode)",
                     );
                     if json {
                         crate::audit::append_command_result(&root, "add", Err(&error));
@@ -223,6 +226,25 @@ fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<()
                 return add::cmd_add_bulk(&root, &paths, dry_run, json);
             }
             let path = &paths[0];
+            if let Some(source_ref) = source.as_deref() {
+                if name.is_some()
+                    || !files.is_empty()
+                    || !patterns.is_empty()
+                    || file
+                    || to.is_some()
+                {
+                    let error = StitchError::usage(
+                        "--source cannot be combined with --name, --files, --patterns, --file, or --to",
+                    );
+                    if json {
+                        crate::audit::append_command_result(&root, "add", Err(&error));
+                        report::write_error("add", &error, Vec::new());
+                        std::process::exit(error.exit_code());
+                    }
+                    return Err(error);
+                }
+                return add::cmd_add_source(&root, path, source_ref, dry_run, json);
+            }
             if json {
                 return add::cmd_add_json(
                     &root,
@@ -247,9 +269,13 @@ fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<()
                 json,
             )
         }
-        cli::Commands::Remove { name, dry_run } => {
+        cli::Commands::Remove {
+            name,
+            dry_run,
+            force,
+        } => {
             let root = resolve_root(repo)?;
-            remove::cmd_remove(&root, &name, dry_run, json)
+            remove::cmd_remove(&root, &name, dry_run, force, json)
         }
         cli::Commands::Edit { entry, print_path } => {
             if json {

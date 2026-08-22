@@ -2019,3 +2019,87 @@ target = "{target_str}"
     assert_eq!(entry["store"].as_str(), Some("nvim"));
     assert_eq!(entry["state"].as_str(), Some("foreign"));
 }
+
+#[test]
+fn apply_multi_target_canonical_equivalent_symlinked_home_union() {
+    // Regression for "canonical-equivalent targets with disjoint files sweep each other".
+    // With a symlinked $HOME, "~/out" and "/realhome/out" resolve to the same physical
+    // directory. Two file-mode targets inside one store that share that directory but list
+    // disjoint files must union their keep-sets and sweep once; otherwise each sweep deletes
+    // the other's live link.
+    let tmp = tempfile::tempdir().unwrap();
+    let real_home = tmp.path().join("real_home");
+    let home_link = tmp.path().join("home_link");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&real_home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    std::os::unix::fs::symlink(&real_home, &home_link).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("init")
+        .assert()
+        .success();
+
+    let store_dir = repo.join("app");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(store_dir.join("a"), "a").unwrap();
+    fs::write(store_dir.join("b"), "b").unwrap();
+
+    let real_out = real_home.join("out");
+    fs::write(
+        repo.join(".stitch").join("state.toml"),
+        format!(
+            "[stores.app.targets.t1]\ntarget = \"~/out\"\nfiles = [\"a\"]\n\n[stores.app.targets.t2]\ntarget = \"{}\"\nfiles = [\"b\"]\n",
+            real_out.display()
+        ),
+    )
+    .unwrap();
+
+    // First apply must create both links and remove none.
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("create:"))
+        .stdout(contains("remove:").not());
+
+    let a = real_home.join("out").join("a");
+    let b = real_home.join("out").join("b");
+    assert!(a.is_symlink(), "a must be linked after first apply");
+    assert!(b.is_symlink(), "b must be linked after first apply");
+    assert_eq!(
+        fs::read_link(&a).unwrap(),
+        store_dir.join("a").canonicalize().unwrap()
+    );
+    assert_eq!(
+        fs::read_link(&b).unwrap(),
+        store_dir.join("b").canonicalize().unwrap()
+    );
+
+    // Second apply must be idempotent (no create, no remove) and diff must be clean.
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("ok"));
+
+    assert!(a.is_symlink(), "a must survive second apply");
+    assert!(b.is_symlink(), "b must survive second apply");
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .args(["diff", "--exit-code"])
+        .assert()
+        .success();
+}

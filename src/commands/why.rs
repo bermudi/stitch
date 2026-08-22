@@ -1,4 +1,5 @@
 use super::common::print_warnings;
+use crate::commands::add::paths_equal;
 use crate::config::{self, Config};
 use crate::error::StitchError;
 use crate::linker::LinkStatus;
@@ -13,10 +14,10 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
     }
     let platform = Platform::detect();
 
-    // Expand the query path the same way config targets are expanded, so a
-    // user can pass `~/.bashrc` and match a target stored as `~/.bashrc`.
-    let query_path = config::expand_home(query)
+    let query_expanded = config::expand_home(query)
         .map_err(|e| StitchError::usage(format!("invalid target path: {e}")))?;
+    let repo_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let query_path = query_expanded.clone();
     let query_canonical = canonicalize_or_path(&query_path);
 
     // Run status_all and find the entry whose target matches the query.
@@ -104,12 +105,103 @@ pub(crate) fn cmd_why(root: &std::path::Path, query: &str, json: bool) -> Result
         }
     }
 
+    // Reverse lookup (v0.14): if no target matched but the query resolves
+    // inside the repo, treat it as a *source* file and answer "consumed by".
+    // This is the fan-in visibility query: "if I edit the hub, what changes".
+    // Check after target matching so a target that lives inside the repo
+    // (as in tests where HOME == repo) is correctly identified as a target,
+    // not a source. In real usage HOME is outside the repo, so targets are
+    // never inside the repo and the ordering does not matter.
+    if matched.is_none() && !skipped_platform {
+        let is_repo_relative = !query.starts_with('/') && !query.starts_with('~');
+        let query_in_repo = if is_repo_relative {
+            crate::linker::resolve_path_with_missing(&root.join(query))
+                .or_else(|| std::fs::canonicalize(root.join(query)).ok())
+                .is_some_and(|resolved| resolved.starts_with(&repo_canon) && resolved != repo_canon)
+        } else {
+            std::fs::canonicalize(&query_expanded)
+                .ok()
+                .or_else(|| crate::linker::resolve_path_with_missing(&query_expanded))
+                .is_some_and(|resolved| resolved.starts_with(&repo_canon) && resolved != repo_canon)
+        };
+        if query_in_repo {
+            let source = if is_repo_relative {
+                crate::linker::resolve_path_with_missing(&root.join(query))
+                    .or_else(|| std::fs::canonicalize(root.join(query)).ok())
+                    .expect("query_in_repo checked resolvability")
+            } else {
+                std::fs::canonicalize(&query_expanded)
+                    .ok()
+                    .or_else(|| crate::linker::resolve_path_with_missing(&query_expanded))
+                    .expect("query_in_repo checked resolvability")
+            };
+            // Harden repo-relative queries: the repo-relative form must be a
+            // safe fragment (no `..`, no leading `/`, no bare `.`). A traversal
+            // like `shared/../shared/hub.txt` resolves inside the repo but is
+            // not a valid source spelling, so it should not be treated as a
+            // reverse lookup.
+            let rel = source
+                .strip_prefix(&repo_canon)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if (is_repo_relative && !config::is_safe_fragment(query))
+                || !config::is_safe_fragment(&rel)
+            {
+                // Fall through to target lookup (which will report no owner)
+            } else {
+                let consumers: Vec<report::WhyConsumer> = entries
+                    .iter()
+                    .filter(|e| !e.skipped_platform && paths_equal(&e.source, &source))
+                    .map(|e| report::WhyConsumer {
+                        store: e.store_name.clone(),
+                        target_name: e.target_name.clone(),
+                        name: if e.link_name.is_empty() {
+                            e.target
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        } else {
+                            e.link_name.clone()
+                        },
+                        target: e.target.to_string_lossy().into_owned(),
+                    })
+                    .collect();
+                let data = WhyData {
+                    query: query.to_string(),
+                    entry: None,
+                    skipped_platform: false,
+                    consumers: Some(consumers),
+                };
+                if json {
+                    report::write("why", data, loaded.warnings);
+                    return Ok(());
+                }
+                println!("query: {}", data.query);
+                match &data.consumers {
+                    Some(c) if c.is_empty() => println!("not consumed by any store entry"),
+                    Some(c) => {
+                        println!("consumed by:");
+                        for cons in c {
+                            match &cons.target_name {
+                                Some(t) => println!("  {}:{} → {}", cons.store, t, cons.target),
+                                None => println!("  {} → {}", cons.store, cons.target),
+                            }
+                        }
+                    }
+                    None => println!("not consumed by any store entry"),
+                }
+                return Ok(());
+            }
+        }
+    }
+
     let entry = matched.map(|e| build_why_entry(e, matched_subpath.as_deref()));
 
     let data = WhyData {
         query: query.to_string(),
         entry,
         skipped_platform,
+        consumers: None,
     };
 
     if json {
@@ -289,7 +381,9 @@ mod tests {
             target: PathBuf::from("/home/.bashrc"),
             status,
             skipped_platform: false,
-            is_template: true,            source_name: String::new(),
+            is_template: true,
+            source_name: String::new(),
+            link_name: ".bashrc".to_string(),
             from_sources: false,
         };
         build_why_entry(&entry, None)
@@ -439,7 +533,9 @@ mod tests {
             target: PathBuf::from("/home/.config"),
             status: LinkStatus::Linked,
             skipped_platform: false,
-            is_template: false,            source_name: String::new(),
+            is_template: false,
+            source_name: String::new(),
+            link_name: String::new(),
             from_sources: false,
         };
         let e = build_why_entry(&entry, Some(Path::new("init.lua")));

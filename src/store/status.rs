@@ -28,6 +28,9 @@ pub struct StatusEntry {
     /// for `sources` entries) — the `source_rel` render errors and staging
     /// lookups use.
     pub source_name: String,
+    /// Link name under the target directory (e.g. "nested/alias" for a nested
+    /// source). Used by `why` consumers to report the exact link name.
+    pub link_name: String,
     /// True when this entry is backed by a `.tmpl` (link points at staging).
     pub is_template: bool,
     /// True when the entry comes from a `sources` declaration (v0.14): the
@@ -51,6 +54,7 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                 source: PathBuf::new(),
                 link_source: PathBuf::new(),
                 source_name: String::new(),
+                link_name: String::new(),
                 is_template: false,
                 from_sources: false,
                 target: PathBuf::new(),
@@ -79,6 +83,7 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                         source: store_dir.clone(),
                         link_source: store_dir.clone(),
                         source_name: String::new(),
+                        link_name: String::new(),
                         is_template: false,
                         from_sources: false,
                         target: target_path,
@@ -95,6 +100,7 @@ pub fn status_all(repo_root: &Path, config: &Config, platform: &Platform) -> Vec
                     source: store_dir.clone(),
                     link_source: store_dir.clone(),
                     source_name: String::new(),
+                    link_name: String::new(),
                     is_template: false,
                     from_sources: false,
                     target: target_path,
@@ -167,6 +173,7 @@ fn collect_statuses(
                 source: store_dir.to_path_buf(),
                 link_source: store_dir.to_path_buf(),
                 source_name: String::new(),
+                link_name: String::new(),
                 target: target_path.to_path_buf(),
                 status: LinkStatus::ConfigError(msg),
                 skipped_platform: false,
@@ -181,6 +188,7 @@ fn collect_statuses(
                 source: store_dir.to_path_buf(),
                 link_source: store_dir.to_path_buf(),
                 source_name: String::new(),
+                link_name: String::new(),
                 target: target_path.to_path_buf(),
                 status: linker::check_link(target_path, store_dir, repo_root),
                 skipped_platform: false,
@@ -217,6 +225,7 @@ fn collect_statuses(
                             source: store_dir.to_path_buf(),
                             link_source: store_dir.to_path_buf(),
                             source_name: String::new(),
+                            link_name: String::new(),
                             target: target_path.to_path_buf(),
                             status: linker::LinkStatus::Foreign(resolves_to),
                             skipped_platform: false,
@@ -233,6 +242,7 @@ fn collect_statuses(
                         source: store_dir.to_path_buf(),
                         link_source: store_dir.to_path_buf(),
                         source_name: String::new(),
+                        link_name: String::new(),
                         target: target_path.to_path_buf(),
                         status: linker::LinkStatus::Conflict(target_path.to_path_buf()),
                         skipped_platform: false,
@@ -242,13 +252,9 @@ fn collect_statuses(
                     return entries;
                 }
             }
-            entries.extend(links.iter().map(|link| status_entry_for_link(
-                repo_root,
-                name,
-                target_name,
-                link,
-                target_path,
-            )));
+            entries.extend(links.iter().map(|link| {
+                status_entry_for_link(repo_root, name, target_name, link, target_path)
+            }));
         }
     }
     entries
@@ -278,6 +284,7 @@ fn status_entry_for_link(
         source: link.source.clone(),
         link_source,
         source_name: link.source_rel.clone(),
+        link_name: link.name.clone(),
         is_template,
         from_sources: link.from_sources,
         target,

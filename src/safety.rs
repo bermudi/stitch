@@ -422,7 +422,8 @@ fn check_target_inventory(
     }
 
     // Resolve source names and check for collisions.
-    let targets = store::resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore);
+    let targets =
+        store::resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore);
     if let LinkTargets::Files(links) = targets
         && let Err(msg) = store::check_link_name_collisions(&links)
     {

@@ -128,7 +128,8 @@ fn explain_store(
             &store.sources,
             &store.ignore,
         );
-        let has_files = !store.files.is_empty() || !store.patterns.is_empty() || !store.sources.is_empty();
+        let has_files =
+            !store.files.is_empty() || !store.patterns.is_empty() || !store.sources.is_empty();
         // Derive mode from the resolved entries, not just the config fields.
         // `resolve_target_names` can promote a store to file-mode when it
         // contains templates or ignored entries even if `files`/`patterns`
@@ -283,7 +284,14 @@ mod tests {
         let tmp = tempdir().unwrap();
         let store_dir = tmp.path().join("empty");
         std::fs::create_dir_all(&store_dir).unwrap();
-        let entries = resolve_entries(tmp.path(), &store_dir, &[], &[], &std::collections::BTreeMap::new(), &[]);
+        let entries = resolve_entries(
+            tmp.path(),
+            &store_dir,
+            &[],
+            &[],
+            &std::collections::BTreeMap::new(),
+            &[],
+        );
         assert!(entries.is_empty());
     }
 
@@ -293,7 +301,14 @@ mod tests {
         let store_dir = tmp.path().join("tmpl");
         std::fs::create_dir_all(&store_dir).unwrap();
         std::fs::write(store_dir.join("gitconfig.tmpl"), "host={{ hostname }}\n").unwrap();
-        let entries = resolve_entries(tmp.path(), &store_dir, &["gitconfig.tmpl".into()], &[], &std::collections::BTreeMap::new(), &[]);
+        let entries = resolve_entries(
+            tmp.path(),
+            &store_dir,
+            &["gitconfig.tmpl".into()],
+            &[],
+            &std::collections::BTreeMap::new(),
+            &[],
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source, "gitconfig.tmpl");
         assert_eq!(entries[0].link_name, "gitconfig");
@@ -306,7 +321,14 @@ mod tests {
         let store_dir = tmp.path().join("plain");
         std::fs::create_dir_all(&store_dir).unwrap();
         std::fs::write(store_dir.join("foo.conf"), "x").unwrap();
-        let entries = resolve_entries(tmp.path(), &store_dir, &[], &["*".into()], &std::collections::BTreeMap::new(), &[]);
+        let entries = resolve_entries(
+            tmp.path(),
+            &store_dir,
+            &[],
+            &["*".into()],
+            &std::collections::BTreeMap::new(),
+            &[],
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source, "foo.conf");
         assert_eq!(entries[0].link_name, "foo.conf");

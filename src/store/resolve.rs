@@ -163,7 +163,8 @@ pub(super) fn resolve_targets(
             path.display()
         ));
     }
-    let targets = resolve_target_names(repo_root, store_dir, files, patterns, sources, store_ignore);
+    let targets =
+        resolve_target_names(repo_root, store_dir, files, patterns, sources, store_ignore);
     if let LinkTargets::Files(ref links) = targets {
         check_link_name_collisions(links)?;
     }
@@ -265,13 +266,19 @@ pub(crate) fn resolve_target_names(
             // Promote: expand to every non-ignored file (full tree), so nested
             // `.tmpl` files become individual links rather than riding inside a
             // whole-dir symlink as literal `.tmpl` sources.
-            let mut links = file_links(store_dir, &resolve_files(store_dir, &[], &["**/*".into(), "*".into()], &ignore));
+            let mut links = file_links(
+                store_dir,
+                &resolve_files(store_dir, &[], &["**/*".into(), "*".into()], &ignore),
+            );
             apply_sources(repo_root, &mut links, sources);
             return LinkTargets::Files(links);
         }
         return LinkTargets::WholeDir;
     }
-    let mut links = file_links(store_dir, &resolve_files(store_dir, files, patterns, &ignore));
+    let mut links = file_links(
+        store_dir,
+        &resolve_files(store_dir, files, patterns, &ignore),
+    );
     apply_sources(repo_root, &mut links, sources);
     LinkTargets::Files(links)
 }
@@ -297,11 +304,7 @@ fn file_links(store_dir: &Path, names: &[String]) -> Vec<FileLink> {
 /// Append `sources` entries to a resolved in-store name list, converting each
 /// to a [`FileLink`] rooted at the repo. Keys keep their literal spelling (the
 /// link name); template-ness comes from the source's `.tmpl` suffix.
-fn apply_sources(
-    repo_root: &Path,
-    links: &mut Vec<FileLink>,
-    sources: &BTreeMap<String, String>,
-) {
+fn apply_sources(repo_root: &Path, links: &mut Vec<FileLink>, sources: &BTreeMap<String, String>) {
     for (key, value) in sources {
         links.push(FileLink {
             name: key.clone(),
@@ -324,7 +327,7 @@ pub(crate) fn check_link_name_collisions(links: &[FileLink]) -> Result<(), Strin
     for link in links {
         by_name.entry(link.name.as_str()).or_default().push(link);
     }
-    for (name, claims) in by_name {
+    for (name, claims) in &by_name {
         if claims.len() > 1 {
             let sources: Vec<String> = claims
                 .iter()
@@ -334,6 +337,24 @@ pub(crate) fn check_link_name_collisions(links: &[FileLink]) -> Result<(), Strin
                 "name collision for '{name}': {} — remove or rename one",
                 sources.join(", ")
             ));
+        }
+    }
+    // Ancestor/descendant: `foo` and `foo/bar` would require a file and a
+    // directory at the same path. Reject before any mutation so apply does
+    // not partially create `foo` then fail on `foo/bar`.
+    let mut names: Vec<&str> = by_name.keys().copied().collect();
+    names.sort();
+    for i in 0..names.len() {
+        for j in (i + 1)..names.len() {
+            let a = names[i];
+            let b = names[j];
+            if b.starts_with(&format!("{a}/")) {
+                let a_src = by_name[a][0].source.display().to_string();
+                let b_src = by_name[b][0].source.display().to_string();
+                return Err(format!(
+                    "ancestor collision for '{a}' and '{b}': {a_src} and {b_src} — one is ancestor of the other, rename one"
+                ));
+            }
         }
     }
     Ok(())
@@ -530,7 +551,10 @@ pub(crate) fn check_link_path_collisions(
             if !WhenClause::are_compatible(&combined) {
                 continue;
             }
-            if a.path == b.path || a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
+            let a_canon = crate::config::canonical_target_for_comparison(&a.path);
+            let b_canon = crate::config::canonical_target_for_comparison(&b.path);
+            if a_canon == b_canon || a_canon.starts_with(&b_canon) || b_canon.starts_with(&a_canon)
+            {
                 return Err(ConfigError::Conflict(link_collision_message(
                     &a.store,
                     a.tname.as_deref(),
@@ -712,6 +736,10 @@ pub(crate) fn resolve_link_source(
     target: &Path,
 ) -> Option<String> {
     let store_config = store?;
+    let platform = crate::platform::Platform::detect();
+    if !platform.matches_when(&store_config.when) {
+        return None;
+    }
 
     // A single-target store carries its inventory on Store itself.
     if !store_config.is_multi_target()
@@ -735,6 +763,9 @@ pub(crate) fn resolve_link_source(
     // each TargetEntry. A target path must be resolved with the entry that
     // owns it, not with the store-level (usually empty) lists.
     for target_entry in store_config.targets.values() {
+        if !platform.matches_when(&target_entry.when) {
+            continue;
+        }
         if let Some(source) = resolve_link_source_for_target(
             repo_root,
             store_dir,

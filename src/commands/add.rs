@@ -7,6 +7,423 @@ use crate::platform::Platform;
 use crate::render;
 use crate::report;
 use crate::safety;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// `stitch add <target-path> --source <repo-relative>`: register the target
+/// path with an explicit source — the fan-in flow (one file, many names,
+/// many homes). Nothing is moved or copied; the target path must be absent or
+/// already a link into this repo. Also used for adopt-a-link (`add` on an
+/// existing repo-pointing symlink without `--source`), where the source is
+/// the link's resolution.
+pub(crate) fn cmd_add_source(
+    root: &std::path::Path,
+    path: &str,
+    source: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), StitchError> {
+    let _state_lock = if dry_run {
+        None
+    } else {
+        Some(config::StateLock::exclusive(root).map_err(StitchError::from)?)
+    };
+    let mut loaded = config::ConfigSnapshot::load(root)?.loaded;
+    if !json {
+        print_warnings(&loaded);
+    }
+
+    let expanded =
+        expand_home(path).map_err(|e| StitchError::usage(format!("invalid target path: {e}")))?;
+    let raw_target = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map_err(|e| StitchError::io_context("getting current working directory", e))?
+            .join(expanded)
+    };
+    let target_path = if raw_target
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        crate::linker::resolve_ancestors_with_missing(&raw_target).ok_or_else(|| {
+            StitchError::internal(format!(
+                "could not resolve {} through symlinks — refusing to guess at the path",
+                raw_target.display()
+            ))
+        })?
+    } else {
+        lexically_normalize(&raw_target)
+    };
+
+    // Which store/target owns the target directory? The store whose target
+    // is the longest ancestor of the path. Nested targets are rejected at
+    // load, so the deepest match is unambiguous. Only active targets on this
+    // host can own a path — an inactive target must not shadow an active one.
+    let platform = Platform::detect();
+    let mut owner: Option<(String, Option<String>, PathBuf)> = None; // (store, tname, target_dir)
+    for (store_name, store) in &loaded.config.stores {
+        if !platform.matches_when(&store.when) {
+            continue;
+        }
+        let candidates: Box<dyn Iterator<Item = (&str, &str)>> = if store.is_multi_target() {
+            Box::new(store.targets.iter().filter_map(|(tn, te)| {
+                if platform.matches_when(&te.when) {
+                    Some((te.target.as_str(), tn.as_str()))
+                } else {
+                    None
+                }
+            }))
+        } else {
+            Box::new(store.target.iter().map(|t| (t.as_str(), "")))
+        };
+        for (target_str, tname) in candidates {
+            let Ok(dir) = expand_home(target_str) else {
+                continue;
+            };
+            if target_path.strip_prefix(&dir).is_err() || target_path == dir {
+                continue;
+            }
+            let better = owner.as_ref().is_none_or(|(_, _, existing)| {
+                dir.components().count() > existing.components().count()
+            });
+            if better {
+                owner = Some((
+                    store_name.clone(),
+                    (!tname.is_empty()).then(|| tname.to_string()),
+                    dir,
+                ));
+            }
+        }
+    }
+    let Some((store_name, tname, target_dir)) = owner else {
+        return Err(StitchError::usage(format!(
+            "{} is not inside any store's target directory; `add --source` registers an entry \
+             on the store that owns the target directory — add that store first",
+            target_path.display()
+        )));
+    };
+    // Reject symlinked target ancestors (foreign gateway) before writing state.
+    // An absent path beneath a symlinked ancestor would be saved successfully
+    // but apply would later fail, so reject early. A symlinked $HOME itself
+    // is allowed (supported setup) — only ancestors *inside* HOME are checked.
+    {
+        let home = config::expand_home("~")?;
+        for ancestor in target_path.ancestors().skip(1) {
+            if ancestor == home {
+                continue;
+            }
+            if !ancestor.starts_with(&home) {
+                break;
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(ancestor)
+                && meta.file_type().is_symlink()
+            {
+                return Err(StitchError::path_validation(format!(
+                    "target ancestor {} is a symlink; refusing to add source under it",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    // Ambiguous ownership: two active stores/targets sharing the same target
+    // directory would silently pick the first. Detect ties and reject.
+    // Includes same-store ties (two named targets in one store claiming the
+    // same directory) as well as cross-store ties.
+    {
+        let owner_dir = &target_dir;
+        let owner_store = &store_name;
+        let owner_tname = tname.clone();
+        for (other_store, other_cfg) in &loaded.config.stores {
+            if !platform.matches_when(&other_cfg.when) {
+                continue;
+            }
+            let candidates: Vec<(String, Option<String>)> = if other_cfg.is_multi_target() {
+                other_cfg
+                    .targets
+                    .iter()
+                    .filter_map(|(tn, te)| {
+                        if platform.matches_when(&te.when) {
+                            Some((te.target.clone(), Some(tn.clone())))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                other_cfg.target.iter().map(|t| (t.clone(), None)).collect()
+            };
+            for (target_str, cand_tname) in candidates {
+                if other_store == owner_store && cand_tname == owner_tname {
+                    continue;
+                }
+                if let Ok(dir) = config::expand_home(&target_str)
+                    && dir == *owner_dir
+                    && target_path.strip_prefix(&dir).is_ok()
+                {
+                    let owner_label = match &owner_tname {
+                        Some(t) => format!("store '{owner_store}' target '{t}'"),
+                        None => format!("store '{owner_store}'"),
+                    };
+                    let other_label = match &cand_tname {
+                        Some(t) => format!("store '{other_store}' target '{t}'"),
+                        None => format!("store '{other_store}'"),
+                    };
+                    return Err(StitchError::path_validation(format!(
+                        "ambiguous target ownership: both {owner_label} and {other_label} claim {}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+    }
+    let rel = target_path
+        .strip_prefix(&target_dir)
+        .expect("owner check used strip_prefix")
+        .to_string_lossy()
+        .into_owned();
+
+    // The source must be a safe repo-relative fragment.
+    if !config::is_safe_fragment(source) {
+        return Err(StitchError::path_validation(format!(
+            "invalid source '{source}': sources must be repo-relative paths with no '.', '..' or leading '/'"
+        )));
+    }
+    // Check normalized form so "./.stitch/..." cannot bypass the protected-path check.
+    let normalized_source = {
+        let mut p = PathBuf::new();
+        for c in Path::new(source).components() {
+            if let Component::Normal(part) = c {
+                p.push(part);
+            }
+        }
+        p.to_string_lossy().into_owned()
+    };
+    if normalized_source == ".stitch"
+        || normalized_source.starts_with(".stitch/")
+        || normalized_source == ".git"
+        || normalized_source.starts_with(".git/")
+    {
+        return Err(StitchError::path_validation(format!(
+            "invalid source '{source}': sources must not live under .stitch/ or .git/"
+        )));
+    }
+    let source_path = root.join(source);
+    // One hop only: the source itself must not be a symlink, nor reached
+    // through one (same rule as load-time validation).
+    {
+        let mut current = root.to_path_buf();
+        for component in Path::new(source).components() {
+            let std::path::Component::Normal(part) = component else {
+                continue;
+            };
+            current.push(part);
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(StitchError::path_validation(format!(
+                        "invalid source '{source}': a source must be a real repo file, not a \
+                         symlink or a path through one (one hop only)"
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(StitchError::usage(format!(
+                        "source '{source}' does not exist in the repo"
+                    )));
+                }
+                Err(e) => {
+                    return Err(StitchError::io_context(
+                        format!("inspecting source {}", current.display()),
+                        e,
+                    ));
+                }
+            }
+        }
+    }
+    if std::fs::symlink_metadata(&source_path).is_ok_and(|m| m.is_dir()) {
+        return Err(StitchError::usage(format!(
+            "source '{source}' is a directory; `add --source` links one file (whole-dir stores \
+             cannot declare sources)"
+        )));
+    }
+
+    // The target path must be absent or already a link into this repo —
+    // sources never override the foreign-content red line.
+    match std::fs::symlink_metadata(&target_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if !linker::points_into_repo(&target_path, root) {
+                return Err(StitchError::conflict_foreign(
+                    &target_path,
+                    std::fs::read_link(&target_path).ok(),
+                ));
+            }
+        }
+        Ok(_) => {
+            return Err(StitchError::conflict_real(&target_path));
+        }
+        Err(e) => {
+            return Err(StitchError::io_context(
+                format!("inspecting {}", target_path.display()),
+                e,
+            ));
+        }
+    }
+
+    // Whole-dir stores cannot declare sources: the entry would silently
+    // change the store's mode under the user. This applies to both
+    // single-target and named-target whole-dir stores.
+    let store = loaded.config.stores.get(&store_name).ok_or_else(|| {
+        StitchError::unknown_store(
+            vec![store_name.clone()],
+            loaded.config.stores.keys().cloned().collect(),
+        )
+    })?;
+    let is_whole_dir = match &tname {
+        Some(t) => store.targets.get(t).is_some_and(|te| {
+            te.files.is_empty() && te.patterns.is_empty() && te.sources.is_empty()
+        }),
+        None => {
+            store.target.is_some()
+                && store.files.is_empty()
+                && store.patterns.is_empty()
+                && store.sources.is_empty()
+        }
+    };
+    if is_whole_dir {
+        return Err(StitchError::usage(format!(
+            "store '{store_name}' is a whole-directory store; whole-dir stores cannot declare \
+             sources — switch the store to file mode first (or link the file under the store dir)"
+        )));
+    }
+
+    // Candidate state: insert into the owning inventory's sources map.
+    let mut candidate = loaded.generated.clone();
+    let gen_store = candidate.stores.get_mut(&store_name).ok_or_else(|| {
+        StitchError::usage(format!(
+            "store '{store_name}' has no generated inventory in state.toml"
+        ))
+    })?;
+    let inventory_sources: &mut BTreeMap<String, String> = match &tname {
+        Some(t) => {
+            let entry = gen_store.targets.get_mut(t).ok_or_else(|| {
+                StitchError::usage(format!(
+                    "store '{store_name}' has no target '{t}' in state.toml"
+                ))
+            })?;
+            &mut entry.sources
+        }
+        None => &mut gen_store.sources,
+    };
+    if let Some(existing) = inventory_sources.get(&rel)
+        && existing != source
+    {
+        return Err(StitchError::usage(format!(
+            "'{}' is already mapped to source '{existing}' on store '{store_name}'; \
+             remove the entry first to change it",
+            rel
+        )));
+    }
+    inventory_sources.insert(rel.clone(), source.to_string());
+    config::validate_merged_with_repo(&loaded.authored, &candidate, root)?;
+    // Pattern collision: a sources key colliding with a pattern-produced link
+    // would be written successfully and fail only on the next apply. Detect
+    // here by resolving the owning target's desired links and checking for
+    // link-name collisions before persisting.
+    {
+        let empty_files: Vec<String> = Vec::new();
+        let empty_sources: BTreeMap<String, String> = BTreeMap::new();
+        let authored_store = loaded.authored.stores.get(&store_name);
+        let (files, patterns, sources): (&[String], &[String], &BTreeMap<String, String>) =
+            match &tname {
+                Some(t) => {
+                    if let Some(entry) = candidate
+                        .stores
+                        .get(&store_name)
+                        .and_then(|s| s.targets.get(t))
+                    {
+                        (&entry.files, &entry.patterns, &entry.sources)
+                    } else {
+                        (&empty_files, &empty_files, &empty_sources)
+                    }
+                }
+                None => {
+                    if let Some(entry) = candidate.stores.get(&store_name) {
+                        (&entry.files, &entry.patterns, &entry.sources)
+                    } else {
+                        (&empty_files, &empty_files, &empty_sources)
+                    }
+                }
+            };
+        let ignore: &[String] = match &tname {
+            Some(t) => authored_store
+                .and_then(|a| a.targets.get(t))
+                .map(|at| at.ignore.as_slice())
+                .unwrap_or(&[]),
+            None => authored_store.map(|a| a.ignore.as_slice()).unwrap_or(&[]),
+        };
+        let store_dir = root.join(&store_name);
+        let links =
+            crate::store::resolve_target_names(root, &store_dir, files, patterns, sources, ignore);
+        if let crate::store::LinkTargets::Files(links) = links
+            && let Err(msg) = crate::store::check_link_name_collisions(&links)
+        {
+            return Err(StitchError::path_validation(msg));
+        }
+    }
+
+    let mode = "add-source".to_string();
+    let data = report::AddData {
+        store: store_name.clone(),
+        target: collapse_home(&target_dir)?,
+        mode,
+        source: Some(source.to_string()),
+        files: vec![],
+        patterns: vec![],
+        link_created: None,
+        moved_from: None,
+        state_entry: None,
+    };
+    if dry_run {
+        if json {
+            report::write("add", data, loaded.warnings);
+        } else {
+            println!("Would register on store '{store_name}':");
+            println!(
+                "  {} ← {} (linked at {})",
+                rel,
+                source,
+                target_path.display()
+            );
+            println!("  no files are moved; run `stitch apply` to create the link");
+        }
+        return Ok(());
+    }
+
+    loaded.generated = candidate;
+    loaded.generated.save(root)?;
+    let state_entry = report::state_entry_for(&loaded.generated, &store_name);
+    if json {
+        report::write(
+            "add",
+            report::AddData {
+                state_entry,
+                ..data
+            },
+            loaded.warnings,
+        );
+    } else {
+        println!(
+            "Registered '{}' ← {} on store '{}'",
+            rel, source, store_name
+        );
+        println!(
+            "  run `stitch apply` to create the link at {}",
+            target_path.display()
+        );
+    }
+    Ok(())
+}
 
 /// Bulk add: add multiple paths as simple stores in one invocation. Each path
 /// gets a store with default name derivation (no per-store flags). Validates
@@ -1091,7 +1508,7 @@ fn cmd_add_to_store(
     if !candidate_entry.files.iter().any(|file| file == relative) {
         candidate_entry.files.push(relative.to_string());
     }
-    config::validate_merged(&loaded.authored, &candidate_generated)?;
+    config::validate_merged_with_repo(&loaded.authored, &candidate_generated, root)?;
     let mut candidate_store = store.clone();
     if !candidate_store.files.iter().any(|file| file == relative) {
         candidate_store.files.push(relative.to_string());
@@ -1512,9 +1929,47 @@ pub(crate) fn cmd_add(
         lexically_normalize(&raw_source)
     };
 
-    // A symlink at the target is always an error — we never silently clobber
-    // or repoint a foreign symlink.
+    // A symlink at the target is either an error — we never silently clobber
+    // or repoint a foreign symlink — or, when it points into this repo, the
+    // adopt-a-link case: register it as a `sources` entry pointing at the
+    // link's resolution (first-class, no copy, no move).
     if source.is_symlink() {
+        if linker::points_into_repo(&source, root) {
+            let resolved = source
+                .canonicalize()
+                .or_else(|_| {
+                    std::fs::read_link(&source).map(|raw| {
+                        if raw.is_absolute() {
+                            raw
+                        } else {
+                            source
+                                .parent()
+                                .unwrap_or_else(|| std::path::Path::new("."))
+                                .join(raw)
+                        }
+                    })
+                })
+                .map_err(|e| {
+                    StitchError::io_context(format!("resolving {}", source.display()), e)
+                })?;
+            let repo_resolved = root.canonicalize().map_err(|error| {
+                StitchError::io_context(format!("resolving repository {}", root.display()), error)
+            })?;
+            let Ok(rel) = resolved.strip_prefix(&repo_resolved) else {
+                return Err(StitchError::conflict_foreign(
+                    &source,
+                    std::fs::read_link(&source).ok(),
+                ));
+            };
+            let rel_str = rel.to_string_lossy().into_owned();
+            if rel_str.is_empty() {
+                return Err(StitchError::usage(
+                    "cannot adopt the repository itself as a source",
+                ));
+            }
+            drop(_state_lock);
+            return cmd_add_source(root, path, &rel_str, dry_run, json);
+        }
         return Err(StitchError::internal(format!(
             "{} is already a symlink — add expects a real file or directory \
              (remove the symlink first if you want stitch to manage it)",
@@ -2505,6 +2960,16 @@ fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
 /// Collapse `$HOME` prefix to `~` for state.toml target strings.
 pub(crate) fn collapse_home(path: &std::path::Path) -> Result<String, ConfigError> {
     let home = config::expand_home("~")?;
+    // Use parent-canonicalized comparison so `~/out` and `/realhome/out`
+    // collapse to the same `~` form when `$HOME` is a symlink.
+    let home_canon = config::canonical_target_for_comparison(&home);
+    let path_canon = config::canonical_target_for_comparison(path);
+    if let Ok(rel) = path_canon.strip_prefix(&home_canon) {
+        if rel.as_os_str().is_empty() {
+            return Ok("~".into());
+        }
+        return Ok(format!("~/{}", rel.display()));
+    }
     if let Ok(rel) = path.strip_prefix(&home) {
         if rel.as_os_str().is_empty() {
             return Ok("~".into());

@@ -45,17 +45,18 @@ pub(crate) fn cmd_import(
     struct ImportBucket {
         /// Whole-dir target path string (with ~), if any link points at the store dir.
         whole_dir_target: Option<String>,
-        /// In-store file-mode: source relative path → target parent dir string.
-        files: std::collections::BTreeMap<String, String>,
-        /// v0.14 `sources`: link name → (repo-relative source, target parent
-        /// dir). Populated when the link's source lives outside the store that
-        /// owns the target directory — the hub fan-in / alias-symlink shape,
-        /// imported declaratively instead of fabricating a store around the
-        /// source path.
-        sources: std::collections::BTreeMap<String, (String, String)>,
-        /// When the owner store already exists in state (single-target),
-        /// entries merge into it rather than creating a new store.
-        merge_target: Option<String>,
+        /// In-store file-mode: (target parent, source relative path). Keyed by
+        /// parent so identical source names under different target directories
+        /// do not overwrite each other.
+        files: std::collections::BTreeSet<(String, String)>,
+        /// v0.14 `sources`: (target parent, link name) → repo-relative source.
+        /// Keyed by parent to allow identical alias names under different target
+        /// directories without overwriting.
+        sources: std::collections::BTreeMap<(String, String), String>,
+        /// When the owner store already exists in state, entries merge into it
+        /// rather than creating a new store. For multi-target stores there may
+        /// be multiple merge parents (one per named target).
+        merge_targets: std::collections::BTreeSet<String>,
     }
     let mut buckets: std::collections::BTreeMap<String, ImportBucket> =
         std::collections::BTreeMap::new();
@@ -66,24 +67,46 @@ pub(crate) fn cmd_import(
     // Target-directory ownership: from existing state first, then from scan
     // votes. `sources` entries are attributed to the store that owns the
     // *target directory*, per the one-store-per-directory invariant.
-    let dir_owner: std::collections::BTreeMap<std::path::PathBuf, String> =
-        loaded
-            .generated
-            .stores
-            .iter()
-            .flat_map(|(name, store)| {
-                let single = store
-                    .target
-                    .iter()
-                    .map(|t| (t.clone(), name.clone()));
-                let multi = store
-                    .targets
-                    .values()
-                    .map(|te| (te.target.clone(), name.clone()));
-                single.chain(multi)
-            })
-            .filter_map(|(target, name)| config::expand_home(&target).ok().map(|p| (p, name)))
-            .collect();
+    // Only active targets (matching platform) can own a directory for import.
+    // We keep per-target entries (not just store name) so a store with
+    // mutually-exclusive targets sharing a path does not lose the active
+    // identity when the map would dedup identical paths.
+    let platform = Platform::detect();
+    let dir_owner: Vec<(std::path::PathBuf, String, Option<String>)> = loaded
+        .generated
+        .stores
+        .iter()
+        .flat_map(|(name, store)| {
+            let config_store = loaded.config.stores.get(name);
+            let store_active = config_store
+                .map(|s| platform.matches_when(&s.when))
+                .unwrap_or(true);
+            if !store_active {
+                return Vec::new();
+            }
+            let single: Vec<(std::path::PathBuf, String, Option<String>)> = store
+                .target
+                .iter()
+                .filter_map(|t| config::expand_home(t).ok().map(|p| (p, name.clone(), None)))
+                .collect();
+            let multi: Vec<(std::path::PathBuf, String, Option<String>)> = store
+                .targets
+                .iter()
+                .filter(|(tname, _)| {
+                    config_store
+                        .and_then(|s| s.targets.get(*tname))
+                        .map(|te| platform.matches_when(&te.when))
+                        .unwrap_or(true)
+                })
+                .filter_map(|(tname, te)| {
+                    config::expand_home(&te.target)
+                        .ok()
+                        .map(|p| (p, name.clone(), Some(tname.clone())))
+                })
+                .collect();
+            [single, multi].concat()
+        })
+        .collect();
     // Votes: every found link (owned or not) votes its source store for its
     // target dir. Used only when state has no owner for the dir.
     let mut votes: std::collections::BTreeMap<
@@ -91,7 +114,7 @@ pub(crate) fn cmd_import(
         std::collections::BTreeMap<String, usize>,
     > = std::collections::BTreeMap::new();
     let classify = |fl: &scan::FoundLink,
-                        votes: &mut std::collections::BTreeMap<
+                    votes: &mut std::collections::BTreeMap<
         std::path::PathBuf,
         std::collections::BTreeMap<String, usize>,
     >|
@@ -109,24 +132,52 @@ pub(crate) fn cmd_import(
         }
         let rest: std::path::PathBuf = comps.collect();
         if rest.as_os_str().is_empty() {
+            // Root-level file like `repo/hub.txt` is not a whole-dir store;
+            // treat it as a file source at the repo root so it can be
+            // imported as a `sources` entry (e.g. `alias -> hub.txt`).
+            let candidate = repo_canon.join(&source_store);
+            if candidate.is_file() {
+                let target_dir = fl.link.parent().map(|p| p.to_path_buf())?;
+                let target_dir_canon = config::canonical_target_for_comparison(&target_dir);
+                votes
+                    .entry(target_dir_canon)
+                    .or_default()
+                    .entry(String::new())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                return Some((String::new(), target_dir, source_store.clone()));
+            }
             return None; // whole-dir handled separately
         }
-        let target_dir = crate::commands::add::target_dir_for_file_link(&fl.link, &rest)?;
+        // For fan-in/renamed links the link path does not end with the
+        // source-relative path (e.g. `rules.md` → `agents/AGENTS.md`). Fall
+        // back to the link's parent directory so the link is not skipped before
+        // the rename handling in the bucket phase.
+        let target_dir = crate::commands::add::target_dir_for_file_link(&fl.link, &rest)
+            .or_else(|| fl.link.parent().map(|p| p.to_path_buf()))?;
+        let target_dir_canon = config::canonical_target_for_comparison(&target_dir);
         votes
-            .entry(target_dir.clone())
+            .entry(target_dir_canon)
             .or_default()
             .entry(source_store.clone())
             .and_modify(|count| *count += 1)
             .or_insert(1);
-        Some((source_store, target_dir, rest.to_string_lossy().into_owned()))
+        Some((
+            source_store,
+            target_dir,
+            rest.to_string_lossy().into_owned(),
+        ))
     };
     // First pass: tally votes so an un-owned link can see its neighbors.
     let mut classified: Vec<(bool, &scan::FoundLink, String, std::path::PathBuf, String)> =
         Vec::new();
     for fl in &found {
-        let is_owned = owned
-            .iter()
-            .any(|t| crate::commands::add::paths_equal(t, &fl.link));
+        // Compare target path identity, not canonical destination. Two
+        // distinct fan-in links (e.g. `~/.config/a/out` and
+        // `~/.config/b/out`) may resolve to the same repo file via
+        // `canonicalize`, but they are distinct link locations and must
+        // not be considered already-owned.
+        let is_owned = owned.iter().any(|t| t == &fl.link);
         match classify(fl, &mut votes) {
             Some((source_store, target_dir, rest)) => {
                 classified.push((is_owned, fl, source_store, target_dir, rest))
@@ -143,59 +194,108 @@ pub(crate) fn cmd_import(
             skipped_owned += 1;
             continue;
         }
-        let parent = crate::commands::add::collapse_home(&target_dir)?;
-        let link_name = fl
-            .link
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        // Resolve the owner of the link's target directory: state first,
-        // then the heaviest voting source store (deterministic tie-break).
-        let from_state = dir_owner.contains_key(&target_dir);
-        let owner = dir_owner.get(&target_dir).cloned().or_else(|| {
-            votes
-                .get(&target_dir)?
-                .iter()
-                .max_by_key(|(store, count)| (**count, std::cmp::Reverse((*store).clone())))
-                .map(|(store, _)| store.clone())
-        });
+        // Resolve the owner of the link's target directory: state first
+        // via longest ancestor (handles nested fan-in like `nested/alias.txt`
+        // under `~/.consumer`), then the heaviest voting source store.
+        // Parent-canonicalized comparison so `~/out` and `/realhome/out`
+        // are recognised as the same physical directory when `$HOME` is
+        // symlinked.
+        let mut best: Option<(String, std::path::PathBuf)> = None;
+        let mut best_len = 0usize;
+        let fl_canon = config::canonical_target_for_comparison(&fl.link);
+        for (dir, owner_name, _tname) in &dir_owner {
+            let dir_canon = config::canonical_target_for_comparison(dir);
+            if fl_canon == dir_canon || fl_canon.starts_with(&dir_canon) {
+                let len = dir.components().count();
+                if len > best_len {
+                    best_len = len;
+                    best = Some((owner_name.clone(), dir.clone()));
+                }
+            }
+        }
+        let from_state = best.is_some();
+        // Use canonical target_dir for vote lookup so `~/out` and
+        // `/realhome/out` share the same vote bucket when `$HOME` is
+        // symlinked.
+        let target_dir_canon = config::canonical_target_for_comparison(&target_dir);
+        let (owner, target_dir_for_owner) = if let Some((owner_name, dir)) = best {
+            (Some(owner_name), dir)
+        } else {
+            let owner = votes.get(&target_dir_canon).and_then(|map| {
+                map.iter()
+                    .max_by_key(|(store, count)| (**count, std::cmp::Reverse((*store).clone())))
+                    .map(|(store, _)| store.clone())
+            });
+            // If canonical lookup missed (e.g. votes key was lexical), fall
+            // back to lexical lookup for backward compat.
+            let owner = owner.or_else(|| {
+                votes.get(&target_dir).and_then(|map| {
+                    map.iter()
+                        .max_by_key(|(store, count)| (**count, std::cmp::Reverse((*store).clone())))
+                        .map(|(store, _)| store.clone())
+                })
+            });
+            (owner, target_dir.clone())
+        };
+        let parent = crate::commands::add::collapse_home(&target_dir_for_owner)?;
+        // Preserve nested relative path (e.g. "nested/alias") not just leaf name.
+        // Use canonical comparison so `~/out/file` under `/realhome/out`
+        // yields `file` even when the lexical prefixes differ due to HOME
+        // symlink alias.
+        let link_name = {
+            let target_canon = config::canonical_target_for_comparison(&target_dir_for_owner);
+            if fl_canon == target_canon {
+                String::new()
+            } else if let Ok(rel) = fl_canon.strip_prefix(&target_canon) {
+                rel.to_string_lossy().into_owned()
+            } else if let Ok(rel) = fl.link.strip_prefix(&target_dir_for_owner) {
+                rel.to_string_lossy().into_owned()
+            } else {
+                fl.link
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }
+        };
         let Some(owner_store) = owner else {
             continue;
         };
+        if owner_store.is_empty() {
+            continue;
+        }
 
         let bucket = buckets.entry(owner_store.clone()).or_default();
         if from_state {
-            bucket.merge_target = Some(parent.clone());
+            bucket.merge_targets.insert(parent.clone());
         }
-        // Leaf-name equality is the geometric rename signal: an in-store
-        // symmetric link (including nested ones like `lua/plugin.lua`) keeps
-        // its leaf; a fan-in/renamed link (`rules.md` → `agents/AGENTS.md`)
-        // does not. Depth alone cannot distinguish — rest is relative to the
-        // target dir by construction.
-        let same_leaf = std::path::Path::new(&rest)
-            .file_name()
-            .zip(fl.link.file_name())
-            .is_some_and(|(a, b)| a == b);
-        if owner_store == source_store && same_leaf {
+        // Full relative path equality is the rename signal: an in-store
+        // symmetric link keeps its exact relative path (including nested
+        // like `lua/plugin.lua`); a fan-in/renamed link (`rules.md` →
+        // `agents/AGENTS.md` or `foo/x` → `bar/x`) does not. Leaf-only
+        // comparison misclassifies `target/bar/x` → `repo/app/foo/x` as
+        // a plain file.
+        let is_symmetric = link_name == rest;
+        if owner_store == source_store && is_symmetric {
             // Symmetric in-store link: plain `files` entry.
-            bucket.files.insert(rest, parent);
+            bucket.files.insert((parent.clone(), rest.clone()));
         } else {
             // Source outside the owner store, or renamed: a `sources`
             // declaration on the owner — never a fabricated store around
             // the source path.
+            let source_rel = if source_store.is_empty() {
+                rest.clone()
+            } else {
+                format!("{source_store}/{rest}")
+            };
             bucket
                 .sources
-                .insert(link_name, (format!("{source_store}/{rest}"), parent));
+                .insert((parent.clone(), link_name.clone()), source_rel);
         }
     }
 
     // Whole-dir pass (unchanged shape): a link at exactly a store dir.
     for fl in &found {
-        if owned
-            .iter()
-            .any(|t| crate::commands::add::paths_equal(t, &fl.link))
-        {
+        if owned.iter().any(|t| t == &fl.link) {
             continue;
         }
         let Ok(rel) = fl.resolves_to.strip_prefix(&repo_canon) else {
@@ -212,11 +312,22 @@ pub(crate) fn cmd_import(
         if comps.by_ref().next().is_some() {
             continue; // file link, handled above
         }
+        // Root-level files like `repo/hub.txt` have a single component but are
+        // not store directories — a whole-dir store must be a directory at
+        // repo/<store>. Reject non-directories so hub.txt becomes a source
+        // entry via the file pass, not a fabricated whole-dir store.
+        if !root.join(&store_name).is_dir() {
+            continue;
+        }
+        // Also require the resolved target itself to be a directory; a file
+        // such as hub.txt must not be promoted to whole-dir.
+        if let Ok(meta) = std::fs::symlink_metadata(&fl.resolves_to)
+            && !meta.is_dir()
+        {
+            continue;
+        }
         let target_str = crate::commands::add::collapse_home(&fl.link)?;
-        buckets
-            .entry(store_name)
-            .or_default()
-            .whole_dir_target = Some(target_str);
+        buckets.entry(store_name).or_default().whole_dir_target = Some(target_str);
     }
 
     if json && buckets.is_empty() {
@@ -254,7 +365,8 @@ pub(crate) fn cmd_import(
         // Merge path: the owner store already exists in state (derived from
         // its configured target). Extend its inventory in place instead of
         // skipping or fabricating a second store for the same directory.
-        if let Some(merge_parent) = bucket.merge_target.clone() {
+        // For multi-target stores there may be multiple merge parents.
+        if !bucket.merge_targets.is_empty() {
             if bucket.whole_dir_target.is_some() {
                 // A whole-dir link at a path another store's config already
                 // owns is a conflict, not an import.
@@ -271,55 +383,60 @@ pub(crate) fn cmd_import(
             let Some(existing) = loaded.generated.stores.get_mut(store_name) else {
                 continue;
             };
-            let mut added_files: Vec<String> = Vec::new();
-            let mut added_sources: std::collections::BTreeMap<String, String> =
-                std::collections::BTreeMap::new();
-            let mut inventory: Option<(&mut Vec<String>, &mut std::collections::BTreeMap<String, String>)> = None;
-            if !existing.targets.is_empty() {
-                for (tname, te) in existing.targets.iter_mut() {
-                    if config::expand_home(&te.target).ok().as_ref() == Some(&merge_parent_path(&merge_parent)) {
-                        let _ = tname;
-                        inventory = Some((&mut te.files, &mut te.sources));
-                        break;
+            let mut any_imported = false;
+            for merge_parent in &bucket.merge_targets {
+                let mut added_files: Vec<String> = Vec::new();
+                let mut added_sources: std::collections::BTreeMap<String, String> =
+                    std::collections::BTreeMap::new();
+                let mut inventory: Option<(
+                    &mut Vec<String>,
+                    &mut std::collections::BTreeMap<String, String>,
+                )> = None;
+                if !existing.targets.is_empty() {
+                    for (tname, te) in existing.targets.iter_mut() {
+                        // Only active targets can be merge destinations.
+                        // When two named targets share a path with mutually
+                        // exclusive `when` clauses, the first entry in map
+                        // order may be inactive; selecting it would write to
+                        // the inactive target and lose the active identity.
+                        if let Some(cfg) = loaded.config.stores.get(store_name) {
+                            if !platform.matches_when(&cfg.when) {
+                                continue;
+                            }
+                            if let Some(at) = cfg.targets.get(tname)
+                                && !platform.matches_when(&at.when)
+                            {
+                                continue;
+                            }
+                        }
+                        if let Ok(expanded) = config::expand_home(&te.target)
+                            && config::canonical_target_for_comparison(&expanded)
+                                == config::canonical_target_for_comparison(&merge_parent_path(
+                                    merge_parent,
+                                ))
+                        {
+                            let _ = tname;
+                            inventory = Some((&mut te.files, &mut te.sources));
+                            break;
+                        }
                     }
+                } else if existing
+                    .target
+                    .as_ref()
+                    .and_then(|t| config::expand_home(t).ok())
+                    .is_some_and(|p| {
+                        config::canonical_target_for_comparison(&p)
+                            == config::canonical_target_for_comparison(&merge_parent_path(
+                                merge_parent,
+                            ))
+                    })
+                {
+                    inventory = Some((&mut existing.files, &mut existing.sources));
                 }
-            } else if existing
-                .target
-                .as_ref()
-                .and_then(|t| config::expand_home(t).ok())
-                == Some(merge_parent_path(&merge_parent))
-            {
-                inventory = Some((&mut existing.files, &mut existing.sources));
-            }
-            let Some((files, sources)) = inventory else {
-                let msg = format!(
-                    "store '{store_name}': no inventory targets {}; skipping merge",
-                    merge_parent
-                );
-                if json {
-                    warnings.push(msg);
-                } else {
-                    eprintln!("warning: {msg}");
-                }
-                continue;
-            };
-            for (source_rel, parent) in &bucket.files {
-                if *parent != merge_parent {
-                    continue;
-                }
-                if !files.contains(source_rel) {
-                    files.push(source_rel.clone());
-                    files.sort();
-                    added_files.push(source_rel.clone());
-                }
-            }
-            for (link_name, (source, parent)) in &bucket.sources {
-                if *parent != merge_parent {
-                    continue;
-                }
-                if files.iter().any(|f| f == link_name) {
+                let Some((files, sources)) = inventory else {
                     let msg = format!(
-                        "store '{store_name}': imported source '{link_name}' collides with an existing file entry; skipping"
+                        "store '{store_name}': no inventory targets {}; skipping merge",
+                        merge_parent
                     );
                     if json {
                         warnings.push(msg);
@@ -327,51 +444,285 @@ pub(crate) fn cmd_import(
                         eprintln!("warning: {msg}");
                     }
                     continue;
-                }
-                if sources.get(link_name).is_none_or(|existing| existing == source) {
-                    if !sources.contains_key(link_name) {
-                        added_sources.insert(link_name.clone(), source.clone());
+                };
+                for (parent_key, source_rel) in &bucket.files {
+                    if parent_key != merge_parent {
+                        continue;
                     }
-                    sources.insert(link_name.clone(), source.clone());
-                } else {
-                    let msg = format!(
-                        "store '{store_name}': imported source '{link_name}' disagrees with existing declaration; skipping"
-                    );
-                    if json {
-                        warnings.push(msg);
+                    if !files.contains(source_rel) {
+                        files.push(source_rel.clone());
+                        files.sort();
+                        added_files.push(source_rel.clone());
+                    }
+                }
+                for ((parent_key, link_name), source) in &bucket.sources {
+                    if parent_key != merge_parent {
+                        continue;
+                    }
+                    if files.iter().any(|f| f == link_name) {
+                        let msg = format!(
+                            "store '{store_name}': imported source '{link_name}' collides with an existing file entry; skipping"
+                        );
+                        if json {
+                            warnings.push(msg);
+                        } else {
+                            eprintln!("warning: {msg}");
+                        }
+                        continue;
+                    }
+                    if sources
+                        .get(link_name)
+                        .is_none_or(|existing| existing == source)
+                    {
+                        if !sources.contains_key(link_name) {
+                            added_sources.insert(link_name.clone(), source.clone());
+                        }
+                        sources.insert(link_name.clone(), source.clone());
                     } else {
-                        eprintln!("warning: {msg}");
+                        let msg = format!(
+                            "store '{store_name}': imported source '{link_name}' disagrees with existing declaration; skipping"
+                        );
+                        if json {
+                            warnings.push(msg);
+                        } else {
+                            eprintln!("warning: {msg}");
+                        }
                     }
                 }
+                if added_files.is_empty() && added_sources.is_empty() {
+                    continue;
+                }
+                if !json {
+                    println!(
+                        "  merge into '{store_name}' → {merge_parent} ({} file(s), {} source(s))",
+                        added_files.len(),
+                        added_sources.len()
+                    );
+                }
+                stores.push(ImportedStore {
+                    store: store_name.clone(),
+                    target: merge_parent.clone(),
+                    mode: "merge".into(),
+                    files: added_files,
+                    sources: added_sources,
+                    targets: Vec::new(),
+                });
+                any_imported = true;
             }
-            if added_files.is_empty() && added_sources.is_empty() {
+            if any_imported {
+                imported += 1;
+            }
+            // If this store had merge targets, don't fall through to the
+            // new-store creation path for the same store — remaining non-merge
+            // parents for this store would be new targets, but creating them
+            // is handled by the grouping logic below when merge_targets is empty.
+            // For now, handled merge parents are done; if there are leftover
+            // parents not in merge_targets, create them as new named targets.
+            let remaining_files: Vec<_> = bucket
+                .files
+                .iter()
+                .filter(|(p, _)| !bucket.merge_targets.contains(p))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let remaining_sources: Vec<_> = bucket
+                .sources
+                .iter()
+                .filter(|((p, _), _)| !bucket.merge_targets.contains(p))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if remaining_files.is_empty() && remaining_sources.is_empty() {
                 continue;
             }
-            if !json {
-                println!(
-                    "  merge into '{store_name}' → {merge_parent} ({} file(s), {} source(s))",
-                    added_files.len(),
-                    added_sources.len()
+            // Fall through to create new targets for remaining parents under the
+            // existing store. Build groups for the remaining parents.
+            let mut groups: std::collections::BTreeMap<
+                String,
+                (Vec<String>, std::collections::BTreeMap<String, String>),
+            > = std::collections::BTreeMap::new();
+            for (parent, source_rel) in remaining_files {
+                groups.entry(parent).or_default().0.push(source_rel);
+            }
+            for ((parent_key, link_name), source) in remaining_sources {
+                groups
+                    .entry(parent_key)
+                    .or_default()
+                    .1
+                    .insert(link_name, source);
+            }
+            // If the existing store is still single-target, promote it to
+            // multi-target before adding new named targets — otherwise we
+            // would create an invalid mixed store (both `target` and
+            // `targets` set).
+            if existing.target.is_some() {
+                let orig_target = existing.target.take().unwrap();
+                let orig_files = std::mem::take(&mut existing.files);
+                let orig_patterns = std::mem::take(&mut existing.patterns);
+                let orig_sources = std::mem::take(&mut existing.sources);
+                // Pick a name that does not collide with incoming groups or
+                // existing targets.
+                let mut base_idx = 1;
+                let mut orig_name = format!("target-{base_idx}");
+                while existing.targets.contains_key(&orig_name) || groups.contains_key(&orig_name) {
+                    base_idx += 1;
+                    orig_name = format!("target-{base_idx}");
+                }
+                existing.targets.insert(
+                    orig_name,
+                    config::GeneratedTarget {
+                        target: orig_target,
+                        files: orig_files,
+                        patterns: orig_patterns,
+                        sources: orig_sources,
+                    },
                 );
             }
-            stores.push(ImportedStore {
-                store: store_name.clone(),
-                target: merge_parent,
-                mode: "merge".into(),
-                files: added_files,
-                sources: added_sources,
-                targets: Vec::new(),
-            });
-            imported += 1;
+            // Create new named targets for remaining groups
+            for (target, (mut files, sources)) in groups {
+                files.sort();
+                // Find an unused target name
+                let mut base_idx = existing.targets.len() + 1;
+                let mut name = format!("target-{base_idx}");
+                while existing.targets.contains_key(&name) {
+                    base_idx += 1;
+                    name = format!("target-{base_idx}");
+                }
+                if !json {
+                    println!(
+                        "  import '{store_name}' → {target} as {name} (files: {}{})",
+                        files.join(", "),
+                        sources_label(&sources)
+                    );
+                }
+                existing.targets.insert(
+                    name.clone(),
+                    config::GeneratedTarget {
+                        target: target.clone(),
+                        files: files.clone(),
+                        patterns: vec![],
+                        sources: sources.clone(),
+                    },
+                );
+                stores.push(ImportedStore {
+                    store: store_name.clone(),
+                    target: target.clone(),
+                    mode: "merge".into(),
+                    files,
+                    sources,
+                    targets: Vec::new(),
+                });
+                imported += 1;
+            }
             continue;
         }
 
-        // New-store path: refuse to clobber an existing store entry.
-        if loaded.generated.stores.contains_key(store_name) {
-            if json {
-                warnings.push(format!("store '{store_name}': already in state.toml"));
-            } else {
-                println!("  skip '{store_name}': already in state.toml");
+        // New-store path: if the store already exists, extend it with new
+        // targets (promoting single-target to multi-target if needed) rather
+        // than dropping or creating a mixed store. This handles the case where
+        // an existing single-target store's second target is discovered via
+        // scan (e.g. `app/a` at `~/.config/appA` already in state, plus
+        // `app/b` at `~/.config/appB` found on disk).
+        if let Some(existing) = loaded.generated.stores.get_mut(store_name) {
+            // Build groups for the bucket's parents.
+            let mut groups: std::collections::BTreeMap<
+                String,
+                (Vec<String>, std::collections::BTreeMap<String, String>),
+            > = std::collections::BTreeMap::new();
+            for (parent, source_rel) in &bucket.files {
+                groups
+                    .entry(parent.clone())
+                    .or_default()
+                    .0
+                    .push(source_rel.clone());
+            }
+            for ((parent_key, link_name), source) in &bucket.sources {
+                groups
+                    .entry(parent_key.clone())
+                    .or_default()
+                    .1
+                    .insert(link_name.clone(), source.clone());
+            }
+            if groups.is_empty() {
+                continue;
+            }
+            // If the existing store is still single-target, promote it.
+            if existing.target.is_some() {
+                let orig_target = existing.target.take().unwrap();
+                let orig_files = std::mem::take(&mut existing.files);
+                let orig_patterns = std::mem::take(&mut existing.patterns);
+                let orig_sources = std::mem::take(&mut existing.sources);
+                let mut base_idx = 1;
+                let mut orig_name = format!("target-{base_idx}");
+                while existing.targets.contains_key(&orig_name) || groups.contains_key(&orig_name) {
+                    base_idx += 1;
+                    orig_name = format!("target-{base_idx}");
+                }
+                existing.targets.insert(
+                    orig_name,
+                    config::GeneratedTarget {
+                        target: orig_target,
+                        files: orig_files,
+                        patterns: orig_patterns,
+                        sources: orig_sources,
+                    },
+                );
+            }
+            // Filter to only truly new parents (not already in state).
+            let existing_parents: std::collections::BTreeSet<String> =
+                if existing.targets.is_empty() {
+                    std::collections::BTreeSet::new()
+                } else {
+                    existing
+                        .targets
+                        .values()
+                        .map(|te| te.target.clone())
+                        .collect()
+                };
+            // Also include the original single target's collapsed form if it was just promoted?
+            // The promotion above already moved it, so existing_parents now includes it.
+            let mut added_any = false;
+            for (target, (mut files, sources)) in groups {
+                // Skip parents already present in state (should not happen for
+                // new-store path, but guard against duplicates).
+                if existing_parents.contains(&target)
+                    || existing.targets.values().any(|te| te.target == target)
+                {
+                    continue;
+                }
+                files.sort();
+                let mut base_idx = existing.targets.len() + 1;
+                let mut name = format!("target-{base_idx}");
+                while existing.targets.contains_key(&name) {
+                    base_idx += 1;
+                    name = format!("target-{base_idx}");
+                }
+                if !json {
+                    println!(
+                        "  import '{store_name}' → {target} as {name} (files: {}{})",
+                        files.join(", "),
+                        sources_label(&sources)
+                    );
+                }
+                existing.targets.insert(
+                    name.clone(),
+                    config::GeneratedTarget {
+                        target: target.clone(),
+                        files: files.clone(),
+                        patterns: vec![],
+                        sources: sources.clone(),
+                    },
+                );
+                stores.push(ImportedStore {
+                    store: store_name.clone(),
+                    target: target.clone(),
+                    mode: "merge".into(),
+                    files,
+                    sources,
+                    targets: Vec::new(),
+                });
+                added_any = true;
+            }
+            if added_any {
+                imported += 1;
             }
             continue;
         }
@@ -419,21 +770,18 @@ pub(crate) fn cmd_import(
             // parent, each with its own file set) instead of being dropped.
             let mut groups: std::collections::BTreeMap<
                 String,
-                (
-                    Vec<String>,
-                    std::collections::BTreeMap<String, String>,
-                ),
+                (Vec<String>, std::collections::BTreeMap<String, String>),
             > = std::collections::BTreeMap::new();
-            for (source_rel, parent) in &bucket.files {
+            for (parent, source_rel) in &bucket.files {
                 groups
                     .entry(parent.clone())
                     .or_default()
                     .0
                     .push(source_rel.clone());
             }
-            for (link_name, (source, parent)) in &bucket.sources {
+            for ((parent_key, link_name), source) in &bucket.sources {
                 groups
-                    .entry(parent.clone())
+                    .entry(parent_key.clone())
                     .or_default()
                     .1
                     .insert(link_name.clone(), source.clone());
@@ -536,17 +884,25 @@ pub(crate) fn cmd_import(
             continue;
         };
 
-        if let Some(entry) = generated_entry
-            && !dry_run
-        {
+        if let Some(entry) = generated_entry {
             loaded.generated.stores.insert(store_name.clone(), entry);
         }
         stores.push(imported_store);
         imported += 1;
     }
 
+    // Full candidate validation so dry-run and real import share the same
+    // failure mode. A dry-run that would write invalid state must not report
+    // success.
+    if imported > 0 {
+        config::validate_merged_with_repo(&loaded.authored, &loaded.generated, root)?;
+    }
+
     if !dry_run && imported > 0 {
         loaded.generated.save(root)?;
+    } else if dry_run && imported > 0 {
+        // Dry-run mutated `loaded.generated` for validation; do not persist.
+        // No further action needed — the report below reflects the candidate.
     }
 
     if json {

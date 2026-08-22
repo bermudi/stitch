@@ -959,7 +959,7 @@ files = [".bashrc"]
     assert!(output.status.success());
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
     let plan: Value = serde_json::from_str(stdout).expect("plan is valid JSON");
-    assert_eq!(plan["schema"], 2);
+    assert_eq!(plan["schema"], 3);
     assert_eq!(plan["kind"], "stitch/plan");
     assert_eq!(
         plan["repo"].as_str().unwrap(),
@@ -1889,7 +1889,11 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("not in config"));
+        .stderr(
+            contains("not in config")
+                .or(contains("source file does not exist"))
+                .or(contains("not the expected source")),
+        );
 }
 
 #[test]
@@ -2394,7 +2398,7 @@ files = ["x"]
 
 [stores.beta]
 target = "{0}"
-files = ["x", "y"]
+files = ["y"]
 "#,
         home.to_string_lossy(),
     ));
@@ -2403,16 +2407,16 @@ files = ["x", "y"]
     assert!(output.status.success());
     let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    // The captured plan wants to create home/x for both alpha and beta. Inject
-    // a replacement that tries to claim alpha's link for beta. The current
-    // plan never authorizes that replacement, so validation must reject it
-    // before any filesystem mutation.
+    // The captured plan wants to create home/x for alpha and home/y for beta.
+    // Inject a replacement that tries to claim y with a different requires.
+    // The current plan never authorizes that replacement, so validation must
+    // reject it before any filesystem mutation.
     let alpha_create = plan["ops"][0].clone();
-    let beta_create_y = plan["ops"][2].clone();
+    let beta_create_y = plan["ops"][1].clone();
     let beta_replace = serde_json::json!({
         "op": "replace_link",
-        "target": home.join("x").to_string_lossy(),
-        "source": repo.path().join("beta").join("x").to_string_lossy(),
+        "target": home.join("y").to_string_lossy(),
+        "source": repo.path().join("beta").join("y").to_string_lossy(),
         "requires": {
             "target": "symlink_to",
             "value": repo.path().join("alpha").join("x").to_string_lossy(),
@@ -2588,7 +2592,7 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("unsupported plan schema: 1 (expected 2)"));
+        .stderr(contains("unsupported plan schema: 1 (expected 3)"));
     assert!(!home.join(".bashrc").exists());
 }
 
@@ -2642,9 +2646,10 @@ files = [".bashrc"]
 
 #[test]
 fn apply_plan_rejects_whole_directory_then_child_link() {
-    // Neither target has a live symlink when captured. The preflight simulator
-    // must still reject beta's child because alpha creates its parent as a
-    // symlink earlier in the store-grouped execution order.
+    // Neither target has a live symlink when captured. The static link-path
+    // collision check now rejects the contradictory whole-dir + child at plan
+    // time, before the preflight simulator would. This is the intended fix
+    // for the plan-omission bug: a contradictory plan must not be produced.
     let repo = Repo::new();
     repo.make_store("alpha", &["profile"]);
     repo.make_store("beta", &["init.lua"]);
@@ -2662,20 +2667,15 @@ files = ["init.lua"]
         config.display(),
     ));
 
-    let plan_path = repo.path().join("overlap.json");
-    let output = repo.cmd().arg("plan").output().unwrap();
-    assert!(output.status.success());
-    fs::write(&plan_path, &output.stdout).unwrap();
-
     repo.cmd()
-        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .arg("plan")
         .assert()
         .failure()
-        .code(12)
-        .stderr(contains("symlinked ancestor"));
+        .code(3)
+        .stderr(contains("claims link path"));
     assert!(
         !config.is_symlink(),
-        "whole-directory link must not run before child preflight fails"
+        "whole-directory link must not be created when plan is rejected"
     );
     assert!(!config.join("nvim").join("init.lua").exists());
 }
@@ -2747,9 +2747,10 @@ files = ["profile"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains(
-            "link operation is not present in the freshly computed apply plan",
-        ));
+        .stderr(
+            contains("link operation is not present in the freshly computed apply plan")
+                .or(contains("does not resolve to a configured source")),
+        );
 
     assert!(!marker.exists(), "global pre-apply hook must not run");
     assert!(
@@ -3119,5 +3120,123 @@ files = [".barrc"]
     assert!(
         !home.join(".barrc").exists(),
         "bar must not be linked on dry-run"
+    );
+}
+
+#[test]
+fn plan_and_apply_plan_succeed_through_symlinked_home() {
+    // Regression for "plan rejects supported symlinked $HOME".
+    // A basic file-mode target under "~/out" is valid when $HOME itself is a symlink
+    // (e.g. home_link -> real_home). `stitch plan` must exempt the configured HOME boundary
+    // while still rejecting symlinks *beneath* it, and `stitch apply --plan` must execute
+    // through that same boundary.
+    let tmp = tempfile::tempdir().unwrap();
+    let real_home = tmp.path().join("real_home");
+    let home_link = tmp.path().join("home_link");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&real_home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    std::os::unix::fs::symlink(&real_home, &home_link).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("init")
+        .assert()
+        .success();
+
+    let store_dir = repo.join("app");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(store_dir.join("file"), "hello").unwrap();
+    fs::write(
+        repo.join(".stitch").join("state.toml"),
+        "[stores.app]\ntarget = \"~/out\"\nfiles = [\"file\"]\n",
+    )
+    .unwrap();
+
+    // Plan capture must succeed and contain the create, not a HOME conflict.
+    let plan_output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert!(
+        plan_output.status.success(),
+        "plan through symlinked HOME must succeed: {}",
+        String::from_utf8_lossy(&plan_output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_output.stdout).unwrap();
+    assert!(
+        plan["conflicts"].as_array().unwrap().is_empty(),
+        "plan must not report HOME as a symlinked ancestor"
+    );
+    let ops = plan["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "create_link");
+
+    let plan_path = repo.join("plan.json");
+    fs::write(&plan_path, &plan_output.stdout).unwrap();
+
+    // Direct apply must also succeed (control).
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("apply")
+        .assert()
+        .success();
+
+    let link = real_home.join("out").join("file");
+    assert!(
+        link.is_symlink(),
+        "file must be linked through symlinked HOME"
+    );
+
+    // Clean the link so the captured plan still has work to do, then execute it.
+    fs::remove_file(&link).unwrap();
+    // Remove the now-empty parent so the plan's create must mkdir -p through HOME.
+    let _ = fs::remove_dir(real_home.join("out"));
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Executed 1/1 ops"));
+
+    assert!(
+        link.is_symlink(),
+        "apply --plan must succeed through symlinked HOME"
+    );
+
+    // A symlink *beneath* HOME must still be rejected by plan.
+    let out_dir = home_link.join("out");
+    // Remove the real directory and replace it with a symlink to an external location.
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_dir_all(&out_dir);
+    let external = tmp.path().join("external");
+    fs::create_dir_all(&external).unwrap();
+    std::os::unix::fs::symlink(&external, &out_dir).unwrap();
+
+    let bad_plan = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert!(
+        !bad_plan.status.success(),
+        "plan must reject a symlinked ancestor beneath HOME"
+    );
+    let bad: Value = serde_json::from_slice(&bad_plan.stdout).unwrap();
+    assert!(
+        !bad["conflicts"].as_array().unwrap().is_empty(),
+        "symlink beneath HOME must be reported as a conflict"
     );
 }

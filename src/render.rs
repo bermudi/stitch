@@ -1529,7 +1529,8 @@ mod tests {
         let p = test_platform();
         let vars = BTreeMap::new();
 
-        let r1 = stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
+        let r1 =
+            stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
         assert!(matches!(r1, StageOutcome::Written(_)));
         let dest = staging_path(repo, "git", "gitconfig");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "host=testhost\n");
@@ -1537,12 +1538,14 @@ mod tests {
         assert_eq!(path_mode(&store_render_dir(repo, "git")), Some(0o700));
 
         // Second stage with same content → Unchanged.
-        let r2 = stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
+        let r2 =
+            stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
         assert!(matches!(r2, StageOutcome::Unchanged(_)));
 
         // Content change → Written again.
         std::fs::write(&src, "host={{ hostname }}!\n").unwrap();
-        let r3 = stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
+        let r3 =
+            stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
         assert!(matches!(r3, StageOutcome::Written(_)));
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "host=testhost!\n");
     }

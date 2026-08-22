@@ -14,7 +14,10 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 use super::error::ConfigError;
-use super::paths::{expand_home, is_safe_fragment, normalized_target_path, validate_store_names};
+use super::paths::{
+    canonical_target_for_comparison, expand_home, is_safe_fragment, normalized_target_path,
+    validate_store_names,
+};
 use super::state::{
     atomic_write, validate_authored_file, validate_state_file, validate_stitch_dir,
 };
@@ -118,6 +121,7 @@ impl ConfigSnapshot {
         warnings.extend(merge_warnings);
         config.validate()?;
         config.normalize();
+        validate_staging_collisions(&config.stores, repo_root)?;
         validate_source_components(repo_root, &config)?;
 
         let hash = hash_config_bytes(authored_bytes.as_deref(), state_bytes.as_deref());
@@ -377,6 +381,7 @@ impl Config {
         warnings.extend(merge_warnings);
         config.validate()?;
         config.normalize();
+        validate_staging_collisions(&config.stores, repo_root)?;
         validate_source_components(repo_root, &config)?;
 
         Ok(Loaded {
@@ -454,6 +459,7 @@ impl Config {
 
 /// Validate authored and generated halves exactly as a subsequent load will.
 /// Migration uses this before either output file is written.
+#[allow(dead_code)]
 pub fn validate_merged(
     authored: &AuthoredConfig,
     generated: &GeneratedState,
@@ -462,6 +468,26 @@ pub fn validate_merged(
     generated.validate()?;
     let (config, _) = merge(authored, generated);
     config.validate()
+}
+
+/// Validate merged halves as `load` will, including normalization and staging
+/// collision checks. `repo_root` is required to resolve patterns for the
+/// collision check, matching `Config::load` / `ConfigSnapshot::load`.
+pub fn validate_merged_with_repo(
+    authored: &AuthoredConfig,
+    generated: &GeneratedState,
+    repo_root: &Path,
+) -> Result<(), ConfigError> {
+    authored.validate()?;
+    generated.validate()?;
+    let (mut config, _) = merge(authored, generated);
+    config.validate()?;
+    config.normalize();
+    validate_staging_collisions(&config.stores, repo_root)?;
+    // Source components are filesystem-checked; callers that already
+    // validated sources lexically may skip, but we include for completeness.
+    validate_source_components(repo_root, &config)?;
+    Ok(())
 }
 
 impl AuthoredConfig {
@@ -594,10 +620,12 @@ fn merge_store(
     g: Option<&GeneratedStore>,
 ) -> (Store, Vec<String>) {
     let mut warnings = Vec::new();
+    let store_ignore: &[String] = a.map(|a| a.ignore.as_slice()).unwrap_or(&[]);
     let targets = merge_targets(
         name,
         a.map(|a| &a.targets),
         g.map(|g| &g.targets),
+        store_ignore,
         &mut warnings,
     );
 
@@ -619,10 +647,20 @@ fn merge_store(
 /// declared, no inventory) is load-OK but contributes no link — it is skipped
 /// and a warning is appended so `doctor` can surface it. A generated-only
 /// target is legal with default behavior.
+///
+/// For multi-target stores, a top-level `ignore` in `stitch.toml` is the
+/// single-target legacy location. When a single-target store is promoted to
+/// multi-target (import's fan-in), the original top-level `ignore` would be
+/// left behind and previously ignored files would become exposed at the
+/// original target. To preserve behavior without rewriting the authored file,
+/// a generated-only target inherits the store-level `ignore` as its default.
+/// Authored targets keep their own `ignore` unchanged — store-level is only
+/// a fallback for targets that have no authored entry.
 fn merge_targets(
     store_name: &str,
     authored: Option<&BTreeMap<String, AuthoredTarget>>,
     generated: Option<&BTreeMap<String, GeneratedTarget>>,
+    store_ignore: &[String],
     warnings: &mut Vec<String>,
 ) -> BTreeMap<String, TargetEntry> {
     let mut result = BTreeMap::new();
@@ -634,6 +672,14 @@ fn merge_targets(
         let at = a.get(&tname);
         match g.get(&tname) {
             Some(gt) => {
+                // Inherit store-level ignore only for generated-only targets so
+                // a promoted single-target store keeps its ignore behavior
+                // without requiring `stitch.toml` to be rewritten.
+                // Authored targets keep their own ignore unchanged.
+                let ignore = match at {
+                    Some(at) => at.ignore.clone(),
+                    None => store_ignore.to_vec(),
+                };
                 result.insert(
                     tname.clone(),
                     TargetEntry {
@@ -641,7 +687,7 @@ fn merge_targets(
                         files: gt.files.clone(),
                         patterns: gt.patterns.clone(),
                         sources: gt.sources.clone(),
-                        ignore: at.map(|a| a.ignore.clone()).unwrap_or_default(),
+                        ignore,
                         when: at.map(|a| a.when.clone()).unwrap_or_default(),
                     },
                 );
@@ -705,12 +751,7 @@ fn normalize_sources(sources: &mut BTreeMap<String, String>) {
     let normalized: BTreeMap<String, String> = sources
         .iter()
         .filter(|(k, v)| is_safe_fragment(k) && is_safe_fragment(v))
-        .map(|(k, v)| {
-            (
-                normalize_fragment(k, false),
-                normalize_fragment(v, false),
-            )
-        })
+        .map(|(k, v)| (normalize_fragment(k, false), normalize_fragment(v, false)))
         .collect();
     *sources = normalized;
 }
@@ -768,38 +809,128 @@ pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<(), ConfigError> {
-    let mut targets: Vec<(String, String, PathBuf, WhenClause)> = Vec::new();
+    let mut targets: Vec<(String, String, PathBuf, PathBuf, WhenClause)> = Vec::new();
     for (store_name, store) in stores {
         if store.is_multi_target() {
             for (target_name, target) in &store.targets {
+                let expanded = expand_home(&target.target)?;
+                let canonical = canonical_target_for_comparison(&expanded);
                 targets.push((
                     store_name.clone(),
                     format!("store '{store_name}' target '{target_name}'"),
-                    normalized_target_path(&target.target)?,
+                    expanded,
+                    canonical,
                     target.when.clone(),
                 ));
             }
         } else if let Some(target) = &store.target {
+            let expanded = expand_home(target)?;
+            let canonical = canonical_target_for_comparison(&expanded);
             targets.push((
                 store_name.clone(),
                 format!("store '{store_name}'"),
-                normalized_target_path(target)?,
+                expanded,
+                canonical,
                 store.when.clone(),
             ));
         }
     }
 
-    for (index, (left_store, left_name, left, left_when)) in targets.iter().enumerate() {
-        for (right_store, right_name, right, right_when) in targets.iter().skip(index + 1) {
+    for (index, (left_store, left_name, left, left_canon, left_when)) in targets.iter().enumerate()
+    {
+        for (right_store, right_name, _right, right_canon, right_when) in
+            targets.iter().skip(index + 1)
+        {
+            // Use canonical forms so `~/out` and `/realhome/out` are
+            // recognised as the same physical location when `$HOME` is
+            // symlinked. Only nested (one starts with the other) is
+            // considered overlapping; equal directories are allowed for
+            // file-mode sharing and are handled at the link-path level.
+            // This mirrors the original check which only rejected same-store
+            // nesting (cross-store nesting is handled by link-path collisions).
             if left_store == right_store
                 && WhenClause::are_compatible(&[left_when, right_when])
-                && left != right
-                && (left.starts_with(right) || right.starts_with(left))
+                && left_canon != right_canon
+                && (left_canon.starts_with(right_canon) || right_canon.starts_with(left_canon))
             {
                 return Err(ConfigError::InvalidPath(format!(
                     "overlapping target paths are unsafe: {left_name} targets '{}' while {right_name} targets '{}'",
                     left.display(),
-                    right.display()
+                    _right.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_staging_collisions(
+    stores: &BTreeMap<String, Store>,
+    repo_root: &Path,
+) -> Result<(), ConfigError> {
+    use crate::platform::Platform;
+    use crate::store::resolve_target_names;
+    use std::collections::BTreeSet;
+    let platform = Platform::detect();
+    for (store_name, store) in stores {
+        if !store.is_multi_target() {
+            continue;
+        }
+        // Only active targets can collide on this host.
+        let active_targets: Vec<_> = store
+            .targets
+            .iter()
+            .filter(|(_, te)| platform.matches_when(&te.when) && platform.matches_when(&store.when))
+            .collect();
+        if active_targets.len() < 2 {
+            continue;
+        }
+        let store_dir = repo_root.join(store_name);
+        // For staging collisions, only templated links matter. Two active
+        // targets using the *same* template source and link name safely share
+        // one staged file; only incompatible template sources collide.
+        let mut template_sources_by_link: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut owners_by_link: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (tname, te) in &active_targets {
+            let links = resolve_target_names(
+                repo_root,
+                &store_dir,
+                &te.files,
+                &te.patterns,
+                &te.sources,
+                &te.ignore,
+            );
+            if let crate::store::LinkTargets::Files(links) = links {
+                // Deduplicate within this target so a single target's internal
+                // duplicate (e.g. gitconfig + gitconfig.tmpl) does not look like
+                // a cross-target collision.
+                let mut seen_in_target: BTreeSet<String> = BTreeSet::new();
+                for link in links {
+                    if !seen_in_target.insert(link.name.clone()) {
+                        continue;
+                    }
+                    if link.is_template() {
+                        template_sources_by_link
+                            .entry(link.name.clone())
+                            .or_default()
+                            .insert(link.source.display().to_string());
+                        owners_by_link
+                            .entry(link.name.clone())
+                            .or_default()
+                            .insert(tname.to_string());
+                    }
+                }
+            }
+        }
+        for (link_name, sources) in template_sources_by_link {
+            if sources.len() > 1 {
+                let owners = owners_by_link.remove(&link_name).unwrap_or_default();
+                let owners_vec: Vec<String> = owners.into_iter().collect();
+                return Err(ConfigError::InvalidPath(format!(
+                    "store '{store_name}': template link '{link_name}' claimed by multiple active targets ({}): staging would collide at .stitch/render/{}/{} — rename one",
+                    owners_vec.join(", "),
+                    store_name,
+                    link_name
                 )));
             }
         }
@@ -870,6 +1001,8 @@ pub fn validate_sources(
     files: &[String],
     context: &str,
 ) -> Result<(), ConfigError> {
+    // Track normalized keys to detect silent collapse (e.g. "a//b" and "a/b").
+    let mut seen_normalized: BTreeMap<String, String> = BTreeMap::new();
     for (key, value) in sources {
         if !is_safe_fragment(key) {
             return Err(ConfigError::InvalidPath(format!(
@@ -881,15 +1014,69 @@ pub fn validate_sources(
                 "invalid source '{value}' for '{key}' in {context}: sources must be repo-relative paths with no '.', '..' or leading '/'"
             )));
         }
-        if value == ".stitch" || value.starts_with(".stitch/") {
+        let normalized_value = normalize_fragment(value, false);
+        if normalized_value == ".stitch"
+            || normalized_value.starts_with(".stitch/")
+            || normalized_value == ".git"
+            || normalized_value.starts_with(".git/")
+        {
             return Err(ConfigError::InvalidPath(format!(
-                "invalid source '{value}' for '{key}' in {context}: sources must not live under .stitch/"
+                "invalid source '{value}' for '{key}' in {context}: sources must not live under .stitch/ or .git/"
             )));
         }
-        if files.iter().any(|f| f == key) {
+        let normalized_key = normalize_fragment(key, false);
+        if let Some(prev) = seen_normalized.get(&normalized_key)
+            && prev != key
+        {
+            return Err(ConfigError::InvalidPath(format!(
+                "sources key '{key}' in {context} collides with '{prev}' after normalization (both become '{normalized_key}')"
+            )));
+        }
+        seen_normalized.insert(normalized_key, key.clone());
+        // Compare normalized files as well to catch "a" vs "./a" style collisions.
+        let normalized_files: BTreeSet<String> =
+            files.iter().map(|f| normalize_fragment(f, false)).collect();
+        if normalized_files.contains(&normalize_fragment(key, false)) {
             return Err(ConfigError::InvalidPath(format!(
                 "sources key '{key}' in {context} is also listed in files; remove one — the two disagree about the source"
             )));
+        }
+    }
+    // Reject ancestor/descendant conflicts: `foo` and `foo/bar` would require
+    // a file and a directory at the same path. Check sources vs sources and
+    // sources vs files.
+    let normalized_keys: Vec<String> = seen_normalized.keys().cloned().collect();
+    for i in 0..normalized_keys.len() {
+        for j in (i + 1)..normalized_keys.len() {
+            let a = &normalized_keys[i];
+            let b = &normalized_keys[j];
+            if b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/")) {
+                let orig_a = &seen_normalized[a];
+                let orig_b = &seen_normalized[b];
+                return Err(ConfigError::InvalidPath(format!(
+                    "sources keys '{orig_a}' and '{orig_b}' in {context} conflict: one is ancestor of the other — rename one"
+                )));
+            }
+        }
+    }
+    let normalized_files_vec: Vec<String> =
+        files.iter().map(|f| normalize_fragment(f, false)).collect();
+    for key_norm in &normalized_keys {
+        for file_norm in &normalized_files_vec {
+            if key_norm.starts_with(&format!("{file_norm}/"))
+                || file_norm.starts_with(&format!("{key_norm}/"))
+            {
+                let orig_key = &seen_normalized[key_norm];
+                // Find original file entry that normalizes to file_norm
+                let orig_file = files
+                    .iter()
+                    .find(|f| normalize_fragment(f, false) == *file_norm)
+                    .map(|s| s.as_str())
+                    .unwrap_or(file_norm);
+                return Err(ConfigError::InvalidPath(format!(
+                    "sources key '{orig_key}' in {context} conflicts with file '{orig_file}': one is ancestor of the other — rename one"
+                )));
+            }
         }
     }
     Ok(())
@@ -948,6 +1135,16 @@ fn validate_one_source_component(
                 return Err(ConfigError::Read(e, current));
             }
         }
+    }
+    // Final component must not be a directory (hand-edited directory sources
+    // would otherwise appear as a false-success apply that creates then removes
+    // the link).
+    if let Ok(meta) = std::fs::symlink_metadata(&current)
+        && meta.is_dir()
+    {
+        return Err(ConfigError::InvalidPath(format!(
+            "invalid source '{value}' for '{key}' in {context}: a source must be a file, not a directory"
+        )));
     }
     Ok(())
 }
@@ -1037,7 +1234,7 @@ mod tests {
         let at: BTreeMap<String, AuthoredTarget> = a.targets.clone();
         let gt: BTreeMap<String, GeneratedTarget> = g.targets.clone();
         let mut warnings = Vec::new();
-        let targets = merge_targets("s", Some(&at), Some(&gt), &mut warnings);
+        let targets = merge_targets("s", Some(&at), Some(&gt), &a.ignore, &mut warnings);
         let store = Store {
             target: g.target,
             files: g.files,
@@ -1129,7 +1326,7 @@ mod tests {
         )]);
         let gt: BTreeMap<String, GeneratedTarget> = BTreeMap::new();
         let mut warnings = Vec::new();
-        let targets = merge_targets("helix", Some(&at), Some(&gt), &mut warnings);
+        let targets = merge_targets("helix", Some(&at), Some(&gt), &[], &mut warnings);
         assert!(
             targets.is_empty(),
             "authored-only target contributes no link"
@@ -1153,7 +1350,7 @@ mod tests {
             },
         )]);
         let mut warnings = Vec::new();
-        let targets = merge_targets("helix", Some(&at), Some(&gt), &mut warnings);
+        let targets = merge_targets("helix", Some(&at), Some(&gt), &[], &mut warnings);
         assert!(warnings.is_empty());
         assert_eq!(targets["server"].target, "~/.config/h");
         assert_eq!(targets["server"].when, WhenClause::default());
@@ -1695,7 +1892,7 @@ patterns = ["./work*//"]
             a_targets.insert("t".into(), AuthoredTarget { ignore: vec![], when: WhenClause::default() });
             let g_targets: BTreeMap<String, GeneratedTarget> = BTreeMap::new();
             let mut warnings = Vec::new();
-            let merged = merge_targets(&name, Some(&a_targets), Some(&g_targets), &mut warnings);
+            let merged = merge_targets(&name, Some(&a_targets), Some(&g_targets), &[], &mut warnings);
             prop_assert!(merged.is_empty(), "authored-only target contributes no link");
             prop_assert_eq!(warnings.len(), 1);
         }

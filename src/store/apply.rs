@@ -656,9 +656,9 @@ fn target_has_template_source(
     else {
         return false;
     };
-    links.into_iter().any(|link| {
-        link.is_template() && is_regular_template_source(&link.source)
-    })
+    links
+        .into_iter()
+        .any(|link| link.is_template() && is_regular_template_source(&link.source))
 }
 
 fn is_regular_template_source(path: &Path) -> bool {
@@ -773,9 +773,13 @@ pub fn apply_store(
                 .expect("HOME was validated by Config::load");
             match target_is_confined(&target_path, repo_root) {
                 Ok(()) => {
-                    let target_link_rels = target_keep_links
-                        .get(&target_path)
-                        .unwrap_or(&empty_link_rels);
+                    let canon = config::canonical_target_for_comparison(&target_path);
+                    let mut unioned = BTreeSet::new();
+                    for (raw_path, rels) in &target_keep_links {
+                        if config::canonical_target_for_comparison(raw_path) == canon {
+                            unioned.extend(rels.iter().cloned());
+                        }
+                    }
                     actions.extend(apply_target(
                         name,
                         &store_dir,
@@ -785,7 +789,7 @@ pub fn apply_store(
                         &target_entry.patterns,
                         &target_entry.sources,
                         &target_entry.ignore,
-                        target_link_rels,
+                        &unioned,
                         platform,
                         vars,
                         opts,
@@ -802,13 +806,43 @@ pub fn apply_store(
         // leave a target symlink pointing at a render that is about to
         // disappear. Declared sources join the ownership set so a renamed-away
         // or repointed `sources` entry is swept exactly like an in-store one.
-        for (target_path, link_rels) in target_keep_links {
-            let declared: Vec<PathBuf> = target_declared_sources
-                .remove(&target_path)
+        // Only reconcile target paths that have at least one active target —
+        // inactive targets at separate directories must be left alone (High 1),
+        // while shared directories (active+inactive at same path) are kept
+        // via the union in `target_keep_links`.
+        let active_canonical: BTreeSet<PathBuf> = store
+            .targets
+            .values()
+            .filter(|te| platform.matches_when(&te.when))
+            .filter_map(|te| config::expand_home(&te.target).ok())
+            .map(|p| config::canonical_target_for_comparison(&p))
+            .collect();
+        // Merge raw-path keep sets that are canonical-equivalent (e.g.
+        // "~/out" and "/realhome/out" with a symlinked $HOME). Without
+        // this, disjoint file sets sweep each other in separate walks.
+        let mut canonical_keep: BTreeMap<PathBuf, (PathBuf, BTreeSet<String>)> = BTreeMap::new();
+        for (raw, rels) in target_keep_links {
+            let canon = config::canonical_target_for_comparison(&raw);
+            let entry = canonical_keep
+                .entry(canon)
+                .or_insert_with(|| (raw.clone(), BTreeSet::new()));
+            entry.1.extend(rels);
+        }
+        let mut canonical_declared: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+        for (raw, sources) in target_declared_sources {
+            let canon = config::canonical_target_for_comparison(&raw);
+            canonical_declared.entry(canon).or_default().extend(sources);
+        }
+        for (canon, (representative, link_rels)) in canonical_keep
+            .into_iter()
+            .filter(|(canon, _)| active_canonical.contains(canon))
+        {
+            let declared: Vec<PathBuf> = canonical_declared
+                .remove(&canon)
                 .map(|set| set.into_iter().collect())
                 .unwrap_or_default();
             match render::reconcile_store_links(
-                &target_path,
+                &representative,
                 repo_root,
                 &store_dir,
                 name,
@@ -1069,13 +1103,7 @@ fn prepare_file_mode_target(
         }
     }
     preflight_file_mode_promotion(
-        store_name,
-        store_dir,
-        repo_root,
-        links,
-        platform,
-        vars,
-        opts,
+        store_name, store_dir, repo_root, links, platform, vars, opts,
     )?;
     if opts.dry_run {
         return Ok((true, vec![ApplyAction::Removed(target_path.to_path_buf())]));
@@ -1111,7 +1139,11 @@ fn preflight_file_mode_promotion(
 ) -> Result<(), ApplyAction> {
     for link in links {
         let source_path = &link.source;
-        let source_root = if link.from_sources { repo_root } else { store_dir };
+        let source_root = if link.from_sources {
+            repo_root
+        } else {
+            store_dir
+        };
         // Validate every desired source before removing the live whole-dir
         // link. Otherwise a source reached through an escaped gateway could
         // fail only after the old target had already been removed.
@@ -1154,7 +1186,7 @@ fn preflight_file_mode_promotion(
             .map(|_| ())
         };
         if let Err(e) = result {
-            return Err(ApplyAction::Error(StitchError::render(&source_path, e)));
+            return Err(ApplyAction::Error(StitchError::render(source_path, e)));
         }
     }
     Ok(())
@@ -1568,7 +1600,11 @@ fn apply_file_entry(
     opts: ApplyOpts,
 ) -> ApplyAction {
     let source_path = link.source.clone();
-    let source_root: &Path = if link.from_sources { repo_root } else { store_dir };
+    let source_root: &Path = if link.from_sources {
+        repo_root
+    } else {
+        store_dir
+    };
     let target = target_path.join(&link.name);
 
     // Safety: do not create a nested link through any symlink ancestor, even
