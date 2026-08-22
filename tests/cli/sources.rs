@@ -3,6 +3,7 @@
 #![allow(clippy::all)]
 use std::fs;
 
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 use crate::support::{Repo, assert_envelope_shape, assert_error_shape, json_output};
@@ -863,6 +864,97 @@ out = "shared/h.tmpl"
     repo.cmd()
         .env("HOME", home_path)
         .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn ancestor_source_sweep_spares_nested_target_dirs() {
+    // The dots hub layout: a store owning ~/.config declares the hub file via
+    // `sources`, while a multi-target store owns nested targets (~/.config/kilo,
+    // ~/.config/mimocode) linking the SAME real file by its own name. The
+    // ancestor's stale-link sweep must not descend into the nested stores'
+    // target directories: before v0.14.1 its declared-source ownership check
+    // classified the nested stores' healthy links as its own stale, repointed
+    // entries and deleted them — every apply fought the previous one.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let config_dir = home_path.join(".config");
+    fs::create_dir_all(config_dir.join("kilo")).unwrap();
+    fs::create_dir_all(config_dir.join("mimocode")).unwrap();
+
+    // The one real hub file, plus the store dir that links it by its own name.
+    repo.make_store("agents", &["AGENTS.md"]);
+    // A sources-only store still owns a (possibly empty) store directory.
+    fs::create_dir_all(repo.path().join("agentsconfig")).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.agents.targets.kilo]
+target = "{kilo}"
+files = ["AGENTS.md"]
+
+[stores.agents.targets.mimocode]
+target = "{mimocode}"
+files = ["AGENTS.md"]
+
+[stores.agentsconfig]
+target = "{config}"
+
+[stores.agentsconfig.sources]
+"AGENTS.md" = "agents/AGENTS.md"
+"#,
+        kilo = config_dir.join("kilo").to_string_lossy(),
+        mimocode = config_dir.join("mimocode").to_string_lossy(),
+        config = config_dir.to_string_lossy(),
+    ));
+
+    // First apply creates all three links.
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .success();
+
+    for link in [
+        config_dir.join("AGENTS.md"),
+        config_dir.join("kilo").join("AGENTS.md"),
+        config_dir.join("mimocode").join("AGENTS.md"),
+    ] {
+        assert!(link.is_symlink(), "link must exist: {}", link.display());
+        assert_eq!(
+            fs::read_to_string(&link).unwrap(),
+            "contents of AGENTS.md",
+            "link must read through to the hub: {}",
+            link.display()
+        );
+    }
+
+    // Second apply must be a no-op: the ancestor store's sweep must not
+    // remove the nested stores' links (the pre-0.14.1 tug-of-war).
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("remove:").not());
+
+    for link in [
+        config_dir.join("kilo").join("AGENTS.md"),
+        config_dir.join("mimocode").join("AGENTS.md"),
+    ] {
+        assert!(
+            link.is_symlink(),
+            "link must survive re-apply: {}",
+            link.display()
+        );
+    }
+
+    // And diff reports full convergence.
+    repo.cmd()
+        .env("HOME", home_path)
+        .args(["diff", "--exit-code"])
         .assert()
         .success();
 }

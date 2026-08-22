@@ -2398,6 +2398,12 @@ pub(crate) fn cmd_add(
         }
         let platform = Platform::detect();
         let mut _warnings = Vec::new();
+        // Sweep boundaries: every configured target dir, plus the new store's
+        // own targets (it is not in `loaded.config` yet).
+        let mut boundaries = store::sweep_boundaries(&loaded.config);
+        for dir in store::store_target_dirs(&new_store) {
+            boundaries.insert(dir);
+        }
         let results = store::apply_store(
             root,
             &store_name,
@@ -2410,6 +2416,7 @@ pub(crate) fn cmd_add(
                 json,
             },
             &mut _warnings,
+            &boundaries,
         );
         if results.actions.iter().any(|a| {
             matches!(
@@ -2739,6 +2746,12 @@ pub(crate) fn cmd_add(
         }
         let platform = Platform::detect();
         let mut _warnings = Vec::new();
+        // Sweep boundaries: every configured target dir, plus the new store's
+        // own targets (it is not in `loaded.config` yet).
+        let mut boundaries = store::sweep_boundaries(&loaded.config);
+        for dir in store::store_target_dirs(&new_store) {
+            boundaries.insert(dir);
+        }
         let results = store::apply_store(
             root,
             &store_name,
@@ -2751,6 +2764,7 @@ pub(crate) fn cmd_add(
                 json,
             },
             &mut _warnings,
+            &boundaries,
         );
         // Target ancestors were created and identity-pinned before the store
         // mutation, so cleanup can never claim a directory created by another

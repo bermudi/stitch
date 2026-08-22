@@ -175,6 +175,10 @@ pub fn apply_all(
     let sorted: BTreeMap<_, _> = config.stores.iter().collect();
     let mut results = Vec::new();
     let mut locked_stores: BTreeMap<String, Store> = BTreeMap::new();
+    // Sweep boundaries are global: every configured store's target dir.
+    // Computed once so each store's stale-link walk stops at every other
+    // store's target directory (see `render::reconcile_store_links`).
+    let boundaries = sweep_boundaries(config);
 
     for (name, store) in sorted {
         if !only.is_empty() && !only.contains(name) {
@@ -461,6 +465,7 @@ pub fn apply_all(
                 &config.vars,
                 opts,
                 &mut warnings,
+                &boundaries,
             )
         } else {
             // Reload a fresh snapshot under the lock and require the same hash
@@ -480,6 +485,7 @@ pub fn apply_all(
                                 &locked_snap.loaded.config.vars,
                                 opts,
                                 &mut warnings,
+                                &boundaries,
                             );
                             locked_stores.insert(name.clone(), locked_store);
                             result
@@ -687,7 +693,34 @@ fn collect_declared_sources(
     }
 }
 
+/// Canonical target directories declared by one store (single target plus
+/// every named target). Used to build [`sweep_boundaries`].
+pub fn store_target_dirs(store: &Store) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(ref t) = store.target
+        && let Ok(p) = config::expand_home(t)
+    {
+        dirs.push(config::canonical_target_for_comparison(&p));
+    }
+    for te in store.targets.values() {
+        if let Ok(p) = config::expand_home(&te.target) {
+            dirs.push(config::canonical_target_for_comparison(&p));
+        }
+    }
+    dirs
+}
+
+/// Canonical target directories of every configured store — the set a
+/// file-mode stale-link sweep must not descend into (see
+/// `render::reconcile_store_links`). Includes inactive (`when`-gated)
+/// stores: a platform-skipped store's links must not be swept by an
+/// ancestor store's apply either.
+pub fn sweep_boundaries(config: &Config) -> BTreeSet<PathBuf> {
+    config.stores.values().flat_map(store_target_dirs).collect()
+}
+
 /// Apply a single store.
+#[allow(clippy::too_many_arguments)] // plumbing: boundaries join the apply context
 pub fn apply_store(
     repo_root: &Path,
     name: &str,
@@ -696,6 +729,7 @@ pub fn apply_store(
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
     _warnings: &mut Vec<String>,
+    boundaries: &BTreeSet<PathBuf>,
 ) -> ApplyResult {
     if !platform.matches_when(&store.when) {
         return ApplyResult {
@@ -793,6 +827,7 @@ pub fn apply_store(
                         platform,
                         vars,
                         opts,
+                        boundaries,
                     ));
                 }
                 Err(action) => {
@@ -806,6 +841,10 @@ pub fn apply_store(
         // leave a target symlink pointing at a render that is about to
         // disappear. Declared sources join the ownership set so a renamed-away
         // or repointed `sources` entry is swept exactly like an in-store one.
+        // The walk stops at other stores' target directories (`boundaries`):
+        // when an ancestor store and a nested store declare the same source
+        // (the hub fan-in), the ancestor's source-ownership check must not
+        // claim the nested store's healthy links as its own stale entries.
         // Only reconcile target paths that have at least one active target —
         // inactive targets at separate directories must be left alone (High 1),
         // while shared directories (active+inactive at same path) are kept
@@ -847,6 +886,7 @@ pub fn apply_store(
                 &store_dir,
                 name,
                 &declared,
+                boundaries,
                 &link_rels,
                 opts.dry_run,
             ) {
@@ -893,6 +933,7 @@ pub fn apply_store(
                     platform,
                     vars,
                     opts,
+                    boundaries,
                 ));
             }
             Err(action) => {
@@ -915,6 +956,7 @@ pub fn apply_store(
                 &store_dir,
                 name,
                 &declared,
+                boundaries,
                 &link_rels,
                 opts.dry_run,
             ) {
@@ -976,6 +1018,7 @@ fn apply_target(
     platform: &Platform,
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
+    boundaries: &BTreeSet<PathBuf>,
 ) -> Vec<ApplyAction> {
     match resolve_targets(repo_root, store_dir, files, patterns, sources, ignore) {
         Err(msg) => vec![ApplyAction::Error(StitchError::path_validation(msg))],
@@ -986,6 +1029,7 @@ fn apply_target(
             repo_root,
             target_link_rels,
             opts,
+            boundaries,
         ),
         Ok(LinkTargets::Files(links)) => {
             let (replaces_whole_dir, mut actions) = match prepare_file_mode_target(
@@ -1217,6 +1261,7 @@ fn apply_whole_dir(
     repo_root: &Path,
     keep_link_rels: &BTreeSet<String>,
     opts: ApplyOpts,
+    boundaries: &BTreeSet<PathBuf>,
 ) -> Vec<ApplyAction> {
     // Do not scan a correct directory symlink: `Path::is_dir` follows it, and
     // treating the root link as a stale child would remove the desired state.
@@ -1231,13 +1276,16 @@ fn apply_whole_dir(
     }
 
     // A whole-dir store never declares `sources` (they force file mode), so
-    // the declared-source ownership set is empty here.
+    // the declared-source ownership set is empty here. Target-directory
+    // boundaries still apply — the transition-pending real dir may contain
+    // nested stores' target directories.
     let removed = match render::reconcile_store_links(
         target_path,
         repo_root,
         store_dir,
         store_name,
         &[],
+        boundaries,
         keep_link_rels,
         opts.dry_run,
     ) {
@@ -2013,6 +2061,7 @@ mod tests {
                 json: false,
             },
             &mut Vec::new(),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -2076,6 +2125,7 @@ mod tests {
                 json: false,
             },
             &mut Vec::new(),
+            &BTreeSet::new(),
         );
 
         // The `home` symlink is the offending ancestor; nothing may be
@@ -2138,6 +2188,7 @@ mod tests {
                 json: false,
             },
             &mut warnings,
+            &BTreeSet::new(),
         );
 
         // One nested entry should conflict on the foreign ancestor.
@@ -2210,6 +2261,7 @@ mod tests {
                 json: false,
             },
             &mut warnings,
+            &BTreeSet::new(),
         );
 
         // The nested entry must conflict on the repo-pointing ancestor.
@@ -2287,6 +2339,7 @@ mod tests {
                 json: false,
             },
             &mut warnings,
+            &BTreeSet::new(),
         );
 
         let conflict = result
@@ -2357,6 +2410,7 @@ mod tests {
                 json: false,
             },
             &mut warnings,
+            &BTreeSet::new(),
         );
 
         assert!(target.is_dir());
@@ -2412,6 +2466,7 @@ mod tests {
                 json: false,
             },
             &mut warnings,
+            &BTreeSet::new(),
         );
 
         assert!(target.is_dir());

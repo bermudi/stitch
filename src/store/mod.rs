@@ -11,6 +11,7 @@ mod status;
 
 pub use apply::{
     ApplyAction, ApplyOpts, apply_all, apply_store, compute_plan, has_active_template_sources,
+    store_target_dirs, sweep_boundaries,
 };
 pub(crate) use apply::{apply_added_plain_file, preflight_add_target, store_resolves_source};
 
