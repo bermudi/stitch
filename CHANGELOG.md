@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 0.14.0 — 2026-08-21
+
+### Added
+
+- **Sources primitive** — `files` entries gain a decoupled `sources` map (`target-name → repo-relative source`). `files = ["AGENTS.md"]` keeps its implicit `store-dir/AGENTS.md`; `sources = { "rules.md" = "agents/AGENTS.md" }` says "this target path's content lives elsewhere in the repo." Repo-root-relative, no escapes, no `.stitch/` or symlinked sources, no whole-dir `sources`. Two names may share one source (hub fan-in) and sources may point into another store's directory. Kills the repo-internal alias-symlink workaround (e.g. `agents/rules.md → AGENTS.md`).
+- `stitch add <path> --source <repo-relative>` — register a target path with an explicit source without moving files; existing repo-pointing symlinks are adopted as `sources` entries.
+- `stitch remove` now refuses to delete a source file still referenced by another store's `sources`; `--force` retains the file and reports `retained_sources[]` (text + JSON). New red line: never destroys a source another store still references.
+- `stitch why <repo-path>` reverse lookup — "consumed by: `<store>:<target>` …" for shared sources; `why <target>` gains `source` field.
+- Template staging is per-consumer: a shared template source renders into the consumer's `.stitch/render/<store>/` with its own hooks, never another store's staging.
+- `status` marks source-mapped links (`AGENTS.md ← agents/AGENTS.md`) in text and JSON; `explain`/`doctor` gain source awareness and new validation findings (alias-symlink warning, source escapes, collisions).
+
+### Changed
+
+- Executable plan schema is now **3** (was 2); old plans are rejected. Plan ops now carry explicit `store` identity and `source` fields; validation ensures backup, target and source constraints and rejects stale or non-executable plans before mutation.
+- New store types are split: `GeneratedStore`/`GeneratedTarget` hold `sources` separately from `Authored*` behavior, merged via name.
+
+### Fixed
+
+- Apply no longer cleans up links under **inactive** `when` targets at separate directories (shared directories still union their keep sets).
+- `sources` keys where one is an ancestor of another (e.g. `foo` and `foo/bar`) are rejected at validation before any mutation — no partial `foo` creates.
+- Symlinked `$HOME` is now treated as the **same physical directory**: `~/out` vs `/realhome/out` aliases are recognized as colliding, canonical-equivalent targets share one unioned keep set (no sweep-deletes-each-other), and `plan` now allows the configured HOME symlink itself while still rejecting gateways below HOME.
+- Ancestor `..` in link targets is now evaluated with POSIX-correct sympathy (hook `HOME` replacement, gateway detection) rather than lexical rejection.
+
 ## 0.13.0 — 2026-08-20
 
 ### Added
