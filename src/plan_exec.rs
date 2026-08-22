@@ -1158,6 +1158,15 @@ fn remove_link_for_store(repo_root: &Path, store: &str, target: &Path) -> Result
     linker::remove_link(target, repo_root).map_err(link_error)
 }
 
+fn reject_home_backup_target(target: &Path) -> Result<(), String> {
+    let home =
+        config::canonical_home().map_err(|error| format!("could not resolve $HOME: {error}"))?;
+    if config::canonical_target_for_comparison(target) == home {
+        return Err("refusing --force to replace $HOME as a whole-directory target".into());
+    }
+    Ok(())
+}
+
 fn preflight_op(
     repo_root: &Path,
     loaded: &Loaded,
@@ -1216,6 +1225,7 @@ fn preflight_op(
             source,
             requires,
         } => {
+            reject_home_backup_target(Path::new(target))?;
             check_ancestors_writable(repo_root, Path::new(target))?;
             let target_state = target_state_from(&requires.target, &requires.value)
                 .map_err(|e| format!("invalid requires: {e}"))?;
@@ -1472,6 +1482,7 @@ fn execute_op(
             let target_path = Path::new(target);
             let backup_path = Path::new(backup);
             let source_path = Path::new(source);
+            reject_home_backup_target(target_path)?;
 
             // Re-check the backup path at exec time (TOCTOU guard).
             if backup_path.symlink_metadata().is_ok() {

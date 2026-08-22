@@ -23,6 +23,29 @@ use crate::support::{
 use super::support as _;
 
 #[test]
+fn apply_force_refuses_to_replace_home_as_a_whole_dir() {
+    let repo = Repo::new();
+    repo.make_store("home", &["payload"]);
+    repo.write_state("[stores.home]\ntarget = \"~\"\n");
+    let home = tempfile::tempdir().unwrap();
+    let sentinel = home.path().join("important.txt");
+    fs::write(&sentinel, "keep me").unwrap();
+    let backup = home.path().with_extension("bak");
+
+    repo.cmd()
+        .args(["apply", "--force"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .stdout(contains("refusing --force to replace $HOME"));
+
+    assert!(home.path().is_dir());
+    assert!(!home.path().is_symlink());
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep me");
+    assert!(!backup.exists());
+}
+
+#[test]
 fn apply_whole_dir_creates_symlink() {
     let repo = Repo::new();
     repo.make_store("nvim", &["init.lua"]);

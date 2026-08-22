@@ -5,7 +5,7 @@
 //! `super::resolve`, but does not call back into `apply`.
 
 use super::apply::{ApplyAction, ApplyOpts, ApplyResult};
-use super::resolve::{resolve_link_source, resolve_remove_source, whole_dir_link_target};
+use super::resolve::{resolve_link_sources, resolve_remove_source, whole_dir_link_target};
 use crate::config::Store;
 use crate::error::FailureClass;
 use crate::linker;
@@ -26,6 +26,7 @@ pub(super) fn to_plan(
     for result in results {
         let store = stores.get(&result.store_name);
         let store_dir = repo_root.join(&result.store_name);
+        let link_sources = resolve_link_sources(repo_root, &store_dir, store, &result.store_name);
         let mut ops = Vec::new();
         for action in &result.actions {
             ops.push(action_to_plan_op(
@@ -33,6 +34,7 @@ pub(super) fn to_plan(
                 &store_dir,
                 store,
                 &result.store_name,
+                &link_sources,
                 action,
             ));
         }
@@ -49,6 +51,7 @@ fn action_to_plan_op(
     store_dir: &Path,
     store: Option<&Store>,
     store_name: &str,
+    link_sources: &BTreeMap<std::path::PathBuf, String>,
     action: &ApplyAction,
 ) -> PlanOp {
     match action {
@@ -84,8 +87,7 @@ fn action_to_plan_op(
         },
         ApplyAction::AlreadyLinked(target) => {
             let target_str = path_to_string(target);
-            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
-            else {
+            let Some(source) = link_sources.get(target).cloned() else {
                 return unresolved_source_op(&target_str);
             };
             PlanOp::AlreadyLinked {
@@ -96,8 +98,7 @@ fn action_to_plan_op(
         }
         ApplyAction::Created(target) => {
             let target_str = path_to_string(target);
-            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
-            else {
+            let Some(source) = link_sources.get(target).cloned() else {
                 return unresolved_source_op(&target_str);
             };
             PlanOp::CreateLink {
@@ -111,8 +112,7 @@ fn action_to_plan_op(
             old_resolves_to,
         } => {
             let target_str = path_to_string(target);
-            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
-            else {
+            let Some(source) = link_sources.get(target).cloned() else {
                 return unresolved_source_op(&target_str);
             };
             let requires_target = match old_resolves_to {
@@ -128,8 +128,7 @@ fn action_to_plan_op(
         }
         ApplyAction::ContentChanged(target) => {
             let target_str = path_to_string(target);
-            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
-            else {
+            let Some(source) = link_sources.get(target).cloned() else {
                 return unresolved_source_op(&target_str);
             };
             PlanOp::ContentChanged {
@@ -141,8 +140,7 @@ fn action_to_plan_op(
         ApplyAction::BackedUp { target, backup } => {
             let target_str = path_to_string(target);
             let backup_str = path_to_string(backup);
-            let Some(source) = resolve_link_source(repo_root, store_dir, store, store_name, target)
-            else {
+            let Some(source) = link_sources.get(target).cloned() else {
                 return unresolved_source_op(&target_str);
             };
             PlanOp::BackupAndLink {

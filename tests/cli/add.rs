@@ -721,6 +721,26 @@ fn add_rejects_the_repository_itself_with_a_clear_message() {
 }
 
 #[test]
+fn add_rejects_home_itself_without_moving_it() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let sentinel = home.path().join("important.txt");
+    fs::write(&sentinel, "keep me").unwrap();
+
+    repo.cmd()
+        .args(["add", "~"])
+        .env("HOME", home.path())
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("cannot add $HOME itself"));
+
+    assert!(home.path().is_dir());
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep me");
+    assert!(!repo.path().join("home").exists());
+}
+
+#[test]
 fn add_strips_setuid_bit_from_adopted_file() {
     // A setuid bit on a dotfile is almost always unintentional and git would
     // drop it on clone anyway. `add` must strip setuid/setgid/sticky bits when

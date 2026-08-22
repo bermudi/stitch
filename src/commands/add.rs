@@ -2064,6 +2064,12 @@ pub(crate) fn cmd_add(
                 )
             }));
         }
+        let home_resolved = config::canonical_home()?;
+        if source_resolved == home_resolved {
+            return Err(StitchError::usage(
+                "cannot add $HOME itself; add a path below $HOME instead",
+            ));
+        }
     }
     if create_file && source_exists {
         return Err(StitchError::usage(format!(

@@ -342,19 +342,16 @@ pub(crate) fn check_link_name_collisions(links: &[FileLink]) -> Result<(), Strin
     // Ancestor/descendant: `foo` and `foo/bar` would require a file and a
     // directory at the same path. Reject before any mutation so apply does
     // not partially create `foo` then fail on `foo/bar`.
-    let mut names: Vec<&str> = by_name.keys().copied().collect();
-    names.sort();
-    for i in 0..names.len() {
-        for j in (i + 1)..names.len() {
-            let a = names[i];
-            let b = names[j];
-            if b.starts_with(&format!("{a}/")) {
-                let a_src = by_name[a][0].source.display().to_string();
-                let b_src = by_name[b][0].source.display().to_string();
-                return Err(format!(
-                    "ancestor collision for '{a}' and '{b}': {a_src} and {b_src} — one is ancestor of the other, rename one"
-                ));
-            }
+    for &a in by_name.keys() {
+        let prefix = format!("{a}/");
+        if let Some((&b, _)) = by_name.range(prefix.as_str()..).next()
+            && b.starts_with(&prefix)
+        {
+            let a_src = by_name[a][0].source.display().to_string();
+            let b_src = by_name[b][0].source.display().to_string();
+            return Err(format!(
+                "ancestor collision for '{a}' and '{b}': {a_src} and {b_src} — one is ancestor of the other, rename one"
+            ));
         }
     }
     Ok(())
@@ -423,6 +420,7 @@ struct LinkClaim {
     tname: Option<String>,
     whens: Vec<WhenClause>,
     path: PathBuf,
+    canonical_path: PathBuf,
 }
 
 /// Build the message naming both claimants of a colliding link path, mirroring
@@ -535,8 +533,21 @@ pub(crate) fn check_link_path_collisions(
         }
     }
 
+    claims.sort_by(|a, b| {
+        a.canonical_path
+            .components()
+            .count()
+            .cmp(&b.canonical_path.components().count())
+    });
+    let mut claims_by_path: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
     for i in 0..claims.len() {
-        for j in (i + 1)..claims.len() {
+        let mut candidate_indices: Vec<usize> = Vec::new();
+        for ancestor in claims[i].canonical_path.ancestors() {
+            if let Some(indices) = claims_by_path.get(ancestor) {
+                candidate_indices.extend(indices);
+            }
+        }
+        for j in candidate_indices {
             let a = &claims[i];
             let b = &claims[j];
             // A store cannot collide with itself across the same target entry;
@@ -551,20 +562,19 @@ pub(crate) fn check_link_path_collisions(
             if !WhenClause::are_compatible(&combined) {
                 continue;
             }
-            let a_canon = crate::config::canonical_target_for_comparison(&a.path);
-            let b_canon = crate::config::canonical_target_for_comparison(&b.path);
-            if a_canon == b_canon || a_canon.starts_with(&b_canon) || b_canon.starts_with(&a_canon)
-            {
-                return Err(ConfigError::Conflict(link_collision_message(
-                    &a.store,
-                    a.tname.as_deref(),
-                    &b.store,
-                    b.tname.as_deref(),
-                    &a.path,
-                    &b.path,
-                )));
-            }
+            return Err(ConfigError::Conflict(link_collision_message(
+                &a.store,
+                a.tname.as_deref(),
+                &b.store,
+                b.tname.as_deref(),
+                &a.path,
+                &b.path,
+            )));
         }
+        claims_by_path
+            .entry(claims[i].canonical_path.clone())
+            .or_default()
+            .push(i);
     }
     Ok(())
 }
@@ -590,19 +600,25 @@ fn collect_link_claims_for_target(
         whens.push(w.clone());
     }
     match resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore) {
-        LinkTargets::WholeDir => claims.push(LinkClaim {
-            store: store_name.to_string(),
-            tname: tname.map(|s| s.to_string()),
-            whens,
-            path: target_path.to_path_buf(),
-        }),
+        LinkTargets::WholeDir => {
+            let path = target_path.to_path_buf();
+            claims.push(LinkClaim {
+                store: store_name.to_string(),
+                tname: tname.map(|s| s.to_string()),
+                whens,
+                canonical_path: config::canonical_target_for_comparison(&path),
+                path,
+            });
+        }
         LinkTargets::Files(links) => {
             for link in links {
+                let path = target_path.join(&link.name);
                 claims.push(LinkClaim {
                     store: store_name.to_string(),
                     tname: tname.map(|s| s.to_string()),
                     whens: whens.clone(),
-                    path: target_path.join(&link.name),
+                    canonical_path: config::canonical_target_for_comparison(&path),
+                    path,
                 });
             }
         }
@@ -781,6 +797,74 @@ pub(crate) fn resolve_link_source(
         }
     }
     None
+}
+
+/// Resolve every desired target to its source once. Plan construction handles
+/// one action per target, so resolving glob patterns again for every action
+/// would turn a large file-mode store into quadratic work.
+pub(crate) fn resolve_link_sources(
+    repo_root: &Path,
+    store_dir: &Path,
+    store: Option<&Store>,
+    store_name: &str,
+) -> BTreeMap<PathBuf, String> {
+    let mut resolved = BTreeMap::new();
+    let Some(store) = store else {
+        return resolved;
+    };
+    let platform = crate::platform::Platform::detect();
+    if !platform.matches_when(&store.when) {
+        return resolved;
+    }
+
+    let mut add_target = |target_path: PathBuf,
+                          files: &[String],
+                          patterns: &[String],
+                          sources: &BTreeMap<String, String>,
+                          ignore: &[String]| {
+        match resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore) {
+            LinkTargets::WholeDir => {
+                resolved.insert(target_path, path_to_string(store_dir));
+            }
+            LinkTargets::Files(links) => {
+                for link in links {
+                    let source = if link.is_template() {
+                        render::staging_path(repo_root, store_name, &link.name)
+                    } else {
+                        link.source
+                    };
+                    resolved.insert(target_path.join(link.name), path_to_string(&source));
+                }
+            }
+        }
+    };
+
+    if store.is_multi_target() {
+        for target in store.targets.values() {
+            if platform.matches_when(&target.when)
+                && let Ok(target_path) = config::expand_home(&target.target)
+            {
+                add_target(
+                    target_path,
+                    &target.files,
+                    &target.patterns,
+                    &target.sources,
+                    &target.ignore,
+                );
+            }
+        }
+    } else if let Some(target) = &store.target
+        && let Ok(target_path) = config::expand_home(target)
+    {
+        add_target(
+            target_path,
+            &store.files,
+            &store.patterns,
+            &store.sources,
+            &store.ignore,
+        );
+    }
+    resolved
 }
 
 #[allow(clippy::too_many_arguments)]
