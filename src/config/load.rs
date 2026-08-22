@@ -150,12 +150,13 @@ fn path_exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-/// Open a file with `O_NOFOLLOW`, validate it via `fstat` on the fd, and read
-/// its bytes from the same fd. Returns `None` for `NotFound` (missing file) and
+/// Open a file with `O_NOFOLLOW | O_NONBLOCK`, validate it via `fstat` on the
+/// fd, and read its bytes from the same fd. Returns `None` for `NotFound` (missing file) and
 /// `Some(bytes)` for a present file (including an empty one). This distinction
 /// is what keeps missing and empty files separate in the hash.
 ///
-/// `O_NOFOLLOW` rejects symlinks at open time. `fstat` on the fd then checks:
+/// `O_NOFOLLOW` rejects symlinks at open time. `O_NONBLOCK` prevents a FIFO
+/// from hanging before `fstat` can reject it. `fstat` on the fd then checks:
 /// - the file is a regular file (not a device, socket, etc.);
 /// - `nlink == 1` (not hard-linked to another path).
 ///
@@ -168,7 +169,7 @@ fn path_exists(path: &Path) -> bool {
 fn open_and_read_validated(path: &Path, kind: &str) -> Result<Option<Vec<u8>>, ConfigError> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -809,55 +810,40 @@ pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<(), ConfigError> {
-    let mut targets: Vec<(String, String, PathBuf, PathBuf, WhenClause)> = Vec::new();
     for (store_name, store) in stores {
-        if store.is_multi_target() {
-            for (target_name, target) in &store.targets {
-                let expanded = expand_home(&target.target)?;
-                let canonical = canonical_target_for_comparison(&expanded);
-                targets.push((
-                    store_name.clone(),
-                    format!("store '{store_name}' target '{target_name}'"),
-                    expanded,
-                    canonical,
-                    target.when.clone(),
-                ));
-            }
-        } else if let Some(target) = &store.target {
-            let expanded = expand_home(target)?;
+        if !store.is_multi_target() {
+            continue;
+        }
+        let mut targets: Vec<(String, PathBuf, PathBuf, WhenClause)> = Vec::new();
+        for (target_name, target) in &store.targets {
+            let expanded = expand_home(&target.target)?;
             let canonical = canonical_target_for_comparison(&expanded);
             targets.push((
-                store_name.clone(),
-                format!("store '{store_name}'"),
+                format!("store '{store_name}' target '{target_name}'"),
                 expanded,
                 canonical,
-                store.when.clone(),
+                target.when.clone(),
             ));
         }
-    }
-
-    for (index, (left_store, left_name, left, left_canon, left_when)) in targets.iter().enumerate()
-    {
-        for (right_store, right_name, _right, right_canon, right_when) in
-            targets.iter().skip(index + 1)
-        {
-            // Use canonical forms so `~/out` and `/realhome/out` are
-            // recognised as the same physical location when `$HOME` is
-            // symlinked. Only nested (one starts with the other) is
-            // considered overlapping; equal directories are allowed for
-            // file-mode sharing and are handled at the link-path level.
-            // This mirrors the original check which only rejected same-store
-            // nesting (cross-store nesting is handled by link-path collisions).
-            if left_store == right_store
-                && WhenClause::are_compatible(&[left_when, right_when])
-                && left_canon != right_canon
-                && (left_canon.starts_with(right_canon) || right_canon.starts_with(left_canon))
-            {
-                return Err(ConfigError::InvalidPath(format!(
-                    "overlapping target paths are unsafe: {left_name} targets '{}' while {right_name} targets '{}'",
-                    left.display(),
-                    _right.display()
-                )));
+        for (index, (left_name, left, left_canon, left_when)) in targets.iter().enumerate() {
+            for (right_name, right, right_canon, right_when) in targets.iter().skip(index + 1) {
+                // Use canonical forms so `~/out` and `/realhome/out` are
+                // recognised as the same physical location when `$HOME` is
+                // symlinked. Only nested (one starts with the other) is
+                // considered overlapping; equal directories are allowed for
+                // file-mode sharing and are handled at the link-path level.
+                // This mirrors the original check which only rejected same-store
+                // nesting (cross-store nesting is handled by link-path collisions).
+                if WhenClause::are_compatible(&[left_when, right_when])
+                    && left_canon != right_canon
+                    && (left_canon.starts_with(right_canon) || right_canon.starts_with(left_canon))
+                {
+                    return Err(ConfigError::InvalidPath(format!(
+                        "overlapping target paths are unsafe: {left_name} targets '{}' while {right_name} targets '{}'",
+                        left.display(),
+                        right.display()
+                    )));
+                }
             }
         }
     }

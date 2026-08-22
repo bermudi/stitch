@@ -1275,6 +1275,23 @@ fn apply_whole_dir(
         )];
     }
 
+    if opts.force {
+        let canonical_target = config::canonical_target_for_comparison(target_path);
+        match config::canonical_home() {
+            Ok(home) if canonical_target == home => {
+                return vec![ApplyAction::Error(StitchError::usage(
+                    "refusing --force to replace $HOME as a whole-directory target",
+                ))];
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return vec![internal_error(format!(
+                    "could not resolve $HOME before whole-directory apply: {error}"
+                ))];
+            }
+        }
+    }
+
     // A whole-dir store never declares `sources` (they force file mode), so
     // the declared-source ownership set is empty here. Target-directory
     // boundaries still apply — the transition-pending real dir may contain

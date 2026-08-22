@@ -23,6 +23,26 @@ use crate::support::{
 use super::support as _;
 
 #[test]
+fn apply_rejects_fifo_state_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = Repo::new();
+    let state = repo.path().join(".stitch/state.toml");
+    fs::remove_file(&state).unwrap();
+    let path = CString::new(state.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `path` is a NUL-terminated pathname owned by this test.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(contains("refusing symlinked or non-regular state file"));
+}
+
+#[test]
 fn config_rejects_target_overlap_through_filesystem_alias() {
     let repo = Repo::new();
     repo.make_store("app", &["a", "b"]);
