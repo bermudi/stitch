@@ -705,7 +705,7 @@ files = ["regular", "alias"]
         );
 
         // `remove` must remove the target link and the state, then exit 0.
-        cmd_remove(repo, "app", false, false).unwrap();
+        cmd_remove(repo, "app", false, false, false).unwrap();
 
         assert!(
             !target_dir.join("alias").exists(),
@@ -773,7 +773,7 @@ files = ["regular"]
 
         // `remove` must still succeed and delete the state, not error with a
         // foreign-symlink conflict.
-        cmd_remove(repo, "app", false, false).unwrap();
+        cmd_remove(repo, "app", false, false, false).unwrap();
 
         let state_text = fs::read_to_string(stitch.join("state.toml")).unwrap();
         assert!(

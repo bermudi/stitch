@@ -24,6 +24,8 @@ pub(crate) fn cmd_plan(
     }
 
     let platform = Platform::detect();
+    store::check_link_path_collisions(root, &filtered_config, &platform)
+        .map_err(StitchError::from)?;
     let plan = store::compute_plan(
         root,
         &filtered_config,

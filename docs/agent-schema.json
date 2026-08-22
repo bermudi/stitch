@@ -4,22 +4,54 @@
   "envelope": {
     "description": "Every --json command prints one of these to stdout.",
     "fields": {
-      "schema": { "type": "u32", "value": 1 },
-      "command": { "type": "string", "description": "The command name (e.g. 'apply', 'status')." },
-      "ok": { "type": "bool", "description": "true on success, false on error or conflict." },
-      "warnings": { "type": "array<string>", "description": "Non-fatal notices, e.g. load-time warnings." },
-      "data": { "type": "object|null", "description": "Command-specific data; null on hard error. Shape depends on `command`." },
-      "error": { "type": "object|null", "description": "Present when ok=false; see `error` shape." }
+      "schema": {
+        "type": "u32",
+        "value": 1
+      },
+      "command": {
+        "type": "string",
+        "description": "The command name (e.g. 'apply', 'status')."
+      },
+      "ok": {
+        "type": "bool",
+        "description": "true on success, false on error or conflict."
+      },
+      "warnings": {
+        "type": "array<string>",
+        "description": "Non-fatal notices, e.g. load-time warnings."
+      },
+      "data": {
+        "type": "object|null",
+        "description": "Command-specific data; null on hard error. Shape depends on `command`."
+      },
+      "error": {
+        "type": "object|null",
+        "description": "Present when ok=false; see `error` shape."
+      }
     }
   },
   "error": {
     "description": "Machine-readable error detail, including structured recovery actions.",
     "fields": {
-      "class": { "type": "string", "description": "Failure class id (e.g. 'conflict-real')." },
-      "code": { "type": "i32", "description": "Exit code; matches the exit-code table." },
-      "message": { "type": "string" },
-      "hint": { "type": "string|null", "description": "Human-readable recovery hint." },
-      "details": { "type": "string|null", "description": "JSON string with structured detail for hook errors: {\"hook\":\"<name>\",\"store\":\"<store>|null\",\"scope\":\"global|per-store\"}. Null for non-hook errors." },
+      "class": {
+        "type": "string",
+        "description": "Failure class id (e.g. 'conflict-real')."
+      },
+      "code": {
+        "type": "i32",
+        "description": "Exit code; matches the exit-code table."
+      },
+      "message": {
+        "type": "string"
+      },
+      "hint": {
+        "type": "string|null",
+        "description": "Human-readable recovery hint."
+      },
+      "details": {
+        "type": "string|null",
+        "description": "JSON string with structured detail for hook errors: {\"hook\":\"<name>\",\"store\":\"<store>|null\",\"scope\":\"global|per-store\"}. Null for non-hook errors."
+      },
       "recoverable_via": {
         "type": "array<RecoveryAction>",
         "description": "Machine-readable recovery actions. Empty when not recoverable via a stitch command."
@@ -44,11 +76,26 @@
           "set-env"
         ]
       },
-      "command": { "type": "string|absent", "description": "The stitch command to run, if any." },
-      "flags": { "type": "array<string>|absent", "description": "Flags to pass (e.g. '--force')." },
-      "args": { "type": "array<string>|absent", "description": "Positional args (e.g. target path)." },
-      "reason": { "type": "string|absent", "description": "Why this action applies; for 'manual', explains why no stitch command can fix it." },
-      "vars": { "type": "array<string>", "description": "For 'set-env': environment variables to set before retrying." }
+      "command": {
+        "type": "string|absent",
+        "description": "The stitch command to run, if any."
+      },
+      "flags": {
+        "type": "array<string>|absent",
+        "description": "Flags to pass (e.g. '--force')."
+      },
+      "args": {
+        "type": "array<string>|absent",
+        "description": "Positional args (e.g. target path)."
+      },
+      "reason": {
+        "type": "string|absent",
+        "description": "Why this action applies; for 'manual', explains why no stitch command can fix it."
+      },
+      "vars": {
+        "type": "array<string>",
+        "description": "For 'set-env': environment variables to set before retrying."
+      }
     }
   },
   "commands": {
@@ -62,15 +109,15 @@
     },
     "diff": {
       "data": "Plan",
-      "description": "What apply would do. Lean — not the composite."
+      "description": "What apply would do. Lean \u2014 not the composite."
     },
     "plan": {
       "data": "PlanFile",
-      "description": "Captured executable plan for `apply --plan`. A versioned, self-describing artifact (schema 2, kind `stitch/plan`) carrying staged-render hashes and a config+platform fingerprint. Distinct from the lean `Plan` shape used by `diff`/`apply`."
+      "description": "Captured executable plan for `apply --plan`. A versioned, self-describing artifact (schema 3, kind `stitch/plan`) carrying staged-render hashes and a config+platform fingerprint. Distinct from the lean `Plan` shape used by `diff`/`apply`."
     },
     "apply": {
       "data": "ApplyData|PlanExecReport",
-      "description": "Direct `apply` emits the composite ApplyData (desired + plan + result + post_status). `apply --plan` emits PlanExecReport instead — the desired state is already pinned in the plan file, so the composite is not needed."
+      "description": "Direct `apply` emits the composite ApplyData (desired + plan + result + post_status). `apply --plan` emits PlanExecReport instead \u2014 the desired state is already pinned in the plan file, so the composite is not needed."
     },
     "doctor": {
       "data": "DoctorData",
@@ -86,11 +133,11 @@
     },
     "add": {
       "data": "AddData|BulkAddData",
-      "description": "Single-path add: AddData. Bulk add (multiple paths): BulkAddData with per-path results. Real mutations include link_created."
+      "description": "Single-path add: AddData. Bulk add: BulkAddData. `--source` registers a repo-relative source mapping; real mutations include link_created."
     },
     "remove": {
       "data": "RemoveData",
-      "description": "Remove report; real mutations include behavior_orphaned."
+      "description": "Remove report; real mutations include behavior_orphaned and retained_sources on --force."
     },
     "migrate": {
       "data": "MigrateData",
@@ -106,7 +153,7 @@
     },
     "why": {
       "data": "WhyData",
-      "description": "Single-path investigation: what owns this target, its source, link state."
+      "description": "Single-path investigation: what owns this target, its source, link state. Repo-relative queries return consumers (reverse lookup)."
     },
     "log": {
       "data": "AuditEntry[]",
@@ -135,6 +182,7 @@
         "target_name": "string|absent (multi-target name; omitted when none)",
         "target": "string (absolute path)",
         "source": "string (absolute path)",
+        "source_rel": "string|absent (repo-relative source for `sources` entries; omitted for in-store entries)",
         "templated": "bool",
         "staged_path": "string|absent (omitted for non-templates and skipped-platform entries)",
         "state": "string (linked|missing|conflict|broken|foreign|store-error|config-error)",
@@ -150,6 +198,7 @@
         "targets": "ListTarget[]|absent",
         "files": "string[]|absent (omitted when empty)",
         "patterns": "string[]|absent (omitted when empty)",
+        "sources": "object<string,string>|absent (repo-relative source mappings; omitted when empty)",
         "when": "WhenClause|absent"
       }
     },
@@ -160,6 +209,7 @@
         "mode": "string",
         "files": "string[]|absent (omitted when empty)",
         "patterns": "string[]|absent (omitted when empty)",
+        "sources": "object<string,string>|absent (repo-relative source mappings; omitted when empty)",
         "when": "WhenClause|absent"
       }
     },
@@ -178,17 +228,59 @@
     "PlanOp": {
       "tag": "action",
       "variants": {
-        "stage_render": { "store": "string", "source_rel": "string", "source": "string", "staged": "string", "sha256": "string" },
-        "create_link": { "target": "string", "source": "string", "requires": "LinkRequires" },
-        "replace_link": { "target": "string", "source": "string", "old_resolves_to": "string|null", "requires": "LinkRequires" },
-        "backup_and_link": { "target": "string", "source": "string", "backup": "string", "requires": "LinkRequires" },
-        "remove_link": { "store": "string", "target": "string", "source": "string|null", "requires": "LinkRequires" },
-        "remove_staged": { "path": "string" },
-        "content_changed": { "target": "string", "source": "string", "requires": "LinkRequires" },
-        "already_linked": { "target": "string", "source": "string", "requires": "LinkRequires" },
-        "conflict": { "target": "string", "resolves_to": "string|null" },
+        "stage_render": {
+          "store": "string",
+          "source_rel": "string",
+          "source": "string",
+          "staged": "string",
+          "sha256": "string"
+        },
+        "create_link": {
+          "target": "string",
+          "source": "string",
+          "requires": "LinkRequires"
+        },
+        "replace_link": {
+          "target": "string",
+          "source": "string",
+          "old_resolves_to": "string|null",
+          "requires": "LinkRequires"
+        },
+        "backup_and_link": {
+          "target": "string",
+          "source": "string",
+          "backup": "string",
+          "requires": "LinkRequires"
+        },
+        "remove_link": {
+          "store": "string",
+          "target": "string",
+          "source": "string|null",
+          "requires": "LinkRequires"
+        },
+        "remove_staged": {
+          "path": "string"
+        },
+        "content_changed": {
+          "target": "string",
+          "source": "string",
+          "requires": "LinkRequires"
+        },
+        "already_linked": {
+          "target": "string",
+          "source": "string",
+          "requires": "LinkRequires"
+        },
+        "conflict": {
+          "target": "string",
+          "resolves_to": "string|null"
+        },
         "skipped_platform": {},
-        "error": { "message": "string", "class": "string", "hook_name": "string|null (hook failures only)" }
+        "error": {
+          "message": "string",
+          "class": "string",
+          "hook_name": "string|null (hook failures only)"
+        }
       }
     },
     "PlanSummary": {
@@ -205,15 +297,15 @@
       }
     },
     "PlanFile": {
-      "description": "The on-disk plan file format emitted by `plan --json` (and text-mode `plan`). Versioned and self-describing; `apply --plan` validates `schema`, `kind`, `config_sha256`, `platform`, and every `stage_render` hash before executing. See SPEC.md §Plan file format.",
+      "description": "The on-disk plan file format emitted by `plan --json` (and text-mode `plan`). Versioned and self-describing; `apply --plan` validates `schema`, `kind`, `config_sha256`, `platform`, and every `stage_render` hash before executing. See SPEC.md \u00a7Plan file format.",
       "fields": {
-        "schema": "u32 (plan schema version; currently 2)",
+        "schema": "u32 (plan schema version; currently 3)",
         "kind": "string (always `stitch/plan`)",
         "repo": "string (absolute path to the repo root at capture time)",
         "config_sha256": "string (domain-separated SHA-256 of stitch.toml + .stitch/state.toml)",
         "platform": "PlatformFingerprint",
         "ops": "PlanFileOp[]",
-        "stores": "string[]|absent (stores owning executable ops; omitted when empty — controls per-store hooks, must match ops exactly)",
+        "stores": "string[]|absent (stores owning executable ops; omitted when empty \u2014 controls per-store hooks, must match ops exactly)",
         "conflicts": "PlanConflict[]",
         "errors": "PlanError[]"
       }
@@ -232,12 +324,41 @@
       "description": "An executable op in the plan file. Tagged by `op` (snake_case). Distinct from the lean `PlanOp` (tagged by `action`) used in `diff`/`apply`.",
       "tag": "op",
       "variants": {
-        "stage_render": { "store": "string", "source_rel": "string", "staged": "string", "sha256": "string" },
-        "create_link": { "target": "string", "source": "string", "requires": "PlanFileRequires" },
-        "replace_link": { "target": "string", "source": "string", "requires": "PlanFileRequires" },
-        "backup_and_link": { "target": "string", "backup": "string", "source": "string", "requires": "PlanFileRequires" },
-        "remove_link": { "store": "string", "target": "string", "source": "string|absent", "requires": "PlanFileRequires" },
-        "remove_staged": { "store": "string", "rel": "string" }
+        "stage_render": {
+          "store": "string",
+          "source_rel": "string",
+          "staged": "string",
+          "sha256": "string"
+        },
+        "create_link": {
+          "store": "string",
+          "target": "string",
+          "source": "string",
+          "requires": "PlanFileRequires"
+        },
+        "replace_link": {
+          "store": "string",
+          "target": "string",
+          "source": "string",
+          "requires": "PlanFileRequires"
+        },
+        "backup_and_link": {
+          "store": "string",
+          "target": "string",
+          "backup": "string",
+          "source": "string",
+          "requires": "PlanFileRequires"
+        },
+        "remove_link": {
+          "store": "string",
+          "target": "string",
+          "source": "string|absent",
+          "requires": "PlanFileRequires"
+        },
+        "remove_staged": {
+          "store": "string",
+          "rel": "string"
+        }
       }
     },
     "PlanFileRequires": {
@@ -266,7 +387,7 @@
       }
     },
     "PlanExecReport": {
-      "description": "Result of executing (or preflighting) a plan file via `apply --plan`. Emitted in the envelope's `data` field with command `apply`. On abort, the same shape is carried in `data` alongside a non-null `error`. Note: `ops_executed` here is a `string[]` of executed op descriptions, unlike `ApplyResult.ops_executed` which is a `usize` count — same field name, different type depending on the apply path.",
+      "description": "Result of executing (or preflighting) a plan file via `apply --plan`. Emitted in the envelope's `data` field with command `apply`. On abort, the same shape is carried in `data` alongside a non-null `error`. Note: `ops_executed` here is a `string[]` of executed op descriptions, unlike `ApplyResult.ops_executed` which is a `usize` count \u2014 same field name, different type depending on the apply path.",
       "fields": {
         "ops_total": "usize",
         "ops_executed": "string[] (descriptions of ops that ran; empty on preflight-only abort)",
@@ -289,7 +410,9 @@
       "variants": {
         "absent": {},
         "real_entry": {},
-        "symlink_to": { "value": "string" },
+        "symlink_to": {
+          "value": "string"
+        },
         "symlink_into_repo": {}
       }
     },
@@ -369,7 +492,7 @@
         "store": "string",
         "target": "string",
         "mode": "string",
-        "source": "string|absent (repo source path; omitted for create modes and on dry-run)",
+        "source": "string|absent (repo source path for --source / adopt; omitted for create modes)",
         "files": "string[]|absent (omitted when empty)",
         "patterns": "string[]|absent (omitted when empty)",
         "link_created": "string|absent (real mutations only; omitted on dry-run)",
@@ -384,6 +507,7 @@
         "links": "string[]|absent (omitted when empty)",
         "staging": "string",
         "dry_run": "bool",
+        "retained_sources": "string[]|absent (repo-relative sources retained on --force; omitted when empty)",
         "behavior_orphaned": "bool|absent (real mutations only; omitted on dry-run)",
         "removed_staging": "string[]|absent (staged-render files removed; omitted on dry-run)",
         "state_entry_removed": "bool|absent (real mutations only; omitted on dry-run)"
@@ -414,6 +538,7 @@
         "target": "string",
         "mode": "string",
         "files": "string[]|absent (omitted when empty)",
+        "sources": "object<string,string>|absent (repo-relative source mappings; omitted when empty)",
         "targets": "ImportedTarget[]|absent"
       }
     },
@@ -421,7 +546,8 @@
       "fields": {
         "name": "string",
         "target": "string",
-        "files": "string[]|absent (omitted when empty)"
+        "files": "string[]|absent (omitted when empty)",
+        "sources": "object<string,string>|absent (repo-relative source mappings; omitted when empty)"
       }
     },
     "ExplainData": {
@@ -467,7 +593,8 @@
       "fields": {
         "source": "string (may end in .tmpl)",
         "templated": "bool",
-        "link_name": "string (.tmpl stripped)"
+        "link_name": "string (.tmpl stripped)",
+        "from_sources": "bool|absent (true when entry comes from a `sources` mapping; omitted when false)"
       }
     },
     "WhenClause": {
@@ -489,7 +616,16 @@
       "fields": {
         "query": "string",
         "entry": "WhyEntry|absent",
-        "skipped_platform": "bool|absent (omitted when false)"
+        "skipped_platform": "bool|absent (omitted when false)",
+        "consumers": "WhyConsumer[]|absent (reverse lookup for repo-relative source queries; absent when query is not a repo source, empty array when source has no consumers)"
+      }
+    },
+    "WhyConsumer": {
+      "fields": {
+        "store": "string",
+        "target_name": "string|absent (multi-target name; omitted when none)",
+        "name": "string (link name under target)",
+        "target": "string (absolute path)"
       }
     },
     "WhyEntry": {
@@ -533,20 +669,80 @@
     }
   },
   "exit_codes": [
-    { "code": 0, "class": "ok", "description": "Success" },
-    { "code": 1, "class": "internal", "description": "Generic / I/O / unexpected" },
-    { "code": 2, "class": "usage", "description": "CLI usage error" },
-    { "code": 3, "class": "config", "description": "Config load, parse, or v0.2 migration" },
-    { "code": 4, "class": "repo-resolution", "description": "Repo root resolution failed" },
-    { "code": 5, "class": "unknown-store", "description": "Unknown store name" },
-    { "code": 6, "class": "conflict-real", "description": "Real file/dir blocks the target" },
-    { "code": 7, "class": "conflict-foreign", "description": "Foreign symlink blocks the target" },
-    { "code": 8, "class": "render", "description": "Template render failed" },
-    { "code": 9, "class": "path-validation", "description": "Path fragment validation failed" },
-    { "code": 10, "class": "hook", "description": "Hook execution failed" },
-    { "code": 11, "class": "mixed", "description": "Multiple failure classes in one run" },
-    { "code": 12, "class": "plan-stale", "description": "Plan is stale or invalid" },
-    { "code": 13, "class": "doctor", "description": "doctor reported error-severity findings" },
-    { "code": 14, "class": "drift", "description": "diff --exit-code: safe pending changes" }
+    {
+      "code": 0,
+      "class": "ok",
+      "description": "Success"
+    },
+    {
+      "code": 1,
+      "class": "internal",
+      "description": "Generic / I/O / unexpected"
+    },
+    {
+      "code": 2,
+      "class": "usage",
+      "description": "CLI usage error"
+    },
+    {
+      "code": 3,
+      "class": "config",
+      "description": "Config load, parse, or v0.2 migration"
+    },
+    {
+      "code": 4,
+      "class": "repo-resolution",
+      "description": "Repo root resolution failed"
+    },
+    {
+      "code": 5,
+      "class": "unknown-store",
+      "description": "Unknown store name"
+    },
+    {
+      "code": 6,
+      "class": "conflict-real",
+      "description": "Real file/dir blocks the target"
+    },
+    {
+      "code": 7,
+      "class": "conflict-foreign",
+      "description": "Foreign symlink blocks the target"
+    },
+    {
+      "code": 8,
+      "class": "render",
+      "description": "Template render failed"
+    },
+    {
+      "code": 9,
+      "class": "path-validation",
+      "description": "Path fragment validation failed"
+    },
+    {
+      "code": 10,
+      "class": "hook",
+      "description": "Hook execution failed"
+    },
+    {
+      "code": 11,
+      "class": "mixed",
+      "description": "Multiple failure classes in one run"
+    },
+    {
+      "code": 12,
+      "class": "plan-stale",
+      "description": "Plan is stale or invalid"
+    },
+    {
+      "code": 13,
+      "class": "doctor",
+      "description": "doctor reported error-severity findings"
+    },
+    {
+      "code": 14,
+      "class": "drift",
+      "description": "diff --exit-code: safe pending changes"
+    }
   ]
 }

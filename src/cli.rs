@@ -113,6 +113,12 @@ pub enum Commands {
         #[arg(long, value_name = "STORE")]
         to: Option<String>,
 
+        /// Register the target path with an explicit repo-relative source
+        /// (the fan-in flow): one file, many names/homes. Nothing is moved or
+        /// copied. Only valid with a single path.
+        #[arg(long, value_name = "REPO-PATH")]
+        source: Option<String>,
+
         /// Preview without making changes
         #[arg(long)]
         dry_run: bool,
@@ -126,6 +132,12 @@ pub enum Commands {
         /// Preview without removing anything
         #[arg(long)]
         dry_run: bool,
+
+        /// Proceed even when other stores' `sources` reference files inside
+        /// this store's directory; the referenced source files are retained
+        /// in place and reported.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Open stitch.toml (or an entry's repo source) in $EDITOR
@@ -369,6 +381,7 @@ mod tests {
                 patterns,
                 file,
                 to,
+                source,
                 dry_run,
             } => {
                 assert_eq!(paths, vec!["~/path"]);
@@ -377,6 +390,7 @@ mod tests {
                 assert!(patterns.is_empty());
                 assert!(!file);
                 assert!(to.is_none());
+                assert!(source.is_none());
                 assert!(!dry_run);
             }
             _ => panic!(),
@@ -405,6 +419,7 @@ mod tests {
                 patterns,
                 file,
                 to,
+                source,
                 dry_run,
             } => {
                 assert_eq!(name.as_deref(), Some("s"));
@@ -412,6 +427,7 @@ mod tests {
                 assert_eq!(patterns, vec!["b"]);
                 assert!(file);
                 assert_eq!(to.as_deref(), Some("store"));
+                assert!(source.is_none());
                 assert!(dry_run);
                 assert_eq!(paths, vec!["~/path"]);
             }
@@ -434,9 +450,14 @@ mod tests {
     fn remove_parses() {
         let cli = parse(&["stitch", "remove", "mystore"]).unwrap();
         match cli.command {
-            Commands::Remove { name, dry_run } => {
+            Commands::Remove {
+                name,
+                dry_run,
+                force,
+            } => {
                 assert_eq!(name, "mystore");
                 assert!(!dry_run);
+                assert!(!force);
             }
             _ => panic!(),
         }

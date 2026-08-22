@@ -162,6 +162,11 @@ pub struct StatusRow {
     pub target_name: Option<String>,
     pub target: String,
     pub source: String,
+    /// Repo-relative source path for `sources`-mapped entries (v0.14):
+    /// `AGENTS.md ← agents/AGENTS.md` visibility in JSON. `None` for in-store
+    /// entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rel: Option<String>,
     pub templated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staged_path: Option<String>,
@@ -180,17 +185,16 @@ pub fn status(repo_root: &Path, entries: &[StatusEntry]) -> Vec<StatusRow> {
 
 fn status_row(repo_root: &Path, entry: &StatusEntry) -> StatusRow {
     let staged_path = if entry.is_template && !entry.skipped_platform {
-        let store_dir = repo_root.join(&entry.store_name);
-        entry
-            .source
-            .strip_prefix(&store_dir)
-            .ok()
-            .and_then(|rel| rel.to_str())
-            .map(|source_rel| {
-                let resolved = render::resolve_entry(source_rel);
-                render::staging_path(repo_root, &entry.store_name, &resolved.link_rel)
-            })
-            .map(|p| path_to_string(&p))
+        // `link_source` is already the absolute staged path for templated
+        // entries (status_entry_for_link sets it to staging_path). Return it
+        // directly when it sits under the store's render dir so we don't emit
+        // a stale relative path for non-render sources.
+        let render_dir = render::store_render_dir(repo_root, &entry.store_name);
+        if entry.link_source.starts_with(&render_dir) {
+            Some(path_to_string(&entry.link_source))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -210,6 +214,9 @@ fn status_row(repo_root: &Path, entry: &StatusEntry) -> StatusRow {
         target_name: entry.target_name.clone(),
         target: path_to_string(&entry.target),
         source: path_to_string(&entry.source),
+        // Repo-relative source path for `sources` entries (v0.14); None for
+        // in-store entries, whose source is derivable from the store dir.
+        source_rel: entry.from_sources.then(|| entry.source_name.clone()),
         templated: entry.is_template,
         staged_path,
         state,
@@ -549,6 +556,12 @@ pub struct RemoveData {
     pub links: Vec<String>,
     pub staging: String,
     pub dry_run: bool,
+    /// v0.14: repo-relative source files inside this store's directory that
+    /// other stores' `sources` still reference. Present only when removal
+    /// proceeded under `--force` despite inbound references; the files are
+    /// retained in place (remove never deletes the store directory).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retained_sources: Vec<String>,
     /// Present on post-op reports (real mutations); omitted on dry-run.
     /// `true` when `stitch.toml` behavior was left in place (the tool never
     /// rewrites authored config) — `doctor` will flag it as orphaned.
@@ -753,13 +766,30 @@ pub struct ExplainEntry {
 #[derive(Serialize)]
 pub struct WhyData {
     pub query: String,
-    /// The matched entry, or null when no store owns this path.
+    /// The matched entry, or absent when no store owns this path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<WhyEntry>,
     /// True when the query path is under a store's target but the store is
     /// skipped on this host (when mismatch).
     #[serde(skip_serializing_if = "skip_bool_false")]
     pub skipped_platform: bool,
+    /// v0.14 reverse lookup: present when the query resolved inside the repo
+    /// (a *source* file). Lists every store/target entry whose link draws
+    /// from that source — the fan-in visibility query. Present as `[]` when
+    /// the source has no consumers, absent when the query is not a repo source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumers: Option<Vec<WhyConsumer>>,
+}
+
+#[derive(Serialize)]
+pub struct WhyConsumer {
+    pub store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    /// Link name under the target directory.
+    pub name: String,
+    /// Absolute target path of the link.
+    pub target: String,
 }
 
 #[derive(Serialize)]
@@ -851,6 +881,7 @@ mod tests {
             source: PathBuf::from(source),
             link_source: PathBuf::from(source),
             source_name: String::new(),
+            link_name: String::new(),
             target: PathBuf::from(target),
             status,
             skipped_platform: skipped,
@@ -977,12 +1008,16 @@ mod tests {
             store_name: "git".to_string(),
             target_name: None,
             source: PathBuf::from(source),
-            link_source: PathBuf::from(source),
+            // What status_all produces for a template: the link points at
+            // the staged render, not the repo template source.
+            link_source: PathBuf::from("/repo/.stitch/render/git/gitconfig"),
+            source_name: "gitconfig.tmpl".to_string(),
+            link_name: "gitconfig".to_string(),
+            from_sources: false,
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Linked,
             skipped_platform: false,
-            is_template: true,            source_name: String::new(),
-            from_sources: false,
+            is_template: true,
         };
         let rows = super::status(&repo, &[entry]);
         assert!(rows[0].staged_path.is_some());
@@ -1005,7 +1040,9 @@ mod tests {
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Linked,
             skipped_platform: true,
-            is_template: true,            source_name: String::new(),
+            is_template: true,
+            source_name: String::new(),
+            link_name: String::new(),
             from_sources: false,
         };
         let rows2 = super::status(&repo, &[entry2]);
@@ -1489,11 +1526,13 @@ mod tests {
             store_name: "git".to_string(),
             target_name: Some("laptop".to_string()),
             source: PathBuf::from("/repo/git/gitconfig.tmpl"),
-            link_source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            link_source: PathBuf::from("/repo/.stitch/render/git/gitconfig"),
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Broken(PathBuf::from("/gone")),
             skipped_platform: false,
-            is_template: true,            source_name: String::new(),
+            is_template: true,
+            source_name: String::new(),
+            link_name: String::new(),
             from_sources: false,
         };
         let rows = super::status(&repo, &[entry]);
@@ -1527,11 +1566,13 @@ mod tests {
             store_name: "git".to_string(),
             target_name: None,
             source: PathBuf::from("/repo/git/gitconfig.tmpl"),
-            link_source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            link_source: PathBuf::from("/repo/.stitch/render/git/gitconfig"),
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Missing,
             skipped_platform: true,
-            is_template: true,            source_name: String::new(),
+            is_template: true,
+            source_name: String::new(),
+            link_name: String::new(),
             from_sources: false,
         };
         let rows = super::status(&repo, &[entry]);
@@ -1747,6 +1788,7 @@ mod tests {
             target_name: Some("laptop".into()),
             target: "/home/.gitconfig".into(),
             source: "/repo/git/gitconfig.tmpl".into(),
+            source_rel: Some("agents/AGENTS.md".into()),
             templated: true,
             staged_path: Some("/repo/.stitch/render/git/gitconfig".into()),
             state: "broken".into(),
@@ -1768,12 +1810,18 @@ mod tests {
                     mode: "file-mode".into(),
                     files: vec!["config.toml".into()],
                     patterns: vec!["*.bak".into()],
-                    sources: std::collections::BTreeMap::new(),
+                    sources: std::collections::BTreeMap::from([(
+                        "alias.txt".into(),
+                        "shared/hub.txt".into(),
+                    )]),
                     when: wc.clone(),
                 }]),
                 files: vec![".bashrc".into()],
                 patterns: vec!["*.bak".into()],
-                sources: std::collections::BTreeMap::new(),
+                sources: std::collections::BTreeMap::from([(
+                    "a.txt".into(),
+                    "shared/hub.txt".into(),
+                )]),
                 when: wc.clone(),
             })
             .unwrap(),
@@ -1812,7 +1860,7 @@ mod tests {
                     source: "gitconfig.tmpl".into(),
                     templated: true,
                     link_name: "gitconfig".into(),
-                    from_sources: false,
+                    from_sources: true,
                 }],
                 targets: vec![ExplainTarget {
                     name: "laptop".into(),
@@ -1821,10 +1869,10 @@ mod tests {
                     target: "~/.config/helix".into(),
                     mode: "file-mode".into(),
                     entries: vec![ExplainEntry {
-                        source: "config.toml".into(),
+                        source: "shared/hub.txt".into(),
                         templated: false,
-                        link_name: "config.toml".into(),
-                        from_sources: false,
+                        link_name: "alias.txt".into(),
+                        from_sources: true,
                     }],
                     ignore: vec!["*.bak".into()],
                 }],
@@ -1933,6 +1981,7 @@ mod tests {
                 links: vec!["/home/.gitconfig".into()],
                 staging: "/repo/.stitch/render".into(),
                 dry_run: false,
+                retained_sources: vec!["hub/hub.txt".into()],
                 behavior_orphaned: Some(true),
                 removed_staging: vec!["/repo/.stitch/render/git/gitconfig".into()],
                 state_entry_removed: Some(true),
@@ -1967,12 +2016,18 @@ mod tests {
                     target: "~".into(),
                     mode: "file-mode".into(),
                     files: vec![".bashrc".into()],
-                    sources: std::collections::BTreeMap::new(),
+                    sources: std::collections::BTreeMap::from([(
+                        "alias.txt".into(),
+                        "shared/hub.txt".into(),
+                    )]),
                     targets: vec![ImportedTarget {
                         name: "laptop".into(),
                         target: "~/.config/helix".into(),
                         files: vec![".bashrc".into()],
-                        sources: std::collections::BTreeMap::new(),
+                        sources: std::collections::BTreeMap::from([(
+                            "a.txt".into(),
+                            "shared/hub.txt".into(),
+                        )]),
                     }],
                 }],
             })
@@ -1995,7 +2050,7 @@ mod tests {
             .unwrap(),
         ));
 
-        // WhyData (covers WhyEntry)
+        // WhyData (covers WhyEntry and WhyConsumer)
         samples.push((
             "WhyData",
             serde_json::to_value(WhyData {
@@ -2015,6 +2070,12 @@ mod tests {
                     owning_config: "state.toml".into(),
                 }),
                 skipped_platform: true,
+                consumers: Some(vec![crate::report::WhyConsumer {
+                    store: "consumer".into(),
+                    target_name: Some("laptop".into()),
+                    name: "alias.txt".into(),
+                    target: "/home/.consumer/alias.txt".into(),
+                }]),
             })
             .unwrap(),
         ));

@@ -103,8 +103,9 @@ pub(crate) fn cmd_migrate(
     // Validate the split inventory before rendering, previewing, or writing.
     // v0.2 accepted entries the new validator rejects (e.g. `./bashrc`); we
     // must fail fast so migration does not create state that cannot load.
-    generated.validate()?;
-    config::validate_merged(&authored, &generated)?;
+    // Use the full repo-aware validator so staging collisions and source
+    // component checks are caught here, not on the next load.
+    config::validate_merged_with_repo(&authored, &generated, root)?;
 
     // Render both halves once: authored (with the read-only header prepended)
     // and generated (sorted + header-stamped). The state string is reused for

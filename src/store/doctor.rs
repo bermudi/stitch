@@ -85,9 +85,7 @@ fn link_resolves_into_repo(link: &Path, repo_root: &Path) -> bool {
     let absolute = if target.is_absolute() {
         target
     } else {
-        link.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(target)
+        link.parent().unwrap_or_else(|| Path::new(".")).join(target)
     };
     let repo_canon = repo_root
         .canonicalize()
@@ -283,10 +281,11 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                     link.display()
                 ),
                 path: Some(link.to_path_buf()),
-                hint: Some(format!(
+                hint: Some(
                     "replace it with a `sources` entry (target name → repo-relative \
                      path) in .stitch/state.toml, then remove the symlink"
-                )),
+                        .to_string(),
+                ),
             });
         }
 

@@ -43,3 +43,6 @@ mod security;
 
 #[path = "cli/template.rs"]
 mod template;
+
+#[path = "cli/sources.rs"]
+mod sources;

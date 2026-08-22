@@ -367,6 +367,17 @@ impl StitchError {
         }
     }
 
+    /// A real-entry conflict whose message carries richer context than a
+    /// single path (e.g. `remove` refusal listing inbound source references).
+    /// Classified as a conflict so the exit code and hint stay honest.
+    pub fn conflict_real_msg(message: String) -> Self {
+        Self::Apply {
+            classes: vec![FailureClass::ConflictReal],
+            message,
+            details: None,
+        }
+    }
+
     pub fn conflict_foreign(
         target: impl Into<PathBuf>,
         resolves_to: Option<impl Into<PathBuf>>,

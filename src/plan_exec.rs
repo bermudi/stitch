@@ -218,6 +218,7 @@ impl<'a> PreflightState<'a> {
                 Ok(())
             }
             PlanFileOp::CreateLink {
+                store: _,
                 target,
                 source,
                 requires,
@@ -231,6 +232,7 @@ impl<'a> PreflightState<'a> {
                 Ok(())
             }
             PlanFileOp::ReplaceLink {
+                store: _,
                 target,
                 source,
                 requires,
@@ -243,6 +245,7 @@ impl<'a> PreflightState<'a> {
                 Ok(())
             }
             PlanFileOp::BackupAndLink {
+                store: _,
                 target,
                 source,
                 backup,
@@ -448,7 +451,8 @@ pub fn execute_plan(
         ));
     }
 
-    let validation_context = ValidationContext::new(repo_root, &initial_loaded.config);
+    let validation_context =
+        ValidationContext::with_platform(repo_root, &initial_loaded.config, platform.clone());
     let current_removals =
         current_removals(repo_root, &initial_loaded, &platform, force).map_err(|e| {
             PlanExecError::new(
@@ -1037,6 +1041,29 @@ fn symlink_ancestor_error(repo_root: &Path, ancestor: &Path) -> String {
 
 /// Inspect one actual ancestor without following it.
 fn check_physical_ancestor(repo_root: &Path, ancestor: &Path) -> Result<(), String> {
+    if let Ok(home) = config::expand_home("~")
+        && ancestor == home
+    {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if linker::points_into_repo(ancestor, repo_root) {
+                    return Err(symlink_ancestor_error(repo_root, ancestor));
+                }
+                return Ok(());
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(format!("parent {} is not a directory", ancestor.display()));
+            }
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "could not inspect target ancestor {}: {e}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
     match std::fs::symlink_metadata(ancestor) {
         Ok(meta) if meta.file_type().is_symlink() => {
             Err(symlink_ancestor_error(repo_root, ancestor))
@@ -1100,11 +1127,14 @@ fn check_target_state(path: &Path, expected: &TargetState) -> Result<(), String>
 }
 
 /// Verify that a removal still belongs to the named store. Source-less stale
-/// removals are scoped to that store's source or render tree; they must not
-/// become an ambiguous "any repo link" deletion when targets overlap.
+/// removals for `sources` may point outside the consumer store's directory
+/// (e.g. `shared/hub.txt` for store `consumer`), so the consumer-store
+/// scoping must not be limited to `store_dir`. The target's membership in
+/// the store's target tree is already validated by `is_under_any_target` in
+/// the plan validator; here we only need to ensure the link is repo-owned.
 fn check_remove_link_ownership(
     repo_root: &Path,
-    store: &str,
+    _store: &str,
     target: &Path,
     source: Option<&str>,
 ) -> Result<(), String> {
@@ -1112,20 +1142,12 @@ fn check_remove_link_ownership(
         linker::points_into_repo(target, repo_root)
             || linker::points_at_source(target, Path::new(source), repo_root)
     } else {
-        let store_dir = repo_root.join(store);
-        let staged_dir = render::store_render_dir(repo_root, store);
         linker::points_into_repo(target, repo_root)
-            && (linker::points_into(target, &store_dir) || linker::points_into(target, &staged_dir))
     };
     if owned {
         Ok(())
-    } else if source.is_some() {
-        Err(format!("{} does not point into repo", target.display()))
     } else {
-        Err(format!(
-            "target {} does not point into store '{store}'",
-            target.display()
-        ))
+        Err(format!("{} does not point into repo", target.display()))
     }
 }
 
@@ -1159,6 +1181,7 @@ fn preflight_op(
             )
         }
         PlanFileOp::CreateLink {
+            store: _,
             target,
             source,
             requires,
@@ -1171,6 +1194,7 @@ fn preflight_op(
             Ok(())
         }
         PlanFileOp::ReplaceLink {
+            store: _,
             target,
             source,
             requires,
@@ -1186,6 +1210,7 @@ fn preflight_op(
             Ok(())
         }
         PlanFileOp::BackupAndLink {
+            store: _,
             target,
             backup,
             source,
@@ -1345,7 +1370,7 @@ fn is_symlink_source(source: &Path) -> bool {
 /// name — a `sources` template stages under its declared key.
 fn staged_link_identity(repo_root: &Path, store: &str, staged: &str) -> Result<String, String> {
     Path::new(staged)
-        .strip_prefix(&render::store_render_dir(repo_root, store))
+        .strip_prefix(render::store_render_dir(repo_root, store))
         .map_err(|_| format!("staged path outside render tree: {staged}"))?
         .to_str()
         .map(str::to_owned)
@@ -1397,13 +1422,19 @@ fn execute_op(
             report.staged.push(staged.clone());
             Ok(())
         }
-        PlanFileOp::CreateLink { target, source, .. } => {
+        PlanFileOp::CreateLink {
+            store: _,
+            target,
+            source,
+            ..
+        } => {
             let target_path = Path::new(target);
             let source_path = Path::new(source);
             create_link_for_plan(repo_root, target_path, source_path)?;
             Ok(())
         }
         PlanFileOp::ReplaceLink {
+            store: _,
             target,
             source,
             requires,
@@ -1432,6 +1463,7 @@ fn execute_op(
             Ok(())
         }
         PlanFileOp::BackupAndLink {
+            store: _,
             target,
             backup,
             source,
@@ -1603,6 +1635,7 @@ mod tests {
             platform: fingerprint,
             stores: vec!["shells".into()],
             ops: vec![PlanFileOp::CreateLink {
+                store: "shells".into(),
                 target: path_to_string(&target),
                 source: path_to_string(&source),
                 requires: PlanFileRequires {
