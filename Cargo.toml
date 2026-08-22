@@ -1,6 +1,6 @@
 [package]
 name = "stitch"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2024"
 description = "A dotfile manager that symlinks your configs into place"
 

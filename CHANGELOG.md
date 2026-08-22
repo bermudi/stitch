@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.14.2 — 2026-08-22
+
+### Fixed
+
+- **`stitch add ~` can no longer relocate `$HOME`.** `add` now rejects the resolved home directory (and its `~/`-spelled variants) before any filesystem mutation, with a clear usage error. Previously the adopt path moved `$HOME` and then failed an internal home-identity check whose rollback was provably unable to restore it, leaving the entire home stranded inside the repo.
+- **`apply --force` can no longer displace `$HOME`.** A whole-directory store with `target = "~"` under `--force` previously renamed `$HOME` to `$HOME.bak` and replaced it with a repo symlink, reporting success. Direct `apply` and plan execution now refuse to back up and link the resolved home directory.
+- **`apply` no longer hangs on a FIFO config/state file.** The snapshot loader opens with `O_NONBLOCK`, so a no-writer FIFO fails fast with the same non-regular-file error other commands already produce, instead of blocking forever on `open(2)`.
+- **Link-collision and plan-source resolution are no longer quadratic.** `check_link_path_collisions`, `check_link_name_collisions`, and same-store target-overlap validation now use index/trie-style ancestor lookups; plan construction resolves each store's link sources once. A 20,000-file `patterns = ["**"]` store now resolves in ~1.4s (was >120s).
+
 ## 0.14.1 — 2026-08-21
 
 ### Fixed
