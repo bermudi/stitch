@@ -4,6 +4,7 @@
 
 #![allow(unused_imports)]
 #![allow(clippy::all)]
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -2344,4 +2345,1992 @@ fn list_allows_targetless_store_with_no_files() {
         .success()
         .stdout(contains("behavior"))
         .stdout(contains("(no target)"));
+}
+
+#[test]
+fn explain_json_resolves_active_and_skipped_stores() {
+    // `explain --json` emits the fully-resolved desired state with `active`
+    // reflecting the current host's `when` evaluation. A platform-skipped
+    // store must appear with `active: false`.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.make_store("shells", &[".bashrc"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.shells]
+target = "~"
+files = [".bashrc"]
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+    repo.write_authored(
+        r#"
+[stores.shells]
+when = { os = "linux" }
+
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(output.status.success(), "explain --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "explain", true);
+    let stores = value["data"]["stores"].as_array().expect("stores array");
+    // Three stores, sorted by name (BTreeMap): macos-only, nvim, shells.
+    assert_eq!(stores.len(), 3);
+    let by_name: std::collections::HashMap<&str, &Value> = stores
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap(), s))
+        .collect();
+    // macos-only is skipped on linux.
+    assert_eq!(by_name["macos-only"]["active"], false);
+    assert_eq!(by_name["macos-only"]["mode"], "whole-dir");
+    // nvim is active, whole-dir, no entries (WholeDir mode).
+    assert_eq!(by_name["nvim"]["active"], true);
+    assert_eq!(by_name["nvim"]["mode"], "whole-dir");
+    // shells is active, file-mode, with one resolved entry.
+    assert_eq!(by_name["shells"]["active"], true);
+    assert_eq!(by_name["shells"]["mode"], "file-mode");
+    let entries = by_name["shells"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["source"], ".bashrc");
+    assert_eq!(entries[0]["templated"], false);
+    assert_eq!(entries[0]["link_name"], ".bashrc");
+    // Platform is reported.
+    assert!(value["data"]["platform"]["os"].is_string());
+    assert!(value["data"]["platform"]["hostname"].is_string());
+}
+
+#[test]
+fn explain_json_active_only_filters_skipped() {
+    // `--active-only` filters out stores whose `when` does not match.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+    repo.write_authored(
+        r#"
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let output = repo
+        .cmd()
+        .args(["--json", "explain", "--active-only"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let stores = value["data"]["stores"].as_array().unwrap();
+    // Only nvim (active on linux); macos-only is filtered out.
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0]["name"], "nvim");
+    assert_eq!(stores[0]["active"], true);
+}
+
+#[test]
+fn explain_json_reports_template_entries() {
+    // A `.tmpl` source must be reported with `templated: true` and the link
+    // name with `.tmpl` stripped.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig.tmpl"]);
+    repo.write_state(
+        r#"
+[stores.git]
+target = "~/.config/git"
+files = ["gitconfig.tmpl"]
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let stores = value["data"]["stores"].as_array().unwrap();
+    assert_eq!(stores.len(), 1);
+    let entries = stores[0]["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["source"], "gitconfig.tmpl");
+    assert_eq!(entries[0]["templated"], true);
+    assert_eq!(entries[0]["link_name"], "gitconfig");
+}
+
+#[test]
+fn explain_text_mode_prints_summary() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+    repo.write_authored(
+        r#"
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let output = repo.cmd().arg("explain").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("platform:"),
+        "text mode prints platform: {stdout}"
+    );
+    assert!(
+        stdout.contains("nvim [active]"),
+        "active store shown: {stdout}"
+    );
+    assert!(
+        stdout.contains("macos-only [skipped]"),
+        "skipped store shown: {stdout}"
+    );
+}
+
+#[test]
+fn schema_json_emits_canonical_schema() {
+    // `schema --json` emits the canonical agent schema in the envelope. It
+    // doesn't need a repo (meta command).
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .args(["--json", "schema"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "schema --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "schema", true);
+    let data = &value["data"];
+    // Top-level keys present.
+    assert_eq!(data["schema_version"], 1);
+    assert!(data["envelope"].is_object(), "envelope shape present");
+    assert!(data["error"].is_object(), "error shape present");
+    assert!(
+        data["recoverable_via"].is_object(),
+        "recoverable_via shape present"
+    );
+    assert!(data["commands"].is_object(), "commands table present");
+    assert!(data["shapes"].is_object(), "shapes table present");
+    assert!(data["exit_codes"].is_array(), "exit_codes table present");
+    // Every command documented in the schema.
+    let commands = data["commands"].as_object().unwrap();
+    for cmd in [
+        "status", "list", "diff", "plan", "apply", "doctor", "prune", "render", "add", "remove",
+        "migrate", "import", "explain", "schema", "why", "log",
+    ] {
+        assert!(commands.contains_key(cmd), "schema.commands missing {cmd}");
+    }
+    // BulkAddData shape is documented for bulk add.
+    let shapes = data["shapes"].as_object().unwrap();
+    assert!(
+        shapes.contains_key("BulkAddData"),
+        "schema.shapes missing BulkAddData"
+    );
+    assert!(
+        shapes.contains_key("BulkAddResult"),
+        "schema.shapes missing BulkAddResult"
+    );
+    // Error details field documents hook detail shape.
+    let error_details = data["error"]["fields"]["details"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        error_details.contains("hook"),
+        "error.details description should mention hook: {error_details}"
+    );
+}
+
+#[test]
+fn schema_text_mode_emits_pretty_json() {
+    // Text mode pretty-prints the schema document (still JSON, just readable).
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .arg("schema")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Should be valid JSON (pretty-printed).
+    let value: Value = serde_json::from_str(&stdout).expect("text mode emits valid JSON");
+    assert_eq!(value["schema_version"], 1);
+}
+
+#[test]
+fn schema_consistency_every_cli_command_is_documented() {
+    // Consistency check: every command the CLI accepts must have an entry in
+    // docs/agent-schema.json. This catches drift between the schema file and
+    // the actual CLI surface.
+    let schema_output = Command::cargo_bin("stitch")
+        .unwrap()
+        .args(["--json", "schema"])
+        .output()
+        .unwrap();
+    assert!(schema_output.status.success());
+    let schema = json_output(&schema_output);
+    let documented: std::collections::HashSet<String> = schema["data"]["commands"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    // Every command in the CLI enum (from --help) must be documented.
+    let help_output = Command::cargo_bin("stitch")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8(help_output.stdout).unwrap();
+    // Derive the subcommand list from the help text so adding a new command
+    // without updating this test is impossible.
+    let commands_section = help
+        .split("Commands:")
+        .nth(1)
+        .expect("help should have a Commands section")
+        .split("Options:")
+        .next()
+        .expect("Commands section should end before Options");
+    let mut cli_commands = Vec::new();
+    for line in commands_section.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let name = line.split_whitespace().next().unwrap();
+        if name == "help" {
+            // `help` is a clap auto-subcommand with no JSON data shape.
+            continue;
+        }
+        cli_commands.push(name.to_string());
+    }
+    for cmd in cli_commands {
+        // init and edit don't support --json, so they're not in the schema's
+        // commands table (which documents --json data shapes). Skip them.
+        if cmd == "init" || cmd == "edit" {
+            continue;
+        }
+        assert!(
+            documented.contains(&cmd),
+            "schema.commands missing {cmd} (CLI exposes it)"
+        );
+    }
+}
+
+#[test]
+fn why_json_reports_owner_of_linked_target() {
+    // `why <target>` finds the store that owns a path and reports its source
+    // and link state.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    // Apply to create the link.
+    repo.cmd().arg("apply").assert().success();
+
+    let target = home.join(".bashrc");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "shells");
+    assert_eq!(entry["target"], target.to_string_lossy().as_ref());
+    assert_eq!(
+        entry["source"],
+        repo.path()
+            .join("shells/.bashrc")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(entry["templated"], false);
+    assert_eq!(entry["state"], "linked");
+    assert_eq!(entry["owning_config"], "state.toml");
+}
+
+#[test]
+fn why_json_reports_ancestor_for_path_inside_whole_dir_store() {
+    // A whole-dir store links the *directory*; a query for a file inside it
+    // must resolve to the store via ancestor containment, with matched_subpath
+    // giving the relative path to the backing repo file.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#,
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let query = target.join("init.lua");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "nvim");
+    assert_eq!(entry["target"], target.to_string_lossy().as_ref());
+    assert_eq!(
+        entry["source"].as_str().unwrap(),
+        repo.path().join("nvim").to_str().unwrap()
+    );
+    assert_eq!(entry["state"], "linked");
+    assert_eq!(entry["matched_subpath"], "init.lua");
+}
+
+#[test]
+fn why_json_reports_missing_for_unlinked_target() {
+    // Before apply, the target doesn't exist — `why` reports state: missing.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let target = home.join(".bashrc");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "shells");
+    assert_eq!(entry["state"], "missing");
+}
+
+#[test]
+fn why_json_reports_no_owner_for_unmanaged_path() {
+    // A path no store references has no entry.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        repo.path().join("home").to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", "/tmp/nonexistent/path"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert!(
+        value["data"]["entry"].is_null(),
+        "no entry for unmanaged path"
+    );
+}
+
+#[test]
+fn why_json_reports_skipped_platform() {
+    // A path under a store skipped on this host reports skipped_platform.
+    let repo = Repo::new();
+    repo.make_store("macos-only", &["config"]);
+    repo.write_state(&format!(
+        r#"
+[stores.macos-only]
+target = "{}/.config/macos"
+"#,
+        repo.path().join("home").to_string_lossy(),
+    ));
+    repo.write_authored(
+        r#"
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    let target = repo.path().join("home").join(".config").join("macos");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert!(value["data"]["entry"].is_null(), "no active entry");
+    assert_eq!(value["data"]["skipped_platform"], true);
+}
+
+#[test]
+fn why_json_reports_conflict_for_real_file_target() {
+    // A real file at the target path is a conflict for a whole-dir store.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "nvim");
+    assert_eq!(entry["state"], "conflict");
+    assert!(entry["resolves_to"].is_null());
+}
+
+#[test]
+fn why_json_reports_broken_for_dangling_symlink() {
+    // A dangling symlink not owned by this repo is reported as broken.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".bashrc");
+    std::os::unix::fs::symlink("/nonexistent", &target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "bashrc");
+    assert_eq!(entry["state"], "broken");
+    assert_eq!(entry["resolves_to"].as_str().unwrap(), "/nonexistent");
+}
+
+#[test]
+fn why_json_reports_foreign_for_live_external_symlink() {
+    // A symlink pointing to a live file outside this repo is foreign.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let target = home.join(".bashrc");
+
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign_file = foreign_dir.path().join("bashrc");
+    fs::write(&foreign_file, "foreign").unwrap();
+    std::os::unix::fs::symlink(&foreign_file, &target).unwrap();
+
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "bashrc");
+    assert_eq!(entry["state"], "foreign");
+    assert_eq!(
+        entry["resolves_to"].as_str().unwrap(),
+        foreign_file.to_str().unwrap()
+    );
+}
+
+#[test]
+fn why_json_reports_store_error_for_non_directory_store() {
+    // A store source that is not a real directory surfaces as store-error.
+    let repo = Repo::new();
+    let store = repo.path().join("bad");
+    fs::write(&store, "not a directory").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.bad]
+target = "{}"
+"#,
+        store.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", store.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "bad");
+    assert_eq!(entry["state"], "store-error");
+    assert_eq!(
+        entry["resolves_to"].as_str().unwrap(),
+        store.to_str().unwrap()
+    );
+}
+
+#[test]
+fn why_json_reports_config_error_for_source_name_collision() {
+    // A source-name collision in files/patterns is reported as config-error.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig", "gitconfig.tmpl"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig", "gitconfig.tmpl"]
+"#,
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "git");
+    assert_eq!(entry["state"], "config-error");
+    assert!(
+        entry["resolves_to"]
+            .as_str()
+            .unwrap()
+            .contains("name collision"),
+        "resolves_to should describe the collision"
+    );
+}
+
+#[test]
+fn why_json_reports_template_source() {
+    // A .tmpl source is reported as templated with the .tmpl source path.
+    let repo = Repo::new();
+    repo.make_store("git", &["gitconfig.tmpl"]);
+    let target = repo.path().join("home").join(".config").join("git");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target_str}"
+files = ["gitconfig.tmpl"]
+"#,
+    ));
+
+    let query = target.join("gitconfig");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "git");
+    assert_eq!(entry["state"], "missing");
+    assert_eq!(entry["templated"], true);
+    assert_eq!(
+        entry["source"].as_str().unwrap(),
+        repo.path()
+            .join("git")
+            .join("gitconfig.tmpl")
+            .to_str()
+            .unwrap()
+    );
+}
+
+#[test]
+fn why_json_reports_target_name_for_multi_target_store() {
+    // Multi-target stores populate target_name for the matched named target.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let t1 = repo.path().join("home1");
+    let t2 = repo.path().join("home2");
+    repo.write_state(&format!(
+        r#"
+[stores.shells.targets.laptop]
+target = "{t1}"
+files = [".bashrc"]
+
+[stores.shells.targets.server]
+target = "{t2}"
+files = [".bashrc"]
+"#,
+        t1 = t1.to_string_lossy(),
+        t2 = t2.to_string_lossy(),
+    ));
+
+    for (target_name, target_dir) in [("laptop", &t1), ("server", &t2)] {
+        let query = target_dir.join(".bashrc");
+        let output = repo
+            .cmd()
+            .args(["--json", "why", query.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value = json_output(&output);
+        assert_envelope_shape(&value, "why", true);
+        let entry = &value["data"]["entry"];
+        assert_eq!(entry["store"], "shells");
+        assert_eq!(entry["target_name"].as_str().unwrap(), target_name);
+        assert_eq!(entry["state"], "missing");
+    }
+}
+
+#[test]
+fn edit_print_path_resolves_store_name() {
+    // `edit <store> --print-path` prints the repo source path without
+    // launching an editor. This is the agent-friendly path.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    let output = repo
+        .cmd()
+        .args(["edit", "nvim", "--print-path"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let expected = repo.path().join("nvim").to_string_lossy().into_owned();
+    assert_eq!(stdout.trim(), expected);
+}
+
+#[test]
+fn edit_print_path_resolves_stitch_toml() {
+    // `edit --print-path` (no entry) prints the stitch.toml path.
+    let repo = Repo::new();
+
+    let output = repo.cmd().args(["edit", "--print-path"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let expected = repo
+        .path()
+        .join("stitch.toml")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(stdout.trim(), expected);
+}
+
+#[test]
+fn audit_log_records_successful_apply() {
+    // A successful `apply` appends an audit-log entry with outcome: "ok".
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+    let entries = value["data"].as_array().expect("log entries array");
+    assert!(!entries.is_empty(), "log should have at least one entry");
+    let last = entries.last().unwrap();
+    assert_eq!(last["command"], "apply");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+    assert!(last["timestamp"].is_string());
+}
+
+#[test]
+fn audit_log_records_failed_apply() {
+    // A failed `apply` (conflict) appends an entry with outcome: "error"
+    // and the exit class.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    // Apply fails with conflict-real (exit 6).
+    repo.cmd().arg("apply").assert().failure().code(6);
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().unwrap();
+    assert_eq!(last["command"], "apply");
+    assert_eq!(last["outcome"], "error");
+    assert_eq!(last["exit_class"], "conflict-real");
+    assert_eq!(last["exit_code"], 6);
+}
+
+#[test]
+fn audit_log_limit_returns_tail() {
+    // `--limit N` returns only the last N entries.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    // Run apply twice to create two log entries.
+    repo.cmd().arg("apply").assert().success();
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "log", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "limit should return only 1 entry");
+}
+
+#[test]
+fn audit_log_empty_when_no_mutations() {
+    // A fresh repo with no mutations has an empty log.
+    let repo = Repo::new();
+    let log_path = repo.path().join(".stitch").join("log.jsonl");
+    assert!(
+        !log_path.exists(),
+        "log.jsonl must not exist before any mutation"
+    );
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(entries.is_empty(), "log should be empty");
+}
+
+#[test]
+fn audit_log_records_failed_add_json() {
+    // A failed `add --json` (store already exists) appends an audit entry.
+    // This is a user collision, classified `usage` (exit 2) — not a tool bug.
+    let repo = Repo::new();
+    repo.write_state("[stores.bashrc]\ntarget = \"~/.bashrc\"\n");
+
+    let home = tempfile::tempdir().unwrap();
+    let bashrc = home.path().join(".bashrc");
+    fs::write(&bashrc, "data").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args(["--json", "add", bashrc.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", false);
+
+    let log = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(log.status.success());
+    let log_value = json_output(&log);
+    let entries = log_value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "add");
+    assert_eq!(last["outcome"], "error");
+    assert_eq!(last["exit_code"], 2);
+    assert_eq!(last["exit_class"], "usage");
+}
+
+#[test]
+fn audit_log_records_failed_apply_json() {
+    // A failed `apply --json` (conflict with a real file) appends an audit entry.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "real file").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(6));
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", false);
+    assert_error_shape(&value, "conflict-real", 6);
+
+    let log = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(log.status.success());
+    let log_value = json_output(&log);
+    let entries = log_value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "apply");
+    assert_eq!(last["outcome"], "error");
+    assert_eq!(last["exit_class"], "conflict-real");
+    assert_eq!(last["exit_code"], 6);
+}
+
+#[test]
+fn audit_log_records_remove() {
+    // A successful `remove` appends an audit entry.
+    let repo = Repo::new();
+    repo.make_store("bashrc", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.bashrc]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    repo.cmd().args(["remove", "bashrc"]).assert().success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "remove");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+}
+
+#[test]
+fn audit_log_records_migrate() {
+    // A successful `migrate` appends an audit entry.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "log"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_envelope_shape(&value, "log", true);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "migrate");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+}
+
+#[test]
+fn audit_log_records_prune_yes() {
+    // A successful `prune --yes` appends an audit entry.
+    let (repo, _covered, _orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--yes")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .env("HOME", home.path().as_os_str())
+        .assert()
+        .success()
+        .stdout(contains("Removed 1 link(s)."));
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    let last = entries.last().expect("log has an entry");
+    assert_eq!(last["command"], "prune");
+    assert_eq!(last["outcome"], "ok");
+    assert_eq!(last["exit_code"], 0);
+}
+
+#[test]
+fn audit_log_skips_prune_list_only() {
+    // `prune` (list-only, no --yes) is a read operation and must not append an
+    // audit entry.
+    let (repo, _covered, _orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("prune")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .env("HOME", home.path().as_os_str())
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "prune"),
+        "list-only prune must not leave an audit entry"
+    );
+}
+
+// Dry runs of the five mutating commands (apply, add, remove, migrate, import)
+// are preview-only — they touch nothing on the filesystem, so they must not
+// append an audit entry. This mirrors the `prune` list-only gate above.
+// Regression: `is_mutation_command` previously used `{ .. }` patterns that
+// ignored the `dry_run` field, so dry runs were logged as real mutations.
+
+#[test]
+fn audit_log_skips_apply_dry_run() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").arg("--dry-run").assert().success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "apply"),
+        "apply --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_add_dry_run() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args([
+            "add",
+            home.path().join(".bashrc").to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "add"),
+        "add --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_remove_dry_run() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd()
+        .arg("remove")
+        .arg("nvim")
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "remove"),
+        "remove --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_migrate_dry_run() {
+    // migrate needs a legacy v0.2 `.stitch/config.toml` to have something to
+    // migrate; the dry run previews the split without writing.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(
+        dir.path().join(".stitch").join("config.toml"),
+        "[stores.nvim]\ntarget = \"~/.config/nvim\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("migrate")
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "log"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "migrate"),
+        "migrate --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_skips_import_dry_run() {
+    let (repo, _covered, _orphan, home) = prune_fixture();
+
+    repo.cmd()
+        .arg("import")
+        .arg("--dry-run")
+        .arg("--scan-dir")
+        .arg(home.path())
+        .env("HOME", home.path().as_os_str())
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let entries = value["data"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|e| e["command"] == "import"),
+        "import --dry-run must not leave an audit entry"
+    );
+}
+
+#[test]
+fn audit_log_limit_zero_returns_empty() {
+    // `--limit 0` is an explicit "no entries" request and must return an empty
+    // array even when the log has content.
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{}/.config/nvim"
+"#,
+        home.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "log", "--limit", "0"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+    let entries = value["data"].as_array().unwrap();
+    assert!(entries.is_empty(), "--limit 0 must return no entries");
+}
+
+#[test]
+fn bulk_add_json_adds_multiple_paths() {
+    // `add path1 path2 --json` adds both paths as simple stores and returns
+    // a BulkAddData envelope with per-path results.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".config").join("nvim")).unwrap();
+    fs::write(
+        home.path().join(".config").join("nvim").join("init.lua"),
+        "nvim",
+    )
+    .unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            home.path().join(".config/nvim").to_str().unwrap(),
+            home.path().join(".bashrc").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "bulk add should succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+    let results = value["data"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "two paths added");
+    assert_eq!(results[0]["store"], "nvim");
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[1]["store"], "bashrc");
+    assert_eq!(results[1]["ok"], true);
+    assert_eq!(value["data"]["all_ok"], true);
+}
+
+#[test]
+fn bulk_add_dry_run_json() {
+    // `add path1 path2 --dry-run --json` validates without mutating.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".config").join("nvim")).unwrap();
+    fs::write(
+        home.path().join(".config").join("nvim").join("init.lua"),
+        "nvim",
+    )
+    .unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            home.path().join(".config/nvim").to_str().unwrap(),
+            home.path().join(".bashrc").to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    let results = value["data"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["dry_run"], true);
+    assert_eq!(results[1]["dry_run"], true);
+    // No actual store dirs created.
+    assert!(!repo.path().join("nvim").exists());
+    assert!(!repo.path().join("bashrc").exists());
+}
+
+#[test]
+fn bulk_add_rejects_per_store_flags() {
+    // `add path1 path2 --name foo` is rejected: per-store flags don't work
+    // in bulk mode.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join(".bashrc"), "bashrc").unwrap();
+    fs::write(home.path().join(".zshrc"), "zshrc").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "add",
+            home.path().join(".bashrc").to_str().unwrap(),
+            home.path().join(".zshrc").to_str().unwrap(),
+            "--name",
+            "foo",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "should reject --name in bulk mode"
+    );
+    // In JSON mode the error is in the JSON envelope on stdout, not stderr.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--name") || stdout.contains("bulk"),
+        "error should mention --name or bulk mode: {stdout}"
+    );
+}
+
+#[test]
+fn why_deepest_owner_wins_for_nested_whole_dir_stores() {
+    // Whole-directory stores with overlapping targets: the deepest matching
+    // owner should win. `apply` refuses to create nested whole-dir links, so
+    // we set up the symlinks manually; `why` is read-only and still resolves.
+    let repo = Repo::new();
+    repo.make_store("outer", &[]);
+    repo.make_store("inner", &["init.lua"]);
+
+    repo.write_state(
+        r#"
+[stores.outer]
+target = "~/.config"
+
+[stores.inner]
+target = "~/.config/nvim"
+"#,
+    );
+
+    let outer_target = repo.path().join(".config");
+    std::os::unix::fs::symlink(&repo.path().join("outer"), &outer_target).unwrap();
+    std::os::unix::fs::symlink(&repo.path().join("inner"), &outer_target.join("nvim")).unwrap();
+
+    let query_inner = outer_target.join("nvim").join("init.lua");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query_inner.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "inner");
+    assert_eq!(entry["matched_subpath"], "init.lua");
+
+    let query_outer = outer_target.join("something");
+    let output = repo
+        .cmd()
+        .args(["--json", "why", query_outer.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["store"], "outer");
+}
+
+#[test]
+fn audit_log_write_failure_is_warning_not_hard_error() {
+    if is_root() {
+        eprintln!("note: audit_log_write_failure_is_warning_not_hard_error skipped under root");
+        return;
+    }
+
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let log = repo.path().join(".stitch").join("log.jsonl");
+    assert!(log.exists(), "log.jsonl must exist after first apply");
+
+    let original = fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+    let _guard = RestoreMode {
+        path: &log,
+        mode: original,
+    };
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "apply must succeed even when audit log is unwritable"
+    );
+    let value = json_output(&output);
+    assert!(value["ok"].as_bool().unwrap());
+
+    let target = repo.path().join(".config").join("nvim");
+    assert!(target.is_symlink(), "target link must remain in place");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not append to audit log"),
+        "audit write failure should warn on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn log_limit_returns_tail() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+
+    let alpha = home.path().join("alpha");
+    let beta = home.path().join("beta");
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", alpha.to_str().unwrap(), "--name", "alpha"])
+        .assert()
+        .success();
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", beta.to_str().unwrap(), "--name", "beta"])
+        .assert()
+        .success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "log", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+
+    let entries = value["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "--limit 1 must return exactly one entry");
+    assert_eq!(
+        entries[0]["store"], "beta",
+        "tail must be the second mutation"
+    );
+}
+
+#[test]
+fn schema_shapes_match_command_outputs() {
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    repo.make_store("git", &["gitconfig"]);
+    repo.make_store("nvim", &[]);
+    fs::create_dir_all(repo.path().join("nvim").join("lua")).unwrap();
+    fs::write(
+        repo.path().join("nvim").join("lua").join("init.lua"),
+        "contents of init.lua",
+    )
+    .unwrap();
+    repo.make_store("macos-only", &[]);
+
+    repo.write_state(
+        r#"
+[stores.shells]
+target = "~"
+files = [".bashrc"]
+
+[stores.git.targets.work]
+target = "~/.config/git"
+files = ["gitconfig"]
+
+[stores.nvim]
+target = "~/.config/nvim"
+
+[stores.macos-only]
+target = "~/.config/macos"
+"#,
+    );
+
+    repo.write_authored(
+        r#"
+[stores.shells]
+when = { os = "linux" }
+ignore = ["*.bak"]
+hooks = { post = "echo done" }
+
+[stores.git]
+when = { os = "linux" }
+ignore = ["*.log"]
+hooks = { post = "echo git" }
+
+[stores.git.targets.work]
+when = { os = "linux" }
+ignore = ["*.log"]
+
+[stores.macos-only]
+when = { os = "macos" }
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let explain = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(explain.status.success());
+    let explain_value = json_output(&explain);
+    assert_envelope_shape(&explain_value, "explain", true);
+
+    assert_value_matches_schema_shape(
+        &explain_value["data"],
+        &schema["shapes"]["ExplainData"],
+        "ExplainData",
+        &schema,
+    );
+    assert_value_matches_schema_shape(
+        &explain_value["data"]["platform"],
+        &schema["shapes"]["ExplainPlatform"],
+        "ExplainPlatform",
+        &schema,
+    );
+    for store in explain_value["data"]["stores"].as_array().unwrap() {
+        let name = store["name"].as_str().unwrap();
+        assert_value_matches_schema_shape(
+            store,
+            &schema["shapes"]["ExplainStore"],
+            &format!("ExplainStore({name})"),
+            &schema,
+        );
+    }
+
+    let query_nvim = "~/.config/nvim/lua/init.lua";
+    let why_nvim = repo
+        .cmd()
+        .args(["--json", "why", query_nvim])
+        .output()
+        .unwrap();
+    assert!(why_nvim.status.success());
+    let why_nvim_value = json_output(&why_nvim);
+    assert_envelope_shape(&why_nvim_value, "why", true);
+    assert_value_matches_schema_shape(
+        &why_nvim_value["data"],
+        &schema["shapes"]["WhyData"],
+        "WhyData(nvim)",
+        &schema,
+    );
+    assert_value_matches_schema_shape(
+        &why_nvim_value["data"]["entry"],
+        &schema["shapes"]["WhyEntry"],
+        "WhyEntry(nvim)",
+        &schema,
+    );
+
+    let query_skipped = "~/.config/macos";
+    let why_skipped = repo
+        .cmd()
+        .args(["--json", "why", query_skipped])
+        .output()
+        .unwrap();
+    assert!(why_skipped.status.success());
+    let why_skipped_value = json_output(&why_skipped);
+    assert_value_matches_schema_shape(
+        &why_skipped_value["data"],
+        &schema["shapes"]["WhyData"],
+        "WhyData(skipped)",
+        &schema,
+    );
+
+    let query_git = "~/.config/git/gitconfig";
+    let why_git = repo
+        .cmd()
+        .args(["--json", "why", query_git])
+        .output()
+        .unwrap();
+    assert!(why_git.status.success());
+    let why_git_value = json_output(&why_git);
+    if !why_git_value["data"]["entry"].is_null() {
+        assert_value_matches_schema_shape(
+            &why_git_value["data"]["entry"],
+            &schema["shapes"]["WhyEntry"],
+            "WhyEntry(git)",
+            &schema,
+        );
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let add_target = home.path().join("extra");
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", add_target.to_str().unwrap(), "--name", "extra"])
+        .assert()
+        .success();
+
+    let log = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(log.status.success());
+    let log_value = json_output(&log);
+    assert_envelope_shape(&log_value, "log", true);
+    for (i, entry) in log_value["data"].as_array().unwrap().iter().enumerate() {
+        assert_value_matches_schema_shape(
+            entry,
+            &schema["shapes"]["AuditEntry"],
+            &format!("AuditEntry[{i}]"),
+            &schema,
+        );
+    }
+}
+
+#[test]
+fn schema_plan_file_shape_matches_output() {
+    // `plan --json` emits a PlanFile (not the lean Plan). The schema's
+    // commands.plan.data must reference the PlanFile shape, and the emitted
+    // object must conform to it. Regression for the schema documenting `Plan`
+    // while the code emits `PlanFile`.
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo.cmd().args(["--json", "plan"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "plan", true);
+
+    // The commands table must point at PlanFile, not Plan.
+    assert_eq!(
+        schema["commands"]["plan"]["data"].as_str(),
+        Some("PlanFile"),
+        "schema commands.plan.data must be PlanFile"
+    );
+    // The PlanFile shape must be documented.
+    let plan_file_shape = schema["shapes"]
+        .get("PlanFile")
+        .expect("schema.shapes must document PlanFile");
+
+    assert_value_matches_schema_shape(&value["data"], plan_file_shape, "PlanFile", &schema);
+
+    // Sub-shapes referenced by PlanFile must exist.
+    for sub in [
+        "PlatformFingerprint",
+        "PlanFileOp",
+        "PlanFileRequires",
+        "PlanConflict",
+        "PlanError",
+    ] {
+        assert!(
+            schema["shapes"].get(sub).is_some(),
+            "schema.shapes missing {sub} (referenced by PlanFile)"
+        );
+    }
+
+    // The platform fingerprint nested in the output must match its shape.
+    assert_value_matches_schema_shape(
+        &value["data"]["platform"],
+        &schema["shapes"]["PlatformFingerprint"],
+        "PlatformFingerprint",
+        &schema,
+    );
+    // Each op must match PlanFileOp (tagged by `op`).
+    let plan_file_op_shape = &schema["shapes"]["PlanFileOp"];
+    for (i, op) in value["data"]["ops"].as_array().unwrap().iter().enumerate() {
+        let tag = op["op"].as_str().expect("plan-file op is tagged by `op`");
+        let variants = plan_file_op_shape["variants"]
+            .as_object()
+            .expect("PlanFileOp has variants");
+        let variant_shape = variants
+            .get(tag)
+            .unwrap_or_else(|| panic!("PlanFileOp variant {tag} not documented"));
+        for (field, _) in variant_shape.as_object().unwrap() {
+            assert!(
+                op.get(field).is_some(),
+                "PlanFileOp::{tag} missing field {field} at ops[{i}]"
+            );
+        }
+    }
+}
+
+#[test]
+fn schema_plan_exec_report_shape_matches_output() {
+    // `apply --plan --json` emits a PlanExecReport (not the composite
+    // ApplyData). The schema must document the PlanExecReport shape and the
+    // apply command must reference it. Regression for the shape being
+    // undocumented.
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    // The apply command must advertise PlanExecReport as a possible data shape.
+    let apply_data = schema["commands"]["apply"]["data"]
+        .as_str()
+        .expect("apply data type documented");
+    assert!(
+        apply_data.split('|').any(|p| p.trim() == "PlanExecReport"),
+        "schema commands.apply.data must include PlanExecReport, got: {apply_data}"
+    );
+    let report_shape = schema["shapes"]
+        .get("PlanExecReport")
+        .expect("schema.shapes must document PlanExecReport");
+
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    // Capture a plan, then execute it via apply --plan --json.
+    let plan_path = repo.path().join("plan.json");
+    let plan_out = repo.cmd().arg("plan").output().unwrap();
+    assert!(plan_out.status.success(), "plan capture must succeed");
+    fs::write(&plan_path, &String::from_utf8(plan_out.stdout).unwrap()).unwrap();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--plan", plan_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "apply --plan must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    assert_value_matches_schema_shape(&value["data"], report_shape, "PlanExecReport", &schema);
+
+    // ops_executed is a string[] in PlanExecReport (descriptions), not the
+    // usize count used in ApplyResult. Lock that distinction in.
+    let ops_executed = &value["data"]["ops_executed"];
+    assert!(
+        ops_executed.is_array(),
+        "PlanExecReport.ops_executed must be an array (string[]), not a usize"
+    );
+}
+
+#[test]
+fn schema_absent_array_fields_omitted_when_empty() {
+    // Eleven array fields serialize with skip_serializing_if = "Vec::is_empty",
+    // so they are absent when empty — not `[]`. The schema must document them
+    // as `...|absent`, matching the ExplainStore.entries convention. An agent
+    // doing `data.files.length` on an absent field gets TypeError otherwise.
+    let schema_raw = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-schema.json"
+    ));
+    let schema: Value = serde_json::from_str(schema_raw).unwrap();
+
+    let cases: &[(&str, &str)] = &[
+        ("ListStore", "files"),
+        ("ListStore", "patterns"),
+        ("ListTarget", "files"),
+        ("ListTarget", "patterns"),
+        ("ExplainTarget", "entries"),
+        ("ExplainTarget", "ignore"),
+        ("ImportedStore", "files"),
+        ("ImportedTarget", "files"),
+        ("RemoveData", "links"),
+        ("AddData", "files"),
+        ("AddData", "patterns"),
+    ];
+    for (shape, field) in cases {
+        let field_schema = &schema["shapes"][shape]["fields"][field];
+        let type_str = schema_field_type(field_schema)
+            .unwrap_or_else(|| panic!("{shape}.{field} type must be a string"));
+        assert!(
+            schema_type_allows(type_str, "absent"),
+            "{shape}.{field} must be documented as `...|absent` (it serializes with skip_serializing_if = Vec::is_empty), got: {type_str}"
+        );
+    }
+}
+
+#[test]
+fn why_active_store_omits_skipped_platform() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", "~/.config/nvim/init.lua"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    assert!(
+        value["data"].get("skipped_platform").is_none(),
+        "skipped_platform must be omitted when the store is active"
+    );
+}
+
+#[test]
+fn why_matched_subpath_multi_component() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &[]);
+    fs::create_dir_all(repo.path().join("nvim").join("lua")).unwrap();
+    fs::write(
+        repo.path().join("nvim").join("lua").join("init.lua"),
+        "contents of init.lua",
+    )
+    .unwrap();
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "why", "~/.config/nvim/lua/init.lua"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "why", true);
+    let entry = &value["data"]["entry"];
+    assert_eq!(entry["matched_subpath"], "lua/init.lua");
+}
+
+#[test]
+fn log_text_mode() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+target = "~/.config/nvim"
+"#,
+    );
+
+    repo.cmd().arg("apply").assert().success();
+
+    let output = repo.cmd().arg("log").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("unix:"),
+        "text log must include a timestamp"
+    );
+    assert!(
+        stdout.contains("apply"),
+        "text log must include the command"
+    );
+    assert!(stdout.contains("ok"), "text log must include the outcome");
+    assert!(
+        stdout.contains("exit_code=0"),
+        "text log must include the exit code"
+    );
+}
+
+#[test]
+fn audit_log_records_store_and_target_fields() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join("mystore");
+
+    repo.cmd()
+        .env("HOME", home.path())
+        .args(["add", target.to_str().unwrap(), "--name", "mystore"])
+        .assert()
+        .success();
+
+    let output = repo.cmd().args(["--json", "log"]).output().unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "log", true);
+
+    let last = value["data"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["store"], "mystore");
+    assert!(
+        last["target"].is_string(),
+        "audit entry target must be a string"
+    );
+}
+
+fn schema_field_type(field_schema: &Value) -> Option<&str> {
+    field_schema
+        .as_str()
+        .or_else(|| field_schema.get("type").and_then(Value::as_str))
+}
+
+fn schema_type_main(type_str: &str) -> &str {
+    if let Some(i) = type_str.find(" (") {
+        return type_str[..i].trim();
+    }
+    type_str.trim()
+}
+
+fn schema_type_allows(type_str: &str, variant: &str) -> bool {
+    schema_type_main(type_str)
+        .split('|')
+        .any(|p| p.trim() == variant)
+}
+
+fn schema_base_shape_name(type_str: &str) -> Option<&str> {
+    let delimiters = ['|', '(', ' ', '['];
+    let end = type_str
+        .char_indices()
+        .find(|(_, c)| delimiters.contains(c))
+        .map(|(i, _)| i)
+        .unwrap_or(type_str.len());
+    let base = type_str[..end].trim();
+    if base.is_empty() { None } else { Some(base) }
+}
+
+fn assert_value_matches_schema_shape(value: &Value, shape: &Value, path: &str, schema: &Value) {
+    let obj = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{path}: expected a JSON object"));
+    let fields = shape
+        .get("fields")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("{path}: schema shape has no fields"));
+
+    let allowed: BTreeSet<String> = fields.keys().cloned().collect();
+    let actual: BTreeSet<String> = obj.keys().cloned().collect();
+    assert!(
+        actual.is_subset(&allowed),
+        "{path}: unexpected keys: {actual:?} not in {allowed:?}"
+    );
+
+    let required: BTreeSet<String> = fields
+        .iter()
+        .filter(|(_, v)| {
+            let Some(t) = schema_field_type(v) else {
+                return true;
+            };
+            !schema_type_allows(t, "absent") && !schema_type_allows(t, "null")
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    assert!(
+        required.is_subset(&actual),
+        "{path}: missing required keys: {required:?} not in {actual:?}"
+    );
+
+    for (key, field_value) in obj {
+        let field_schema = &fields[key];
+        let type_str = schema_field_type(field_schema);
+        if field_value.is_null() && type_str.is_some_and(|t| schema_type_allows(t, "null")) {
+            continue;
+        }
+        if let Some(t) = type_str
+            && let Some(base) = schema_base_shape_name(t)
+            && let Some(nested) = schema["shapes"].get(base)
+        {
+            // Tagged-variant shapes (e.g. PlanFileOp, PlanOp, TargetState) are
+            // validated by tag, not by a flat field set — skip recursion and
+            // let the caller do tag-specific checks.
+            if nested.get("fields").is_none() {
+                continue;
+            }
+            match field_value {
+                Value::Object(_) => assert_value_matches_schema_shape(
+                    field_value,
+                    nested,
+                    &format!("{path}.{key}"),
+                    schema,
+                ),
+                Value::Array(arr) => {
+                    for (i, item) in arr.iter().enumerate() {
+                        if !item.is_null() {
+                            assert_value_matches_schema_shape(
+                                item,
+                                nested,
+                                &format!("{path}.{key}[{i}]"),
+                                schema,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }

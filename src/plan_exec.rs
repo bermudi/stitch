@@ -213,11 +213,12 @@ impl<'a> PreflightState<'a> {
                 render::preflight_staged_path(
                     self.repo_root,
                     store,
-                    &render::resolve_entry(source_rel).link_rel,
+                    &staged_link_identity(self.repo_root, store, staged)?,
                 )?;
                 Ok(())
             }
             PlanFileOp::CreateLink {
+                store: _,
                 target,
                 source,
                 requires,
@@ -231,6 +232,7 @@ impl<'a> PreflightState<'a> {
                 Ok(())
             }
             PlanFileOp::ReplaceLink {
+                store: _,
                 target,
                 source,
                 requires,
@@ -243,6 +245,7 @@ impl<'a> PreflightState<'a> {
                 Ok(())
             }
             PlanFileOp::BackupAndLink {
+                store: _,
                 target,
                 source,
                 backup,
@@ -361,6 +364,7 @@ pub fn execute_plan(
     plan: &PlanFile,
     dry_run: bool,
     force: bool,
+    json: bool,
 ) -> Result<PlanExecReport, PlanExecError> {
     if plan.schema != PLAN_SCHEMA {
         return Err(PlanExecError::new(
@@ -447,7 +451,8 @@ pub fn execute_plan(
         ));
     }
 
-    let validation_context = ValidationContext::new(repo_root, &initial_loaded.config);
+    let validation_context =
+        ValidationContext::with_platform(repo_root, &initial_loaded.config, platform.clone());
     let current_removals =
         current_removals(repo_root, &initial_loaded, &platform, force).map_err(|e| {
             PlanExecError::new(
@@ -622,7 +627,7 @@ pub fn execute_plan(
         target: None,
         action: "apply",
     };
-    if let Err(e) = hooks::run_global_hook(repo_root, "pre-apply", &env, &platform) {
+    if let Err(e) = hooks::run_global_hook(repo_root, "pre-apply", &env, &platform, json) {
         sync_ops_remaining(&mut report, plan, &remaining);
         return Err(PlanExecError::new(
             report,
@@ -746,9 +751,13 @@ pub fn execute_plan(
             ));
         }
 
-        if let Err(e) =
-            run_store_pre_hook(repo_root, store_name, &pre_hook_loaded.config, &platform)
-        {
+        if let Err(e) = run_store_pre_hook(
+            repo_root,
+            store_name,
+            &pre_hook_loaded.config,
+            &platform,
+            json,
+        ) {
             sync_ops_remaining(&mut report, plan, &remaining);
             return Err(PlanExecError::new(report, e));
         }
@@ -881,9 +890,13 @@ pub fn execute_plan(
         }
         drop(_state_lock);
 
-        if let Some(warning) =
-            run_store_post_hook(repo_root, store_name, &locked_loaded.config, &platform)
-        {
+        if let Some(warning) = run_store_post_hook(
+            repo_root,
+            store_name,
+            &locked_loaded.config,
+            &platform,
+            json,
+        ) {
             report.warnings.push(warning);
         }
         // Revalidate $HOME identity after the post-hook, using the
@@ -926,7 +939,7 @@ pub fn execute_plan(
         target: None,
         action: "apply",
     };
-    if let Err(e) = hooks::run_global_hook(repo_root, "post-apply", &env, &platform) {
+    if let Err(e) = hooks::run_global_hook(repo_root, "post-apply", &env, &platform, json) {
         report.warnings.push(format!("post-apply hook: {e}"));
     }
 
@@ -942,6 +955,7 @@ fn run_store_pre_hook(
     store_name: &str,
     config: &Config,
     platform: &Platform,
+    json: bool,
 ) -> Result<(), StitchError> {
     let Some(store) = config.stores.get(store_name) else {
         return Ok(());
@@ -953,7 +967,8 @@ fn run_store_pre_hook(
             target: store.target.as_deref(),
             action: "apply",
         };
-        hooks::run_store_hook(pre, &env, platform).map_err(|e| StitchError::hook("pre", e))?;
+        hooks::run_store_hook(pre, &env, platform, json)
+            .map_err(|e| StitchError::hook_store("pre", e, store_name))?;
     }
     Ok(())
 }
@@ -963,6 +978,7 @@ fn run_store_post_hook(
     store_name: &str,
     config: &Config,
     platform: &Platform,
+    json: bool,
 ) -> Option<String> {
     let store = config.stores.get(store_name)?;
     if let Some(post) = &store.hooks.post {
@@ -972,7 +988,7 @@ fn run_store_post_hook(
             target: store.target.as_deref(),
             action: "apply",
         };
-        if let Err(e) = hooks::run_store_hook(post, &env, platform) {
+        if let Err(e) = hooks::run_store_hook(post, &env, platform, json) {
             return Some(format!("store '{store_name}' post-hook: {e}"));
         }
     }
@@ -1025,6 +1041,29 @@ fn symlink_ancestor_error(repo_root: &Path, ancestor: &Path) -> String {
 
 /// Inspect one actual ancestor without following it.
 fn check_physical_ancestor(repo_root: &Path, ancestor: &Path) -> Result<(), String> {
+    if let Ok(home) = config::expand_home("~")
+        && ancestor == home
+    {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if linker::points_into_repo(ancestor, repo_root) {
+                    return Err(symlink_ancestor_error(repo_root, ancestor));
+                }
+                return Ok(());
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(format!("parent {} is not a directory", ancestor.display()));
+            }
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "could not inspect target ancestor {}: {e}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
     match std::fs::symlink_metadata(ancestor) {
         Ok(meta) if meta.file_type().is_symlink() => {
             Err(symlink_ancestor_error(repo_root, ancestor))
@@ -1088,11 +1127,14 @@ fn check_target_state(path: &Path, expected: &TargetState) -> Result<(), String>
 }
 
 /// Verify that a removal still belongs to the named store. Source-less stale
-/// removals are scoped to that store's source or render tree; they must not
-/// become an ambiguous "any repo link" deletion when targets overlap.
+/// removals for `sources` may point outside the consumer store's directory
+/// (e.g. `shared/hub.txt` for store `consumer`), so the consumer-store
+/// scoping must not be limited to `store_dir`. The target's membership in
+/// the store's target tree is already validated by `is_under_any_target` in
+/// the plan validator; here we only need to ensure the link is repo-owned.
 fn check_remove_link_ownership(
     repo_root: &Path,
-    store: &str,
+    _store: &str,
     target: &Path,
     source: Option<&str>,
 ) -> Result<(), String> {
@@ -1100,20 +1142,12 @@ fn check_remove_link_ownership(
         linker::points_into_repo(target, repo_root)
             || linker::points_at_source(target, Path::new(source), repo_root)
     } else {
-        let store_dir = repo_root.join(store);
-        let staged_dir = render::store_render_dir(repo_root, store);
         linker::points_into_repo(target, repo_root)
-            && (linker::points_into(target, &store_dir) || linker::points_into(target, &staged_dir))
     };
     if owned {
         Ok(())
-    } else if source.is_some() {
-        Err(format!("{} does not point into repo", target.display()))
     } else {
-        Err(format!(
-            "target {} does not point into store '{store}'",
-            target.display()
-        ))
+        Err(format!("{} does not point into repo", target.display()))
     }
 }
 
@@ -1143,10 +1177,11 @@ fn preflight_op(
             render::preflight_staged_path(
                 repo_root,
                 store,
-                &render::resolve_entry(source_rel).link_rel,
+                &staged_link_identity(repo_root, store, staged)?,
             )
         }
         PlanFileOp::CreateLink {
+            store: _,
             target,
             source,
             requires,
@@ -1159,6 +1194,7 @@ fn preflight_op(
             Ok(())
         }
         PlanFileOp::ReplaceLink {
+            store: _,
             target,
             source,
             requires,
@@ -1174,6 +1210,7 @@ fn preflight_op(
             Ok(())
         }
         PlanFileOp::BackupAndLink {
+            store: _,
             target,
             backup,
             source,
@@ -1328,6 +1365,19 @@ fn is_symlink_source(source: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The staging identity (link name under `.stitch/render/<store>/`) of a
+/// staged path. v0.14: this is *not* derivable from the template's source
+/// name — a `sources` template stages under its declared key.
+fn staged_link_identity(repo_root: &Path, store: &str, staged: &str) -> Result<String, String> {
+    Path::new(staged)
+        .strip_prefix(render::store_render_dir(repo_root, store))
+        .map_err(|_| format!("staged path outside render tree: {staged}"))?
+        .to_str()
+        .map(str::to_owned)
+        .filter(|rel| !rel.is_empty())
+        .ok_or_else(|| format!("staged path has no link identity: {staged}"))
+}
+
 fn create_link_for_plan(repo_root: &Path, target: &Path, source: &Path) -> Result<(), String> {
     // Re-derive and validate the configured source root at the mutation
     // boundary so a hook cannot install a gateway after plan preflight.
@@ -1358,11 +1408,13 @@ fn execute_op(
             let source_path = verify_stage_render(
                 repo_root, loaded, platform, store, source_rel, staged, sha256,
             )?;
+            let link_identity = staged_link_identity(repo_root, store, staged)?;
             render::stage_template(
                 repo_root,
                 store,
                 source_rel,
                 &source_path,
+                &link_identity,
                 platform,
                 &loaded.config.vars,
             )
@@ -1370,13 +1422,19 @@ fn execute_op(
             report.staged.push(staged.clone());
             Ok(())
         }
-        PlanFileOp::CreateLink { target, source, .. } => {
+        PlanFileOp::CreateLink {
+            store: _,
+            target,
+            source,
+            ..
+        } => {
             let target_path = Path::new(target);
             let source_path = Path::new(source);
             create_link_for_plan(repo_root, target_path, source_path)?;
             Ok(())
         }
         PlanFileOp::ReplaceLink {
+            store: _,
             target,
             source,
             requires,
@@ -1405,6 +1463,7 @@ fn execute_op(
             Ok(())
         }
         PlanFileOp::BackupAndLink {
+            store: _,
             target,
             backup,
             source,
@@ -1512,6 +1571,7 @@ mod tests {
             ApplyOpts {
                 dry_run: true,
                 force: false,
+                json: false,
             },
         );
         let plan = build_plan_file(&repo_alias, &loaded, &computed, &platform).unwrap();
@@ -1520,7 +1580,7 @@ mod tests {
         }));
 
         assert!(plan.conflicts.is_empty());
-        execute_plan(&repo_alias, &loaded, &plan, false, false).unwrap();
+        execute_plan(&repo_alias, &loaded, &plan, false, false, false).unwrap();
         assert!(target.is_dir());
         assert!(target.join("profile").is_symlink());
     }
@@ -1575,6 +1635,7 @@ mod tests {
             platform: fingerprint,
             stores: vec!["shells".into()],
             ops: vec![PlanFileOp::CreateLink {
+                store: "shells".into(),
                 target: path_to_string(&target),
                 source: path_to_string(&source),
                 requires: PlanFileRequires {
@@ -1588,7 +1649,7 @@ mod tests {
             errors: vec![],
         };
 
-        let result = execute_plan(&repo_root, &stale_loaded, &plan, false, false);
+        let result = execute_plan(&repo_root, &stale_loaded, &plan, false, false, false);
         assert!(
             result.is_err(),
             "stale loaded must not authorize a create_link for a removed store: {result:?}"
@@ -1638,6 +1699,7 @@ mod tests {
             ApplyOpts {
                 dry_run: true,
                 force: false,
+                json: false,
             },
         );
         let plan = build_plan_file(&repo_root, &loaded, &computed, &platform).unwrap();
@@ -1652,7 +1714,7 @@ mod tests {
             fs::write(repo_arc.join("stitch.toml"), malicious).unwrap();
         })));
 
-        let result = execute_plan(&repo_root, &loaded, &plan, false, false);
+        let result = execute_plan(&repo_root, &loaded, &plan, false, false, false);
         set_test_pause_after_global_hash(None);
 
         let err = result.expect_err("config change must abort before pre-hook");

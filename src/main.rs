@@ -1,4 +1,5 @@
 mod ancestor;
+mod audit;
 mod cli;
 mod commands;
 mod config;

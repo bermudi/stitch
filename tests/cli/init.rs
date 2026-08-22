@@ -312,6 +312,51 @@ when = { os = \"linux\" }
         .stdout(contains("nvim"));
 }
 
+/// `stitch migrate --json` performs the real migration and emits a post-op
+/// envelope with the authored/state paths and contents, so an agent can verify
+/// the write without re-reading the files.
+#[test]
+fn migrate_json_emits_post_op_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let original = "\
+vars = { editor = \"nvim\" }
+
+[stores.nvim]
+target = \"~/.config/nvim\"
+";
+    fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "migrate"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "migrate --json must succeed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON envelope");
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["command"], "migrate");
+    assert_eq!(value["ok"], true);
+    assert!(value["data"]["authored_path"].is_string());
+    assert!(value["data"]["state_path"].is_string());
+    assert!(value["data"]["authored"].is_string());
+    assert!(value["data"]["state"].is_string());
+    // The warning about comments being dropped is carried in the envelope.
+    let warnings = value["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.contains("comments"))),
+        "warnings should mention comments: {warnings:?}"
+    );
+    // The files were actually written.
+    assert!(dir.path().join("stitch.toml").exists());
+    assert!(dir.path().join(".stitch").join("state.toml").exists());
+    assert!(dir.path().join(".stitch").join("config.toml.bak").exists());
+}
+
 /// `stitch migrate --dry-run` previews without writing.
 #[test]
 fn migrate_dry_run_writes_nothing() {
@@ -833,4 +878,94 @@ fn init_io_error_includes_path() {
         .stderr(contains(".stitch"))
         .stderr(contains("Permission denied"))
         .stderr(contains("I/O error").not());
+}
+
+/// `migrate --dry-run --json` previews the authored/state split without writing.
+#[test]
+fn migrate_dry_run_json_previews_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    let original = "\
+vars = { editor = \"nvim\" }
+
+[stores.nvim]
+target = \"~/.config/nvim\"
+";
+    fs::write(dir.path().join(".stitch").join("config.toml"), original).unwrap();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "migrate", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "migrate --dry-run --json must succeed"
+    );
+    let value: Value = json_output(&output);
+    assert_envelope_shape(&value, "migrate", true);
+
+    let data = &value["data"];
+    assert!(data["authored_path"].is_string());
+    assert!(data["authored"].is_string());
+    assert!(data["state_path"].is_string());
+    assert!(data["state"].is_string());
+    let authored = data["authored"].as_str().unwrap();
+    let state = data["state"].as_str().unwrap();
+    assert!(authored.contains("editor = \"nvim\""));
+    assert!(state.contains("[stores.nvim]"));
+    assert!(state.contains("target = \"~/.config/nvim\""));
+
+    // No files were written and the legacy config is untouched.
+    assert!(!dir.path().join("stitch.toml").exists());
+    assert!(!dir.path().join(".stitch").join("state.toml").exists());
+    assert!(!dir.path().join(".stitch").join("config.toml.bak").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".stitch").join("config.toml")).unwrap(),
+        original
+    );
+}
+
+/// `migrate --json` on an already-converted repo reports the nothing-to-migrate
+/// shape and a warning, leaving the filesystem untouched.
+#[test]
+fn migrate_json_nothing_to_migrate() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".stitch")).unwrap();
+    fs::write(dir.path().join("stitch.toml"), "").unwrap();
+
+    let output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--json", "migrate"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "migrate on already-converted repo must succeed"
+    );
+    let value: Value = json_output(&output);
+    assert_envelope_shape(&value, "migrate", true);
+
+    let data = &value["data"];
+    assert!(data["authored_path"].is_null());
+    assert!(data["authored"].is_null());
+    assert!(data["state_path"].is_null());
+    assert!(data["state"].is_null());
+
+    let warnings = value["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.contains("nothing to migrate"))),
+        "warnings should mention nothing to migrate: {warnings:?}"
+    );
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("stitch.toml")).unwrap(),
+        ""
+    );
+    assert!(!dir.path().join(".stitch").join("state.toml").exists());
+    assert!(!dir.path().join(".stitch").join("config.toml.bak").exists());
 }

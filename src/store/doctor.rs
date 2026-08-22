@@ -71,6 +71,29 @@ fn duplicate_target_message(
     }
 }
 
+/// Whether a symlink resolves (even dangling) back into this repo. Used by
+/// the `alias-symlink` finding: live links via the canonical ownership
+/// predicate, dangling ones via missing-path resolution against the
+/// canonicalized repo root.
+fn link_resolves_into_repo(link: &Path, repo_root: &Path) -> bool {
+    if crate::linker::points_into_repo(link, repo_root) {
+        return true;
+    }
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    let absolute = if target.is_absolute() {
+        target
+    } else {
+        link.parent().unwrap_or_else(|| Path::new(".")).join(target)
+    };
+    let repo_canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    crate::linker::resolve_path_with_missing(&absolute)
+        .is_some_and(|resolved| resolved.starts_with(&repo_canon))
+}
+
 /// Run health checks.
 ///
 /// Takes [`Loaded`] (both halves) rather than just the merged [`Config`] so it
@@ -230,6 +253,42 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
             continue;
         }
 
+        // Legacy alias-symlink workaround (v0.14 `sources` migration): a
+        // repo-internal symlink inside a store dir that resolves back into
+        // the repo. It exists only so another store has a same-named file to
+        // link, and it survives the stale-link sweep by geometry — its target
+        // lives in another store's directory, which the narrow ownership
+        // check never matches. That is protection by coincidence, not by
+        // design; the `sources` declaration is the designed replacement.
+        for walk in walkdir::WalkDir::new(&store_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if walk.depth() == 0 || !walk.file_type().is_symlink() {
+                continue;
+            }
+            let link = walk.path();
+            if !link_resolves_into_repo(link, repo_root) {
+                continue;
+            }
+            findings.push(DoctorFinding {
+                id: "alias-symlink",
+                severity: Severity::Warning,
+                message: format!(
+                    "store '{name}': repo-internal symlink {} — the pre-sources \
+                     alias workaround",
+                    link.display()
+                ),
+                path: Some(link.to_path_buf()),
+                hint: Some(
+                    "replace it with a `sources` entry (target name → repo-relative \
+                     path) in .stitch/state.toml, then remove the symlink"
+                        .to_string(),
+                ),
+            });
+        }
+
         if store_dir
             .read_dir()
             .map_or(true, |mut d| d.next().is_none())
@@ -306,6 +365,7 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
              tname: Option<&str>,
              files: &[String],
              patterns: &[String],
+             sources: &BTreeMap<String, String>,
              ignore: &[String]| {
                 // Non-regular template sources (symlink/dir named *.tmpl) must be
                 // reported separately from source-name collisions.
@@ -348,9 +408,10 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                     Ok(None) => {}
                 }
 
-                let names = resolve_target_names(&store_dir, files, patterns, ignore);
-                if let LinkTargets::Files(ref names) = names
-                    && let Err(msg) = render::check_name_collisions(names)
+                let resolved =
+                    resolve_target_names(repo_root, &store_dir, files, patterns, sources, ignore);
+                if let LinkTargets::Files(ref links) = resolved
+                    && let Err(msg) = super::resolve::check_link_name_collisions(links)
                 {
                     findings.push(DoctorFinding {
                         id: "source-name-collision",
@@ -373,6 +434,7 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                 None,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.ignore,
             );
         }
@@ -385,6 +447,7 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                 Some(tname),
                 &tentry.files,
                 &tentry.patterns,
+                &tentry.sources,
                 &tentry.ignore,
             );
         }
@@ -499,50 +562,49 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
             // Hand-edits (or a vars/env change since last apply) surface here
             // so the next apply's overwrite is never silent.
             if entry.is_template {
-                match render::staged_differs(
-                    repo_root,
-                    name,
-                    // source is the repo path; recover the store-relative name.
-                    entry
-                        .source
-                        .strip_prefix(&store_dir)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| {
-                            entry
-                                .source
-                                .file_name()
-                                .map(|f| f.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        })
-                        .as_str(),
-                    &entry.source,
-                    platform,
-                    &config.vars,
-                ) {
-                    Ok(true) => {
-                        findings.push(DoctorFinding {
-                            id: "staging-drift",
-                            severity: Severity::Warning,
-                            message: format!(
-                                "store '{}': staged render for {} is stale (run `stitch apply`)",
-                                name,
-                                entry.target.display()
-                            ),
-                            path: Some(entry.target.clone()),
-                            hint: Some("run `stitch apply`".into()),
-                        });
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        // A template that fails to render is an error — same
-                        // class as a broken link.
-                        findings.push(DoctorFinding {
-                            id: "render-error",
-                            severity: Severity::Error,
-                            message: format!("store '{name}': {e}"),
-                            path: Some(entry.source.clone()),
-                            hint: Some("set missing env vars or fix the template".into()),
-                        });
+                // `source_name` is the template identity (store-relative for
+                // `files` entries, repo-relative for `sources`); the staging
+                // identity is carried by `link_source`.
+                let link_rel = entry
+                    .link_source
+                    .strip_prefix(render::store_render_dir(repo_root, name))
+                    .ok()
+                    .and_then(|rel| rel.to_str().map(str::to_owned));
+                if let Some(link_rel) = link_rel {
+                    match render::staged_differs(
+                        repo_root,
+                        name,
+                        &entry.source_name,
+                        &entry.source,
+                        &link_rel,
+                        platform,
+                        &config.vars,
+                    ) {
+                        Ok(true) => {
+                            findings.push(DoctorFinding {
+                                id: "staging-drift",
+                                severity: Severity::Warning,
+                                message: format!(
+                                    "store '{}': staged render for {} is stale (run `stitch apply`)",
+                                    name,
+                                    entry.target.display()
+                                ),
+                                path: Some(entry.target.clone()),
+                                hint: Some("run `stitch apply`".into()),
+                            });
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            // A template that fails to render is an error — same
+                            // class as a broken link.
+                            findings.push(DoctorFinding {
+                                id: "render-error",
+                                severity: Severity::Error,
+                                message: format!("store '{name}': {e}"),
+                                path: Some(entry.source.clone()),
+                                hint: Some("set missing env vars or fix the template".into()),
+                            });
+                        }
                     }
                 }
             }

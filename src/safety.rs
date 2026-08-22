@@ -334,20 +334,25 @@ pub fn validate_inventory(repo_root: &Path, config: &Config) -> Vec<InventoryErr
         if store.is_multi_target() {
             for (target_name, target_entry) in &store.targets {
                 check_target_inventory(
+                    repo_root,
                     &store_dir,
                     &target_entry.files,
                     &target_entry.patterns,
+                    &target_entry.sources,
                     &target_entry.ignore,
                     name,
                     Some(target_name),
                     &mut errors,
                 );
             }
-        } else if !store.files.is_empty() || !store.patterns.is_empty() {
+        } else if !store.files.is_empty() || !store.patterns.is_empty() || !store.sources.is_empty()
+        {
             check_target_inventory(
+                repo_root,
                 &store_dir,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.ignore,
                 name,
                 None,
@@ -357,7 +362,17 @@ pub fn validate_inventory(repo_root: &Path, config: &Config) -> Vec<InventoryErr
             // Whole-dir mode with no explicit files/patterns: check for
             // unsupported template sources and collisions in the implicit
             // expansion.
-            check_target_inventory(&store_dir, &[], &[], &store.ignore, name, None, &mut errors);
+            check_target_inventory(
+                repo_root,
+                &store_dir,
+                &[],
+                &[],
+                &store.sources,
+                &store.ignore,
+                name,
+                None,
+                &mut errors,
+            );
         }
     }
 
@@ -366,10 +381,13 @@ pub fn validate_inventory(repo_root: &Path, config: &Config) -> Vec<InventoryErr
 
 /// Check one target's source inventory for collisions and unsupported
 /// templates. Appends errors to `out`.
+#[allow(clippy::too_many_arguments)]
 fn check_target_inventory(
+    repo_root: &Path,
     store_dir: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &std::collections::BTreeMap<String, String>,
     ignore: &[String],
     store_name: &str,
     target_name: Option<&str>,
@@ -404,9 +422,10 @@ fn check_target_inventory(
     }
 
     // Resolve source names and check for collisions.
-    let targets = store::resolve_target_names(store_dir, files, patterns, ignore);
-    if let LinkTargets::Files(names) = targets
-        && let Err(msg) = render::check_name_collisions(&names)
+    let targets =
+        store::resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore);
+    if let LinkTargets::Files(links) = targets
+        && let Err(msg) = store::check_link_name_collisions(&links)
     {
         out.push(InventoryError {
             store: store_name.to_string(),

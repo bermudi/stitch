@@ -8,7 +8,7 @@
 
 use crate::platform::Platform;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Context injected as `STITCH_*` env vars into every hook process.
 pub struct HookEnv<'a> {
@@ -46,15 +46,37 @@ fn fmt_status(status: std::process::ExitStatus) -> String {
         .unwrap_or_else(|| "signal".into())
 }
 
+/// When `json` is true, redirect the hook's stdout to stderr so hook output
+/// cannot corrupt the machine-readable JSON envelope on stdout. Stderr is
+/// still inherited so the user/agent sees hook messages.
+fn isolate_stdout_if_json(cmd: &mut Command, json: bool) {
+    if json {
+        // Open /dev/stderr as a File and use it as the hook's stdout. On
+        // Linux /dev/stderr is a symlink to /proc/self/fd/2.
+        if let Ok(stderr_file) = std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+            cmd.stdout(Stdio::from(stderr_file));
+        }
+    }
+}
+
 /// Run a per-store hook: a shell command string from config, via `sh -c`.
 ///
 /// Returns `Ok(())` on exit 0, `Err(message)` on non-zero exit or failure to
 /// launch. The caller decides policy: pre-hook failure aborts the store,
 /// post-hook failure is a warning.
-pub fn run_store_hook(command: &str, env: &HookEnv, platform: &Platform) -> Result<(), String> {
+///
+/// When `json` is true, the hook's stdout is redirected to stderr so it
+/// cannot corrupt the JSON envelope.
+pub fn run_store_hook(
+    command: &str,
+    env: &HookEnv,
+    platform: &Platform,
+    json: bool,
+) -> Result<(), String> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
     inject_env(&mut cmd, env, platform);
+    isolate_stdout_if_json(&mut cmd, json);
     match cmd.status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!(
@@ -71,11 +93,15 @@ pub fn run_store_hook(command: &str, env: &HookEnv, platform: &Platform) -> Resu
 /// file is present (nothing to run), `Err(message)` if it existed and failed.
 /// The hook must be executable (`chmod +x`) — like git hooks, stitch does not
 /// auto-chmod.
+///
+/// When `json` is true, the hook's stdout is redirected to stderr so it
+/// cannot corrupt the JSON envelope.
 pub fn run_global_hook(
     root: &Path,
     name: &str,
     env: &HookEnv,
     platform: &Platform,
+    json: bool,
 ) -> Result<bool, String> {
     let hook_path = root.join(".stitch").join("hooks").join(name);
     if !hook_path.exists() {
@@ -83,6 +109,7 @@ pub fn run_global_hook(
     }
     let mut cmd = Command::new(&hook_path);
     inject_env(&mut cmd, env, platform);
+    isolate_stdout_if_json(&mut cmd, json);
     match cmd.status() {
         Ok(status) if status.success() => Ok(true),
         Ok(status) => Err(format!(
@@ -116,7 +143,7 @@ mod tests {
             action: "apply",
         };
         let cmd = format!("touch {}", marker.display());
-        run_store_hook(&cmd, &env, &platform()).unwrap();
+        run_store_hook(&cmd, &env, &platform(), false).unwrap();
         assert!(marker.exists());
     }
 
@@ -129,7 +156,7 @@ mod tests {
             target: None,
             action: "apply",
         };
-        let err = run_store_hook("exit 1", &env, &platform()).unwrap_err();
+        let err = run_store_hook("exit 1", &env, &platform(), false).unwrap_err();
         assert!(err.contains("exited with 1"), "got: {err}");
     }
 
@@ -144,7 +171,7 @@ mod tests {
             action: "apply",
         };
         let cmd = format!("env | grep ^STITCH > {}", outfile.display());
-        run_store_hook(&cmd, &env, &platform()).unwrap();
+        run_store_hook(&cmd, &env, &platform(), false).unwrap();
         let captured = std::fs::read_to_string(&outfile).unwrap();
         assert!(captured.contains("STITCH_STORE=mystore"), "got: {captured}");
         assert!(
@@ -168,7 +195,7 @@ mod tests {
             target: None,
             action: "apply",
         };
-        assert!(!run_global_hook(tmp.path(), "pre-apply", &env, &platform()).unwrap());
+        assert!(!run_global_hook(tmp.path(), "pre-apply", &env, &platform(), false).unwrap());
     }
 
     #[test]
@@ -187,7 +214,7 @@ mod tests {
             target: None,
             action: "apply",
         };
-        assert!(run_global_hook(tmp.path(), "pre-apply", &env, &platform()).unwrap());
+        assert!(run_global_hook(tmp.path(), "pre-apply", &env, &platform(), false).unwrap());
         assert!(marker.exists());
     }
 
@@ -206,7 +233,7 @@ mod tests {
             target: None,
             action: "apply",
         };
-        let err = run_global_hook(tmp.path(), "post-apply", &env, &platform()).unwrap_err();
+        let err = run_global_hook(tmp.path(), "post-apply", &env, &platform(), false).unwrap_err();
         assert!(err.contains("exited with 3"), "got: {err}");
     }
 

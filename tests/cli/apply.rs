@@ -1668,3 +1668,438 @@ fn apply_target_home_does_not_eat_repo_internal_symlinks() {
         "repo-internal symlink still resolves"
     );
 }
+
+#[test]
+fn apply_json_conflict_real_has_recoverable_via() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "I am a real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    let err = &v["error"];
+    assert_eq!(err["class"], "conflict-real");
+    assert_eq!(err["code"], 6);
+    let actions = err["recoverable_via"]
+        .as_array()
+        .expect("recoverable_via array");
+    // apply aggregates into an Apply error with a single ConflictReal class.
+    // It delegates to force-apply (no target-specific args at the aggregate
+    // level; the agent should consult the plan ops in `data` for per-entry targets).
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["kind"], "force-apply");
+    assert_eq!(actions[0]["command"], "apply");
+    assert_eq!(actions[0]["flags"][0], "--force");
+}
+
+#[test]
+fn apply_json_conflict_foreign_has_manual_recoverable_via() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    // Foreign symlink: points outside this repo (another manager's store).
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("nvim");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("init.lua"), "not ours").unwrap();
+    std::os::unix::fs::symlink(&foreign, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    let err = &v["error"];
+    assert_eq!(err["class"], "conflict-foreign");
+    let actions = err["recoverable_via"]
+        .as_array()
+        .expect("recoverable_via array");
+    // Red line: foreign symlinks are never auto-clobbered — only manual.
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["kind"], "manual");
+    assert!(actions[0].get("command").is_none() || actions[0]["command"].is_null());
+    assert!(
+        actions[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("never auto-clobbered")
+    );
+}
+
+#[test]
+fn apply_json_single_render_class_returns_manual_not_edit_template() {
+    // A single `render` failure class in an Apply aggregate returns `manual`,
+    // not `edit-template` — the aggregate does not record which source path
+    // failed, and `edit-template` requires one. The agent should read the
+    // failing source from the plan ops in `data`. This locks in the SPEC
+    // wording (the single-class delegation has a Render exception).
+    let repo = Repo::new();
+    let store = repo.make_store("git", &["config"]);
+    // A broken template triggers a render failure on apply.
+    fs::write(store.join("broken.tmpl"), "{{").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{target}"
+"#,
+        target = target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(v["ok"], false);
+    let err = &v["error"];
+    assert_eq!(err["class"], "render");
+    assert_eq!(err["code"], 8);
+    let actions = err["recoverable_via"]
+        .as_array()
+        .expect("recoverable_via array");
+    // Single Render class → manual (not edit-template), because the aggregate
+    // lacks the source path that edit-template requires.
+    assert_eq!(actions.len(), 1, "single render class yields one action");
+    assert_eq!(actions[0]["kind"], "manual");
+    assert!(
+        actions[0].get("command").is_none() || actions[0]["command"].is_null(),
+        "render recovery must not offer a stitch command (no source path at aggregate level)"
+    );
+    assert!(
+        actions[0]["reason"].as_str().unwrap().contains("template"),
+        "render manual reason should reference the template/plan ops: {}",
+        actions[0]["reason"]
+    );
+}
+
+#[test]
+fn apply_json_result_happy_path() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    assert_envelope_shape(&v, "apply", true);
+
+    let data = &v["data"];
+    assert!(data.is_object());
+    let result = &data["result"];
+    assert!(result.is_object(), "data.result must be an object");
+    assert_eq!(
+        result["ops_executed"].as_u64(),
+        result["ops_total"].as_u64()
+    );
+    assert!(result["ops_executed"].as_u64().is_some());
+    assert_eq!(result["conflicts"].as_u64(), Some(0));
+    assert_eq!(result["errors"].as_u64(), Some(0));
+
+    let stores = result["stores"]
+        .as_array()
+        .expect("result.stores must be an array");
+    assert_eq!(stores.len(), 1);
+    let nvim = &stores[0];
+    assert_eq!(nvim["store"].as_str(), Some("nvim"));
+    assert!(nvim["ok"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(nvim["conflicts"].as_u64(), Some(0));
+    assert_eq!(nvim["errors"].as_u64(), Some(0));
+    assert_eq!(nvim["skipped"].as_u64(), Some(0));
+}
+
+#[test]
+fn apply_json_result_conflict_real_file() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "I am a real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    assert_envelope_shape(&v, "apply", false);
+
+    let data = &v["data"];
+    assert!(data.is_object());
+    let result = &data["result"];
+    assert!(result.is_object(), "data.result must be an object");
+    assert!(result["conflicts"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(result["errors"].as_u64(), Some(0));
+    assert!(
+        result["ops_executed"].as_u64().unwrap_or(0) < result["ops_total"].as_u64().unwrap_or(0)
+    );
+
+    let stores = result["stores"]
+        .as_array()
+        .expect("result.stores must be an array");
+    let nvim = stores
+        .iter()
+        .find(|s| s["store"].as_str() == Some("nvim"))
+        .expect("nvim in result.stores");
+    assert!(nvim["conflicts"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(nvim["errors"].as_u64(), Some(0));
+}
+
+#[test]
+fn apply_json_result_error_no_target() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.write_state(
+        r#"
+[stores.nvim]
+"#,
+    );
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    assert_envelope_shape(&v, "apply", false);
+
+    let data = &v["data"];
+    assert!(data.is_object());
+    let result = &data["result"];
+    assert!(result.is_object(), "data.result must be an object");
+    assert!(result["errors"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(result["conflicts"].as_u64(), Some(0));
+
+    let stores = result["stores"]
+        .as_array()
+        .expect("result.stores must be an array");
+    let nvim = stores
+        .iter()
+        .find(|s| s["store"].as_str() == Some("nvim"))
+        .expect("nvim in result.stores");
+    assert!(nvim["errors"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(nvim["conflicts"].as_u64(), Some(0));
+}
+
+#[test]
+fn apply_json_post_status_conflict_real_file() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, "I am a real file").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    let post_status = v["data"]["post_status"]
+        .as_array()
+        .expect("data.post_status must be an array");
+    assert!(
+        !post_status.is_empty(),
+        "post_status must not be empty on conflict"
+    );
+    let entry = &post_status[0];
+    assert_eq!(entry["store"].as_str(), Some("nvim"));
+    assert_eq!(entry["state"].as_str(), Some("conflict"));
+}
+
+#[test]
+fn apply_json_post_status_foreign_symlink() {
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    let target = repo.path().join("home").join(".config").join("nvim");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign = foreign_dir.path().join("nvim");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("init.lua"), "not ours").unwrap();
+    std::os::unix::fs::symlink(&foreign, &target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{target_str}"
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .arg("--json")
+        .arg("apply")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let v = json_output(&output);
+    let post_status = v["data"]["post_status"]
+        .as_array()
+        .expect("data.post_status must be an array");
+    assert!(
+        !post_status.is_empty(),
+        "post_status must not be empty on foreign symlink"
+    );
+    let entry = &post_status[0];
+    assert_eq!(entry["store"].as_str(), Some("nvim"));
+    assert_eq!(entry["state"].as_str(), Some("foreign"));
+}
+
+#[test]
+fn apply_multi_target_canonical_equivalent_symlinked_home_union() {
+    // Regression for "canonical-equivalent targets with disjoint files sweep each other".
+    // With a symlinked $HOME, "~/out" and "/realhome/out" resolve to the same physical
+    // directory. Two file-mode targets inside one store that share that directory but list
+    // disjoint files must union their keep-sets and sweep once; otherwise each sweep deletes
+    // the other's live link.
+    let tmp = tempfile::tempdir().unwrap();
+    let real_home = tmp.path().join("real_home");
+    let home_link = tmp.path().join("home_link");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&real_home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    std::os::unix::fs::symlink(&real_home, &home_link).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("init")
+        .assert()
+        .success();
+
+    let store_dir = repo.join("app");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(store_dir.join("a"), "a").unwrap();
+    fs::write(store_dir.join("b"), "b").unwrap();
+
+    let real_out = real_home.join("out");
+    fs::write(
+        repo.join(".stitch").join("state.toml"),
+        format!(
+            "[stores.app.targets.t1]\ntarget = \"~/out\"\nfiles = [\"a\"]\n\n[stores.app.targets.t2]\ntarget = \"{}\"\nfiles = [\"b\"]\n",
+            real_out.display()
+        ),
+    )
+    .unwrap();
+
+    // First apply must create both links and remove none.
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("create:"))
+        .stdout(contains("remove:").not());
+
+    let a = real_home.join("out").join("a");
+    let b = real_home.join("out").join("b");
+    assert!(a.is_symlink(), "a must be linked after first apply");
+    assert!(b.is_symlink(), "b must be linked after first apply");
+    assert_eq!(
+        fs::read_link(&a).unwrap(),
+        store_dir.join("a").canonicalize().unwrap()
+    );
+    assert_eq!(
+        fs::read_link(&b).unwrap(),
+        store_dir.join("b").canonicalize().unwrap()
+    );
+
+    // Second apply must be idempotent (no create, no remove) and diff must be clean.
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("ok"));
+
+    assert!(a.is_symlink(), "a must survive second apply");
+    assert!(b.is_symlink(), "b must survive second apply");
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .args(["diff", "--exit-code"])
+        .assert()
+        .success();
+}

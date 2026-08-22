@@ -137,6 +137,9 @@ pub struct ApplyOpts {
     /// Rename real-file/dir conflicts to `{target}.bak` and link instead of
     /// stopping. Foreign symlinks remain hard conflicts regardless.
     pub force: bool,
+    /// When true, hook stdout is redirected to stderr so it cannot corrupt
+    /// the JSON envelope.
+    pub json: bool,
 }
 
 /// Apply all stores in the config. Returns the executed (or previewed) plan
@@ -306,10 +309,12 @@ pub fn apply_all(
                 target: store.target.as_deref(),
                 action: "apply",
             };
-            if let Err(msg) = hooks::run_store_hook(pre, &env, platform) {
+            if let Err(msg) = hooks::run_store_hook(pre, &env, platform, opts.json) {
                 results.push(ApplyResult {
                     store_name: name.clone(),
-                    actions: vec![ApplyAction::Error(StitchError::hook("pre", msg))],
+                    actions: vec![ApplyAction::Error(StitchError::hook_store(
+                        "pre", msg, name,
+                    ))],
                 });
                 continue;
             }
@@ -520,7 +525,7 @@ pub fn apply_all(
                 target: locked_store.target.as_deref(),
                 action: "apply",
             };
-            if let Err(msg) = hooks::run_store_hook(post, &env, platform) {
+            if let Err(msg) = hooks::run_store_hook(post, &env, platform, opts.json) {
                 warnings.push(format!("store '{name}' post-hook: {msg}"));
             }
             // Revalidate $HOME identity after the post-hook, using the
@@ -598,6 +603,7 @@ pub fn compute_plan(
     let classify_opts = ApplyOpts {
         dry_run: true,
         force: opts.force,
+        json: opts.json,
     };
     apply_all(repo_root, config, None, &[], platform, classify_opts).0
 }
@@ -616,37 +622,69 @@ pub fn has_active_template_sources(repo_root: &Path, config: &Config, platform: 
             store.targets.values().any(|target| {
                 platform.matches_when(&target.when)
                     && target_has_template_source(
+                        repo_root,
                         &store_dir,
                         &target.files,
                         &target.patterns,
+                        &target.sources,
                         &target.ignore,
                     )
             })
         } else {
-            target_has_template_source(&store_dir, &store.files, &store.patterns, &store.ignore)
+            target_has_template_source(
+                repo_root,
+                &store_dir,
+                &store.files,
+                &store.patterns,
+                &store.sources,
+                &store.ignore,
+            )
         }
     })
 }
 
 fn target_has_template_source(
+    repo_root: &Path,
     store_dir: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     ignore: &[String],
 ) -> bool {
-    let LinkTargets::Files(names) = resolve_target_names(store_dir, files, patterns, ignore) else {
+    let LinkTargets::Files(links) =
+        resolve_target_names(repo_root, store_dir, files, patterns, sources, ignore)
+    else {
         return false;
     };
-    names.into_iter().any(|source_name| {
-        let entry = render::resolve_entry(&source_name);
-        entry.is_template && is_regular_template_source(&store_dir.join(entry.source_rel))
-    })
+    links
+        .into_iter()
+        .any(|link| link.is_template() && is_regular_template_source(&link.source))
 }
 
 fn is_regular_template_source(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|meta| meta.file_type().is_file() && !meta.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+/// Union one target entry's declared `sources` into the per-target-path set
+/// used by the sweep's ownership check. Union (not replace) because two target
+/// entries may share a target path, mirroring `target_keep_links`.
+fn collect_declared_sources(
+    repo_root: &Path,
+    target_path: &Path,
+    sources: &BTreeMap<String, String>,
+    target_declared_sources: &mut BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+) {
+    if sources.is_empty() {
+        return;
+    }
+    let entry = target_declared_sources
+        .entry(target_path.to_path_buf())
+        .or_default();
+    for value in sources.values() {
+        entry.insert(repo_root.join(value));
+    }
 }
 
 /// Apply a single store.
@@ -699,17 +737,26 @@ pub fn apply_store(
         // Build every desired keep-set before applying any target. An active
         // whole-dir target must see a skipped file-mode sibling that shares its
         // path; otherwise it could erase that sibling before its turn.
+        let mut target_declared_sources: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
         for target_entry in store.targets.values() {
             let target_path = config::expand_home(&target_entry.target)
                 .expect("HOME was validated by Config::load");
             collect_reconciliation_keeps(
+                repo_root,
                 &store_dir,
                 &target_path,
                 &target_entry.files,
                 &target_entry.patterns,
+                &target_entry.sources,
                 &target_entry.ignore,
                 &mut keep_links,
                 &mut target_keep_links,
+            );
+            collect_declared_sources(
+                repo_root,
+                &target_path,
+                &target_entry.sources,
+                &mut target_declared_sources,
             );
             // Keep desired staged renders, but never scan a target whose path
             // reaches back into the repo through an ancestor symlink.
@@ -726,9 +773,13 @@ pub fn apply_store(
                 .expect("HOME was validated by Config::load");
             match target_is_confined(&target_path, repo_root) {
                 Ok(()) => {
-                    let target_link_rels = target_keep_links
-                        .get(&target_path)
-                        .unwrap_or(&empty_link_rels);
+                    let canon = config::canonical_target_for_comparison(&target_path);
+                    let mut unioned = BTreeSet::new();
+                    for (raw_path, rels) in &target_keep_links {
+                        if config::canonical_target_for_comparison(raw_path) == canon {
+                            unioned.extend(rels.iter().cloned());
+                        }
+                    }
                     actions.extend(apply_target(
                         name,
                         &store_dir,
@@ -736,8 +787,9 @@ pub fn apply_store(
                         repo_root,
                         &target_entry.files,
                         &target_entry.patterns,
+                        &target_entry.sources,
                         &target_entry.ignore,
-                        target_link_rels,
+                        &unioned,
                         platform,
                         vars,
                         opts,
@@ -750,14 +802,71 @@ pub fn apply_store(
                 }
             }
         }
+        // Reconcile file-mode links before staging: a deleted source must not
+        // leave a target symlink pointing at a render that is about to
+        // disappear. Declared sources join the ownership set so a renamed-away
+        // or repointed `sources` entry is swept exactly like an in-store one.
+        // Only reconcile target paths that have at least one active target —
+        // inactive targets at separate directories must be left alone (High 1),
+        // while shared directories (active+inactive at same path) are kept
+        // via the union in `target_keep_links`.
+        let active_canonical: BTreeSet<PathBuf> = store
+            .targets
+            .values()
+            .filter(|te| platform.matches_when(&te.when))
+            .filter_map(|te| config::expand_home(&te.target).ok())
+            .map(|p| config::canonical_target_for_comparison(&p))
+            .collect();
+        // Merge raw-path keep sets that are canonical-equivalent (e.g.
+        // "~/out" and "/realhome/out" with a symlinked $HOME). Without
+        // this, disjoint file sets sweep each other in separate walks.
+        let mut canonical_keep: BTreeMap<PathBuf, (PathBuf, BTreeSet<String>)> = BTreeMap::new();
+        for (raw, rels) in target_keep_links {
+            let canon = config::canonical_target_for_comparison(&raw);
+            let entry = canonical_keep
+                .entry(canon)
+                .or_insert_with(|| (raw.clone(), BTreeSet::new()));
+            entry.1.extend(rels);
+        }
+        let mut canonical_declared: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+        for (raw, sources) in target_declared_sources {
+            let canon = config::canonical_target_for_comparison(&raw);
+            canonical_declared.entry(canon).or_default().extend(sources);
+        }
+        for (canon, (representative, link_rels)) in canonical_keep
+            .into_iter()
+            .filter(|(canon, _)| active_canonical.contains(canon))
+        {
+            let declared: Vec<PathBuf> = canonical_declared
+                .remove(&canon)
+                .map(|set| set.into_iter().collect())
+                .unwrap_or_default();
+            match render::reconcile_store_links(
+                &representative,
+                repo_root,
+                &store_dir,
+                name,
+                &declared,
+                &link_rels,
+                opts.dry_run,
+            ) {
+                Ok(removed) => actions.extend(removed.into_iter().map(ApplyAction::Removed)),
+                Err(e) => {
+                    link_reconciliation_failed = true;
+                    actions.push(internal_error(e));
+                }
+            }
+        }
     } else if let Some(ref target_str) = store.target {
         let target_path =
             config::expand_home(target_str).expect("HOME was validated by Config::load");
         collect_reconciliation_keeps(
+            repo_root,
             &store_dir,
             &target_path,
             &store.files,
             &store.patterns,
+            &store.sources,
             &store.ignore,
             &mut keep_links,
             &mut target_keep_links,
@@ -778,6 +887,7 @@ pub fn apply_store(
                     repo_root,
                     &store.files,
                     &store.patterns,
+                    &store.sources,
                     &store.ignore,
                     target_link_rels,
                     platform,
@@ -789,6 +899,30 @@ pub fn apply_store(
                 target_keep_links.remove(&target_path);
                 link_reconciliation_failed = true;
                 actions.push(action);
+            }
+        }
+        // Reconcile file-mode links before staging (see the multi-target arm
+        // for the rationale).
+        let declared: Vec<PathBuf> = store
+            .sources
+            .values()
+            .map(|value| repo_root.join(value))
+            .collect();
+        for (target_path, link_rels) in target_keep_links {
+            match render::reconcile_store_links(
+                &target_path,
+                repo_root,
+                &store_dir,
+                name,
+                &declared,
+                &link_rels,
+                opts.dry_run,
+            ) {
+                Ok(removed) => actions.extend(removed.into_iter().map(ApplyAction::Removed)),
+                Err(e) => {
+                    link_reconciliation_failed = true;
+                    actions.push(internal_error(e));
+                }
             }
         }
     } else {
@@ -803,26 +937,6 @@ pub fn apply_store(
              state.toml has no link inventory; re-add the store with `stitch add` or remove the \
              entry from stitch.toml"
         )));
-    }
-
-    // Reconcile file-mode links before staging: a deleted source must not leave
-    // a target symlink pointing at a render that is about to disappear. The
-    // helper is dry-run aware so `diff` previews removals without mutating.
-    for (target_path, link_rels) in target_keep_links {
-        match render::reconcile_store_links(
-            &target_path,
-            repo_root,
-            &store_dir,
-            name,
-            &link_rels,
-            opts.dry_run,
-        ) {
-            Ok(removed) => actions.extend(removed.into_iter().map(ApplyAction::Removed)),
-            Err(e) => {
-                link_reconciliation_failed = true;
-                actions.push(internal_error(e));
-            }
-        }
     }
 
     // Reap staging only after target cleanup fully succeeds. An I/O failure
@@ -856,13 +970,14 @@ fn apply_target(
     repo_root: &Path,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     ignore: &[String],
     target_link_rels: &BTreeSet<String>,
     platform: &Platform,
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
 ) -> Vec<ApplyAction> {
-    match resolve_targets(store_dir, files, patterns, ignore) {
+    match resolve_targets(repo_root, store_dir, files, patterns, sources, ignore) {
         Err(msg) => vec![ApplyAction::Error(StitchError::path_validation(msg))],
         Ok(LinkTargets::WholeDir) => apply_whole_dir(
             store_name,
@@ -872,13 +987,13 @@ fn apply_target(
             target_link_rels,
             opts,
         ),
-        Ok(LinkTargets::Files(names)) => {
+        Ok(LinkTargets::Files(links)) => {
             let (replaces_whole_dir, mut actions) = match prepare_file_mode_target(
                 store_name,
                 store_dir,
                 target_path,
                 repo_root,
-                &names,
+                &links,
                 platform,
                 vars,
                 opts,
@@ -886,19 +1001,16 @@ fn apply_target(
                 Ok(prepared) => prepared,
                 Err(action) => return vec![action],
             };
-            for source_name in &names {
+            for link in &links {
                 if replaces_whole_dir && opts.dry_run {
-                    actions.push(preview_file_entry_after_root_removal(
-                        target_path,
-                        source_name,
-                    ));
+                    actions.push(preview_file_entry_after_root_removal(target_path, link));
                 } else {
                     actions.push(apply_file_entry(
                         store_name,
                         store_dir,
                         target_path,
                         repo_root,
-                        source_name,
+                        link,
                         platform,
                         vars,
                         opts,
@@ -919,7 +1031,7 @@ fn prepare_file_mode_target(
     store_dir: &Path,
     target_path: &Path,
     repo_root: &Path,
-    source_names: &[String],
+    links: &[super::resolve::FileLink],
     platform: &Platform,
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
@@ -991,13 +1103,7 @@ fn prepare_file_mode_target(
         }
     }
     preflight_file_mode_promotion(
-        store_name,
-        store_dir,
-        repo_root,
-        source_names,
-        platform,
-        vars,
-        opts,
+        store_name, store_dir, repo_root, links, platform, vars, opts,
     )?;
     if opts.dry_run {
         return Ok((true, vec![ApplyAction::Removed(target_path.to_path_buf())]));
@@ -1026,41 +1132,43 @@ fn preflight_file_mode_promotion(
     store_name: &str,
     store_dir: &Path,
     repo_root: &Path,
-    source_names: &[String],
+    links: &[super::resolve::FileLink],
     platform: &Platform,
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
 ) -> Result<(), ApplyAction> {
-    let entries: Vec<_> = source_names
-        .iter()
-        .map(|name| render::resolve_entry(name))
-        .collect();
-    for entry in &entries {
-        let source_path = store_dir.join(&entry.source_rel);
+    for link in links {
+        let source_path = &link.source;
+        let source_root = if link.from_sources {
+            repo_root
+        } else {
+            store_dir
+        };
         // Validate every desired source before removing the live whole-dir
         // link. Otherwise a source reached through an escaped gateway could
         // fail only after the old target had already been removed.
-        if let Err(error) = linker::validate_source_in(&source_path, store_dir) {
+        if let Err(error) = linker::validate_source_in(source_path, source_root) {
             return Err(ApplyAction::Error(error.into()));
         }
         // `symlink_metadata` does not follow terminal source symlinks, so a
         // dangling non-template source remains a valid entry. Template
         // sources are checked as direct regular files by the render step.
-        if std::fs::symlink_metadata(&source_path).is_err() {
+        if std::fs::symlink_metadata(source_path).is_err() {
             return Err(internal_error(format!(
                 "source does not exist: {}",
                 source_path.display()
             )));
         }
     }
-    for entry in entries.iter().filter(|entry| entry.is_template) {
-        let source_path = store_dir.join(&entry.source_rel);
+    for link in links.iter().filter(|link| link.is_template()) {
+        let source_path = &link.source;
         let result = if opts.dry_run {
             render::staged_differs(
                 repo_root,
                 store_name,
-                &entry.source_rel,
-                &source_path,
+                &link.source_rel,
+                source_path,
+                &link.name,
                 platform,
                 vars,
             )
@@ -1069,15 +1177,16 @@ fn preflight_file_mode_promotion(
             render::stage_template(
                 repo_root,
                 store_name,
-                &entry.source_rel,
-                &source_path,
+                &link.source_rel,
+                source_path,
+                &link.name,
                 platform,
                 vars,
             )
             .map(|_| ())
         };
         if let Err(e) = result {
-            return Err(ApplyAction::Error(StitchError::render(&source_path, e)));
+            return Err(ApplyAction::Error(StitchError::render(source_path, e)));
         }
     }
     Ok(())
@@ -1086,9 +1195,11 @@ fn preflight_file_mode_promotion(
 /// Preview an entry after [`prepare_file_mode_target`] would remove the old
 /// whole-directory root. The promotion preflight already verified its source
 /// and template render, so every child link is known to be absent afterwards.
-fn preview_file_entry_after_root_removal(target_path: &Path, source_name: &str) -> ApplyAction {
-    let entry = render::resolve_entry(source_name);
-    ApplyAction::Created(target_path.join(entry.link_rel))
+fn preview_file_entry_after_root_removal(
+    target_path: &Path,
+    link: &super::resolve::FileLink,
+) -> ApplyAction {
+    ApplyAction::Created(target_path.join(&link.name))
 }
 
 /// Apply a whole-directory store, including a safe transition back from file mode.
@@ -1119,11 +1230,14 @@ fn apply_whole_dir(
         )];
     }
 
+    // A whole-dir store never declares `sources` (they force file mode), so
+    // the declared-source ownership set is empty here.
     let removed = match render::reconcile_store_links(
         target_path,
         repo_root,
         store_dir,
         store_name,
+        &[],
         keep_link_rels,
         opts.dry_run,
     ) {
@@ -1346,13 +1460,25 @@ fn symlink_ancestor(target_root: &Path, target: &Path) -> Option<(PathBuf, Optio
     None
 }
 
-/// Apply one resolved file-mode entry. Templates render to staging first;
-/// non-templates link the store source directly.
-#[allow(clippy::too_many_arguments)] // mirrors apply_target's parameter set
-pub(crate) fn store_resolves_source(store_dir: &Path, store: &Store, source_name: &str) -> bool {
+/// Whether `source_name` (a store-relative file entry) resolves in this
+/// store's desired entry set — i.e. `add --to`'s adopted file is not ignored
+/// or shadowed.
+pub(crate) fn store_resolves_source(
+    repo_root: &Path,
+    store_dir: &Path,
+    store: &Store,
+    source_name: &str,
+) -> bool {
     matches!(
-        resolve_targets(store_dir, &store.files, &store.patterns, &store.ignore),
-        Ok(LinkTargets::Files(names)) if names.iter().any(|name| name == source_name)
+        resolve_targets(
+            repo_root,
+            store_dir,
+            &store.files,
+            &store.patterns,
+            &store.sources,
+            &store.ignore
+        ),
+        Ok(LinkTargets::Files(links)) if links.iter().any(|link| link.source_rel == source_name)
     )
 }
 
@@ -1439,36 +1565,47 @@ pub(crate) fn apply_added_plain_file(
         Err(error) => return ApplyAction::Error(error.into()),
     };
     let entry = render::resolve_entry(source_name);
-    let target = target_path.join(&entry.link_rel);
-    if let Err(action) = preflight_add_target(repo_root, &target_path, &target) {
-        return action;
-    }
+    let link = super::resolve::FileLink {
+        name: entry.link_rel,
+        source: store_dir.join(&entry.source_rel),
+        source_rel: entry.source_rel,
+        from_sources: false,
+    };
     apply_file_entry(
         store_name,
         &store_dir,
         &target_path,
         repo_root,
-        source_name,
+        &link,
         platform,
         &BTreeMap::new(),
         opts,
     )
 }
 
+/// Apply one resolved file-mode entry. Templates render to staging first;
+/// non-templates link the store source directly. A `sources` entry (v0.14)
+/// links a repo file outside the store dir — the source root for validation is
+/// the repo, and a template source stages under this store's identity (the
+/// declared link name), never another store's.
 #[allow(clippy::too_many_arguments)]
 fn apply_file_entry(
     store_name: &str,
     store_dir: &Path,
     target_path: &Path,
     repo_root: &Path,
-    source_name: &str,
+    link: &super::resolve::FileLink,
     platform: &Platform,
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
 ) -> ApplyAction {
-    let entry = render::resolve_entry(source_name);
-    let source_path = store_dir.join(&entry.source_rel);
-    let target = target_path.join(&entry.link_rel);
+    let source_path = link.source.clone();
+    let source_root: &Path = if link.from_sources {
+        repo_root
+    } else {
+        store_dir
+    };
+    let target = target_path.join(&link.name);
 
     // Safety: do not create a nested link through any symlink ancestor, even
     // one that points into the repository. The target itself is handled by
@@ -1480,8 +1617,8 @@ fn apply_file_entry(
         };
     }
 
-    if !entry.is_template {
-        return apply_single_link(&source_path, &target, repo_root, store_dir, opts);
+    if !link.is_template() {
+        return apply_single_link(&source_path, &target, repo_root, source_root, opts);
     }
     if !is_regular_template_source(&source_path) {
         return ApplyAction::Error(StitchError::render(
@@ -1490,15 +1627,16 @@ fn apply_file_entry(
         ));
     }
 
-    let staged = render::staging_path(repo_root, store_name, &entry.link_rel);
+    let staged = render::staging_path(repo_root, store_name, &link.name);
 
     if opts.dry_run {
         // Content dimension: fresh in-memory render vs staged. Never write.
         let content_differs = match render::staged_differs(
             repo_root,
             store_name,
-            &entry.source_rel,
+            &link.source_rel,
             &source_path,
+            &link.name,
             platform,
             vars,
         ) {
@@ -1517,8 +1655,9 @@ fn apply_file_entry(
         let (link_source, wrote) = match render::stage_template(
             repo_root,
             store_name,
-            &entry.source_rel,
+            &link.source_rel,
             &source_path,
+            &link.name,
             platform,
             vars,
         ) {
@@ -1849,6 +1988,7 @@ mod tests {
             target: Some(home.join(".config").to_string_lossy().into_owned()),
             files: vec!["active".into()],
             patterns: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
             ignore: Vec::new(),
             when: crate::config::WhenClause::default(),
             hooks: crate::config::Hooks::default(),
@@ -1870,6 +2010,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -1910,6 +2051,7 @@ mod tests {
             target: Some(home.join(".config").to_string_lossy().into_owned()),
             files: vec!["init.lua".into()],
             patterns: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
             ignore: Vec::new(),
             when: crate::config::WhenClause::default(),
             hooks: crate::config::Hooks::default(),
@@ -1931,6 +2073,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -1969,6 +2112,7 @@ mod tests {
             target: Some(target.to_string_lossy().into_owned()),
             files: Vec::new(),
             patterns: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
             ignore: vec!["*.bak".into()],
             when: crate::config::WhenClause::default(),
             hooks: crate::config::Hooks::default(),
@@ -1991,6 +2135,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );
@@ -2039,6 +2184,7 @@ mod tests {
             target: Some(target.to_string_lossy().into_owned()),
             files: Vec::new(),
             patterns: vec!["**/*".into()],
+            sources: std::collections::BTreeMap::new(),
             ignore: Vec::new(),
             when: crate::config::WhenClause::default(),
             hooks: crate::config::Hooks::default(),
@@ -2061,6 +2207,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );
@@ -2114,6 +2261,7 @@ mod tests {
             target: Some(target.to_string_lossy().into_owned()),
             files: Vec::new(),
             patterns: vec!["**/*".into()],
+            sources: std::collections::BTreeMap::new(),
             ignore: Vec::new(),
             when: crate::config::WhenClause::default(),
             hooks: crate::config::Hooks::default(),
@@ -2136,6 +2284,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: true,
+                json: false,
             },
             &mut warnings,
         );
@@ -2182,6 +2331,7 @@ mod tests {
             target: Some(target.to_string_lossy().into_owned()),
             files: Vec::new(),
             patterns: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
             ignore: vec!["*.bak".into()],
             when: crate::config::WhenClause::default(),
             hooks: crate::config::Hooks::default(),
@@ -2204,6 +2354,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );
@@ -2235,6 +2386,7 @@ mod tests {
             target: Some(target.to_string_lossy().into_owned()),
             files: Vec::new(),
             patterns: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
             ignore: vec!["*.bak".into()],
             when: crate::config::WhenClause::default(),
             hooks: crate::config::Hooks::default(),
@@ -2257,6 +2409,7 @@ mod tests {
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut warnings,
         );

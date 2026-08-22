@@ -4,15 +4,19 @@ mod common;
 pub(crate) mod diff;
 pub(crate) mod doctor;
 pub(crate) mod edit;
+pub(crate) mod explain;
 pub(crate) mod import;
 pub(crate) mod init;
 pub(crate) mod list;
+pub(crate) mod log;
 pub(crate) mod migrate;
 pub(crate) mod plan;
 pub(crate) mod prune;
 pub(crate) mod remove;
 pub(crate) mod render;
+pub(crate) mod schema;
 pub(crate) mod status;
+pub(crate) mod why;
 
 pub(crate) use common::resolve_root;
 
@@ -38,6 +42,10 @@ pub(crate) fn command_name(command: &cli::Commands) -> &'static str {
         Commands::Migrate { .. } => "migrate",
         Commands::Prune { .. } => "prune",
         Commands::Render { .. } => "render",
+        Commands::Explain { .. } => "explain",
+        Commands::Schema => "schema",
+        Commands::Why { .. } => "why",
+        Commands::Log { .. } => "log",
     }
 }
 
@@ -50,6 +58,80 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
         json,
         command,
     } = cli;
+    let command_name = command_name(&command).to_string();
+    let is_mutation = is_mutation_command(&command);
+    let (audit_store, audit_target) = command_audit_context(&command);
+    let result = dispatch(repo.as_deref(), json, command);
+
+    // Audit-log mutating operations. Best-effort: a log write failure is a
+    // warning, not a hard error, so the log never blocks a mutation.
+    if is_mutation && let Some(root) = resolved_repo_for_audit(repo.as_deref()) {
+        if audit_store.is_some() || audit_target.is_some() {
+            crate::audit::append_with_context(
+                &root,
+                &command_name,
+                audit_store.as_deref(),
+                audit_target.as_deref(),
+                result.as_ref().map(|_| ()),
+            );
+        } else {
+            crate::audit::append_command_result(&root, &command_name, result.as_ref().map(|_| ()));
+        }
+    }
+
+    result
+}
+
+/// Best-effort store/target strings for audit logging, derived from the CLI.
+/// Errors before dispatch still get logged; this only enriches entries where
+/// the command itself carries enough context.
+fn command_audit_context(command: &cli::Commands) -> (Option<String>, Option<String>) {
+    use cli::Commands;
+    match command {
+        Commands::Remove { name, .. } => (Some(name.clone()), None),
+        Commands::Add {
+            paths, name, to, ..
+        } => {
+            let store = to.clone().or_else(|| name.clone());
+            let target = if paths.len() > 1 {
+                Some(paths.join(", "))
+            } else {
+                paths.first().cloned()
+            };
+            (store, target)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Whether a command mutates state and should be audit-logged.
+///
+/// Dry runs are preview-only — they touch nothing on the filesystem, so they
+/// are not audit-logged. This mirrors the `Prune { yes: true }` gate: list-only
+/// prune is also a preview. SPEC.md §Audit log enumerates the mutating
+/// operations as "apply, add, remove, migrate, import, prune --yes" — dry runs
+/// of the first five are excluded by the `dry_run: false` field match.
+fn is_mutation_command(command: &cli::Commands) -> bool {
+    use cli::Commands;
+    matches!(
+        command,
+        Commands::Apply { dry_run: false, .. }
+            | Commands::Add { dry_run: false, .. }
+            | Commands::Remove { dry_run: false, .. }
+            | Commands::Migrate { dry_run: false, .. }
+            | Commands::Import { dry_run: false, .. }
+            | Commands::Prune { yes: true, .. }
+    )
+}
+
+/// Resolve the repo root for audit logging. Returns None for `init` (no repo
+/// yet) and for resolution failures (the audit log must not block the error
+/// path).
+fn resolved_repo_for_audit(repo: Option<&str>) -> Option<std::path::PathBuf> {
+    resolve_root(repo).ok()
+}
+
+fn dispatch(repo: Option<&str>, json: bool, command: cli::Commands) -> Result<(), StitchError> {
     match command {
         cli::Commands::Init => {
             if json {
@@ -63,22 +145,31 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
             force,
             plan,
         } => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             if let Some(plan_file) = plan {
                 if !only.is_empty() {
                     return Err(StitchError::usage("--plan is not compatible with --only"));
                 }
                 apply::cmd_apply_plan(&root, &plan_file, dry_run, force, json)
             } else {
-                apply::cmd_apply(&root, &only, store::ApplyOpts { dry_run, force }, json)
+                apply::cmd_apply(
+                    &root,
+                    &only,
+                    store::ApplyOpts {
+                        dry_run,
+                        force,
+                        json,
+                    },
+                    json,
+                )
             }
         }
         cli::Commands::Plan { only, force } => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             plan::cmd_plan(&root, &only, force, json)
         }
         cli::Commands::Status { name } => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             status::cmd_status(&root, &name, json)
         }
         cli::Commands::Diff {
@@ -86,49 +177,89 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
             force,
             exit_code,
         } => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             diff::cmd_diff(&root, &only, force, exit_code, json)
         }
         cli::Commands::List => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             list::cmd_list(&root, json)
         }
         cli::Commands::Add {
-            path,
+            paths,
             name,
             files,
             patterns,
             file,
             to,
+            source,
             dry_run,
         } => {
-            if json && !dry_run {
-                return Err(StitchError::usage(
-                    "--json is not supported for add without --dry-run",
-                ));
-            }
-            let root = match resolve_root(repo.as_deref()) {
+            let root = match resolve_root(repo) {
                 Ok(root) => root,
-                Err(error) if json && dry_run => {
+                Err(error) if json => {
                     report::write_error("add", &error, Vec::new());
                     std::process::exit(error.exit_code());
                 }
                 Err(error) => return Err(error),
             };
-            if json && dry_run {
+            if paths.len() > 1 {
+                // Bulk add: multiple paths, simple adds only. Per-store flags
+                // (--name, --files, --patterns, --file, --to, --source) are
+                // rejected.
+                if name.is_some()
+                    || !files.is_empty()
+                    || !patterns.is_empty()
+                    || file
+                    || to.is_some()
+                    || source.is_some()
+                {
+                    let error = StitchError::usage(
+                        "--name, --files, --patterns, --file, --to, and --source are not supported with multiple paths (bulk mode)",
+                    );
+                    if json {
+                        crate::audit::append_command_result(&root, "add", Err(&error));
+                        report::write_error("add", &error, Vec::new());
+                        std::process::exit(error.exit_code());
+                    }
+                    return Err(error);
+                }
+                return add::cmd_add_bulk(&root, &paths, dry_run, json);
+            }
+            let path = &paths[0];
+            if let Some(source_ref) = source.as_deref() {
+                if name.is_some()
+                    || !files.is_empty()
+                    || !patterns.is_empty()
+                    || file
+                    || to.is_some()
+                {
+                    let error = StitchError::usage(
+                        "--source cannot be combined with --name, --files, --patterns, --file, or --to",
+                    );
+                    if json {
+                        crate::audit::append_command_result(&root, "add", Err(&error));
+                        report::write_error("add", &error, Vec::new());
+                        std::process::exit(error.exit_code());
+                    }
+                    return Err(error);
+                }
+                return add::cmd_add_source(&root, path, source_ref, dry_run, json);
+            }
+            if json {
                 return add::cmd_add_json(
                     &root,
-                    &path,
+                    path,
                     &name,
                     &files,
                     &patterns,
                     file,
                     to.as_deref(),
+                    dry_run,
                 );
             }
             add::cmd_add(
                 &root,
-                &path,
+                path,
                 &name,
                 &files,
                 &patterns,
@@ -138,37 +269,31 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
                 json,
             )
         }
-        cli::Commands::Remove { name, dry_run } => {
-            if json && !dry_run {
-                return Err(StitchError::usage(
-                    "--json is not supported for remove without --dry-run",
-                ));
-            }
-            let root = resolve_root(repo.as_deref())?;
-            remove::cmd_remove(&root, &name, dry_run, json)
+        cli::Commands::Remove {
+            name,
+            dry_run,
+            force,
+        } => {
+            let root = resolve_root(repo)?;
+            remove::cmd_remove(&root, &name, dry_run, force, json)
         }
-        cli::Commands::Edit { entry } => {
+        cli::Commands::Edit { entry, print_path } => {
             if json {
                 return Err(StitchError::usage("--json is not supported for edit"));
             }
-            let root = resolve_root(repo.as_deref())?;
-            edit::cmd_edit(&root, entry.as_deref())
+            let root = resolve_root(repo)?;
+            edit::cmd_edit(&root, entry.as_deref(), print_path)
         }
         cli::Commands::Import { scan_dirs, dry_run } => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             import::cmd_import(&root, &scan_dirs, dry_run, json)
         }
         cli::Commands::Doctor => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             doctor::cmd_doctor(&root, json)
         }
         cli::Commands::Migrate { dry_run } => {
-            if json && !dry_run {
-                return Err(StitchError::usage(
-                    "--json is not supported for migrate without --dry-run",
-                ));
-            }
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             migrate::cmd_migrate(&root, dry_run, json)
         }
         cli::Commands::Prune {
@@ -176,12 +301,25 @@ pub(crate) fn run(cli: cli::Cli) -> Result<(), StitchError> {
             dry_run,
             yes,
         } => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             prune::cmd_prune(&root, &scan_dirs, dry_run, yes, json)
         }
         cli::Commands::Render { spec } => {
-            let root = resolve_root(repo.as_deref())?;
+            let root = resolve_root(repo)?;
             render::cmd_render(&root, &spec, json)
+        }
+        cli::Commands::Explain { active_only } => {
+            let root = resolve_root(repo)?;
+            explain::cmd_explain(&root, active_only, json)
+        }
+        cli::Commands::Schema => schema::cmd_schema(json),
+        cli::Commands::Why { target } => {
+            let root = resolve_root(repo)?;
+            why::cmd_why(&root, &target, json)
+        }
+        cli::Commands::Log { limit } => {
+            let root = resolve_root(repo)?;
+            log::cmd_log(&root, limit, json)
         }
     }
 }

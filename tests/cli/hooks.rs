@@ -691,3 +691,66 @@ target = "~/.app"
         repo.path().join("app").canonicalize().unwrap()
     );
 }
+
+/// Per-store pre-hook failure surfaces structured `error.details` in JSON mode
+/// with the store name, hook name, and scope ("per-store").
+#[test]
+fn per_store_pre_hook_failure_json_details() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_split(
+        &format!(
+            r#"
+[stores.s]
+target = "{target_str}"
+"#,
+        ),
+        r#"
+[stores.s]
+hooks = { pre = "exit 1" }
+"#,
+    );
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(!output.status.success(), "hook failure must exit non-zero");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["class"], "hook");
+    assert_eq!(value["error"]["code"], 10);
+    let details = value["error"]["details"].as_str().expect("details string");
+    let parsed: Value = serde_json::from_str(details).expect("details is JSON");
+    assert_eq!(parsed["hook"], "pre");
+    assert_eq!(parsed["store"], "s");
+    assert_eq!(parsed["scope"], "per-store");
+}
+
+/// Global pre-apply hook failure surfaces structured `error.details` in JSON
+/// mode with scope "global" and store null.
+#[test]
+fn global_pre_apply_hook_failure_json_details() {
+    let repo = Repo::new();
+    repo.make_store("s", &["f"]);
+    let target = repo.path().join("home").join("s");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!("\n[stores.s]\ntarget = \"{target_str}\"\n"));
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook = hooks_dir.join("pre-apply");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut perms = fs::metadata(&hook).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&hook, perms).unwrap();
+
+    let output = repo.cmd().args(["--json", "apply"]).output().unwrap();
+    assert!(!output.status.success(), "hook failure must exit non-zero");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["class"], "hook");
+    let details = value["error"]["details"].as_str().expect("details string");
+    let parsed: Value = serde_json::from_str(details).expect("details is JSON");
+    assert_eq!(parsed["hook"], "pre-apply");
+    assert!(parsed["store"].is_null(), "global hook has no store");
+    assert_eq!(parsed["scope"], "global");
+}

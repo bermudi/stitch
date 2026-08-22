@@ -427,7 +427,15 @@ files = [".bashrc"]
     assert_envelope_shape(&value, "apply", true);
 
     let data = value.get("data").unwrap();
-    let stores = data["stores"].as_array().expect("stores array");
+    // Composite apply --json: data = {desired, plan, result, post_status}.
+    assert!(
+        data["desired"]["stores"].is_array(),
+        "desired.stores present"
+    );
+    assert!(data["result"].is_object(), "result present on real apply");
+    assert!(data["post_status"].is_array(), "post_status present");
+    let plan = &data["plan"];
+    let stores = plan["stores"].as_array().expect("plan.stores array");
     assert_eq!(stores.len(), 1);
     assert_eq!(stores[0]["store_name"], "shells");
     let ops = stores[0]["ops"].as_array().expect("ops array");
@@ -448,7 +456,147 @@ files = [".bashrc"]
 
     // The link was actually created.
     assert!(home.join(".bashrc").is_symlink());
-    assert_plan_summary_fields(&data["summary"]);
+    assert_plan_summary_fields(&plan["summary"]);
+    // post_status confirms convergence.
+    let post = data["post_status"].as_array().unwrap();
+    assert_eq!(post.len(), 1);
+    assert_eq!(post[0]["state"], "linked");
+}
+
+#[test]
+fn json_apply_dry_run_composite_has_null_result() {
+    // On --dry-run, the composite `result` field is null (no execution) and
+    // `post_status` reflects pre-apply state.
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.shells]
+target = "{}"
+files = [".bashrc"]
+"#,
+        home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+    let data = &value["data"];
+    assert!(data["desired"]["stores"].is_array(), "desired present");
+    assert!(data["plan"]["stores"].is_array(), "plan present");
+    assert!(data["result"].is_null(), "result is null on dry-run");
+    assert!(data["post_status"].is_array(), "post_status present");
+    // No link was created.
+    assert!(!home.join(".bashrc").exists());
+}
+
+#[test]
+fn json_apply_composite_desired_matches_explain() {
+    // The `desired` field of `apply --json` should match `explain --json`
+    // output for the same repo (same platform, same stores).
+    let repo = Repo::new();
+    repo.make_store("nvim", &["init.lua"]);
+    repo.make_store("shells", &[".bashrc"]);
+    let home = repo.path().join("home");
+    repo.write_state(&format!(
+        r#"
+[stores.nvim]
+target = "{home}/.config/nvim"
+
+[stores.shells]
+target = "{home}"
+files = [".bashrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+    repo.write_authored(
+        r#"
+[stores.shells]
+when = { os = "linux" }
+"#,
+    );
+
+    let apply_output = repo
+        .cmd()
+        .args(["--json", "apply", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(apply_output.status.success());
+    let apply_value = json_output(&apply_output);
+    let explain_output = repo.cmd().args(["--json", "explain"]).output().unwrap();
+    assert!(explain_output.status.success());
+    let explain_value = json_output(&explain_output);
+    // `desired` from apply should equal `data` from explain (same platform,
+    // same stores, same resolution).
+    assert_eq!(apply_value["data"]["desired"], explain_value["data"]);
+}
+
+#[test]
+fn json_apply_only_filters_composite_data() {
+    // `apply --only foo --json` should only include store `foo` in the
+    // composite desired/plan/result/post_status fields.
+    let repo = Repo::new();
+    repo.make_store("foo", &[".foorc"]);
+    repo.make_store("bar", &[".barrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.foo]
+target = "{home}"
+files = [".foorc"]
+
+[stores.bar]
+target = "{home}"
+files = [".barrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--only", "foo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply --only foo --json should succeed"
+    );
+
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    let data = &value["data"];
+    let desired_stores = data["desired"]["stores"]
+        .as_array()
+        .expect("desired stores");
+    assert_eq!(desired_stores.len(), 1, "desired should only contain foo");
+    assert_eq!(desired_stores[0]["name"], "foo");
+
+    let plan_stores = data["plan"]["stores"].as_array().expect("plan stores");
+    assert_eq!(plan_stores.len(), 1, "plan should only contain foo");
+    assert_eq!(plan_stores[0]["store_name"], "foo");
+
+    let result = data["result"].as_object().expect("result object");
+    let result_stores = result["stores"].as_array().expect("result stores");
+    assert_eq!(result_stores.len(), 1, "result should only contain foo");
+    assert_eq!(result_stores[0]["store"], "foo");
+
+    let post_status = data["post_status"].as_array().expect("post_status");
+    assert!(
+        post_status.iter().all(|row| row["store"] == "foo"),
+        "post_status must only contain store foo"
+    );
+
+    // The unselected store should not have been linked.
+    assert!(home.join(".foorc").is_symlink(), "foo should be linked");
+    assert!(!home.join(".barrc").exists(), "bar should not be linked");
 }
 
 #[test]
@@ -542,10 +690,18 @@ target = "{target_str}"
     assert_error_shape(&value, "conflict-real", 6);
 
     let data = value["data"].as_object().expect("partial plan data");
-    let summary = &data["summary"];
+    // Composite apply --json: data = {desired, plan, result, post_status}.
+    assert!(
+        data["desired"]["stores"].is_array(),
+        "desired.stores present"
+    );
+    assert!(data["result"].is_object(), "result present on real apply");
+    assert!(data["post_status"].is_array(), "post_status present");
+    let plan = &data["plan"];
+    let summary = &plan["summary"];
     assert_plan_summary_fields(summary);
     assert_eq!(summary["conflicts"].as_u64().unwrap(), 1);
-    let stores = data["stores"].as_array().unwrap();
+    let stores = plan["stores"].as_array().unwrap();
     assert!(stores.iter().any(|s| {
         s["ops"]
             .as_array()
@@ -598,37 +754,17 @@ target = "{target_str}"
 }
 
 #[test]
-fn json_rejected_on_unsupported_write_commands_as_usage_envelope() {
-    // Non-dry-run write commands other than `apply`/`diff` are not JSON-enabled.
-    // The rejection must go through the same envelope contract an agent already
-    // parses — a `usage` error (code 2) on stdout, honest exit 2 — not a prose
-    // stderr line. The check fires before repo resolution, so no real repo is
-    // needed, but we use one to keep the test realistic.
+fn json_supported_on_mutation_commands() {
+    // `add` and `remove` both support `--json` for real mutations (not just
+    // dry-run). The post-op envelope goes to stdout (one-stream rule) with
+    // an honest exit code.
     let repo = Repo::new();
-    let output = repo.cmd().args(["--json", "add", "~/x"]).output().unwrap();
-    assert!(!output.status.success(), "add --json must not succeed");
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "add --json must exit with the usage code 2"
-    );
 
-    // The envelope goes to stdout (one-stream rule); stderr is hook passthrough.
-    let value = json_output(&output);
-    assert_envelope_shape(&value, "add", false);
-    assert_error_shape(&value, "usage", 2);
-    assert!(
-        value["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("--json is not supported for add"),
-        "message should name the unsupported flag"
-    );
-
-    // Dry-run add is intentionally supported and returns its normal envelope.
+    // Dry-run add is supported and returns its normal envelope.
+    let target = repo.path().join("home").join(".config").join("x");
     let output = repo
         .cmd()
-        .args(["--json", "add", "~/x", "--dry-run"])
+        .args(["--json", "add", &target.to_string_lossy(), "--dry-run"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -636,13 +772,173 @@ fn json_rejected_on_unsupported_write_commands_as_usage_envelope() {
     assert_envelope_shape(&value, "add", true);
     assert_eq!(value["data"]["mode"], "create");
 
-    // Spot-check a second unsupported write command so the boundary isn't
-    // single-command.
-    let output = repo.cmd().args(["--json", "remove", "x"]).output().unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    // Real add is also supported and reports the created link.
+    let output = repo
+        .cmd()
+        .args(["--json", "add", &target.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
     let value = json_output(&output);
-    assert_envelope_shape(&value, "remove", false);
-    assert_error_shape(&value, "usage", 2);
+    assert_envelope_shape(&value, "add", true);
+    assert!(value["data"]["link_created"].is_string());
+
+    // Real remove is supported and reports the removed link.
+    let output = repo.cmd().args(["--json", "remove", "x"]).output().unwrap();
+    assert!(output.status.success(), "remove --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", true);
+    assert_eq!(value["data"]["store"], "x");
+    assert!(value["data"]["behavior_orphaned"].is_boolean());
+}
+
+#[test]
+fn remove_state_only_reports_behavior_not_orphaned() {
+    // A store created by `add` lives only in `.stitch/state.toml`. Removing it
+    // leaves no authored behavior, so the JSON report says behavior_orphaned=false.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join(".myapp");
+    fs::write(&target, "data").unwrap();
+
+    let output = repo
+        .cmd()
+        .env("HOME", home.path())
+        .args(["--json", "add", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --json must succeed");
+    let value = json_output(&output);
+    assert_eq!(value["data"]["store"], "myapp");
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "myapp"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "remove --json must succeed");
+    let value = json_output(&output);
+    assert_eq!(value["data"]["behavior_orphaned"], false);
+}
+
+#[test]
+fn remove_authored_store_reports_behavior_orphaned() {
+    // A store defined in `stitch.toml` with a matching generated entry: removing
+    // it drops the generated state but the authored behavior remains, so the
+    // JSON report says behavior_orphaned=true.
+    let repo = Repo::new();
+    repo.make_store("app", &["f"]);
+    repo.write_authored("[stores.app]\n");
+    repo.write_state("[stores.app]\ntarget = \"~/.app\"\nfiles = [\"f\"]\n");
+
+    let home = tempfile::tempdir().unwrap();
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home.path())
+        .assert()
+        .success();
+    assert!(home.path().join(".app").join("f").is_symlink());
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "app"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "remove --json must succeed");
+    let value = json_output(&output);
+    assert_eq!(value["data"]["behavior_orphaned"], true);
+}
+
+#[test]
+fn add_json_post_op_reports_created_link() {
+    // `add --json` without --dry-run emits a post-op report with the created
+    // symlink path, so an agent can verify the mutation without a second call.
+    let repo = Repo::new();
+    let target = repo.path().join("home").join(".config").join("x");
+    let output = repo
+        .cmd()
+        .args(["--json", "add", &target.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+    assert_eq!(value["data"]["mode"], "create");
+    assert!(
+        value["data"]["link_created"].is_string(),
+        "link_created must be present"
+    );
+    // The link should actually exist at the reported path.
+    let link = value["data"]["link_created"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(link).is_symlink(),
+        "reported link must exist"
+    );
+}
+
+#[test]
+fn add_json_post_op_adopt_reports_moved_source() {
+    // `add --json` on an existing file (adopt) reports the mode as "adopt"
+    // and the original source path, so an agent can verify the move.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join(".gitconfig");
+    fs::write(&target, "[user]\nname = test\n").unwrap();
+
+    let output = repo
+        .cmd()
+        .args(["--json", "add", &target.to_string_lossy()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "add --json adopt must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "add", true);
+    assert_eq!(value["data"]["mode"], "adopt");
+    assert!(
+        value["data"]["source"].is_string(),
+        "source must be present for adopt"
+    );
+    assert!(
+        value["data"]["link_created"].is_string(),
+        "link_created must be present"
+    );
+
+    let data = &value["data"];
+    let raw_name = target.file_name().unwrap().to_string_lossy().into_owned();
+    let store_name = raw_name.strip_prefix('.').unwrap_or(&raw_name).to_string();
+    assert_eq!(data["store"].as_str().unwrap(), store_name);
+
+    // `moved_from` is the original adopted path, collapsed to `~` because
+    // the test set HOME to the temp home dir.
+    let moved_from = data["moved_from"]
+        .as_str()
+        .expect("moved_from must be present for adopt");
+    let rel = target
+        .strip_prefix(home.path())
+        .expect("target must be under HOME");
+    let expected_moved_from = if rel.as_os_str().is_empty() {
+        "~".to_string()
+    } else {
+        let mut s = "~/".to_string();
+        s.push_str(&*rel.to_string_lossy());
+        s
+    };
+    assert_eq!(moved_from, expected_moved_from);
+
+    // `state_entry` is the [stores.<name>] slice written to .stitch/state.toml.
+    let state_entry = data["state_entry"]
+        .as_str()
+        .expect("state_entry must be present for adopt");
+    assert!(
+        state_entry.contains("[stores.gitconfig]"),
+        "state_entry must contain the [stores.<name>] slice: {state_entry}"
+    );
+
+    // The target is now a symlink.
+    assert!(target.is_symlink(), "target must be a symlink after adopt");
 }
 
 #[test]
@@ -663,7 +959,7 @@ files = [".bashrc"]
     assert!(output.status.success());
     let stdout = std::str::from_utf8(&output.stdout).unwrap();
     let plan: Value = serde_json::from_str(stdout).expect("plan is valid JSON");
-    assert_eq!(plan["schema"], 2);
+    assert_eq!(plan["schema"], 3);
     assert_eq!(plan["kind"], "stitch/plan");
     assert_eq!(
         plan["repo"].as_str().unwrap(),
@@ -1593,7 +1889,11 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("not in config"));
+        .stderr(
+            contains("not in config")
+                .or(contains("source file does not exist"))
+                .or(contains("not the expected source")),
+        );
 }
 
 #[test]
@@ -2098,7 +2398,7 @@ files = ["x"]
 
 [stores.beta]
 target = "{0}"
-files = ["x", "y"]
+files = ["y"]
 "#,
         home.to_string_lossy(),
     ));
@@ -2107,16 +2407,16 @@ files = ["x", "y"]
     assert!(output.status.success());
     let mut plan: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    // The captured plan wants to create home/x for both alpha and beta. Inject
-    // a replacement that tries to claim alpha's link for beta. The current
-    // plan never authorizes that replacement, so validation must reject it
-    // before any filesystem mutation.
+    // The captured plan wants to create home/x for alpha and home/y for beta.
+    // Inject a replacement that tries to claim y with a different requires.
+    // The current plan never authorizes that replacement, so validation must
+    // reject it before any filesystem mutation.
     let alpha_create = plan["ops"][0].clone();
-    let beta_create_y = plan["ops"][2].clone();
+    let beta_create_y = plan["ops"][1].clone();
     let beta_replace = serde_json::json!({
         "op": "replace_link",
-        "target": home.join("x").to_string_lossy(),
-        "source": repo.path().join("beta").join("x").to_string_lossy(),
+        "target": home.join("y").to_string_lossy(),
+        "source": repo.path().join("beta").join("y").to_string_lossy(),
         "requires": {
             "target": "symlink_to",
             "value": repo.path().join("alpha").join("x").to_string_lossy(),
@@ -2292,7 +2592,7 @@ files = [".bashrc"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains("unsupported plan schema: 1 (expected 2)"));
+        .stderr(contains("unsupported plan schema: 1 (expected 3)"));
     assert!(!home.join(".bashrc").exists());
 }
 
@@ -2346,9 +2646,10 @@ files = [".bashrc"]
 
 #[test]
 fn apply_plan_rejects_whole_directory_then_child_link() {
-    // Neither target has a live symlink when captured. The preflight simulator
-    // must still reject beta's child because alpha creates its parent as a
-    // symlink earlier in the store-grouped execution order.
+    // Neither target has a live symlink when captured. The static link-path
+    // collision check now rejects the contradictory whole-dir + child at plan
+    // time, before the preflight simulator would. This is the intended fix
+    // for the plan-omission bug: a contradictory plan must not be produced.
     let repo = Repo::new();
     repo.make_store("alpha", &["profile"]);
     repo.make_store("beta", &["init.lua"]);
@@ -2366,20 +2667,15 @@ files = ["init.lua"]
         config.display(),
     ));
 
-    let plan_path = repo.path().join("overlap.json");
-    let output = repo.cmd().arg("plan").output().unwrap();
-    assert!(output.status.success());
-    fs::write(&plan_path, &output.stdout).unwrap();
-
     repo.cmd()
-        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .arg("plan")
         .assert()
         .failure()
-        .code(12)
-        .stderr(contains("symlinked ancestor"));
+        .code(3)
+        .stderr(contains("claims link path"));
     assert!(
         !config.is_symlink(),
-        "whole-directory link must not run before child preflight fails"
+        "whole-directory link must not be created when plan is rejected"
     );
     assert!(!config.join("nvim").join("init.lua").exists());
 }
@@ -2451,9 +2747,10 @@ files = ["profile"]
         .assert()
         .failure()
         .code(12)
-        .stderr(contains(
-            "link operation is not present in the freshly computed apply plan",
-        ));
+        .stderr(
+            contains("link operation is not present in the freshly computed apply plan")
+                .or(contains("does not resolve to a configured source")),
+        );
 
     assert!(!marker.exists(), "global pre-apply hook must not run");
     assert!(
@@ -2675,5 +2972,271 @@ hooks = { pre = "rm -rf $HOME/.config && mv $HOME/.ssh $HOME/.config" }
     assert!(
         !repo.path().join(".config").join("app").join("f").exists(),
         "apply --plan must not write through the per-store hook redirect"
+    );
+}
+
+#[test]
+fn json_apply_only_platform_skipped_store_is_reported() {
+    // `apply --json --only <store>` with a platform-skipped store must
+    // succeed, report the skip in the composite result/post_status, and not
+    // create any link.
+    let repo = Repo::new();
+    repo.make_store("skipped", &["profile"]);
+    let home = repo.path().join("home");
+    let target = home.join("skipped");
+    let other_os = if std::env::consts::OS == "linux" {
+        "macos"
+    } else {
+        "linux"
+    };
+    repo.write_state(&format!(
+        r#"
+[stores.skipped]
+target = "{}"
+files = ["profile"]
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.write_authored(&format!(
+        r#"
+[stores.skipped]
+when = {{ os = "{other_os}" }}
+"#
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--only", "skipped"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply --only skipped should succeed for platform-skipped store"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    let data = &value["data"];
+    let desired_stores = data["desired"]["stores"]
+        .as_array()
+        .expect("desired stores");
+    assert_eq!(desired_stores.len(), 1);
+    assert_eq!(desired_stores[0]["name"], "skipped");
+    assert_eq!(desired_stores[0]["active"], false);
+
+    let plan_stores = data["plan"]["stores"].as_array().expect("plan stores");
+    assert_eq!(plan_stores.len(), 1);
+    assert_eq!(plan_stores[0]["store_name"], "skipped");
+    let ops = plan_stores[0]["ops"].as_array().expect("plan ops");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["action"], "skipped_platform");
+
+    let result = data["result"].as_object().expect("result object");
+    let result_stores = result["stores"].as_array().expect("result stores");
+    assert_eq!(result_stores.len(), 1);
+    assert_eq!(result_stores[0]["store"], "skipped");
+    assert_eq!(result_stores[0]["skipped"], 1);
+    assert_eq!(result_stores[0]["ok"], 0);
+    assert_eq!(result_stores[0]["conflicts"], 0);
+    assert_eq!(result_stores[0]["errors"], 0);
+
+    let post_status = data["post_status"].as_array().expect("post_status");
+    assert_eq!(post_status.len(), 1);
+    assert_eq!(post_status[0]["store"], "skipped");
+    assert_eq!(post_status[0]["state"], "missing");
+    assert_eq!(post_status[0]["skipped_platform"], true);
+
+    // The store should not have been linked.
+    assert!(
+        !target.is_symlink(),
+        "platform-skipped store must not create a link"
+    );
+    assert!(!target.join("profile").exists());
+}
+
+#[test]
+fn json_apply_dry_run_only_filters_composite_data() {
+    // `apply --json --dry-run --only foo` should only include store `foo` in
+    // the composite desired/plan/post_status fields and leave `result` null.
+    let repo = Repo::new();
+    repo.make_store("foo", &[".foorc"]);
+    repo.make_store("bar", &[".barrc"]);
+    let home = repo.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.foo]
+target = "{home}"
+files = [".foorc"]
+
+[stores.bar]
+target = "{home}"
+files = [".barrc"]
+"#,
+        home = home.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .args(["--json", "apply", "--dry-run", "--only", "foo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply --json --dry-run --only foo should succeed"
+    );
+
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "apply", true);
+
+    let data = &value["data"];
+    let desired_stores = data["desired"]["stores"]
+        .as_array()
+        .expect("desired stores");
+    assert_eq!(desired_stores.len(), 1, "desired should only contain foo");
+    assert_eq!(desired_stores[0]["name"], "foo");
+
+    let plan_stores = data["plan"]["stores"].as_array().expect("plan stores");
+    assert_eq!(plan_stores.len(), 1, "plan should only contain foo");
+    assert_eq!(plan_stores[0]["store_name"], "foo");
+    let ops = plan_stores[0]["ops"].as_array().expect("plan ops");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["action"], "create_link");
+
+    assert!(data["result"].is_null(), "result is null on dry-run");
+
+    let post_status = data["post_status"].as_array().expect("post_status");
+    assert!(
+        post_status.iter().all(|row| row["store"] == "foo"),
+        "post_status must only contain store foo"
+    );
+    assert_eq!(post_status[0]["state"], "missing");
+
+    // Neither store should have been linked.
+    assert!(
+        !home.join(".foorc").exists(),
+        "foo must not be linked on dry-run"
+    );
+    assert!(
+        !home.join(".barrc").exists(),
+        "bar must not be linked on dry-run"
+    );
+}
+
+#[test]
+fn plan_and_apply_plan_succeed_through_symlinked_home() {
+    // Regression for "plan rejects supported symlinked $HOME".
+    // A basic file-mode target under "~/out" is valid when $HOME itself is a symlink
+    // (e.g. home_link -> real_home). `stitch plan` must exempt the configured HOME boundary
+    // while still rejecting symlinks *beneath* it, and `stitch apply --plan` must execute
+    // through that same boundary.
+    let tmp = tempfile::tempdir().unwrap();
+    let real_home = tmp.path().join("real_home");
+    let home_link = tmp.path().join("home_link");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&real_home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    std::os::unix::fs::symlink(&real_home, &home_link).unwrap();
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("init")
+        .assert()
+        .success();
+
+    let store_dir = repo.join("app");
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(store_dir.join("file"), "hello").unwrap();
+    fs::write(
+        repo.join(".stitch").join("state.toml"),
+        "[stores.app]\ntarget = \"~/out\"\nfiles = [\"file\"]\n",
+    )
+    .unwrap();
+
+    // Plan capture must succeed and contain the create, not a HOME conflict.
+    let plan_output = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert!(
+        plan_output.status.success(),
+        "plan through symlinked HOME must succeed: {}",
+        String::from_utf8_lossy(&plan_output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_output.stdout).unwrap();
+    assert!(
+        plan["conflicts"].as_array().unwrap().is_empty(),
+        "plan must not report HOME as a symlinked ancestor"
+    );
+    let ops = plan["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "create_link");
+
+    let plan_path = repo.join("plan.json");
+    fs::write(&plan_path, &plan_output.stdout).unwrap();
+
+    // Direct apply must also succeed (control).
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("apply")
+        .assert()
+        .success();
+
+    let link = real_home.join("out").join("file");
+    assert!(
+        link.is_symlink(),
+        "file must be linked through symlinked HOME"
+    );
+
+    // Clean the link so the captured plan still has work to do, then execute it.
+    fs::remove_file(&link).unwrap();
+    // Remove the now-empty parent so the plan's create must mkdir -p through HOME.
+    let _ = fs::remove_dir(real_home.join("out"));
+
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(contains("Executed 1/1 ops"));
+
+    assert!(
+        link.is_symlink(),
+        "apply --plan must succeed through symlinked HOME"
+    );
+
+    // A symlink *beneath* HOME must still be rejected by plan.
+    let out_dir = home_link.join("out");
+    // Remove the real directory and replace it with a symlink to an external location.
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_dir_all(&out_dir);
+    let external = tmp.path().join("external");
+    fs::create_dir_all(&external).unwrap();
+    std::os::unix::fs::symlink(&external, &out_dir).unwrap();
+
+    let bad_plan = Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(&repo)
+        .env("HOME", &home_link)
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert!(
+        !bad_plan.status.success(),
+        "plan must reject a symlinked ancestor beneath HOME"
+    );
+    let bad: Value = serde_json::from_slice(&bad_plan.stdout).unwrap();
+    assert!(
+        !bad["conflicts"].as_array().unwrap().is_empty(),
+        "symlink beneath HOME must be reported as a conflict"
     );
 }

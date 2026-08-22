@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-pub const PLAN_SCHEMA: u32 = 2;
+pub const PLAN_SCHEMA: u32 = 3;
 pub const PLAN_KIND: &str = "stitch/plan";
 
 /// The on-disk plan file format. Kept intentionally close to the §2 spec so
@@ -106,18 +106,24 @@ pub enum PlanFileOp {
     },
 
     CreateLink {
+        #[serde(default)]
+        store: String,
         target: String,
         source: String,
         requires: PlanFileRequires,
     },
 
     ReplaceLink {
+        #[serde(default)]
+        store: String,
         target: String,
         source: String,
         requires: PlanFileRequires,
     },
 
     BackupAndLink {
+        #[serde(default)]
+        store: String,
         target: String,
         backup: String,
         source: String,
@@ -141,12 +147,12 @@ pub enum PlanFileOp {
 }
 
 impl PlanFileOp {
-    pub fn op_store(&self, repo_root: &Path) -> Option<String> {
+    pub fn op_store(&self, _repo_root: &Path) -> Option<String> {
         match self {
             PlanFileOp::StageRender { store, .. } => Some(store.clone()),
-            PlanFileOp::CreateLink { source, .. }
-            | PlanFileOp::ReplaceLink { source, .. }
-            | PlanFileOp::BackupAndLink { source, .. } => source_store(source, repo_root),
+            PlanFileOp::CreateLink { store, .. }
+            | PlanFileOp::ReplaceLink { store, .. }
+            | PlanFileOp::BackupAndLink { store, .. } => Some(store.clone()),
             PlanFileOp::RemoveLink { store, .. } => Some(store.clone()),
             PlanFileOp::RemoveStaged { store, .. } => Some(store.clone()),
         }
@@ -267,7 +273,7 @@ pub fn build_plan_file(
                     kind: conflict_kind(resolves_to),
                     resolves_to: resolves_to.clone(),
                 });
-            } else if let PlanOp::Error { message, class } = op {
+            } else if let PlanOp::Error { message, class, .. } = op {
                 errors.push(PlanError {
                     target: PlanOp::target(op).map(str::to_owned),
                     message: message.clone(),
@@ -307,8 +313,14 @@ fn symlinked_ancestor(
     target: &Path,
     removed_ancestors: &BTreeSet<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
+    let home = config::expand_home("~").ok();
     for ancestor in target.ancestors().skip(1) {
         if removed_ancestors.contains(ancestor) {
+            continue;
+        }
+        if let Some(ref h) = home
+            && ancestor == h
+        {
             continue;
         }
         match std::fs::symlink_metadata(ancestor) {
@@ -391,10 +403,12 @@ fn convert_store_ops(
             for target in store.targets.values() {
                 let target_path = config::expand_home(&target.target).map_err(StitchError::from)?;
                 store::collect_reconciliation_keeps(
+                    repo_root,
                     store_dir,
                     &target_path,
                     &target.files,
                     &target.patterns,
+                    &target.sources,
                     &target.ignore,
                     &mut keep_staged,
                     &mut target_keep_links,
@@ -403,10 +417,12 @@ fn convert_store_ops(
         } else if let Some(target) = &store.target {
             let target_path = config::expand_home(target).map_err(StitchError::from)?;
             store::collect_reconciliation_keeps(
+                repo_root,
                 store_dir,
                 &target_path,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.ignore,
                 &mut keep_staged,
                 &mut target_keep_links,
@@ -418,8 +434,14 @@ fn convert_store_ops(
         let maybe_render =
             stage_render_for_op(repo_root, loaded, store_name, store_dir, op, platform)?;
         if let Some(render) = maybe_render {
-            if let PlanFileOp::StageRender { source_rel, .. } = &render {
-                keep_staged.insert(render::resolve_entry(source_rel).link_rel.clone());
+            if let PlanFileOp::StageRender { staged, .. } = &render {
+                // Keep-set membership is by staging identity: the link name
+                // (a `sources` key keeps its literal spelling).
+                if let Ok(rel) =
+                    Path::new(staged).strip_prefix(render::store_render_dir(repo_root, store_name))
+                {
+                    keep_staged.insert(rel.to_string_lossy().into_owned());
+                }
             }
             renders.push(render);
         }
@@ -431,6 +453,7 @@ fn convert_store_ops(
                 requires,
             } => {
                 links.push(PlanFileOp::CreateLink {
+                    store: store_name.to_owned(),
                     target: target.clone(),
                     source: source.clone(),
                     requires: requires.clone().into(),
@@ -443,6 +466,7 @@ fn convert_store_ops(
                 ..
             } => {
                 links.push(PlanFileOp::ReplaceLink {
+                    store: store_name.to_owned(),
                     target: target.clone(),
                     source: source.clone(),
                     requires: requires.clone().into(),
@@ -455,6 +479,7 @@ fn convert_store_ops(
                 requires,
             } => {
                 links.push(PlanFileOp::BackupAndLink {
+                    store: store_name.to_owned(),
                     target: target.clone(),
                     source: source.clone(),
                     backup: backup.clone(),
@@ -586,7 +611,7 @@ fn stage_render_for_op(
     repo_root: &Path,
     loaded: &Loaded,
     store_name: &str,
-    store_dir: &Path,
+    _store_dir: &Path,
     op: &PlanOp,
     platform: &Platform,
 ) -> Result<Option<PlanFileOp>, StitchError> {
@@ -627,8 +652,12 @@ fn stage_render_for_op(
     }
     let link_rel: PathBuf = components.collect();
     let link_rel = link_rel.to_string_lossy().into_owned();
-    let source_rel = link_rel.clone() + render::TMPL_SUFFIX;
-    let tmpl_source = store_dir.join(&source_rel);
+    // v0.14: the staging name (the link identity) does not determine the
+    // template path — a `sources` template stages under its declared key while
+    // its repo path lives elsewhere. Resolve the entry from the loaded state.
+    let (tmpl_source, source_rel) =
+        resolve_staged_template_source(repo_root, loaded, store_name, &link_rel)
+            .map_err(StitchError::plan_stale)?;
 
     if !tmpl_source.is_file() {
         return Err(StitchError::plan_stale(format!(
@@ -648,6 +677,65 @@ fn stage_render_for_op(
         staged: path_to_string(&staged_path),
         sha256: sha256_hex(&content),
     }))
+}
+
+/// Resolve the configured template entry that stages at `link_rel` for
+/// `store_name`, from the loaded (pinned) state. Returns the absolute source
+/// path and its identity string (store-relative for `files` entries,
+/// repo-relative for `sources` entries).
+///
+/// In-store reconstruction (`link_rel + ".tmpl"` under the store dir) stopped
+/// being sufficient in v0.14: a `sources` template's staging name is its
+/// declared key and does not determine the repo path of its source.
+pub(crate) fn resolve_staged_template_source(
+    repo_root: &Path,
+    loaded: &Loaded,
+    store_name: &str,
+    link_rel: &str,
+) -> Result<(PathBuf, String), String> {
+    let Some(store) = loaded.config.stores.get(store_name) else {
+        return Err(format!("store '{store_name}' is not configured"));
+    };
+    if !crate::platform::Platform::detect().matches_when(&store.when) {
+        return Err(format!(
+            "no template entry stages at '{link_rel}' for store '{store_name}'"
+        ));
+    }
+    let store_dir = repo_root.join(store_name);
+    let mut found: Option<(PathBuf, String)> = None;
+    let mut check = |files: &[String],
+                     patterns: &[String],
+                     sources: &std::collections::BTreeMap<String, String>,
+                     ignore: &[String]| {
+        if found.is_some() {
+            return;
+        }
+        if let store::LinkTargets::Files(links) =
+            store::resolve_target_names(repo_root, &store_dir, files, patterns, sources, ignore)
+        {
+            found = links
+                .into_iter()
+                .find(|link| link.is_template() && link.name == link_rel)
+                .map(|link| (link.source, link.source_rel));
+        }
+    };
+    if store.is_multi_target() {
+        for target in store.targets.values() {
+            if !crate::platform::Platform::detect().matches_when(&target.when) {
+                continue;
+            }
+            check(
+                &target.files,
+                &target.patterns,
+                &target.sources,
+                &target.ignore,
+            );
+        }
+    } else {
+        check(&store.files, &store.patterns, &store.sources, &store.ignore);
+    }
+    found
+        .ok_or_else(|| format!("no template entry stages at '{link_rel}' for store '{store_name}'"))
 }
 
 impl From<LinkRequires> for PlanFileRequires {
@@ -810,12 +898,23 @@ pub(crate) fn verify_stage_render(
     staged: &str,
     sha256: &str,
 ) -> Result<PathBuf, String> {
-    let source_path = repo_root.join(store).join(source_rel);
-    let expected_staged = render::staging_path(
-        repo_root,
-        store,
-        &render::resolve_entry(source_rel).link_rel,
-    );
+    let staged_path = Path::new(staged);
+    let link_rel = staged_path
+        .strip_prefix(render::store_render_dir(repo_root, store))
+        .map_err(|_| format!("staged path outside render tree: {staged}"))?
+        .to_string_lossy()
+        .into_owned();
+    if link_rel.is_empty() {
+        return Err(format!("staged path has no link identity: {staged}"));
+    }
+    let (source_path, resolved_rel) =
+        resolve_staged_template_source(repo_root, loaded, store, &link_rel)?;
+    if resolved_rel != source_rel {
+        return Err(format!(
+            "template identity drifted: plan says '{source_rel}', state says '{resolved_rel}'"
+        ));
+    }
+    let expected_staged = render::staging_path(repo_root, store, &link_rel);
     if path_to_string(&expected_staged) != staged {
         return Err(format!(
             "staged path mismatch: expected {}",
@@ -836,13 +935,31 @@ pub(crate) fn plan_source_root(repo_root: &Path, source: &Path) -> Result<PathBu
     if let Some(store) = staged_store(source) {
         return Ok(render::store_render_dir(repo_root, &store));
     }
-    let store = source
+    let rel = source
         .strip_prefix(repo_root)
-        .ok()
-        .and_then(|path| path.components().next())
-        .and_then(|component| component.as_os_str().to_str())
+        .map_err(|_| format!("source {} is not under a store", source.display()))?;
+    let mut comps = rel.components();
+    let first = comps
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
         .ok_or_else(|| format!("source {} is not under a store", source.display()))?;
-    Ok(repo_root.join(store))
+    // Root-level shared sources (e.g. "hub.txt" at repo root) have a single
+    // component; their source root is the repo itself, not a file-named store dir.
+    if comps.next().is_none() {
+        // Check if the first component is a file at repo root (shared) vs a
+        // store directory. If it's a file directly under repo_root, use repo_root.
+        // Otherwise treat as store dir (e.g. "shared/hub.txt" where "shared" is
+        // a directory). Heuristic: if repo_root/first is a file, it's a root-level
+        // shared source; if it's a directory, it's a store or shared dir.
+        let candidate = repo_root.join(first);
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.is_file() || m.is_symlink()) {
+            return Ok(repo_root.to_path_buf());
+        }
+        // Fallback: single-component source that is not a file at repo root is
+        // likely a whole-dir store path; treat as store (will be validated as dir later).
+        return Ok(candidate);
+    }
+    Ok(repo_root.join(first))
 }
 
 pub(crate) fn check_source_exists_for_preflight(

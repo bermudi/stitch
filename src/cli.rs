@@ -80,30 +80,44 @@ pub enum Commands {
     List,
 
     /// Add a path to stitch: move existing content into the repo and link back,
-    /// or create an empty store if the path doesn't exist yet
+    /// or create an empty store if the path doesn't exist yet. Multiple paths
+    /// trigger bulk mode (simple adds only, no per-store flags).
     Add {
-        /// Target path to manage (e.g. ~/.config/nvim)
-        path: String,
+        /// Target path(s) to manage (e.g. ~/.config/nvim). Multiple paths
+        /// trigger bulk add mode.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
 
-        /// Override the derived store name (default: basename, leading dot stripped)
+        /// Override the derived store name (default: basename, leading dot
+        /// stripped). Only valid with a single path.
         #[arg(short, long)]
         name: Option<String>,
 
-        /// Files to link individually (repeatable; only when creating a new store)
+        /// Files to link individually (repeatable; only when creating a new
+        /// store and only with a single path)
         #[arg(short, long = "files", value_name = "FILE")]
         files: Vec<String>,
 
-        /// Glob patterns (repeatable; only when creating a new store)
+        /// Glob patterns (repeatable; only when creating a new store and only
+        /// with a single path)
         #[arg(short, long = "patterns", value_name = "PATTERN")]
         patterns: Vec<String>,
 
-        /// Create PATH as a single empty file (PATH must not exist)
+        /// Create PATH as a single empty file (PATH must not exist). Only
+        /// valid with a single path.
         #[arg(long)]
         file: bool,
 
-        /// Adopt an existing regular file into an existing file-mode store
+        /// Adopt an existing regular file into an existing file-mode store.
+        /// Only valid with a single path.
         #[arg(long, value_name = "STORE")]
         to: Option<String>,
+
+        /// Register the target path with an explicit repo-relative source
+        /// (the fan-in flow): one file, many names/homes. Nothing is moved or
+        /// copied. Only valid with a single path.
+        #[arg(long, value_name = "REPO-PATH")]
+        source: Option<String>,
 
         /// Preview without making changes
         #[arg(long)]
@@ -118,6 +132,12 @@ pub enum Commands {
         /// Preview without removing anything
         #[arg(long)]
         dry_run: bool,
+
+        /// Proceed even when other stores' `sources` reference files inside
+        /// this store's directory; the referenced source files are retained
+        /// in place and reported.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Open stitch.toml (or an entry's repo source) in $EDITOR
@@ -126,6 +146,11 @@ pub enum Commands {
         /// templated entry, the plain file otherwise) — never the staged render.
         /// Omit to open `stitch.toml`.
         entry: Option<String>,
+
+        /// Print the resolved repo source path instead of opening $EDITOR.
+        /// Useful for agents that open files with their own tools.
+        #[arg(long)]
+        print_path: bool,
     },
 
     /// Run health checks
@@ -171,6 +196,29 @@ pub enum Commands {
     Render {
         /// Store and source file, e.g. `git/gitconfig.tmpl`.
         spec: String,
+    },
+
+    /// Show the fully-resolved desired state for this host (read-only)
+    Explain {
+        /// Only show stores whose `when` matches this host
+        #[arg(long)]
+        active_only: bool,
+    },
+
+    /// Emit the canonical agent JSON schema (docs/agent-schema.json)
+    Schema,
+
+    /// Investigate a single target path: what owns it, its source, link state
+    Why {
+        /// Target path to investigate (e.g. ~/.bashrc or /home/user/.config/nvim)
+        target: String,
+    },
+
+    /// Show the audit log of mutating operations (.stitch/log.jsonl)
+    Log {
+        /// Only show the last N entries
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
@@ -327,20 +375,22 @@ mod tests {
         let cli = parse(&["stitch", "add", "~/path"]).unwrap();
         match cli.command {
             Commands::Add {
-                path,
+                paths,
                 name,
                 files,
                 patterns,
                 file,
                 to,
+                source,
                 dry_run,
             } => {
-                assert_eq!(path, "~/path");
+                assert_eq!(paths, vec!["~/path"]);
                 assert!(name.is_none());
                 assert!(files.is_empty());
                 assert!(patterns.is_empty());
                 assert!(!file);
                 assert!(to.is_none());
+                assert!(source.is_none());
                 assert!(!dry_run);
             }
             _ => panic!(),
@@ -363,12 +413,13 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Add {
-                path,
+                paths,
                 name,
                 files,
                 patterns,
                 file,
                 to,
+                source,
                 dry_run,
             } => {
                 assert_eq!(name.as_deref(), Some("s"));
@@ -376,8 +427,20 @@ mod tests {
                 assert_eq!(patterns, vec!["b"]);
                 assert!(file);
                 assert_eq!(to.as_deref(), Some("store"));
+                assert!(source.is_none());
                 assert!(dry_run);
-                assert_eq!(path, "~/path");
+                assert_eq!(paths, vec!["~/path"]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn add_parses_bulk_multiple_paths() {
+        let cli = parse(&["stitch", "add", "~/path1", "~/path2", "~/path3"]).unwrap();
+        match cli.command {
+            Commands::Add { paths, .. } => {
+                assert_eq!(paths, vec!["~/path1", "~/path2", "~/path3"]);
             }
             _ => panic!(),
         }
@@ -387,9 +450,14 @@ mod tests {
     fn remove_parses() {
         let cli = parse(&["stitch", "remove", "mystore"]).unwrap();
         match cli.command {
-            Commands::Remove { name, dry_run } => {
+            Commands::Remove {
+                name,
+                dry_run,
+                force,
+            } => {
                 assert_eq!(name, "mystore");
                 assert!(!dry_run);
+                assert!(!force);
             }
             _ => panic!(),
         }
@@ -403,10 +471,27 @@ mod tests {
     #[test]
     fn edit_parses_with_and_without_entry() {
         let cli = parse(&["stitch", "edit"]).unwrap();
-        assert!(matches!(cli.command, Commands::Edit { entry: None }));
+        match cli.command {
+            Commands::Edit { entry, print_path } => {
+                assert!(entry.is_none());
+                assert!(!print_path);
+            }
+            _ => panic!(),
+        }
         let cli = parse(&["stitch", "edit", "nvim/init.lua"]).unwrap();
         match cli.command {
-            Commands::Edit { entry } => assert_eq!(entry.as_deref(), Some("nvim/init.lua")),
+            Commands::Edit { entry, print_path } => {
+                assert_eq!(entry.as_deref(), Some("nvim/init.lua"));
+                assert!(!print_path);
+            }
+            _ => panic!(),
+        }
+        let cli = parse(&["stitch", "edit", "nvim/init.lua", "--print-path"]).unwrap();
+        match cli.command {
+            Commands::Edit { entry, print_path } => {
+                assert_eq!(entry.as_deref(), Some("nvim/init.lua"));
+                assert!(print_path);
+            }
             _ => panic!(),
         }
     }
@@ -466,6 +551,49 @@ mod tests {
         let cli = parse(&["stitch", "render", "git/gitconfig.tmpl"]).unwrap();
         match cli.command {
             Commands::Render { spec } => assert_eq!(spec, "git/gitconfig.tmpl"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn explain_parses() {
+        let cli = parse(&["stitch", "explain"]).unwrap();
+        match cli.command {
+            Commands::Explain { active_only } => assert!(!active_only),
+            _ => panic!(),
+        }
+        let cli = parse(&["stitch", "explain", "--active-only"]).unwrap();
+        match cli.command {
+            Commands::Explain { active_only } => assert!(active_only),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn schema_parses() {
+        let cli = parse(&["stitch", "schema"]).unwrap();
+        assert!(matches!(cli.command, Commands::Schema));
+    }
+
+    #[test]
+    fn why_parses() {
+        let cli = parse(&["stitch", "why", "~/.bashrc"]).unwrap();
+        match cli.command {
+            Commands::Why { target } => assert_eq!(target, "~/.bashrc"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn log_parses() {
+        let cli = parse(&["stitch", "log"]).unwrap();
+        match cli.command {
+            Commands::Log { limit } => assert!(limit.is_none()),
+            _ => panic!(),
+        }
+        let cli = parse(&["stitch", "log", "--limit", "10"]).unwrap();
+        match cli.command {
+            Commands::Log { limit } => assert_eq!(limit, Some(10)),
             _ => panic!(),
         }
     }

@@ -41,6 +41,9 @@ pub(crate) fn cmd_migrate(
                         authored: None,
                         state_path: None,
                         state: None,
+                        backup_path: None,
+                        stores_split: 0,
+                        comment_loss_note: None,
                     },
                     vec![msg],
                 );
@@ -100,8 +103,9 @@ pub(crate) fn cmd_migrate(
     // Validate the split inventory before rendering, previewing, or writing.
     // v0.2 accepted entries the new validator rejects (e.g. `./bashrc`); we
     // must fail fast so migration does not create state that cannot load.
-    generated.validate()?;
-    config::validate_merged(&authored, &generated)?;
+    // Use the full repo-aware validator so staging collisions and source
+    // component checks are caught here, not on the next load.
+    config::validate_merged_with_repo(&authored, &generated, root)?;
 
     // Render both halves once: authored (with the read-only header prepended)
     // and generated (sorted + header-stamped). The state string is reused for
@@ -114,6 +118,9 @@ pub(crate) fn cmd_migrate(
     );
     let state_str = generated.render_for_display()?;
 
+    let stores_split = legacy.stores.len();
+    let comment_loss_note = Some(true);
+
     if dry_run {
         if json {
             let data = MigrateData {
@@ -121,6 +128,9 @@ pub(crate) fn cmd_migrate(
                 authored: Some(authored_str),
                 state_path: Some(state_path.to_string_lossy().into_owned()),
                 state: Some(state_str),
+                backup_path: None,
+                stores_split,
+                comment_loss_note,
             };
             report::write("migrate", data, Vec::new());
         } else {
@@ -177,20 +187,50 @@ pub(crate) fn cmd_migrate(
         )
     })?;
 
-    println!("Migrated v0.2 config:");
-    println!("  wrote {}", authored_path.display());
-    println!("  wrote {}", state_path.display());
-    println!(
-        "  backed up {} → {}",
-        legacy_path.display(),
-        backup_path.display()
-    );
-    eprintln!(
-        "note: comments in the old config were not carried into stitch.toml \
-         (structural conversion drops them). The original is preserved at {}. \
-         Re-add any comments you want to keep.",
-        backup_path.display()
-    );
+    if json {
+        let data = MigrateData {
+            authored_path: Some(authored_path.to_string_lossy().into_owned()),
+            authored: Some(authored_str),
+            state_path: Some(state_path.to_string_lossy().into_owned()),
+            state: Some(state_str),
+            backup_path: Some(backup_path.to_string_lossy().into_owned()),
+            stores_split,
+            comment_loss_note,
+        };
+        let mut warnings = durability_warnings.clone();
+        warnings.push(format!(
+            "comments in the old config were not carried into stitch.toml \
+             (structural conversion drops them). The original is preserved at {}",
+            backup_path.display()
+        ));
+        if !durability_warnings.is_empty() {
+            // Emit a single error envelope with the migrated data so JSON
+            // consumers see exactly one envelope, not a success followed by
+            // a failure.
+            let error = StitchError::internal(format!(
+                "migration completed, but its config directory could not be synced: {}",
+                durability_warnings.join("; ")
+            ));
+            report::write_data_error("migrate", data, &error, warnings);
+        } else {
+            report::write("migrate", data, warnings);
+        }
+    } else {
+        println!("Migrated v0.2 config:");
+        println!("  wrote {}", authored_path.display());
+        println!("  wrote {}", state_path.display());
+        println!(
+            "  backed up {} → {}",
+            legacy_path.display(),
+            backup_path.display()
+        );
+        eprintln!(
+            "note: comments in the old config were not carried into stitch.toml \
+             (structural conversion drops them). The original is preserved at {}. \
+             Re-add any comments you want to keep.",
+            backup_path.display()
+        );
+    }
     if !durability_warnings.is_empty() {
         return Err(StitchError::internal(format!(
             "migration completed, but its config directory could not be synced: {}",

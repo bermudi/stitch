@@ -82,26 +82,6 @@ pub fn resolve_entry(source_rel: &str) -> ResolvedEntry {
     }
 }
 
-/// Reject stores that contain both `foo` and `foo.tmpl` (same link name).
-pub fn check_name_collisions(source_names: &[String]) -> Result<(), String> {
-    let mut by_link: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for name in source_names {
-        by_link
-            .entry(link_name(name).to_string())
-            .or_default()
-            .push(name.clone());
-    }
-    for (link, sources) in by_link {
-        if sources.len() > 1 {
-            return Err(format!(
-                "name collision for '{link}': {} — remove or rename one",
-                sources.join(", ")
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// True if any non-directory entry under `store_dir` has a `.tmpl` suffix.
 ///
 /// A terminal symlink named `*.tmpl` counts deliberately: forcing file mode
@@ -818,6 +798,11 @@ pub enum StageOutcome {
 
 /// Render `source_path` in memory and stage it at the canonical path.
 ///
+/// `link_rel` is the staging identity under `.stitch/render/<store>/` — the
+/// target link name (a `sources` key keeps its literal spelling; an in-store
+/// template drops its `.tmpl` suffix). `source_rel` is only the template's
+/// identity in error messages and the root it must resolve within.
+///
 /// Hash-gated: skips the write when the existing staged content is identical,
 /// so re-apply is cheap and does not bust mtimes. On render failure nothing is
 /// written (and any prior staged file is left alone — the caller skips the link).
@@ -826,11 +811,11 @@ pub fn stage_template(
     store_name: &str,
     source_rel: &str,
     source_path: &Path,
+    link_rel: &str,
     platform: &Platform,
     vars: &BTreeMap<String, String>,
 ) -> Result<StageOutcome, String> {
-    let entry = resolve_entry(source_rel);
-    if !entry.is_template {
+    if !is_template(source_rel) {
         return Err(format!(
             "internal: stage_template called on non-template '{source_rel}'"
         ));
@@ -844,7 +829,7 @@ pub fn stage_template(
         ));
     }
     let rendered = render_file(source_path, source_rel, platform, vars)?;
-    let paths = staged_paths(repo_root, store_name, &entry.link_rel)?;
+    let paths = staged_paths(repo_root, store_name, link_rel)?;
 
     if let Some((existing, meta)) = read_staged_file(&paths)?
         && existing == rendered
@@ -863,20 +848,21 @@ pub fn stage_template(
 
 /// Fresh in-memory render and required metadata compared against the staged file.
 ///
-/// Used by `diff` and `doctor`. Returns `true` when apply would atomically
-/// replace the staged file: it is missing, its content differs, its mode is not
-/// `0600`, or it has more than one hard link.
+/// Used by `diff` and `doctor`. `link_rel` is the staging identity (see
+/// [`stage_template`]). Returns `true` when apply would atomically replace the
+/// staged file: it is missing, its content differs, its mode is not `0600`, or
+/// it has more than one hard link.
 pub fn staged_differs(
     repo_root: &Path,
     store_name: &str,
     source_rel: &str,
     source_path: &Path,
+    link_rel: &str,
     platform: &Platform,
     vars: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
-    let entry = resolve_entry(source_rel);
     let rendered = render_file(source_path, source_rel, platform, vars)?;
-    let paths = staged_paths(repo_root, store_name, &entry.link_rel)?;
+    let paths = staged_paths(repo_root, store_name, link_rel)?;
     match read_staged_file(&paths)? {
         Some((existing, meta)) => Ok(existing != rendered
             || meta.nlink() != 1
@@ -890,10 +876,17 @@ pub fn staged_differs(
 /// A whole-dir store containing a `.tmpl` is promoted to file mode. If a source
 /// is later deleted or renamed, it disappears from the resolved entry set, but
 /// its old target symlink is otherwise invisible to the next apply. Reconcile
-/// those links before staging cleanup. Only links that point into this store or
-/// its staging tree are candidates; `remove_link` performs the final
-/// repo-ownership check immediately before unlinking, so foreign links are not
-/// clobbered.
+/// those links before staging cleanup. Only links that point into this store,
+/// its staging tree, or at one of this store's declared `sources` files are
+/// candidates; `remove_link` performs the final repo-ownership check
+/// immediately before unlinking, so foreign links are not clobbered.
+///
+/// `declared_sources` (v0.14) lists the absolute repo paths of this
+/// store/target's `sources` entries. Ownership follows the manifest, not
+/// directory geometry: a link whose rel path is not in the keep set but which
+/// resolves to one of these declared sources is a renamed-away or repointed
+/// entry — stale, exactly like an in-store one. A link resolving into another
+/// store's directory (and not at one of ours) stays skipped, as before.
 ///
 /// The walk never descends into the repository itself. A file-mode store with
 /// `target = "~"` (the stow-mirror layout) walks all of `$HOME`; if the repo
@@ -909,6 +902,7 @@ pub fn reconcile_store_links(
     repo_root: &Path,
     store_dir: &Path,
     store_name: &str,
+    declared_sources: &[PathBuf],
     keep_link_rels: &BTreeSet<String>,
     dry_run: bool,
 ) -> Result<Vec<PathBuf>, String> {
@@ -999,9 +993,15 @@ pub fn reconcile_store_links(
 
         // The first check is the invariant used by remove_link. The narrower
         // checks prevent this store from removing a link into another store
-        // merely because it also lives under repo_root.
+        // merely because it also lives under repo_root: a link is ours only
+        // when it resolves into this store, its staging tree, or exactly at
+        // one of this store's declared source files.
         if !linker::points_into_repo(path, repo_root)
-            || (!linker::points_into(path, store_dir) && !linker::points_into(path, &staging_dir))
+            || (!linker::points_into(path, store_dir)
+                && !linker::points_into(path, &staging_dir)
+                && !declared_sources
+                    .iter()
+                    .any(|source| linker::points_to_source(path, source, repo_root)))
         {
             continue;
         }
@@ -1198,14 +1198,28 @@ pub fn reconcile_store_staging(
 
 /// Delete the entire staging tree for a store (used by `remove`). Missing
 /// staging stays a no-op and never causes directories to be created.
-pub fn remove_store_staging(repo_root: &Path, store_name: &str) -> Result<(), String> {
+///
+/// Returns the paths of staged files that were removed (empty when the
+/// staging tree did not exist or contained no files).
+pub fn remove_store_staging(repo_root: &Path, store_name: &str) -> Result<Vec<PathBuf>, String> {
     let store = store_staging_paths(repo_root, store_name)?;
     if !checked_render_dirs(&store.dirs, false)? {
-        return Ok(());
+        return Ok(Vec::new());
+    }
+    // Collect the staged-file paths before dropping the tree, so callers can
+    // report exactly what was removed.
+    let mut removed = Vec::new();
+    for entry in walkdir::WalkDir::new(&store.store_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        removed.push(entry.path().to_path_buf());
     }
     match std::fs::remove_dir_all(&store.store_dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(
             "could not remove staging {}: {e}",
             store.store_dir.display()
@@ -1409,13 +1423,6 @@ mod tests {
     }
 
     #[test]
-    fn collision_detected() {
-        let names = vec!["foo".into(), "foo.tmpl".into()];
-        assert!(check_name_collisions(&names).is_err());
-        assert!(check_name_collisions(&["foo.tmpl".into(), "bar".into()]).is_ok());
-    }
-
-    #[test]
     fn render_context_fields() {
         let p = test_platform();
         let vars = BTreeMap::from([("editor".into(), "nvim".into())]);
@@ -1522,7 +1529,8 @@ mod tests {
         let p = test_platform();
         let vars = BTreeMap::new();
 
-        let r1 = stage_template(repo, "git", "gitconfig.tmpl", &src, &p, &vars).unwrap();
+        let r1 =
+            stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
         assert!(matches!(r1, StageOutcome::Written(_)));
         let dest = staging_path(repo, "git", "gitconfig");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "host=testhost\n");
@@ -1530,12 +1538,14 @@ mod tests {
         assert_eq!(path_mode(&store_render_dir(repo, "git")), Some(0o700));
 
         // Second stage with same content → Unchanged.
-        let r2 = stage_template(repo, "git", "gitconfig.tmpl", &src, &p, &vars).unwrap();
+        let r2 =
+            stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
         assert!(matches!(r2, StageOutcome::Unchanged(_)));
 
         // Content change → Written again.
         std::fs::write(&src, "host={{ hostname }}!\n").unwrap();
-        let r3 = stage_template(repo, "git", "gitconfig.tmpl", &src, &p, &vars).unwrap();
+        let r3 =
+            stage_template(repo, "git", "gitconfig.tmpl", &src, "gitconfig", &p, &vars).unwrap();
         assert!(matches!(r3, StageOutcome::Written(_)));
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "host=testhost!\n");
     }
@@ -1576,6 +1586,7 @@ mod tests {
             "git",
             "gitconfig.tmpl",
             &source,
+            "gitconfig",
             &test_platform(),
             &BTreeMap::new(),
         )
@@ -1605,6 +1616,7 @@ mod tests {
             "git",
             "gitconfig.tmpl",
             &source,
+            "gitconfig",
             &test_platform(),
             &BTreeMap::new(),
         )
@@ -1632,6 +1644,7 @@ mod tests {
             "git",
             "gitconfig.tmpl",
             &source,
+            "gitconfig",
             &test_platform(),
             &BTreeMap::new(),
         )
@@ -1644,6 +1657,7 @@ mod tests {
             "git",
             "gitconfig.tmpl",
             &source,
+            "gitconfig",
             &test_platform(),
             &BTreeMap::new(),
         )
@@ -1671,6 +1685,7 @@ mod tests {
             "git",
             "gitconfig.tmpl",
             &source,
+            "gitconfig",
             &test_platform(),
             &BTreeMap::new(),
         )
@@ -1771,6 +1786,7 @@ mod tests {
                     target: Some(target.to_string_lossy().into_owned()),
                     files: vec!["gitconfig".into()],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: config::WhenClause::default(),
                     hooks: config::Hooks::default(),
@@ -1803,6 +1819,7 @@ mod tests {
                     target: Some(target.to_string_lossy().into_owned()),
                     files: vec!["gitconfig.tmpl".into()],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: config::WhenClause::default(),
                     hooks: config::Hooks::default(),
@@ -1843,6 +1860,7 @@ mod tests {
                     target: Some(target.to_string_lossy().into_owned()),
                     files: vec!["gitconfig".into()],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: config::WhenClause::default(),
                     hooks: config::Hooks::default(),
@@ -1876,6 +1894,7 @@ mod tests {
                     target: Some(target.to_string_lossy().into_owned()),
                     files: vec![],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: config::WhenClause::default(),
                     hooks: config::Hooks::default(),
@@ -1916,6 +1935,7 @@ mod tests {
                     target: Some(target.to_string_lossy().into_owned()),
                     files: vec!["gitconfig".into()],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: config::WhenClause::default(),
                     hooks: config::Hooks::default(),
@@ -1954,6 +1974,7 @@ mod tests {
                     target: Some(target.to_string_lossy().into_owned()),
                     files: vec!["lua/plugin.lua".into()],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     ignore: vec![],
                     when: config::WhenClause::default(),
                     hooks: config::Hooks::default(),
@@ -2028,16 +2049,5 @@ mod tests {
             prop_assert_eq!(link_name(&once), once.as_str());
         }
 
-        #[test]
-        fn prop_collision_detection(names in prop::collection::vec("[a-z]{1,5}(\\.tmpl)?", 2..5)) {
-            // Check that collision detection agrees with manual link_name grouping
-            let mut by_link: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-            for n in &names {
-                *by_link.entry(link_name(n).to_string()).or_default() += 1;
-            }
-            let has_collision = by_link.values().any(|&c| c > 1);
-            let check = check_name_collisions(&names);
-            prop_assert_eq!(check.is_err(), has_collision);
-        }
     }
 }

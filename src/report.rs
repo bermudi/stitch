@@ -4,8 +4,8 @@
 //! `list`, `doctor`, `prune`, `render`). It keeps the text and JSON views of
 //! the same data structurally close so they do not drift.
 
-use crate::config::{Config, WhenClause};
-use crate::error::StitchError;
+use crate::config::{Config, Hooks, WhenClause};
+use crate::error::{RecoveryAction, StitchError};
 use crate::linker::LinkStatus;
 use crate::render;
 use crate::scan::FoundLink;
@@ -38,6 +38,10 @@ pub struct ErrorDetail {
     /// today; it is `None` and serialized as `null`. Kept in the struct so
     /// the envelope shape is locked now and later fills are additive-only.
     pub details: Option<String>,
+    /// Machine-readable recovery actions an agent can take to resolve this
+    /// error. Empty when the error is not recoverable via a stitch command.
+    /// `manual` entries signal "escalate, don't retry stitch commands."
+    pub recoverable_via: Vec<RecoveryAction>,
 }
 
 /// Print a successful JSON envelope to stdout.
@@ -63,7 +67,8 @@ pub fn write_error(command: &'static str, error: &StitchError, warnings: Vec<Str
         code: error.exit_code(),
         message: error.to_string(),
         hint: error.hint(),
-        details: None,
+        details: error.details(),
+        recoverable_via: error.recoverable_via(),
     };
     let envelope = Envelope::<()> {
         schema: SCHEMA,
@@ -93,7 +98,8 @@ pub fn write_data_error<T: Serialize>(
         code: error.exit_code(),
         message: error.to_string(),
         hint: error.hint(),
-        details: None,
+        details: error.details(),
+        recoverable_via: error.recoverable_via(),
     };
     let envelope = Envelope {
         schema: SCHEMA,
@@ -120,8 +126,13 @@ pub type JsonResult<T> = Result<(T, Vec<String>), Box<(StitchError, Vec<String>)
 /// the error's class code so callers never return a successful exit code for a
 /// failed run. The closure returns warnings alongside the result so load-time
 /// warnings are preserved even when a later step fails.
+///
+/// `audit_root` is `Some` for mutating commands (e.g. `prune --yes`) so the
+/// audit log captures JSON-mode failures that would otherwise bypass the
+/// central runner.
 pub fn run_json<T: Serialize, F: FnOnce() -> JsonResult<T>>(
     command: &'static str,
+    audit_root: Option<&std::path::Path>,
     f: F,
 ) -> Result<(), StitchError> {
     match f() {
@@ -131,6 +142,9 @@ pub fn run_json<T: Serialize, F: FnOnce() -> JsonResult<T>>(
         }
         Err(boxed) => {
             let (error, warnings) = *boxed;
+            if let Some(root) = audit_root {
+                crate::audit::append_command_result(root, command, Err(&error));
+            }
             write_error(command, &error, warnings);
             std::process::exit(error.exit_code());
         }
@@ -148,6 +162,11 @@ pub struct StatusRow {
     pub target_name: Option<String>,
     pub target: String,
     pub source: String,
+    /// Repo-relative source path for `sources`-mapped entries (v0.14):
+    /// `AGENTS.md ← agents/AGENTS.md` visibility in JSON. `None` for in-store
+    /// entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rel: Option<String>,
     pub templated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staged_path: Option<String>,
@@ -166,17 +185,16 @@ pub fn status(repo_root: &Path, entries: &[StatusEntry]) -> Vec<StatusRow> {
 
 fn status_row(repo_root: &Path, entry: &StatusEntry) -> StatusRow {
     let staged_path = if entry.is_template && !entry.skipped_platform {
-        let store_dir = repo_root.join(&entry.store_name);
-        entry
-            .source
-            .strip_prefix(&store_dir)
-            .ok()
-            .and_then(|rel| rel.to_str())
-            .map(|source_rel| {
-                let resolved = render::resolve_entry(source_rel);
-                render::staging_path(repo_root, &entry.store_name, &resolved.link_rel)
-            })
-            .map(|p| path_to_string(&p))
+        // `link_source` is already the absolute staged path for templated
+        // entries (status_entry_for_link sets it to staging_path). Return it
+        // directly when it sits under the store's render dir so we don't emit
+        // a stale relative path for non-render sources.
+        let render_dir = render::store_render_dir(repo_root, &entry.store_name);
+        if entry.link_source.starts_with(&render_dir) {
+            Some(path_to_string(&entry.link_source))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -187,8 +205,8 @@ fn status_row(repo_root: &Path, entry: &StatusEntry) -> StatusRow {
         LinkStatus::Conflict(_) => ("conflict".to_string(), None),
         LinkStatus::Broken(p) => ("broken".to_string(), Some(path_to_string(p))),
         LinkStatus::Foreign(p) => ("foreign".to_string(), Some(path_to_string(p))),
-        LinkStatus::StoreError(p) => ("error".to_string(), Some(path_to_string(p))),
-        LinkStatus::ConfigError(msg) => ("error".to_string(), Some(msg.clone())),
+        LinkStatus::StoreError(p) => ("store-error".to_string(), Some(path_to_string(p))),
+        LinkStatus::ConfigError(msg) => ("config-error".to_string(), Some(msg.clone())),
     };
 
     StatusRow {
@@ -196,6 +214,9 @@ fn status_row(repo_root: &Path, entry: &StatusEntry) -> StatusRow {
         target_name: entry.target_name.clone(),
         target: path_to_string(&entry.target),
         source: path_to_string(&entry.source),
+        // Repo-relative source path for `sources` entries (v0.14); None for
+        // in-store entries, whose source is derivable from the store dir.
+        source_rel: entry.from_sources.then(|| entry.source_name.clone()),
         templated: entry.is_template,
         staged_path,
         state,
@@ -220,6 +241,9 @@ pub struct ListStore {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// v0.14: link name → repo-relative source (outside the store dir).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "WhenClause::is_default")]
     pub when: WhenClause,
 }
@@ -233,6 +257,9 @@ pub struct ListTarget {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// v0.14: link name → repo-relative source (outside the store dir).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "WhenClause::is_default")]
     pub when: WhenClause,
 }
@@ -254,9 +281,14 @@ fn list_store(name: &str, store: &crate::config::Store) -> ListStore {
                 .map(|(target_name, target)| ListTarget {
                     name: target_name.clone(),
                     target: target.target.clone(),
-                    mode: mode_for(target.files.is_empty() && target.patterns.is_empty()),
+                    mode: mode_for(
+                        target.files.is_empty()
+                            && target.patterns.is_empty()
+                            && target.sources.is_empty(),
+                    ),
                     files: target.files.clone(),
                     patterns: target.patterns.clone(),
+                    sources: target.sources.clone(),
                     when: target.when.clone(),
                 })
                 .collect(),
@@ -268,10 +300,12 @@ fn list_store(name: &str, store: &crate::config::Store) -> ListStore {
             targets,
             files: Vec::new(),
             patterns: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
             when: store.when.clone(),
         }
     } else {
-        let has_files = !store.files.is_empty() || !store.patterns.is_empty();
+        let has_files =
+            !store.files.is_empty() || !store.patterns.is_empty() || !store.sources.is_empty();
         let mode = match (store.target.is_some(), has_files) {
             (false, false) => "none",
             (true, false) => "whole-dir",
@@ -284,6 +318,7 @@ fn list_store(name: &str, store: &crate::config::Store) -> ListStore {
             targets: None,
             files: store.files.clone(),
             patterns: store.patterns.clone(),
+            sources: store.sources.clone(),
             when: store.when.clone(),
         }
     }
@@ -483,6 +518,33 @@ pub struct AddData {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// Absolute path of the created symlink(s). Present on post-op reports
+    /// (real mutations); omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_created: Option<String>,
+    /// Original path when an adopt moved existing content into the repo.
+    /// Omitted for create modes and on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
+    /// The `[stores.<name>]` slice that was written to `.stitch/state.toml`.
+    /// Omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_entry: Option<String>,
+}
+
+/// Render the `[stores.<name>]` slice that was (or would be) written to
+/// `.stitch/state.toml`. Returns `None` when the store is not in generated
+/// state, which only happens on dry-run or a partially failed real mutation.
+pub fn state_entry_for(
+    generated: &crate::config::GeneratedState,
+    store_name: &str,
+) -> Option<String> {
+    generated.stores.get(store_name).cloned().and_then(|store| {
+        let slice = crate::config::GeneratedState {
+            stores: std::collections::BTreeMap::from([(store_name.to_string(), store)]),
+        };
+        slice.render_for_display().ok()
+    })
 }
 
 #[derive(Serialize)]
@@ -494,6 +556,25 @@ pub struct RemoveData {
     pub links: Vec<String>,
     pub staging: String,
     pub dry_run: bool,
+    /// v0.14: repo-relative source files inside this store's directory that
+    /// other stores' `sources` still reference. Present only when removal
+    /// proceeded under `--force` despite inbound references; the files are
+    /// retained in place (remove never deletes the store directory).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retained_sources: Vec<String>,
+    /// Present on post-op reports (real mutations); omitted on dry-run.
+    /// `true` when `stitch.toml` behavior was left in place (the tool never
+    /// rewrites authored config) — `doctor` will flag it as orphaned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behavior_orphaned: Option<bool>,
+    /// Staged-render paths removed alongside the store. Empty when no
+    /// templates were staged; omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_staging: Vec<String>,
+    /// `true` when the `.stitch/state.toml` entry for this store was removed.
+    /// Omitted on dry-run previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_entry_removed: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -503,6 +584,10 @@ pub struct ImportedStore {
     pub mode: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// v0.14: link name → repo-relative source, for links whose source lives
+    /// outside this store (the hub fan-in shape).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
     /// Present only for `multi-target` imports (stow-style fan-in: one store's
     /// file links span several target dirs). Each entry is one named target
     /// with its own file set. Empty for whole-dir and single-target file-mode
@@ -517,6 +602,8 @@ pub struct ImportedTarget {
     pub target: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -537,13 +624,239 @@ pub struct MigrateData {
     pub state_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// The `.toml.bak` path where the original v0.2 config was preserved.
+    /// Present on real migrations; omitted on dry-run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    /// Number of v0.2 stores split into the new authored/generated files.
+    /// `0` when there is nothing to migrate.
+    pub stores_split: usize,
+    /// `true` when a comment-loss note is carried in `warnings[]`.
+    /// Omitted when there is nothing to migrate or no comment was lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_loss_note: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// apply --json (composite)
+// ---------------------------------------------------------------------------
+
+/// Composite `apply --json` data: the full agent loop in one call.
+///
+/// `desired` is the host-evaluated merge (same shape as `explain --json`).
+/// `plan` is the existing `Plan` shape — byte-identical to the pre-composite
+/// `apply --json` output, so key-access consumers keep working.
+/// `result` is `null` on `--dry-run`; on real apply it carries per-op
+/// execution outcome. `post_status` is the status of the applied stores
+/// after execution (the verification an agent would otherwise do via a
+/// second `status` call).
+#[derive(Serialize)]
+pub struct ApplyData {
+    pub desired: ExplainData,
+    pub plan: crate::plan::Plan,
+    /// `null` on `--dry-run`; the per-op execution outcome on a real apply.
+    /// Always serialized so agents can key on `data.result` without a
+    /// missing-key fallback.
+    pub result: Option<ApplyResult>,
+    pub post_status: Vec<StatusRow>,
+}
+
+/// Per-op execution outcome. On a clean apply, every op is `ok`. On a
+/// partial failure, the agent sees which target failed and the error class.
+#[derive(Serialize)]
+pub struct ApplyResult {
+    pub ops_executed: usize,
+    pub ops_total: usize,
+    pub conflicts: usize,
+    pub errors: usize,
+    /// Per-store outcome summary. Each store's ops are classified as
+    /// `ok`, `conflict`, or `error` based on the plan ops.
+    pub stores: Vec<ApplyResultStore>,
+}
+
+#[derive(Serialize)]
+pub struct ApplyResultStore {
+    pub store: String,
+    pub ok: usize,
+    pub conflicts: usize,
+    pub errors: usize,
+    pub skipped: usize,
+}
+
+// ---------------------------------------------------------------------------
+// explain --json
+// ---------------------------------------------------------------------------
+
+/// The fully-resolved, host-evaluated desired state. Reused as `desired` in
+/// the composite `apply --json` envelope (§3 of the agent-loop plan).
+#[derive(Serialize)]
+pub struct ExplainData {
+    pub platform: ExplainPlatform,
+    pub stores: Vec<ExplainStore>,
+}
+
+#[derive(Serialize)]
+pub struct ExplainPlatform {
+    pub os: String,
+    pub arch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+    pub hostname: String,
+    pub shell: String,
+}
+
+#[derive(Serialize)]
+pub struct ExplainStore {
+    pub name: String,
+    /// Whether this store's `when` matches the current host.
+    pub active: bool,
+    #[serde(skip_serializing_if = "WhenClause::is_default")]
+    pub when: WhenClause,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ExplainEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ExplainTarget>,
+    #[serde(skip_serializing_if = "Hooks::is_default")]
+    pub hooks: Hooks,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ExplainTarget {
+    pub name: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "WhenClause::is_default")]
+    pub when: WhenClause,
+    pub target: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ExplainEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ExplainEntry {
+    /// Source path relative to the store directory for `files`/`patterns`
+    /// entries, or relative to the repo root for `sources` entries (may end
+    /// in `.tmpl`).
+    pub source: String,
+    /// `true` when the source ends in `.tmpl`.
+    pub templated: bool,
+    /// Link name under the target (`.tmpl` stripped for in-store entries;
+    /// verbatim key for `sources` entries).
+    pub link_name: String,
+    /// `true` when this entry comes from a `sources` declaration: the link
+    /// name is decoupled from a repo path outside the store dir.
+    #[serde(skip_serializing_if = "skip_bool_false")]
+    pub from_sources: bool,
+}
+
+// ---------------------------------------------------------------------------
+// why --json
+// ---------------------------------------------------------------------------
+
+/// Single-path investigation: what owns this target, its source, link state.
+/// Merges config + filesystem for one target so an agent doesn't cross-
+/// reference `list` + `status` + `doctor`.
+#[derive(Serialize)]
+pub struct WhyData {
+    pub query: String,
+    /// The matched entry, or absent when no store owns this path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<WhyEntry>,
+    /// True when the query path is under a store's target but the store is
+    /// skipped on this host (when mismatch).
+    #[serde(skip_serializing_if = "skip_bool_false")]
+    pub skipped_platform: bool,
+    /// v0.14 reverse lookup: present when the query resolved inside the repo
+    /// (a *source* file). Lists every store/target entry whose link draws
+    /// from that source — the fan-in visibility query. Present as `[]` when
+    /// the source has no consumers, absent when the query is not a repo source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumers: Option<Vec<WhyConsumer>>,
+}
+
+#[derive(Serialize)]
+pub struct WhyConsumer {
+    pub store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    /// Link name under the target directory.
+    pub name: String,
+    /// Absolute target path of the link.
+    pub target: String,
+}
+
+#[derive(Serialize)]
+pub struct WhyEntry {
+    pub store: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    pub target: String,
+    /// Repo source path (absolute). For templates, this is the `.tmpl` source
+    /// — never the staged render.
+    pub source: String,
+    pub templated: bool,
+    /// Link state: linked|missing|conflict|broken|foreign|store-error|config-error.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolves_to: Option<String>,
+    /// Present only when the query matched via ancestor containment — i.e.
+    /// the query lives *inside* a whole-dir store's target directory rather
+    /// than being the target itself. Gives the subpath relative to the target
+    /// (and equivalently relative to the store source dir), so an agent can
+    /// locate the backing repo file without a second lookup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_subpath: Option<String>,
+    /// Which config file owns the inventory for this entry.
+    pub owning_config: String,
+}
+
+fn skip_bool_false(b: &bool) -> bool {
+    !b
+}
+
+// ---------------------------------------------------------------------------
+// bulk add --json
+// ---------------------------------------------------------------------------
+
+/// Result of a bulk `add` operation (multiple paths in one invocation).
+#[derive(Serialize)]
+pub struct BulkAddData {
+    /// One entry per path, in order.
+    pub results: Vec<BulkAddResult>,
+    /// True if every path succeeded.
+    pub all_ok: bool,
+}
+
+/// One path's outcome in a bulk add.
+#[derive(Serialize)]
+pub struct BulkAddResult {
+    /// The path that was added.
+    pub path: String,
+    /// The store name it was added as (derived from basename).
+    pub store: String,
+    /// True if this path was added successfully.
+    pub ok: bool,
+    /// Error message if `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Dry-run: no changes were made.
+    pub dry_run: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditEntry;
     use crate::config::{Config, Hooks, Store, WhenClause};
     use crate::linker::LinkStatus;
+    use crate::plan::*;
     use crate::scan::FoundLink;
     use crate::store::{DoctorFinding, DoctorResult, Severity, StatusEntry};
     use serde_json::Value;
@@ -567,10 +880,13 @@ mod tests {
             target_name: None,
             source: PathBuf::from(source),
             link_source: PathBuf::from(source),
+            source_name: String::new(),
+            link_name: String::new(),
             target: PathBuf::from(target),
             status,
             skipped_platform: skipped,
             is_template,
+            from_sources: false,
         }
     }
 
@@ -606,6 +922,7 @@ mod tests {
             message: "boom".to_string(),
             hint: None,
             details: None,
+            recoverable_via: Vec::new(),
         };
         let env = Envelope::<()> {
             schema: SCHEMA,
@@ -622,6 +939,8 @@ mod tests {
         assert_eq!(v["error"]["code"], 1);
         assert!(v["error"]["hint"].is_null());
         assert!(v["error"]["details"].is_null());
+        assert!(v["error"]["recoverable_via"].is_array());
+        assert!(v["error"]["recoverable_via"].as_array().unwrap().is_empty());
         assert_eq!(v["schema"], 1);
     }
 
@@ -644,12 +963,12 @@ mod tests {
             ),
             (
                 LinkStatus::StoreError(PathBuf::from("/store")),
-                "error",
+                "store-error",
                 Some("/store"),
             ),
             (
                 LinkStatus::ConfigError("bad".to_string()),
-                "error",
+                "config-error",
                 Some("bad"),
             ),
         ];
@@ -689,7 +1008,12 @@ mod tests {
             store_name: "git".to_string(),
             target_name: None,
             source: PathBuf::from(source),
-            link_source: PathBuf::from(source),
+            // What status_all produces for a template: the link points at
+            // the staged render, not the repo template source.
+            link_source: PathBuf::from("/repo/.stitch/render/git/gitconfig"),
+            source_name: "gitconfig.tmpl".to_string(),
+            link_name: "gitconfig".to_string(),
+            from_sources: false,
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Linked,
             skipped_platform: false,
@@ -717,6 +1041,9 @@ mod tests {
             status: LinkStatus::Linked,
             skipped_platform: true,
             is_template: true,
+            source_name: String::new(),
+            link_name: String::new(),
+            from_sources: false,
         };
         let rows2 = super::status(&repo, &[entry2]);
         assert!(rows2[0].staged_path.is_none());
@@ -767,6 +1094,7 @@ mod tests {
             target: target.map(|t| t.to_string()),
             files: files.iter().map(|s| s.to_string()).collect(),
             patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            sources: std::collections::BTreeMap::new(),
             ignore: vec![],
             when: WhenClause::default(),
             hooks: Hooks::default(),
@@ -821,6 +1149,7 @@ mod tests {
                 target: "~/.config/helix".to_string(),
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
             },
@@ -831,6 +1160,7 @@ mod tests {
                 target: None,
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -992,6 +1322,129 @@ mod tests {
         );
     }
 
+    fn agent_schema() -> Value {
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/agent-schema.json"
+        ));
+        serde_json::from_str(raw).expect("docs/agent-schema.json is valid JSON")
+    }
+
+    fn base_shape_name(type_str: &str) -> Option<&str> {
+        let delimiters = ['|', '(', ' ', '['];
+        let end = type_str
+            .char_indices()
+            .find(|(_, c)| delimiters.contains(c))
+            .map(|(i, _)| i)
+            .unwrap_or(type_str.len());
+        let base = &type_str[..end];
+        let base = base.trim();
+        if base.is_empty() { None } else { Some(base) }
+    }
+
+    fn resolve_shape<'a>(schema: &'a Value, base: &str) -> Option<&'a Value> {
+        schema["shapes"].get(base).or_else(|| schema.get(base))
+    }
+
+    fn field_type_str(field_schema: &Value) -> Option<&str> {
+        field_schema
+            .as_str()
+            .or_else(|| field_schema.get("type").and_then(Value::as_str))
+    }
+
+    fn type_allows(type_str: &str, variant: &str) -> bool {
+        type_str.split('|').any(|p| p.trim() == variant)
+    }
+
+    fn check_value_against_shape(value: &Value, shape: &Value, path: &str, schema: &Value) {
+        let obj = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}: expected a JSON object"));
+
+        let (field_map, tag) = if let Some(fields) = shape.get("fields").and_then(Value::as_object)
+        {
+            (fields.clone(), None)
+        } else if let Some(tag) = shape.get("tag").and_then(Value::as_str) {
+            let variants = shape["variants"]
+                .as_object()
+                .expect("enum shape must declare variants");
+            let variant_name = obj[tag]
+                .as_str()
+                .unwrap_or_else(|| panic!("{path}: missing enum tag {tag}"));
+            let variant = variants
+                .get(variant_name)
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{path}: unknown variant {variant_name}"));
+            (variant.clone(), Some(tag.to_string()))
+        } else {
+            panic!("{path}: schema node is not an object or enum shape: {shape}");
+        };
+
+        let mut allowed: std::collections::BTreeSet<String> = field_map.keys().cloned().collect();
+        let mut required: std::collections::BTreeSet<String> = field_map
+            .iter()
+            .filter(|(_, schema)| {
+                let Some(type_str) = field_type_str(schema) else {
+                    return true;
+                };
+                !type_allows(type_str, "absent")
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        if let Some(tag) = &tag {
+            allowed.insert(tag.clone());
+            required.insert(tag.clone());
+        }
+        let actual: std::collections::BTreeSet<String> = obj.keys().cloned().collect();
+        assert!(
+            actual.is_subset(&allowed),
+            "{path}: unexpected keys: {actual:?} not in {allowed:?}"
+        );
+        assert!(
+            required.is_subset(&actual),
+            "{path}: missing required keys: {required:?} not in {actual:?}"
+        );
+
+        for (key, field_value) in obj {
+            if Some(key) == tag.as_ref() {
+                continue;
+            }
+            let field_schema = &field_map[key];
+            let type_str = field_type_str(field_schema);
+            if field_value.is_null() && type_str.is_some_and(|t| type_allows(t, "null")) {
+                continue;
+            }
+            if let Some(type_str) = type_str
+                && let Some(base) = base_shape_name(type_str)
+                && let Some(nested_shape) = resolve_shape(schema, base)
+            {
+                match field_value {
+                    Value::Object(_) => {
+                        check_value_against_shape(
+                            field_value,
+                            nested_shape,
+                            &format!("{path}.{key}"),
+                            schema,
+                        );
+                    }
+                    Value::Array(arr) => {
+                        for (i, item) in arr.iter().enumerate() {
+                            if !item.is_null() {
+                                check_value_against_shape(
+                                    item,
+                                    nested_shape,
+                                    &format!("{path}.{key}[{i}]"),
+                                    schema,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     #[test]
     fn envelope_schema_is_exact() {
         let ok_env = Envelope {
@@ -1018,6 +1471,7 @@ mod tests {
             message: "boom".to_string(),
             hint: None,
             details: None,
+            recoverable_via: Vec::new(),
         };
         let err_env = Envelope::<()> {
             schema: SCHEMA,
@@ -1036,7 +1490,14 @@ mod tests {
         assert!(v["data"].is_null());
         assert_keys_eq(
             &v["error"],
-            &["class", "code", "details", "hint", "message"],
+            &[
+                "class",
+                "code",
+                "details",
+                "hint",
+                "message",
+                "recoverable_via",
+            ],
         );
     }
 
@@ -1065,11 +1526,14 @@ mod tests {
             store_name: "git".to_string(),
             target_name: Some("laptop".to_string()),
             source: PathBuf::from("/repo/git/gitconfig.tmpl"),
-            link_source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            link_source: PathBuf::from("/repo/.stitch/render/git/gitconfig"),
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Broken(PathBuf::from("/gone")),
             skipped_platform: false,
             is_template: true,
+            source_name: String::new(),
+            link_name: String::new(),
+            from_sources: false,
         };
         let rows = super::status(&repo, &[entry]);
         let v = serde_json::to_value(&rows[0]).unwrap();
@@ -1102,11 +1566,14 @@ mod tests {
             store_name: "git".to_string(),
             target_name: None,
             source: PathBuf::from("/repo/git/gitconfig.tmpl"),
-            link_source: PathBuf::from("/repo/git/gitconfig.tmpl"),
+            link_source: PathBuf::from("/repo/.stitch/render/git/gitconfig"),
             target: PathBuf::from("/home/.gitconfig"),
             status: LinkStatus::Missing,
             skipped_platform: true,
             is_template: true,
+            source_name: String::new(),
+            link_name: String::new(),
+            from_sources: false,
         };
         let rows = super::status(&repo, &[entry]);
         let v = serde_json::to_value(&rows[0]).unwrap();
@@ -1159,6 +1626,7 @@ mod tests {
                 target: "~/.config/helix".to_string(),
                 files: vec!["config.toml".to_string()],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause {
                     hostname: Some("laptop".to_string()),
@@ -1172,6 +1640,7 @@ mod tests {
                 target: None,
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1294,5 +1763,487 @@ mod tests {
         let d2 = super::render(&PathBuf::from("/repo/s/file"), "file", "x");
         let v2 = serde_json::to_value(&d2).unwrap();
         assert_eq!(v2["link_name"], "file");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dto_samples() -> Vec<(&'static str, Value)> {
+        let mut samples = Vec::new();
+
+        let wc = WhenClause {
+            os: Some("linux".into()),
+            arch: Some("x86_64".into()),
+            distro: Some("ubuntu".into()),
+            hostname: Some("h".into()),
+            shell: Some("bash".into()),
+        };
+
+        let hooks = Hooks {
+            pre: Some("echo pre".into()),
+            post: Some("echo post".into()),
+        };
+
+        // StatusRow (and reused later in ApplyData.post_status)
+        let status_row = StatusRow {
+            store: "git".into(),
+            target_name: Some("laptop".into()),
+            target: "/home/.gitconfig".into(),
+            source: "/repo/git/gitconfig.tmpl".into(),
+            source_rel: Some("agents/AGENTS.md".into()),
+            templated: true,
+            staged_path: Some("/repo/.stitch/render/git/gitconfig".into()),
+            state: "broken".into(),
+            skipped_platform: false,
+            resolves_to: Some("/gone".into()),
+        };
+        samples.push(("StatusRow", serde_json::to_value(&status_row).unwrap()));
+
+        // ListStore (covers ListTarget and WhenClause via recursion)
+        samples.push((
+            "ListStore",
+            serde_json::to_value(ListStore {
+                name: "shells".into(),
+                mode: "file-mode".into(),
+                target: Some("~".into()),
+                targets: Some(vec![ListTarget {
+                    name: "laptop".into(),
+                    target: "~/.config/helix".into(),
+                    mode: "file-mode".into(),
+                    files: vec!["config.toml".into()],
+                    patterns: vec!["*.bak".into()],
+                    sources: std::collections::BTreeMap::from([(
+                        "alias.txt".into(),
+                        "shared/hub.txt".into(),
+                    )]),
+                    when: wc.clone(),
+                }]),
+                files: vec![".bashrc".into()],
+                patterns: vec!["*.bak".into()],
+                sources: std::collections::BTreeMap::from([(
+                    "a.txt".into(),
+                    "shared/hub.txt".into(),
+                )]),
+                when: wc.clone(),
+            })
+            .unwrap(),
+        ));
+
+        // Plan (covers PlanStore, PlanSummary, PlanOp, LinkRequires, TargetState)
+        let plan = Plan::from_stores(vec![PlanStore {
+            store_name: "git".into(),
+            ops: vec![PlanOp::CreateLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: LinkRequires::with_backup(
+                    TargetState::SymlinkTo("/repo/git/gitconfig".into()),
+                    TargetState::Absent,
+                ),
+            }],
+        }]);
+        samples.push(("Plan", serde_json::to_value(&plan).unwrap()));
+
+        // ExplainData (covers ExplainPlatform, ExplainStore, ExplainTarget, ExplainEntry, WhenClause, Hooks)
+        let explain_data = ExplainData {
+            platform: ExplainPlatform {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                distro: Some("ubuntu".into()),
+                hostname: "h".into(),
+                shell: "bash".into(),
+            },
+            stores: vec![ExplainStore {
+                name: "git".into(),
+                active: true,
+                when: wc.clone(),
+                mode: "file-mode".into(),
+                target: Some("~".into()),
+                entries: vec![ExplainEntry {
+                    source: "gitconfig.tmpl".into(),
+                    templated: true,
+                    link_name: "gitconfig".into(),
+                    from_sources: true,
+                }],
+                targets: vec![ExplainTarget {
+                    name: "laptop".into(),
+                    active: true,
+                    when: wc.clone(),
+                    target: "~/.config/helix".into(),
+                    mode: "file-mode".into(),
+                    entries: vec![ExplainEntry {
+                        source: "shared/hub.txt".into(),
+                        templated: false,
+                        link_name: "alias.txt".into(),
+                        from_sources: true,
+                    }],
+                    ignore: vec!["*.bak".into()],
+                }],
+                hooks: hooks.clone(),
+                ignore: vec!["*.log".into()],
+            }],
+        };
+        samples.push(("ExplainData", serde_json::to_value(&explain_data).unwrap()));
+
+        // ApplyData (covers ApplyResult, ApplyResultStore, StatusRow, Plan, ExplainData)
+        samples.push((
+            "ApplyData",
+            serde_json::to_value(ApplyData {
+                desired: explain_data,
+                plan,
+                result: Some(ApplyResult {
+                    ops_executed: 1,
+                    ops_total: 2,
+                    conflicts: 0,
+                    errors: 0,
+                    stores: vec![ApplyResultStore {
+                        store: "git".into(),
+                        ok: 1,
+                        conflicts: 0,
+                        errors: 0,
+                        skipped: 0,
+                    }],
+                }),
+                post_status: vec![status_row],
+            })
+            .unwrap(),
+        ));
+
+        // DoctorData (covers DoctorRow, DoctorSummary)
+        samples.push((
+            "DoctorData",
+            serde_json::to_value(DoctorData {
+                findings: vec![DoctorRow {
+                    id: "broken-link".into(),
+                    severity: "error".into(),
+                    message: "bad".into(),
+                    path: Some("/p".into()),
+                    hint: Some("fix".into()),
+                }],
+                summary: DoctorSummary {
+                    errors: 1,
+                    warnings: 2,
+                    info: 3,
+                },
+            })
+            .unwrap(),
+        ));
+
+        // PruneData (covers PruneRow)
+        samples.push((
+            "PruneData",
+            serde_json::to_value(PruneData {
+                orphans: vec![PruneRow {
+                    link: "/home/.oldrc".into(),
+                    resolves_to: "/repo/old/.oldrc".into(),
+                    status: "removed".into(),
+                }],
+                removed: 1,
+                failed: 2,
+            })
+            .unwrap(),
+        ));
+
+        // RenderData
+        samples.push((
+            "RenderData",
+            serde_json::to_value(RenderData {
+                source: "/repo/git/gitconfig.tmpl".into(),
+                link_name: "gitconfig".into(),
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into(),
+                content: "hello".into(),
+            })
+            .unwrap(),
+        ));
+
+        // AddData
+        samples.push((
+            "AddData",
+            serde_json::to_value(AddData {
+                store: "git".into(),
+                target: "~/.gitconfig".into(),
+                mode: "add-to-store".into(),
+                source: Some("/repo/git/gitconfig".into()),
+                files: vec!["gitconfig".into()],
+                patterns: vec!["*.tmpl".into()],
+                link_created: Some("/home/.gitconfig".into()),
+                moved_from: Some("/home/.gitconfig".into()),
+                state_entry: Some(
+                    "[stores.git]\ntarget = \"~/.gitconfig\"\nfiles = [\"gitconfig\"]\n".into(),
+                ),
+            })
+            .unwrap(),
+        ));
+
+        // RemoveData
+        samples.push((
+            "RemoveData",
+            serde_json::to_value(RemoveData {
+                store: "git".into(),
+                target: Some("laptop".into()),
+                links: vec!["/home/.gitconfig".into()],
+                staging: "/repo/.stitch/render".into(),
+                dry_run: false,
+                retained_sources: vec!["hub/hub.txt".into()],
+                behavior_orphaned: Some(true),
+                removed_staging: vec!["/repo/.stitch/render/git/gitconfig".into()],
+                state_entry_removed: Some(true),
+            })
+            .unwrap(),
+        ));
+
+        // MigrateData
+        samples.push((
+            "MigrateData",
+            serde_json::to_value(MigrateData {
+                authored_path: Some("/repo/stitch.toml".into()),
+                authored: Some("# authored".into()),
+                state_path: Some("/repo/.stitch/state.toml".into()),
+                state: Some("# state".into()),
+                backup_path: Some("/repo/.stitch/config.toml.bak".into()),
+                stores_split: 1,
+                comment_loss_note: Some(true),
+            })
+            .unwrap(),
+        ));
+
+        // ImportData (covers ImportedStore, ImportedTarget)
+        samples.push((
+            "ImportData",
+            serde_json::to_value(ImportData {
+                dry_run: false,
+                imported: 1,
+                skipped_owned: 2,
+                stores: vec![ImportedStore {
+                    store: "git".into(),
+                    target: "~".into(),
+                    mode: "file-mode".into(),
+                    files: vec![".bashrc".into()],
+                    sources: std::collections::BTreeMap::from([(
+                        "alias.txt".into(),
+                        "shared/hub.txt".into(),
+                    )]),
+                    targets: vec![ImportedTarget {
+                        name: "laptop".into(),
+                        target: "~/.config/helix".into(),
+                        files: vec![".bashrc".into()],
+                        sources: std::collections::BTreeMap::from([(
+                            "a.txt".into(),
+                            "shared/hub.txt".into(),
+                        )]),
+                    }],
+                }],
+            })
+            .unwrap(),
+        ));
+
+        // BulkAddData (covers BulkAddResult)
+        samples.push((
+            "BulkAddData",
+            serde_json::to_value(BulkAddData {
+                results: vec![BulkAddResult {
+                    path: "/home/.bashrc".into(),
+                    store: "bashrc".into(),
+                    ok: false,
+                    error: Some("boom".into()),
+                    dry_run: false,
+                }],
+                all_ok: false,
+            })
+            .unwrap(),
+        ));
+
+        // WhyData (covers WhyEntry and WhyConsumer)
+        samples.push((
+            "WhyData",
+            serde_json::to_value(WhyData {
+                query: "/home/.gitconfig".into(),
+                entry: Some(WhyEntry {
+                    store: "git".into(),
+                    target_name: Some("laptop".into()),
+                    target: "/home/.gitconfig".into(),
+                    source: "/repo/git/gitconfig.tmpl".into(),
+                    templated: true,
+                    state: "broken".into(),
+                    resolves_to: Some("/gone".into()),
+                    // Maximal fixture: matched_subpath is only present for
+                    // whole-dir containment matches, but the schema-shape test
+                    // exercises every field, so include it here.
+                    matched_subpath: Some("gitconfig".into()),
+                    owning_config: "state.toml".into(),
+                }),
+                skipped_platform: true,
+                consumers: Some(vec![crate::report::WhyConsumer {
+                    store: "consumer".into(),
+                    target_name: Some("laptop".into()),
+                    name: "alias.txt".into(),
+                    target: "/home/.consumer/alias.txt".into(),
+                }]),
+            })
+            .unwrap(),
+        ));
+
+        // AuditEntry
+        samples.push((
+            "AuditEntry",
+            serde_json::to_value(AuditEntry {
+                timestamp: "unix:1700000000".into(),
+                command: "apply".into(),
+                store: Some("git".into()),
+                target: Some("/home/.gitconfig".into()),
+                outcome: "ok".into(),
+                exit_class: Some("internal".into()),
+                exit_code: 1,
+            })
+            .unwrap(),
+        ));
+
+        // WhenClause and Hooks (referenced by many shapes; also tested directly)
+        samples.push(("WhenClause", serde_json::to_value(wc).unwrap()));
+        samples.push(("Hooks", serde_json::to_value(hooks).unwrap()));
+
+        // PlanOp: every variant
+        let op_requires = LinkRequires::with_backup(
+            TargetState::SymlinkTo("/repo/git/gitconfig".into()),
+            TargetState::Absent,
+        );
+        for op in [
+            PlanOp::StageRender {
+                store: "git".into(),
+                source_rel: "gitconfig.tmpl".into(),
+                source: "/repo/git/gitconfig.tmpl".into(),
+                staged: "/repo/.stitch/render/git/gitconfig".into(),
+                sha256: "abc".into(),
+            },
+            PlanOp::CreateLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::ReplaceLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                old_resolves_to: Some("/old".into()),
+                requires: op_requires.clone(),
+            },
+            PlanOp::BackupAndLink {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                backup: "/home/.gitconfig.bak".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::RemoveLink {
+                store: "git".into(),
+                target: "/home/.gitconfig".into(),
+                source: Some("/repo/git/gitconfig".into()),
+                requires: op_requires.clone(),
+            },
+            PlanOp::RemoveStaged {
+                path: "/repo/.stitch/render/git/gitconfig".into(),
+            },
+            PlanOp::ContentChanged {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::AlreadyLinked {
+                target: "/home/.gitconfig".into(),
+                source: "/repo/git/gitconfig".into(),
+                requires: op_requires.clone(),
+            },
+            PlanOp::Conflict {
+                target: "/home/.gitconfig".into(),
+                resolves_to: Some("/foreign".into()),
+            },
+            PlanOp::SkippedPlatform,
+            PlanOp::Error {
+                message: "boom".into(),
+                class: "internal".into(),
+                hook_name: None,
+            },
+        ] {
+            samples.push(("PlanOp", serde_json::to_value(op).unwrap()));
+        }
+
+        // RecoveryAction (set-env with a var, and a manual action)
+        samples.push((
+            "RecoveryAction",
+            serde_json::to_value(RecoveryAction {
+                kind: "set-env".into(),
+                command: None,
+                flags: Vec::new(),
+                args: Vec::new(),
+                reason: None,
+                vars: vec!["EDITOR".into()],
+            })
+            .unwrap(),
+        ));
+
+        // TargetState: every variant
+        for state in [
+            TargetState::Absent,
+            TargetState::RealEntry,
+            TargetState::SymlinkTo("/repo/git/gitconfig".into()),
+            TargetState::SymlinkIntoRepo,
+        ] {
+            samples.push(("TargetState", serde_json::to_value(state).unwrap()));
+        }
+
+        samples
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn schema_shape_keys_match_dto_serializations() {
+        let schema = agent_schema();
+        let shapes = schema["shapes"]
+            .as_object()
+            .expect("shapes must be an object");
+
+        for (name, value) in dto_samples() {
+            let shape = &shapes[name];
+            check_value_against_shape(&value, shape, name, &schema);
+        }
+    }
+
+    #[test]
+    fn error_detail_and_recovery_action_match_schema() {
+        // The top-level `error` and `recoverable_via` shapes are not under
+        // `shapes`, so they need their own consistency check.
+        let schema = agent_schema();
+        let error = ErrorDetail {
+            class: "render".into(),
+            code: 8,
+            message: "missing env".into(),
+            hint: Some("set EDITOR".into()),
+            details: None,
+            recoverable_via: vec![
+                RecoveryAction {
+                    kind: "edit-template".into(),
+                    command: Some("edit".into()),
+                    flags: Vec::new(),
+                    args: vec!["/repo/git/gitconfig.tmpl".into()],
+                    reason: None,
+                    vars: Vec::new(),
+                },
+                RecoveryAction {
+                    kind: "set-env".into(),
+                    command: None,
+                    flags: Vec::new(),
+                    args: Vec::new(),
+                    reason: None,
+                    vars: vec!["EDITOR".into()],
+                },
+            ],
+        };
+        let v = serde_json::to_value(&error).unwrap();
+        check_value_against_shape(&v, &schema["error"], "error", &schema);
+        let action_shape = &schema["recoverable_via"];
+        for (i, action) in error.recoverable_via.iter().enumerate() {
+            let v = serde_json::to_value(action).unwrap();
+            check_value_against_shape(
+                &v,
+                action_shape,
+                &format!("error.recoverable_via[{i}]"),
+                &schema,
+            );
+        }
     }
 }
