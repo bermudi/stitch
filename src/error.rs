@@ -914,6 +914,7 @@ mod tests {
             (StitchError::plan_stale("x"), 12, "plan-stale"),
             (StitchError::doctor(1), 13, "doctor"),
             (StitchError::drift(1), 14, "drift"),
+            (StitchError::self_update("x"), 15, "self-update"),
         ];
         for (err, expected_code, label) in cases {
             assert_eq!(
@@ -939,6 +940,7 @@ mod tests {
             StitchError::plan_stale("x"),
             StitchError::doctor(1),
             StitchError::drift(1),
+            StitchError::self_update("x"),
         ] {
             assert_eq!(err.exit_code(), err.class().code());
         }

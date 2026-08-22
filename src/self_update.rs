@@ -343,6 +343,27 @@ impl Identity {
     }
 }
 
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: `geteuid` has no arguments, dereferences no pointers, and only
+    // returns process credentials maintained by the kernel.
+    unsafe { libc::geteuid() }
+}
+
+fn set_file_owner_and_group(
+    file: &File,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> std::io::Result<()> {
+    // SAFETY: `file.as_raw_fd()` is valid for the duration of this call because
+    // `file` is borrowed, and `uid`/`gid` are plain numeric kernel identifiers.
+    let result = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 struct InstallTarget {
     path: PathBuf,
     parent: PathBuf,
@@ -362,7 +383,7 @@ impl InstallTarget {
                 path.display()
             ));
         }
-        let effective_uid = unsafe { libc::geteuid() };
+        let effective_uid = effective_uid();
         if metadata.uid() != effective_uid {
             return Err(format!(
                 "running executable {} is owned by uid {}, not effective uid {effective_uid}",
@@ -425,7 +446,7 @@ impl InstallTarget {
         if Identity::from(&file) != self.file_identity
             || Identity::from(&parent) != self.parent_identity
             || !file.file_type().is_file()
-            || file.uid() != unsafe { libc::geteuid() }
+            || file.uid() != effective_uid()
             || file.gid() != self.gid
             || file.nlink() != 1
             || file.mode() & 0o777 != self.mode
@@ -483,13 +504,8 @@ impl InstallTarget {
         let result = (|| {
             extract_binary(archive, &mut temp)?;
             validate_elf(&mut temp, target)?;
-            let chown_result = unsafe { libc::fchown(temp.as_raw_fd(), libc::geteuid(), self.gid) };
-            if chown_result != 0 {
-                return Err(format!(
-                    "cannot preserve executable group ownership: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
+            set_file_owner_and_group(&temp, effective_uid(), self.gid)
+                .map_err(|error| format!("cannot preserve executable group ownership: {error}"))?;
             temp.set_permissions(fs::Permissions::from_mode(self.mode))
                 .map_err(|error| format!("cannot set update permissions: {error}"))?;
             temp.sync_all()

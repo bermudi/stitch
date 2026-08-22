@@ -47,9 +47,9 @@ grep -q '[^[:space:]]' "$notes" || {
 # before the next section header); printf adds back exactly one.
 printf '%s\n' "$(cat "$notes")" > "$notes"
 
-if gh release view "$ver" >/dev/null 2>&1; then
+if gh release view "$ver" >/dev/null; then
     gh release edit "$ver" --title "$ver — $summary" --notes-file "$notes"
 else
-    echo "error: release $ver does not exist; publish its artifacts with the release workflow first" >&2
+    echo "error: could not verify existing release $ver; ensure it exists and gh is authenticated" >&2
     exit 1
 fi
