@@ -94,7 +94,8 @@ Artifacts: `stitch-vX.Y.Z-<target>.tar.gz` plus a `.sha256` sidecar.
 
 `stitch self-update` depends on that exact asset naming and treats published
 assets as immutable. The release workflow must never clobber a published
-asset (a partial draft may be resumed). It validates tag/package-version
+asset (a partial draft may be resumed). Publication is serialized per tag and
+rechecks draft status at the upload boundary. It validates tag/package-version
 agreement, builds on the pinned Ubuntu 22.04 glibc baseline, and publishes the
 archive + checksum together.
 The updater checks the checksum, archive shape, ELF architecture, and staged

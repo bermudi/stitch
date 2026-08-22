@@ -91,15 +91,36 @@ impl Transport for HttpsTransport {
             .agent
             .get(url)
             .header("Accept", "application/vnd.github+json")
+            .header("Accept-Encoding", "identity")
             .call()
             .map_err(|error| format!("GET {url} failed: {error}"))?;
-        response
-            .body_mut()
-            .with_config()
-            .limit(u64::try_from(limit).map_err(|_| "response limit is too large".to_string())?)
-            .read_to_vec()
-            .map_err(|error| format!("reading {url} failed: {error}"))
+        if let Some(encoding) = response.headers().get("Content-Encoding") {
+            return Err(format!(
+                "GET {url} returned unsupported Content-Encoding `{}`",
+                encoding.to_str().unwrap_or("<non-UTF-8>")
+            ));
+        }
+        read_limited(response.body_mut().as_reader(), url, limit)
     }
+}
+
+fn read_limited(reader: impl Read, url: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let decoded_limit =
+        u64::try_from(limit).map_err(|_| "response limit is too large".to_string())?;
+    let read_limit = decoded_limit
+        .checked_add(1)
+        .ok_or_else(|| "response limit is too large".to_string())?;
+    let mut bytes = Vec::with_capacity(limit.min(1024 * 1024));
+    reader
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("reading {url} failed: {error}"))?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "GET {url} exceeded the {limit}-byte decoded response limit"
+        ));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn run(check_only: bool, progress: bool) -> Result<UpdateData, String> {
@@ -408,6 +429,7 @@ impl InstallTarget {
             || file.gid() != self.gid
             || file.nlink() != 1
             || file.mode() & 0o777 != self.mode
+            || file.mode() & 0o7000 != 0
         {
             return Err(
                 "the executable or its parent directory changed during the update; retry".into(),
@@ -781,6 +803,15 @@ mod tests {
     }
 
     #[test]
+    fn decoded_response_limit_rejects_one_extra_byte() {
+        let exact = read_limited(std::io::Cursor::new(vec![b'x'; 8]), "test", 8).unwrap();
+        assert_eq!(exact.len(), 8);
+
+        let error = read_limited(std::io::Cursor::new(vec![b'x'; 9]), "test", 8).unwrap_err();
+        assert!(error.contains("8-byte decoded response limit"));
+    }
+
+    #[test]
     fn check_reports_available_without_downloading_assets() {
         let target = "x86_64-unknown-linux-gnu";
         let mut transport = FakeTransport::default();
@@ -989,6 +1020,19 @@ mod tests {
             xattr::get(&executable, "user.stitch-test").unwrap(),
             Some(b"preserve-me".to_vec())
         );
+    }
+
+    #[test]
+    fn revalidation_rejects_new_special_permission_bits() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("stitch");
+        fs::write(&executable, b"old").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = InstallTarget::preflight(&executable).unwrap();
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o4755)).unwrap();
+        let error = target.revalidate().unwrap_err();
+        assert!(error.contains("changed during the update"));
     }
 
     #[test]

@@ -62,6 +62,16 @@ fn self_update_rejects_irrelevant_repo_flag_before_network_access() {
         ));
 }
 
+#[test]
+fn self_update_help_says_repo_flag_is_rejected() {
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .args(["self-update", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("rejected by `self-update`"));
+}
+
 /// Run `stitch --repo <path> list` from an unrelated cwd and confirm it
 /// operates on the referenced repo.
 #[test]

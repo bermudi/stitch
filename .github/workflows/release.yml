@@ -17,6 +17,13 @@ on:
 permissions:
   contents: read
 
+# A rerun for one tag must finish after the previous run. Otherwise two jobs
+# could both observe a draft and one could publish while the other is still
+# replacing draft assets.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: build (${{ matrix.target }})
@@ -179,6 +186,15 @@ jobs:
               --notes-file "$NOTES_PATH"
           fi
 
+          # Recheck at the mutation boundary. This also catches a maintainer
+          # publishing the draft while this job was preparing the files.
+          is_draft="$(
+            gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft'
+          )"
+          [ "$is_draft" = true ] || {
+            echo "error: release $GITHUB_REF_NAME is no longer a draft; refusing to replace its assets" >&2
+            exit 1
+          }
           gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
 
           expected="$(

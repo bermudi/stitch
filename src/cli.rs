@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 )]
 pub struct Cli {
     /// Path to the stitch repo to operate on. Overrides the STITCH_REPO env
-    /// var and the upward cwd walk. Ignored by `init` (which is cwd-anchored).
+    /// var and the upward cwd walk. Ignored by `init`; rejected by `self-update`.
     #[arg(long, global = true, value_name = "PATH")]
     pub repo: Option<String>,
 
