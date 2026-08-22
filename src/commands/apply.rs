@@ -691,6 +691,7 @@ files = ["regular", "alias"]
                 json: false,
             },
             &mut Vec::new(),
+            &BTreeSet::new(),
         );
 
         assert!(target_dir.join("regular").is_symlink());
@@ -763,6 +764,7 @@ files = ["regular"]
                 json: false,
             },
             &mut Vec::new(),
+            &BTreeSet::new(),
         );
 
         assert!(target_dir.join("regular").is_symlink());

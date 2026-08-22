@@ -888,6 +888,16 @@ pub fn staged_differs(
 /// entry — stale, exactly like an in-store one. A link resolving into another
 /// store's directory (and not at one of ours) stays skipped, as before.
 ///
+/// `boundaries` (v0.14.1) lists the canonical target directories of every
+/// configured store. The walk never descends into one: directory exclusivity
+/// is the invariant that makes sweeps safe, and `sources` can otherwise break
+/// it — when an ancestor store and a nested store declare the *same* source
+/// file (the hub fan-in layout: a store owning `~/.config` plus stores owning
+/// `~/.config/kilo`, …), the ancestor's source-ownership check would classify
+/// the nested stores' healthy links as its own stale, repointed entries and
+/// delete them, fighting the nested stores' own apply every run. Subtrees
+/// that are another target's directory belong to that target's sweep alone.
+///
 /// The walk never descends into the repository itself. A file-mode store with
 /// `target = "~"` (the stow-mirror layout) walks all of `$HOME`; if the repo
 /// lives under `~`, descending into it would classify repo-internal
@@ -897,12 +907,14 @@ pub fn staged_differs(
 /// apply. The walk root is canonicalized so the prefix check against the
 /// canonical repo root stays exact when `target_path` has symlinked ancestors
 /// (e.g. a symlinked `$HOME`).
+#[allow(clippy::too_many_arguments)] // plumbing: sweep inputs are independent concerns
 pub fn reconcile_store_links(
     target_path: &Path,
     repo_root: &Path,
     store_dir: &Path,
     store_name: &str,
     declared_sources: &[PathBuf],
+    boundaries: &BTreeSet<PathBuf>,
     keep_link_rels: &BTreeSet<String>,
     dry_run: bool,
 ) -> Result<Vec<PathBuf>, String> {
@@ -942,12 +954,26 @@ pub fn reconcile_store_links(
     // the target itself is inside the repo, the whole walk is the target's
     // own subtree and must not be pruned.
     let target_in_repo = walk_root.starts_with(&repo_canon);
+    // Foreign target directories *beneath* this walk root are hard sweep
+    // boundaries: pruned before descending, so neither their stale check nor
+    // their keep-set comparison ever runs for another target's subtree.
+    // Ancestor targets (e.g. `~` for a `~/.config` target) are irrelevant
+    // here and filtered out so they cannot prune the entire walk.
+    let nested_targets: Vec<&PathBuf> = boundaries
+        .iter()
+        .filter(|b| **b != walk_root && b.starts_with(&walk_root))
+        .collect();
     let staging_dir = store_render_dir(repo_root, store_name);
     let mut stale = Vec::new();
     for entry in walkdir::WalkDir::new(&walk_root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| target_in_repo || !e.path().starts_with(&repo_canon))
+        .filter_entry(|e| {
+            if !target_in_repo && e.path().starts_with(&repo_canon) {
+                return false;
+            }
+            !nested_targets.iter().any(|t| e.path().starts_with(*t))
+        })
     {
         let entry = match entry {
             Ok(entry) => entry,
