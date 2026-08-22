@@ -724,3 +724,227 @@ files = ["f"]
         "hook-invoked adds must have persisted:\n{state}"
     );
 }
+
+/// `remove --dry-run --json` reports the links that would be removed without
+/// touching the filesystem and omits `behavior_orphaned`.
+#[test]
+fn remove_dry_run_json_previews_without_removing() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    repo.make_store("app", &["f"]);
+    repo.write_state("[stores.app]\ntarget = \"~\"\nfiles = [\"f\"]\n");
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_path)
+        .assert()
+        .success();
+
+    let link = home_path.join("f");
+    assert!(link.is_symlink());
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "app", "--dry-run"])
+        .env("HOME", home_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "remove --dry-run --json must succeed"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", true);
+
+    let data = &value["data"];
+    assert_eq!(data["store"], "app");
+    assert_eq!(data["target"], "~");
+    assert_eq!(data["dry_run"], true);
+    assert!(
+        data["behavior_orphaned"].is_null(),
+        "behavior_orphaned must be omitted on dry-run"
+    );
+    let staging = data["staging"].as_str().expect("staging string");
+    assert!(
+        staging.ends_with("/app"),
+        "staging must include store name: {staging}"
+    );
+
+    let links = data["links"].as_array().expect("links array");
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].as_str(), Some(link.to_str().unwrap()));
+
+    // Nothing was actually removed.
+    assert!(link.is_symlink());
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(state.contains("[stores.app]"));
+}
+
+/// A pre-remove hook that removes the generated state before `remove` runs
+/// must still clean up the stitch-owned links rather than leaving them as
+/// unmanaged orphans. The JSON response reports the cleaned-up links.
+#[test]
+fn remove_json_already_removed_by_pre_hook() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    repo.make_store("app", &["f"]);
+    repo.write_state("[stores.app]\ntarget = \"~\"\nfiles = [\"f\"]\n");
+    repo.cmd()
+        .arg("apply")
+        .env("HOME", home_path)
+        .assert()
+        .success();
+
+    let link = home_path.join("f");
+    assert!(link.is_symlink());
+
+    let hooks_dir = repo.path().join(".stitch").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let pre = hooks_dir.join("pre-remove");
+    fs::write(
+        &pre,
+        format!(
+            "#!/bin/sh\nrm -f \"{}\"\n",
+            repo.path().join(".stitch").join("state.toml").display()
+        ),
+    )
+    .unwrap();
+    make_executable(&pre);
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "app"])
+        .env("HOME", home_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "remove --json on already-removed store must succeed"
+    );
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", true);
+
+    let data = &value["data"];
+    assert_eq!(data["store"], "app");
+    assert_eq!(data["dry_run"], false);
+    assert!(
+        data["behavior_orphaned"].is_null(),
+        "behavior_orphaned must be omitted for an already-removed store"
+    );
+    // The link must be reported as cleaned up, not omitted.
+    let links = data["links"].as_array().expect("links array");
+    assert_eq!(links.len(), 1, "the stitch-owned link must be cleaned up");
+
+    // The pre-hook removed the state; the command cleaned up the link.
+    assert!(!repo.path().join(".stitch").join("state.toml").exists());
+    assert!(
+        !link.exists(),
+        "stitch-owned link must be removed, not left as an orphan"
+    );
+}
+
+/// `remove --json` for a template store must report that the generated state
+/// entry was dropped and that staged-render files were removed.
+#[test]
+fn remove_json_reports_state_entry_removed_and_removed_staging() {
+    let repo = Repo::new();
+    let store = repo.path().join("git");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("gitconfig.tmpl"), "user.name = {{ hostname }}\n").unwrap();
+    let target = repo.path().join("home").join(".config").join("git");
+    repo.write_state(&format!(
+        r#"
+[stores.git]
+target = "{}"
+files = ["gitconfig.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("git")
+        .join("gitconfig");
+    assert!(staged.is_file(), "staged render must exist before removal");
+
+    let output = repo
+        .cmd()
+        .args(["--json", "remove", "git"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "remove --json must succeed");
+    let value = json_output(&output);
+    assert_envelope_shape(&value, "remove", true);
+
+    let data = &value["data"];
+    assert_eq!(data["store"], "git");
+    assert_eq!(data["state_entry_removed"], true);
+
+    let removed_staging = data["removed_staging"]
+        .as_array()
+        .expect("removed_staging must be an array");
+    assert!(
+        !removed_staging.is_empty(),
+        "removed_staging must report the staged-render files"
+    );
+
+    // The generated state entry is gone, but the store directory remains.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state.contains("[stores.git]"),
+        "state entry must be removed:\n{state}"
+    );
+    assert!(store.is_dir(), "store directory must be left untouched");
+}
+
+/// Red line: `remove` must never rewrite the authored `stitch.toml`.
+/// It drops the generated state entry and removes links, but user comments and
+/// hand-formatting in the authored file survive byte-for-byte.
+#[test]
+fn remove_preserves_authored_stitch_toml_bytes() {
+    let repo = Repo::new();
+    let authored = r#"# Authored config for stitch.
+# This file is hand-edited and must never be rewritten by the tool.
+
+[stores.legacy]
+# A store I configured by hand.
+ignore = ["*.bak"]
+"#;
+    repo.write_authored(authored);
+    let before = fs::read_to_string(repo.path().join("stitch.toml")).unwrap();
+
+    // Define the same store in generated state and apply it.
+    repo.make_store("legacy", &["file"]);
+    repo.write_state("[stores.legacy]\ntarget = \"~/.myapp\"\n");
+
+    repo.cmd().arg("apply").assert().success();
+    let link = repo.path().join(".myapp");
+    assert!(link.is_symlink(), "store must be linked before remove");
+
+    repo.cmd()
+        .args(["remove", "legacy"])
+        .assert()
+        .success()
+        .stdout(contains("Removed store 'legacy'"));
+
+    // Generated state entry is gone; link is gone; store dir remains.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        !state.contains("[stores.legacy]"),
+        "state entry must be removed:\n{state}"
+    );
+    assert!(!link.exists(), "symlink must be removed");
+    assert!(
+        repo.path().join("legacy").is_dir(),
+        "store directory must remain"
+    );
+
+    // Authored config must be byte-for-byte identical.
+    let after = fs::read_to_string(repo.path().join("stitch.toml")).unwrap();
+    assert_eq!(before, after, "remove must not rewrite stitch.toml");
+}

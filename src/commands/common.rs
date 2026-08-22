@@ -148,6 +148,7 @@ fn resolve_override(path: &str, label: &str) -> Result<std::path::PathBuf, Stitc
 
 pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
     let mut classes = BTreeSet::new();
+    let mut hook_errors: Vec<(String, Option<String>)> = Vec::new(); // (store, hook_name)
     for store in &plan.stores {
         for op in &store.ops {
             match op {
@@ -158,9 +159,14 @@ pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
                         classes.insert(FailureClass::ConflictReal);
                     }
                 }
-                plan::PlanOp::Error { class, .. } => {
+                plan::PlanOp::Error {
+                    class, hook_name, ..
+                } => {
                     if let Some(c) = FailureClass::from_id(class) {
                         classes.insert(c);
+                        if c == FailureClass::Hook {
+                            hook_errors.push((store.store_name.clone(), hook_name.clone()));
+                        }
                     }
                 }
                 _ => {}
@@ -169,8 +175,84 @@ pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
     }
     let conflicts = plan.summary.conflicts;
     let errors = plan.summary.errors;
-    StitchError::apply(
-        classes.into_iter().collect(),
+    let classes_vec: Vec<FailureClass> = classes.into_iter().collect();
+
+    // When the only error class is Hook, populate structured details with
+    // the store and hook name from the plan ops.
+    let details = if classes_vec.as_slice() == [FailureClass::Hook] {
+        if let Some((store, hook_name)) = hook_errors.first() {
+            Some(
+                serde_json::to_string(&serde_json::json!({
+                    "hook": hook_name.as_deref().unwrap_or("unknown"),
+                    "store": store,
+                    "scope": "per-store",
+                }))
+                .expect("hook details are serializable"),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut error = StitchError::apply(
+        classes_vec,
         format!("{command} reported {conflicts} conflict(s), {errors} error(s)"),
-    )
+    );
+    // Populate details on the Apply variant directly.
+    if let StitchError::Apply { details: d, .. } = &mut error {
+        *d = details;
+    }
+    error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hook_error_plan(hook_name: Option<String>) -> plan::Plan {
+        plan::Plan::from_stores(vec![plan::PlanStore {
+            store_name: "s".into(),
+            ops: vec![plan::PlanOp::Error {
+                message: "hook failed: pre: exit 1".into(),
+                class: FailureClass::Hook.id().into(),
+                hook_name,
+            }],
+        }])
+    }
+
+    #[test]
+    fn plan_error_uses_structured_hook_name() {
+        let plan = hook_error_plan(Some("pre".into()));
+        let err = plan_error(&plan, "apply");
+        assert_eq!(err.class(), FailureClass::Hook);
+
+        let details = if let StitchError::Apply {
+            details: Some(d), ..
+        } = err
+        {
+            serde_json::from_str::<serde_json::Value>(&d).unwrap()
+        } else {
+            panic!("expected Apply error with details");
+        };
+        assert_eq!(details["hook"], "pre");
+        assert_eq!(details["store"], "s");
+        assert_eq!(details["scope"], "per-store");
+    }
+
+    #[test]
+    fn plan_error_falls_back_to_unknown_hook_name() {
+        let plan = hook_error_plan(None);
+        let err = plan_error(&plan, "apply");
+        let details = if let StitchError::Apply {
+            details: Some(d), ..
+        } = err
+        {
+            serde_json::from_str::<serde_json::Value>(&d).unwrap()
+        } else {
+            panic!("expected Apply error with details");
+        };
+        assert_eq!(details["hook"], "unknown");
+    }
 }

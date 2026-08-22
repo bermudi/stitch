@@ -112,6 +112,7 @@ pub fn split_legacy(legacy: &LegacyConfig) -> (AuthoredConfig, GeneratedState) {
                     target: lstore.target.clone(),
                     files: lstore.files.clone(),
                     patterns: lstore.patterns.clone(),
+                    sources: BTreeMap::new(),
                     targets: g_targets,
                 },
             );
@@ -155,6 +156,7 @@ fn split_legacy_targets(
                 target: lte.target.clone(),
                 files: lte.files.clone(),
                 patterns: lte.patterns.clone(),
+                sources: BTreeMap::new(),
             },
         );
 

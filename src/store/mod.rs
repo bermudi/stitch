@@ -17,8 +17,9 @@ pub(crate) use apply::{apply_added_plain_file, preflight_add_target, store_resol
 pub use doctor::{DoctorFinding, DoctorResult, Severity, doctor};
 
 pub(crate) use resolve::{
-    LinkTargets, check_link_path_collisions, collect_reconciliation_keeps,
-    collect_store_link_targets, resolve_link_source, resolve_target_names,
+    LinkTargets, check_link_name_collisions, check_link_path_collisions,
+    collect_reconciliation_keeps, collect_store_link_targets, resolve_link_source,
+    resolve_target_names,
 };
 
 pub use status::{StatusEntry, status_all};

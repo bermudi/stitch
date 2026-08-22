@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+## 0.13.0 — 2026-08-20
+
+### Added
+
+- `stitch explain` — show the fully-resolved, host-evaluated desired state
+  (the merged view of `stitch.toml` + `.stitch/state.toml` with `when` clauses
+  evaluated against the current host). Read-only. `--active-only` filters to
+  stores whose `when` matches this host. `--json` emits the same `ExplainData`
+  shape embedded in the composite `apply --json` envelope.
+- `stitch why <target>` — investigate a single target path in one call: what
+  store owns it, its source, link state, and owning config. Replaces the
+  `list` + `status` + `doctor` cross-reference an agent needed to investigate
+  a broken dotfile. Handles whole-dir containment (a path *inside* a whole-dir
+  store's target, reported with `matched_subpath`) and skipped-platform stores
+  (`skipped_platform: true` when the path is under a store whose `when` doesn't
+  match this host).
+- `stitch log` — show the audit log of mutating operations
+  (`.stitch/log.jsonl`). Append-only JSONL, one line per mutating op
+  (`apply`, `add`, `remove`, `migrate`, `import`, `prune --yes`), recording
+  command, timestamp, outcome, and exit class/code. `--limit N` reads the tail.
+  A log write failure is a warning, not a hard error — the log never blocks a
+  mutation. The log is visible and documented (not hidden state); `stitch log`
+  is the only reader.
+- `stitch schema` — emit the canonical agent JSON schema
+  (`docs/agent-schema.json`), embedded at compile time so the binary is
+  self-describing without a filesystem read. Describes the envelope, every
+  per-command `data` shape, the `error` shape, `recoverable_via` kinds, plan-op
+  shapes, and the exit-code table. `--json` wraps it in the standard envelope;
+  text mode pretty-prints the schema document. No repo required.
+- `stitch add <path> [path...]` — bulk add mode. Multiple positional paths each
+  get a simple store (default name derivation, no per-store flags). All paths
+  are validated first (dry-run), then applied; duplicate derived store names
+  are detected before any mutation. `--json` emits `BulkAddData` with per-path
+  results (`results[]`, `all_ok`).
+- `recoverable_via` — machine-readable recovery actions in the `--json` error
+  envelope, so an agent can branch without parsing the prose `hint`. Kinds:
+  `force-apply`, `adopt`, `edit-template`, `list`, `init`, `migrate`, `replan`,
+  `apply`, `manual`, `set-env`. Foreign-symlink conflicts are always `manual`
+  (red line: never auto-clobbered).
+- Composite `apply --json` — `apply --json` now returns `desired` (the
+  host-evaluated merge, same shape as `explain --json`), `plan` (the existing
+  `Plan` shape, unchanged), `result` (per-op execution outcome, `null` on
+  `--dry-run`), and `post_status` (`StatusRow[]` computed after execution).
+  `--only <store>` filters all four fields. `diff --json` and `plan --json`
+  are unchanged. `apply --plan --json` still emits `PlanExecReport`.
+- Audit log — every mutating operation (`apply`, `add`, `remove`, `migrate`,
+  `import`, `prune --yes`) appends to `.stitch/log.jsonl`. The log is
+  symlink-hardened: a symlinked `.stitch` or `log.jsonl` is refused, and the
+  final open uses `O_NOFOLLOW` so a same-UID swap-to-symlink between the
+  metadata check and the open gets `ELOOP`, not a redirected write.
+
+### Changed
+
+- `stitch status` states now include `foreign`, `store-error`, and
+  `config-error` (previously `linked`, `missing`, `conflict`, `broken`). The
+  JSON `StatusRow.resolves_to` field is populated for the new states. This
+  aligns `status` with the states `why` and the linker already report.
+
 ## 0.12.0 — 2026-08-14
 
 ### Fixed

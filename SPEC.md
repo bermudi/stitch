@@ -54,6 +54,7 @@ target = "~/.config/git"
 | `target` | `state.toml` | inventory — where to link |
 | `files` | `state.toml` | inventory — what to link |
 | `patterns` | `state.toml` | inventory — what to link |
+| `sources` | `state.toml` | inventory — what to link (fan-in: link name → repo-relative source) |
 
 Every `target` must be absolute after `~` expansion. `stitch add` accepts a
 relative command-line path but resolves it against the invocation directory
@@ -165,9 +166,137 @@ Capture an executable operation list for `apply --plan`. Plan capture is intenti
 
 Render a `.tmpl` to stdout. Read-only — no staging write, no link touch. `--json` emits `{source, link_name, sha256, content}`.
 
+### `stitch explain`
+
+Show the fully-resolved, host-evaluated desired state — the merged view of
+`stitch.toml` + `.stitch/state.toml` with `when` clauses evaluated against
+the current host. Read-only; no filesystem mutation.
+
+```json
+{
+  "platform": { "os": "linux", "arch": "x86_64", "distro": "arch", "hostname": "x", "shell": "zsh" },
+  "stores": [
+    {
+      "name": "git",
+      "active": true,
+      "mode": "file-mode",
+      "target": "/home/daniel/.config/git",
+      "entries": [
+        { "source": "gitconfig.tmpl", "templated": true, "link_name": "gitconfig" }
+      ],
+      "hooks": { "post": "git config --global core.editor nvim" },
+      "ignore": ["*.bak"]
+    }
+  ]
+}
+```
+
+- `active`: whether the store's `when` matches this host (the bit an agent
+  can't compute itself without replicating platform detection).
+- `entries`: per-file resolution (source name, `templated` flag, link name
+  with `.tmpl` stripped) — the resolved inventory, not raw `files`/`patterns`.
+  Omitted when empty (e.g. `whole-dir` stores, where one symlink covers the
+  whole directory, or multi-target stores whose entries live under `targets`).
+- `targets`: present for multi-target stores; each has its own `active`,
+  `when`, `target`, `mode`, `entries`, and `ignore`.
+- This is the `desired` object embedded in the composite `apply --json`
+  envelope (see [Composite apply --json](#composite-apply---json)).
+
+| Flag | Description |
+|---|---|
+| `--active-only` | Only show stores whose `when` matches this host |
+
+Text mode prints a human-readable summary (active/skipped stores, their
+targets, entry counts). `--json` emits the envelope.
+
+### `stitch schema`
+
+Emit the canonical agent JSON schema (`docs/agent-schema.json`), describing
+the envelope, every per-command `data` shape, the `error` shape including
+`recoverable_via` kinds, the plan-op shapes, and the exit-code table. The
+schema is embedded at compile time, so the binary is self-describing without
+a filesystem read.
+
+`--json` wraps the schema document in the standard envelope's `data` field.
+Text mode pretty-prints the schema document directly (still valid JSON, just
+readable). No repo is required — `schema` is a meta command.
+
+The schema is the canonical shape source; `SPEC.md` references it. A
+consistency test (`schema_consistency_every_cli_command_is_documented`)
+verifies that every CLI command with `--json` support has a matching entry
+in the schema.
+
+### `stitch why <target>`
+
+Investigate a single target path: what store owns it, its source, link
+state, and owning config. Merges config + filesystem for one path so an
+agent doesn't cross-reference `list` + `status` + `doctor` when
+investigating a broken dotfile. Read-only. When the query resolves inside
+the repo (a repo-relative source like `agents/AGENTS.md` or an absolute
+repo path), it is a reverse lookup: `consumers` lists every active entry
+drawing from that source (the fan-in query).
+
+```json
+{
+  "query": "/home/daniel/.bashrc",
+  "entry": {
+    "store": "shells",
+    "target": "/home/daniel/.bashrc",
+    "source": "/home/daniel/build/stitch/shells/.bashrc",
+    "templated": false,
+    "state": "linked",
+    "owning_config": "state.toml"
+  }
+}
+```
+
+- `entry`: the matched status entry, or absent (omitted) when no store owns the path.
+- `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`,
+  `store-error`, or `config-error` (same states as `status --json`).
+- `matched_subpath`: present only when the query was matched via ancestor
+  containment — i.e. the query lives *inside* a whole-dir store's target
+  directory rather than being a target itself. Gives the subpath relative to
+  the target (and equivalently relative to the store source dir), so an agent
+  can locate the backing repo file without a second lookup. Omitted for exact
+  target matches. If multiple whole-dir stores nest, the deepest owner wins.
+- `skipped_platform`: present and `true` when the query is under a store's
+  target but the store is skipped on this host (when mismatch). In that case
+  `entry` is absent (no active entry exists).
+- `owning_config`: always `state.toml` — the link inventory lives in the
+  generated half.
+- `consumers`: present only for a repo-relative source query (reverse lookup,
+  e.g. `why agents/AGENTS.md`). Lists every active store/target entry whose
+  link draws from that source — the fan-in visibility query. `entry` is absent
+  and `skipped_platform` is `false` in this mode. When the source has no
+  consumers, `consumers` is `[]` (present but empty), making it distinguishable
+  from an unowned target where `consumers` is absent. Repo-relative queries must
+  be safe fragments (no `..`, no leading `/`); traversal is rejected.
+
+### `stitch log`
+
+Show the audit log of mutating operations (`.stitch/log.jsonl`). Append-only
+JSONL: one line per mutating op (`apply`, `add`, `remove`, `migrate`,
+`import`, `prune --yes`), each recording the command, timestamp, outcome,
+and exit class/code. Lets an agent verify post-hoc what actually happened
+without re-running `diff`.
+
+| Flag | Description |
+|---|---|
+| `--limit N` | Only show the last N entries |
+
+`--json` emits `AuditEntry[]` in the envelope's `data`. Text mode prints one
+line per entry (`timestamp command store target outcome exit_code class`).
+
+The log is unbounded (Q3 decision: rotation is premature for a personal
+dotfile tool; `--limit` reads the tail). It respects the "no hidden state"
+red line: the log is a visible, documented JSONL file under `.stitch/`, and
+`stitch log` is the only reader. It is not a quarantine or retention
+mechanism. A log write failure is a warning, not a hard error — the log
+never blocks a mutation.
+
 ### `stitch status [name]`
 
-Show symlink state for one or all stores. States: `linked`, `missing`, `conflict`, `broken`.
+Show symlink state for one or all stores. States: `linked`, `missing`, `conflict`, `broken`, `foreign`, `store-error`, or `config-error`. For `sources` entries the text tree shows `link_name ← repo/path` (e.g. `AGENTS.md ← agents/AGENTS.md`) and `--json` carries `source_rel` with the repo-relative source.
 
 ### `stitch diff`
 
@@ -187,7 +316,7 @@ Platform-skipped stores do not count as drift.
 
 Print all configured stores and their targets.
 
-### `stitch add <path>`
+### `stitch add <path> [path...]`
 
 Add a path to stitch. If the path exists as a real file or directory, it is moved into the repo and symlinked back (adopt). If it doesn't exist, an empty store directory is created and linked to the path, unless `--file` requests a single empty file. Either way, the link inventory is recorded in `.stitch/state.toml` only — `stitch.toml` is untouched.
 
@@ -197,22 +326,38 @@ By default, a missing path creates a whole-directory store. Use `--file` when th
 
 Use `--to <store>` to adopt one existing regular, non-hard-linked file into an existing single-target file-mode store. The file must be below that store's configured target and outside the stitch repository; stitch moves it to the matching store-relative path, creates the return symlink, and appends that path to generated state. This initial workflow does not accept directories, symlinks, templates, whole-directory stores, or multi-target stores. Existing store entries are not reconciled. Both normal adoption and `--to` reject repository-contained sources, symlinked target ancestors, and unsafe destination parents before changing anything; `--dry-run` performs those checks without creating directories.
 
+Use `--source <repo-path>` to register a target path with an explicit repo-relative source (the fan-in flow: one file, many names/homes). Nothing is moved or copied; the target path must be absent or already a symlink into this repo (the adopt-a-link case). The source must be a safe repo-relative fragment, not under `.stitch/` or `.git/`, and not a symlink or through one (one hop only). Whole-directory stores cannot declare sources. The target's owning store is inferred from the longest matching target directory.
+
+**Bulk add:** Multiple positional paths trigger bulk mode — each path is added as a simple store (default name derivation, no per-store flags). Per-store flags (`--name`, `--files`, `--patterns`, `--file`, `--to`, `--source`) are rejected in bulk mode. All paths are validated first (dry-run), then applied. If any apply fails, prior successful adds are kept. `--json` emits `BulkAddData` with per-path results (`results[]`, `all_ok`).
+
 | Flag | Short | Description |
 |---|---|---|
-| `--name` | `-n` | Override derived store name |
-| `--files` | `-f` | Files to link individually (repeatable; create-empty only) |
-| `--patterns` | `-p` | Glob patterns (repeatable; create-empty only) |
-| `--file` | | Create a missing path as one empty file in a new store |
-| `--to` | | Adopt an existing file into an existing file-mode store |
+| `--name` | `-n` | Override derived store name (single-path only) |
+| `--files` | `-f` | Files to link individually (repeatable; create-empty only; single-path only) |
+| `--patterns` | `-p` | Glob patterns (repeatable; create-empty only; single-path only) |
+| `--file` | | Create a missing path as one empty file in a new store (single-path only) |
+| `--to` | | Adopt an existing file into an existing file-mode store (single-path only) |
+| `--source` | | Register target with explicit repo-relative source (single-path only; fan-in) |
 | `--dry-run` | | Preview |
 
 ### `stitch remove <name>`
 
 Remove store symlinks, the store's staged renders under `.stitch/render/<name>/`, and the store's `state.toml` entry. `stitch.toml` behavior is left in place (the tool never rewrites authored config) — `doctor` flags the orphaned behavior; remove it via `stitch edit`. Store directory left untouched, so re-`add`ing the same store requires renaming or `rm -rf`-ing the leftover directory first; `add` refuses to adopt into an existing store directory.
 
+When other stores' `sources` reference files inside this store's directory, `remove` refuses by default (listing the inbound references) to avoid destroying a source another store still needs. Pass `--force` to proceed: the store's links and state are removed, but the referenced source files are retained in place and reported as `retained_sources` in `--json`.
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Preview without removing |
+| `--force` | Proceed even when other stores reference files inside this store via `sources` |
+
 ### `stitch edit [entry]`
 
 Open `stitch.toml` in `$EDITOR`. With an argument, opens an entry's **repo source** instead — the `.tmpl` for a templated entry, the plain file otherwise — resolved via the merged config (works pre-apply, since it reads config rather than filesystem links). Never the staged render. The arg is a store name or a home-expanded target path.
+
+| Flag | Description |
+|---|---|
+| `--print-path` | Print the resolved repo source path to stdout instead of launching `$EDITOR`. Agent-friendly: the agent opens the file with its own tools. No `--json` support (the path is plain text on stdout). |
 
 ### `stitch doctor`
 
@@ -408,10 +553,10 @@ exact op list with preflight and fingerprint checks.
 ### Global `--json` flag
 
 `--json` is global. It is supported for `status`, `list`, `diff`, `apply`,
-`plan`, `doctor`, `prune`, and `render`. `add` and `remove` support it only with
-`--dry-run`; `migrate` supports it only with `--dry-run`; and `import` supports
-it for its report. It is not supported for `init` or `edit`, or for non-dry-run
-`add`, `remove`, and `migrate`; those combinations exit with code 2.
+`plan`, `doctor`, `prune`, `render`, `explain`, `schema`, `why`, and `log`.
+`add`, `remove`, and `migrate` support it for both dry-run previews and real
+mutations; `import` supports it for its report. It is not supported for
+`init` or `edit`; those combinations exit with code 2.
 
 ### JSON envelope
 
@@ -432,13 +577,55 @@ warnings and errors travel inside the envelope.
 
 - `schema` is always `1` for v0.7.x.
 - `data` and `error` are always present; the unused one is `null`.
-- `error`, when non-null, is `{class, code, message, hint, details}`. `hint`
-  and `details` are always present and `null` when unset.
+- `error`, when non-null, is `{class, code, message, hint, details,
+  recoverable_via}`. `hint` and `details` are always present and `null` when
+  unset. `recoverable_via` is always present and `[]` when the error is not
+  recoverable via a stitch command. For hook errors (`class: "hook"`),
+  `details` is a JSON string with `{"hook":"<name>","store":"<store>|null","scope":"global|per-store"}`
+  so an agent can identify which hook failed without parsing the message.
 - On partial failure (e.g. `apply` with conflicts, `doctor` with error findings)
   both `data` and `error` are populated and the process exits with the error's
   class code.
 - Warnings collected at load time are in `warnings[]`; nothing is written to
   stderr by the reporter.
+
+### `recoverable_via`
+
+Machine-readable recovery actions for an error, so an agent can branch
+without parsing the prose `hint`. Each entry is a concrete action:
+
+```json
+"recoverable_via": [
+  {"kind": "force-apply", "command": "apply", "flags": ["--force"]},
+  {"kind": "adopt", "command": "add", "args": ["/home/user/.gitconfig"]}
+]
+```
+
+| `kind` | Fields | Meaning |
+|---|---|---|
+| `force-apply` | `command`, `flags` | Run `apply --force` to back up and replace conflicts |
+| `adopt` | `command`, `args` | Run `add <path>` to move the conflicting file into the repo |
+| `edit-template` | `command`, `args` | Run `edit <source>` to open the template for fixing |
+| `list` | `command` | Run `list` to see valid stores |
+| `init` | `command` | Run `init` to create a new repo |
+| `migrate` | `command` | Run `migrate` to convert a v0.2 config |
+| `replan` | `command` | Run `plan` to capture a fresh plan |
+| `apply` | `command` | Run `apply` to reconcile drift |
+| `manual` | `reason` | No stitch command can fix this; escalate, don't retry |
+
+`manual` entries signal "this needs a human or a non-stitch action" — the
+agent should stop retrying stitch commands and escalate. Foreign symlinks
+(`conflict-foreign`) and hook failures (`hook`) are always `manual`; foreign
+symlinks are never auto-clobbered (red line).
+
+For `apply` with a single failure class, `recoverable_via` delegates to that
+class's generic recovery (without target-specific args — the agent should
+consult the plan's `conflict`/`error` ops in `data` for per-entry targets),
+with one exception: a single `render` class returns `manual` rather than
+`edit-template`, because the aggregate does not record which source path
+failed and `edit-template` requires one. The agent should read the failing
+source from the plan ops in `data` and open it directly. `apply` with multiple
+classes and `mixed` return `[]`; per-entry detail is in the plan ops.
 
 ### Per-command JSON shapes
 
@@ -454,8 +641,7 @@ warnings and errors travel inside the envelope.
     "templated": true,
     "staged_path": "/home/daniel/dots/.stitch/render/git/gitconfig",
     "state": "linked",
-    "skipped_platform": false,
-    "resolves_to": null
+    "skipped_platform": false
   }
 ]
 ```
@@ -466,17 +652,55 @@ warnings and errors travel inside the envelope.
 - `target`: absolute target path.
 - `source`: absolute source path (template source for templated files; store
   file otherwise).
+- `source_rel`: repo-relative source for `sources` entries (e.g. `agents/AGENTS.md`); omitted for in-store entries.
 - `templated`: `true` when the source ends in `.tmpl`.
 - `staged_path`: absolute staged render path for active templates; omitted
   otherwise.
-- `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`, or `error`.
+- `state`: `linked`, `missing`, `conflict`, `broken`, `foreign`, `store-error`, or `config-error`.
 - `skipped_platform`: `true` when the store's `when` clause does not match.
 - `resolves_to`: for `broken`, the absolute path the broken symlink resolves to;
-  `null` otherwise.
+  omitted otherwise.
 
-`add --dry-run --json`: an add preview with `store`, `target`, `mode`, optional
-`source`, `files`, and `patterns` fields. `mode` is `adopt`, `create`,
-`create-file`, or `add-to-store`.
+`add --json`: an add report with `store`, `target`, `mode`, optional `source`,
+`files`, and `patterns` fields. `mode` is `adopt`, `create`, `create-file`,
+`add-to-store`, or `add-source` (for `--source` fan-in). On a real mutation (no `--dry-run`), the report also includes
+`link_created` (the absolute path of the created symlink), `moved_from` (the
+original path for adopt modes; omitted for create modes), and `state_entry` (the
+`[stores.<name>]` slice written to `.stitch/state.toml`). On `--dry-run`, these
+real-mutation fields are omitted.
+
+`remove --json`: a remove report with `store`, optional `target`, `links`
+(removed link paths), `staging` (the staging dir removed), and `dry_run`. On
+a real mutation, `behavior_orphaned` is `true` — `stitch.toml` behavior is
+left in place (the tool never rewrites authored config); `doctor` will flag
+it. `removed_staging` lists staged-render files removed, and
+`state_entry_removed` is `true` when the `.stitch/state.toml` entry was removed.
+When `--force` retains inbound `sources`, `retained_sources` lists the repo-relative
+source files that were kept in place. On `--dry-run`, these real-mutation fields are omitted.
+
+`migrate --json`: a migrate report with `authored_path`, `authored`,
+`state_path`, and `state` (the written file contents). `stores_split` is the
+number of v0.2 stores that were split, and `comment_loss_note` is `true` when
+a comment-loss note is carried in `warnings[]`. On a real migration, the
+comment-lossy warning is carried in `warnings[]`. When there is nothing to
+migrate (already converted), the string fields are omitted, `stores_split` is
+`0`, and a note is in `warnings[]`.
+
+`explain --json`: the fully-resolved desired state — `platform` (os, arch,
+distro, hostname, shell) and `stores[]` (each with `name`, `active`, `when`,
+`mode`, `target`, `entries[]`, `targets[]`, `hooks`, `ignore`). See
+[`stitch explain`](#stitch-explain).
+
+`schema --json`: the canonical agent schema document (see
+[`stitch schema`](#stitch-schema)). The schema describes every per-command
+`data` shape, the `error` shape, `recoverable_via` kinds, plan-op shapes,
+and the exit-code table.
+
+`why --json`: single-path investigation — `query`, `entry` (or null),
+`skipped_platform`, and `consumers` (reverse lookup for repo-relative source queries). See [`stitch why`](#stitch-why-target).
+
+`log --json`: `AuditEntry[]` — the audit log of mutating operations. See
+[`stitch log`](#stitch-log).
 
 `list --json`: array of configured stores.
 
@@ -513,11 +737,56 @@ omitted when empty.
 }
 ```
 
-`severity` is `error`, `warning`, or `info`. `path` and `hint` are always
-present and `null` when unset.
+`severity` is `error`, `warning`, or `info`. `path` and `hint` are omitted when unset.
 
-`diff --json` / `apply --json`: the `Plan` shape consumed by both the text and
-JSON renderers.
+`diff --json`: the `Plan` shape consumed by both the text and JSON renderers.
+
+#### Composite `apply --json`
+
+`apply --json` (direct, not `--plan`) emits a composite envelope so an agent
+can compute, execute, and verify in one call. The `data` object is:
+
+```json
+{
+  "desired":     { ... same shape as `explain --json` ... },
+  "plan":        { ... the existing Plan shape, unchanged ... },
+  "result":      { ... per-op execution outcome, or null on --dry-run ... },
+  "post_status": [ ... StatusRow[] for all stores, computed after execution ... ]
+}
+```
+
+- `desired`: the host-evaluated merge (same struct as `explain --json`), so
+  the agent knows what the world should look like without a separate call.
+- `plan`: the existing `Plan` shape — byte-identical to the pre-composite
+  `apply --json` output. Consumers that read `data.plan` (or
+  `data.plan.summary`) keep working; consumers that treated `data` as the
+  `Plan` directly must read `data.plan` now.
+- `result`: per-op execution outcome. On `--dry-run`, `result` is `null`.
+  On real apply, it carries `ops_executed`, `ops_total`, `conflicts`,
+  `errors`, and a per-store breakdown (`stores[]` with `store`, `ok`,
+  `conflicts`, `errors`, `skipped`).
+- `post_status`: `StatusRow[]` (same shape as `status --json`) for all
+  stores, computed *after* execution. This is the verification the agent
+  would otherwise do via a second `status` call. On `--dry-run` it reflects
+  pre-apply state.
+
+When `--only <store>` is used, all four composite fields — `desired`, `plan`,
+`result`, and `post_status` — are filtered to the named store(s), not just
+`plan`.
+
+`diff --json` and `plan --json` are **unchanged** — they stay lean (desired
+state isn't executed, so the composite isn't needed). Only `apply --json`
+gets the composite, because only `apply` both computes and mutates.
+
+Exit codes are unchanged. Conflicts/errors still exit with their class code;
+the envelope carries `ok: false` plus the composite `data` (partial success
+is already represented by `plan` containing `conflict`/`error` ops).
+
+`apply --plan --json` is also unchanged — it emits the `PlanExecReport`
+shape, not the composite, because the desired state is already pinned in the
+plan file.
+
+#### `Plan` shape (`diff --json`, `apply --json` `plan` field)
 
 ```json
 {
@@ -638,7 +907,7 @@ and a platform/config fingerprint. Plan files are versioned and self-describing:
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "kind": "stitch/plan",
   "repo": "/home/daniel/dots",
   "config_sha256": "...",
@@ -663,10 +932,10 @@ and a platform/config fingerprint. Plan files are versioned and self-describing:
 - `ops` are tagged by `op` (snake_case):
   - `stage_render`: `{store, source_rel, staged, sha256}` — pins a template
     render by hash; no plaintext content is stored.
-  - `create_link`: `{target, source, requires}` — target must be absent.
-  - `replace_link`: `{target, source, requires}` — target must be a symlink
+  - `create_link`: `{store, target, source, requires}` — target must be absent.
+  - `replace_link`: `{store, target, source, requires}` — target must be a symlink
     pointing at the expected source or a real entry.
-  - `backup_and_link`: `{target, backup, source, requires}` — target must be a
+  - `backup_and_link`: `{store, target, backup, source, requires}` — target must be a
     real entry and the backup path must be absent.
   - `remove_link`: `{store, target, source, requires}` — target must be a
     repo-owned symlink. `store` identifies the originating store (including
@@ -695,8 +964,8 @@ Semantics:
   `{target}.bak`; and `.stitch/render/` gitignore is checked before staging
   writes. "Untrusted" means edited JSON remains confined to current desired
   operations; it does not mean the original capture scope is authenticated.
-- **Stale-plan detection.** `apply --plan` accepts only plan schema `2`
-  (schema `1` is stale and must be replanned), and refuses if `kind`,
+- **Stale-plan detection.** `apply --plan` accepts only plan schema `3`
+  (schema `2` and below are stale and must be replanned), and refuses if `kind`,
   `config_sha256`, or `platform` do not match, or if any `stage_render` hash
   does not match a fresh in-memory render. All of these exit 12.
 - **Preflight and per-op re-check.** Before any mutation, every op's

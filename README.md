@@ -155,7 +155,18 @@ target = "~/.config/git"
 | `stitch import` | Found old hand-made links pointing into your repo? Register them. |
 | `stitch plan` | Save exactly what `apply` would do to a file, so you can review and run `apply --plan <file>` later. |
 
-`apply`, `add`, and `remove` support `--dry-run` (just pretend); `diff` is always a preview. `apply` and `diff` take `--only <name>` to act on one store, and `apply` takes `--force` to back up a real file to `*.bak` before replacing it. Add `--json` to read/plan commands, or to supported dry-run/reporting commands such as `add --dry-run`, for machine-readable output.
+**For agents & scripts:**
+
+| Command | What it does |
+|---|---|
+| `stitch explain` | Show the resolved desired state for this host — every store, target, and entry with `when` clauses evaluated. One call instead of parsing `stitch.toml` + `state.toml` yourself. `--active-only` filters to stores that apply here. |
+| `stitch why <target>` | Investigate one path: what store owns it, its source, link state, and owning config. One call instead of cross-referencing `list` + `status` + `doctor`. Handles paths *inside* a whole-dir store (`matched_subpath`) and skipped-platform stores. |
+| `stitch log` | Show the audit log of mutating operations (`.stitch/log.jsonl`). `--limit N` reads the tail. Verify what actually happened without re-running `diff`. |
+| `stitch schema` | Emit the canonical JSON schema for the `--json` interface — every command's `data` shape, the `error` shape, `recoverable_via` kinds, and exit codes. Self-describing; no repo required. |
+
+`apply`, `add`, and `remove` support `--dry-run` (just pretend); `diff` is always a preview. `apply` and `diff` take `--only <name>` to act on one store, and `apply` takes `--force` to back up a real file to `*.bak` before replacing it. `add` takes multiple paths at once for bulk mode (simple stores only, no per-path flags).
+
+Add `--json` to any read/plan command, or to supported dry-run/reporting commands such as `add --dry-run`, for machine-readable output. Every `--json` response is one envelope: `{schema, command, ok, warnings, data, error}`. On error, `error.recoverable_via` lists machine-readable next steps (`force-apply`, `adopt`, `edit-template`, `manual`, …) so a script can branch without parsing prose. `apply --json` returns a composite envelope — `desired` (what the world should look like), `plan` (what it'll do), `result` (per-op outcome), and `post_status` (verification after execution) — so a single call is the full agent loop. Run `stitch schema --json` for the canonical shape of every command.
 
 > Want the full details? See **[SPEC.md](SPEC.md)** — every flag, edge case, and design choice is there.
 

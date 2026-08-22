@@ -15,7 +15,10 @@ pub(crate) fn cmd_prune(
     json: bool,
 ) -> Result<(), StitchError> {
     if json {
-        return report::run_json("prune", || {
+        // --dry-run is non-mutating even with --yes: exclude it from audit
+        // logging so dry runs don't produce audit entries.
+        let audit_root = if yes && !dry_run { Some(root) } else { None };
+        return report::run_json("prune", audit_root, || {
             let loaded =
                 Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             let warnings = loaded.warnings;
@@ -77,6 +80,7 @@ pub(crate) fn cmd_prune(
             if failed > 0 {
                 let error =
                     StitchError::internal(format!("prune could not remove {failed} link(s)"));
+                crate::audit::append_command_result(root, "prune", Err(&error));
                 report::write_data_error("prune", data, &error, warnings);
             }
             Ok((data, warnings))

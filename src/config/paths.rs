@@ -154,6 +154,47 @@ pub(crate) fn canonical_home() -> Result<PathBuf, ConfigError> {
     normalized_target_path("~")
 }
 
+/// Parent-canonicalized form of a target path for collision checks. The
+/// parent chain is resolved through symlinks (handling a symlinked `$HOME`)
+/// while the final entry name is preserved, so a whole-directory symlink
+/// at the target is not followed to its store directory. Falls back to
+/// lexical normalization when the parent cannot be resolved.
+pub(crate) fn canonical_target_for_comparison(path: &Path) -> PathBuf {
+    // Fast path: if the path is exactly $HOME, canonicalize the whole path
+    // so `~` and `/realhome/user` compare equal when $HOME is symlinked.
+    if let Ok(home) = expand_home("~")
+        && path == home
+        && let Some(r) = crate::linker::resolve_path_with_missing(path)
+    {
+        return r;
+    }
+    if let Some(r) = crate::linker::resolve_ancestors_with_missing(path) {
+        return r;
+    }
+    if let Some(r) = crate::linker::resolve_path_with_missing(path) {
+        return r;
+    }
+    // Lexical fallback — same normalization as `normalized_target_path`'s else branch.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 pub(crate) fn normalized_target_path(target: &str) -> Result<PathBuf, ConfigError> {
     let expanded = expand_home(target)?;
     if let Some(resolved) = crate::linker::resolve_path_with_missing(&expanded) {

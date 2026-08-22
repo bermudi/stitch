@@ -136,6 +136,10 @@ pub enum PlanOp {
     Error {
         message: String,
         class: String,
+        /// Hook name when the error is a hook failure; `None` otherwise.
+        /// Populated by `error_op` from `StitchError::Hook` so `plan_error`
+        /// doesn't parse the message prose.
+        hook_name: Option<String>,
     },
 }
 
@@ -206,9 +210,14 @@ pub fn path_to_string(path: &Path) -> String {
 /// Build an `Error` op from a typed `StitchError`, preserving its class id.
 #[allow(dead_code)]
 pub fn error_op(error: &crate::error::StitchError) -> PlanOp {
+    let hook_name = match error {
+        crate::error::StitchError::Hook { name, .. } => Some(name.clone()),
+        _ => None,
+    };
     PlanOp::Error {
         message: error.to_string(),
         class: error.class().id().to_string(),
+        hook_name,
     }
 }
 
@@ -218,6 +227,7 @@ pub fn error_op_class(class: FailureClass, message: impl Into<String>) -> PlanOp
     PlanOp::Error {
         message: message.into(),
         class: class.id().to_string(),
+        hook_name: None,
     }
 }
 
@@ -295,6 +305,7 @@ mod tests {
                     PlanOp::Error {
                         message: "oops".into(),
                         class: "internal".into(),
+                        hook_name: None,
                     },
                     PlanOp::SkippedPlatform,
                     PlanOp::StageRender {
@@ -431,7 +442,8 @@ mod tests {
         assert_eq!(
             PlanOp::Error {
                 message: "m".into(),
-                class: "internal".into()
+                class: "internal".into(),
+                hook_name: None,
             }
             .target(),
             None
@@ -501,7 +513,7 @@ mod tests {
         let err = StitchError::internal("boom");
         let op = error_op(&err);
         match op {
-            PlanOp::Error { message, class } => {
+            PlanOp::Error { message, class, .. } => {
                 assert!(message.contains("boom"));
                 assert_eq!(class, "internal");
             }
@@ -513,9 +525,27 @@ mod tests {
     fn error_op_class_uses_given_class() {
         let op = error_op_class(FailureClass::ConflictReal, "msg");
         match op {
-            PlanOp::Error { message, class } => {
+            PlanOp::Error { message, class, .. } => {
                 assert_eq!(message, "msg");
                 assert_eq!(class, "conflict-real");
+            }
+            _ => panic!("expected Error op"),
+        }
+    }
+
+    #[test]
+    fn error_op_hook_sets_hook_name() {
+        let err = StitchError::hook_store("pre", "exit 1", "dotfiles");
+        let op = error_op(&err);
+        match op {
+            PlanOp::Error {
+                message,
+                class,
+                hook_name,
+            } => {
+                assert!(message.contains("pre"));
+                assert_eq!(class, "hook");
+                assert_eq!(hook_name.as_deref(), Some("pre"));
             }
             _ => panic!("expected Error op"),
         }
@@ -537,6 +567,7 @@ mod tests {
             PlanOp::Error {
                 message: "m".into(),
                 class: "internal".into(),
+                hook_name: None,
             },
         ];
         let variants = ["create_link", "conflict", "skipped_platform", "error"];
@@ -684,8 +715,9 @@ mod tests {
                 PlanOp::Error {
                     message: "m".into(),
                     class: "internal".into(),
+                    hook_name: None,
                 },
-                vec!["action", "class", "message"],
+                vec!["action", "class", "hook_name", "message"],
             ),
         ];
         for (op, expected_keys) in ops {

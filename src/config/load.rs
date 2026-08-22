@@ -14,7 +14,10 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 use super::error::ConfigError;
-use super::paths::{expand_home, is_safe_fragment, normalized_target_path, validate_store_names};
+use super::paths::{
+    canonical_target_for_comparison, expand_home, is_safe_fragment, normalized_target_path,
+    validate_store_names,
+};
 use super::state::{
     atomic_write, validate_authored_file, validate_state_file, validate_stitch_dir,
 };
@@ -118,6 +121,8 @@ impl ConfigSnapshot {
         warnings.extend(merge_warnings);
         config.validate()?;
         config.normalize();
+        validate_staging_collisions(&config.stores, repo_root)?;
+        validate_source_components(repo_root, &config)?;
 
         let hash = hash_config_bytes(authored_bytes.as_deref(), state_bytes.as_deref());
 
@@ -376,6 +381,8 @@ impl Config {
         warnings.extend(merge_warnings);
         config.validate()?;
         config.normalize();
+        validate_staging_collisions(&config.stores, repo_root)?;
+        validate_source_components(repo_root, &config)?;
 
         Ok(Loaded {
             authored,
@@ -394,7 +401,10 @@ impl Config {
             // Mixed modes: store with top-level target/files plus named targets
             // must error — otherwise top-level inventory silently disappears.
             if !store.targets.is_empty()
-                && (store.target.is_some() || !store.files.is_empty() || !store.patterns.is_empty())
+                && (store.target.is_some()
+                    || !store.files.is_empty()
+                    || !store.patterns.is_empty()
+                    || !store.sources.is_empty())
             {
                 return Err(ConfigError::InvalidPath(format!(
                     "invalid store '{name}' in merged config: cannot mix top-level target/files with named targets"
@@ -404,6 +414,7 @@ impl Config {
                 name,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.target,
                 !store.targets.is_empty(),
                 "merged config",
@@ -412,22 +423,17 @@ impl Config {
                 validate_target(target, &format!("store '{name}'"))?;
             }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            validate_sources(&store.sources, &store.files, &format!("store '{name}'"))?;
             validate_globs(&store.patterns, &store.ignore, &format!("store '{name}'"))?;
             for te in store.targets.values() {
                 validate_target(
                     &te.target,
                     &format!("store '{name}' (target '{}')", te.target),
                 )?;
-                validate_fragments(
-                    &te.files,
-                    &te.patterns,
-                    &format!("store '{name}' (target '{}')", te.target),
-                )?;
-                validate_globs(
-                    &te.patterns,
-                    &te.ignore,
-                    &format!("store '{name}' (target '{}')", te.target),
-                )?;
+                let context = format!("store '{name}' (target '{}')", te.target);
+                validate_fragments(&te.files, &te.patterns, &context)?;
+                validate_sources(&te.sources, &te.files, &context)?;
+                validate_globs(&te.patterns, &te.ignore, &context)?;
             }
         }
         validate_non_overlapping_targets(&self.stores)?;
@@ -441,9 +447,11 @@ impl Config {
         for store in self.stores.values_mut() {
             normalize_fragment_lists(&mut store.files, &mut store.patterns);
             normalize_ignores(&mut store.ignore);
+            normalize_sources(&mut store.sources);
             for target in store.targets.values_mut() {
                 normalize_fragment_lists(&mut target.files, &mut target.patterns);
                 normalize_ignores(&mut target.ignore);
+                normalize_sources(&mut target.sources);
             }
         }
     }
@@ -451,6 +459,7 @@ impl Config {
 
 /// Validate authored and generated halves exactly as a subsequent load will.
 /// Migration uses this before either output file is written.
+#[allow(dead_code)]
 pub fn validate_merged(
     authored: &AuthoredConfig,
     generated: &GeneratedState,
@@ -459,6 +468,26 @@ pub fn validate_merged(
     generated.validate()?;
     let (config, _) = merge(authored, generated);
     config.validate()
+}
+
+/// Validate merged halves as `load` will, including normalization and staging
+/// collision checks. `repo_root` is required to resolve patterns for the
+/// collision check, matching `Config::load` / `ConfigSnapshot::load`.
+pub fn validate_merged_with_repo(
+    authored: &AuthoredConfig,
+    generated: &GeneratedState,
+    repo_root: &Path,
+) -> Result<(), ConfigError> {
+    authored.validate()?;
+    generated.validate()?;
+    let (mut config, _) = merge(authored, generated);
+    config.validate()?;
+    config.normalize();
+    validate_staging_collisions(&config.stores, repo_root)?;
+    // Source components are filesystem-checked; callers that already
+    // validated sources lexically may skip, but we include for completeness.
+    validate_source_components(repo_root, &config)?;
+    Ok(())
 }
 
 impl AuthoredConfig {
@@ -517,7 +546,10 @@ impl GeneratedState {
         validate_store_names(self.stores.keys(), "generated state")?;
         for (name, store) in &self.stores {
             if !store.targets.is_empty()
-                && (store.target.is_some() || !store.files.is_empty() || !store.patterns.is_empty())
+                && (store.target.is_some()
+                    || !store.files.is_empty()
+                    || !store.patterns.is_empty()
+                    || !store.sources.is_empty())
             {
                 return Err(ConfigError::InvalidPath(format!(
                     "invalid store '{name}' in generated state: cannot mix top-level target/files with named targets"
@@ -527,6 +559,7 @@ impl GeneratedState {
                 name,
                 &store.files,
                 &store.patterns,
+                &store.sources,
                 &store.target,
                 !store.targets.is_empty(),
                 "generated state",
@@ -535,6 +568,7 @@ impl GeneratedState {
                 validate_target(target, &format!("store '{name}'"))?;
             }
             validate_fragments(&store.files, &store.patterns, &format!("store '{name}'"))?;
+            validate_sources(&store.sources, &store.files, &format!("store '{name}'"))?;
             validate_globs(&store.patterns, &[], &format!("store '{name}'"))?;
             for target in store.targets.values() {
                 validate_target(
@@ -543,6 +577,7 @@ impl GeneratedState {
                 )?;
                 let context = format!("store '{name}' (target '{}')", target.target);
                 validate_fragments(&target.files, &target.patterns, &context)?;
+                validate_sources(&target.sources, &target.files, &context)?;
                 validate_globs(&target.patterns, &[], &context)?;
             }
         }
@@ -585,10 +620,12 @@ fn merge_store(
     g: Option<&GeneratedStore>,
 ) -> (Store, Vec<String>) {
     let mut warnings = Vec::new();
+    let store_ignore: &[String] = a.map(|a| a.ignore.as_slice()).unwrap_or(&[]);
     let targets = merge_targets(
         name,
         a.map(|a| &a.targets),
         g.map(|g| &g.targets),
+        store_ignore,
         &mut warnings,
     );
 
@@ -596,6 +633,7 @@ fn merge_store(
         target: g.and_then(|g| g.target.clone()),
         files: g.map(|g| g.files.clone()).unwrap_or_default(),
         patterns: g.map(|g| g.patterns.clone()).unwrap_or_default(),
+        sources: g.map(|g| g.sources.clone()).unwrap_or_default(),
         ignore: a.map(|a| a.ignore.clone()).unwrap_or_default(),
         when: a.map(|a| a.when.clone()).unwrap_or_default(),
         hooks: a.map(|a| a.hooks.clone()).unwrap_or_default(),
@@ -609,10 +647,20 @@ fn merge_store(
 /// declared, no inventory) is load-OK but contributes no link — it is skipped
 /// and a warning is appended so `doctor` can surface it. A generated-only
 /// target is legal with default behavior.
+///
+/// For multi-target stores, a top-level `ignore` in `stitch.toml` is the
+/// single-target legacy location. When a single-target store is promoted to
+/// multi-target (import's fan-in), the original top-level `ignore` would be
+/// left behind and previously ignored files would become exposed at the
+/// original target. To preserve behavior without rewriting the authored file,
+/// a generated-only target inherits the store-level `ignore` as its default.
+/// Authored targets keep their own `ignore` unchanged — store-level is only
+/// a fallback for targets that have no authored entry.
 fn merge_targets(
     store_name: &str,
     authored: Option<&BTreeMap<String, AuthoredTarget>>,
     generated: Option<&BTreeMap<String, GeneratedTarget>>,
+    store_ignore: &[String],
     warnings: &mut Vec<String>,
 ) -> BTreeMap<String, TargetEntry> {
     let mut result = BTreeMap::new();
@@ -624,13 +672,22 @@ fn merge_targets(
         let at = a.get(&tname);
         match g.get(&tname) {
             Some(gt) => {
+                // Inherit store-level ignore only for generated-only targets so
+                // a promoted single-target store keeps its ignore behavior
+                // without requiring `stitch.toml` to be rewritten.
+                // Authored targets keep their own ignore unchanged.
+                let ignore = match at {
+                    Some(at) => at.ignore.clone(),
+                    None => store_ignore.to_vec(),
+                };
                 result.insert(
                     tname.clone(),
                     TargetEntry {
                         target: gt.target.clone(),
                         files: gt.files.clone(),
                         patterns: gt.patterns.clone(),
-                        ignore: at.map(|a| a.ignore.clone()).unwrap_or_default(),
+                        sources: gt.sources.clone(),
+                        ignore,
                         when: at.map(|a| a.when.clone()).unwrap_or_default(),
                     },
                 );
@@ -686,6 +743,19 @@ fn normalize_ignores(ignore: &mut [String]) {
     }
 }
 
+/// Normalize `sources` keys and values in the merged, in-memory view. Keys
+/// are target-relative names; values are repo-relative source paths (a
+/// trailing `.tmpl` on a value is a template source, so no separator
+/// handling is involved).
+fn normalize_sources(sources: &mut BTreeMap<String, String>) {
+    let normalized: BTreeMap<String, String> = sources
+        .iter()
+        .filter(|(k, v)| is_safe_fragment(k) && is_safe_fragment(v))
+        .map(|(k, v)| (normalize_fragment(k, false), normalize_fragment(v, false)))
+        .collect();
+    *sources = normalized;
+}
+
 pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
     let expanded = expand_home(target)?;
     if !expanded.is_absolute() {
@@ -739,38 +809,128 @@ pub fn validate_target(target: &str, context: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_non_overlapping_targets(stores: &BTreeMap<String, Store>) -> Result<(), ConfigError> {
-    let mut targets: Vec<(String, String, PathBuf, WhenClause)> = Vec::new();
+    let mut targets: Vec<(String, String, PathBuf, PathBuf, WhenClause)> = Vec::new();
     for (store_name, store) in stores {
         if store.is_multi_target() {
             for (target_name, target) in &store.targets {
+                let expanded = expand_home(&target.target)?;
+                let canonical = canonical_target_for_comparison(&expanded);
                 targets.push((
                     store_name.clone(),
                     format!("store '{store_name}' target '{target_name}'"),
-                    normalized_target_path(&target.target)?,
+                    expanded,
+                    canonical,
                     target.when.clone(),
                 ));
             }
         } else if let Some(target) = &store.target {
+            let expanded = expand_home(target)?;
+            let canonical = canonical_target_for_comparison(&expanded);
             targets.push((
                 store_name.clone(),
                 format!("store '{store_name}'"),
-                normalized_target_path(target)?,
+                expanded,
+                canonical,
                 store.when.clone(),
             ));
         }
     }
 
-    for (index, (left_store, left_name, left, left_when)) in targets.iter().enumerate() {
-        for (right_store, right_name, right, right_when) in targets.iter().skip(index + 1) {
+    for (index, (left_store, left_name, left, left_canon, left_when)) in targets.iter().enumerate()
+    {
+        for (right_store, right_name, _right, right_canon, right_when) in
+            targets.iter().skip(index + 1)
+        {
+            // Use canonical forms so `~/out` and `/realhome/out` are
+            // recognised as the same physical location when `$HOME` is
+            // symlinked. Only nested (one starts with the other) is
+            // considered overlapping; equal directories are allowed for
+            // file-mode sharing and are handled at the link-path level.
+            // This mirrors the original check which only rejected same-store
+            // nesting (cross-store nesting is handled by link-path collisions).
             if left_store == right_store
                 && WhenClause::are_compatible(&[left_when, right_when])
-                && left != right
-                && (left.starts_with(right) || right.starts_with(left))
+                && left_canon != right_canon
+                && (left_canon.starts_with(right_canon) || right_canon.starts_with(left_canon))
             {
                 return Err(ConfigError::InvalidPath(format!(
                     "overlapping target paths are unsafe: {left_name} targets '{}' while {right_name} targets '{}'",
                     left.display(),
-                    right.display()
+                    _right.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_staging_collisions(
+    stores: &BTreeMap<String, Store>,
+    repo_root: &Path,
+) -> Result<(), ConfigError> {
+    use crate::platform::Platform;
+    use crate::store::resolve_target_names;
+    use std::collections::BTreeSet;
+    let platform = Platform::detect();
+    for (store_name, store) in stores {
+        if !store.is_multi_target() {
+            continue;
+        }
+        // Only active targets can collide on this host.
+        let active_targets: Vec<_> = store
+            .targets
+            .iter()
+            .filter(|(_, te)| platform.matches_when(&te.when) && platform.matches_when(&store.when))
+            .collect();
+        if active_targets.len() < 2 {
+            continue;
+        }
+        let store_dir = repo_root.join(store_name);
+        // For staging collisions, only templated links matter. Two active
+        // targets using the *same* template source and link name safely share
+        // one staged file; only incompatible template sources collide.
+        let mut template_sources_by_link: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut owners_by_link: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (tname, te) in &active_targets {
+            let links = resolve_target_names(
+                repo_root,
+                &store_dir,
+                &te.files,
+                &te.patterns,
+                &te.sources,
+                &te.ignore,
+            );
+            if let crate::store::LinkTargets::Files(links) = links {
+                // Deduplicate within this target so a single target's internal
+                // duplicate (e.g. gitconfig + gitconfig.tmpl) does not look like
+                // a cross-target collision.
+                let mut seen_in_target: BTreeSet<String> = BTreeSet::new();
+                for link in links {
+                    if !seen_in_target.insert(link.name.clone()) {
+                        continue;
+                    }
+                    if link.is_template() {
+                        template_sources_by_link
+                            .entry(link.name.clone())
+                            .or_default()
+                            .insert(link.source.display().to_string());
+                        owners_by_link
+                            .entry(link.name.clone())
+                            .or_default()
+                            .insert(tname.to_string());
+                    }
+                }
+            }
+        }
+        for (link_name, sources) in template_sources_by_link {
+            if sources.len() > 1 {
+                let owners = owners_by_link.remove(&link_name).unwrap_or_default();
+                let owners_vec: Vec<String> = owners.into_iter().collect();
+                return Err(ConfigError::InvalidPath(format!(
+                    "store '{store_name}': template link '{link_name}' claimed by multiple active targets ({}): staging would collide at .stitch/render/{}/{} — rename one",
+                    owners_vec.join(", "),
+                    store_name,
+                    link_name
                 )));
             }
         }
@@ -827,20 +987,187 @@ pub fn validate_globs(
     Ok(())
 }
 
-/// Reject a store that declares `files`/`patterns` but has no target to
-/// link them into. Whole-directory stores and authored-only behavior are
-/// still allowed to have no target, but file/pattern mode requires one.
+/// Validate `sources` entries (v0.14): keys are safe target-relative
+/// fragments, values are safe repo-relative fragments that do not live under
+/// `.stitch/`, and a key must not also appear in `files` — the two would
+/// disagree about which source wins.
+///
+/// The lexical-only checks live here so they fire for every load path
+/// (authored preview, `migrate`, `add`'s candidate validation). The
+/// filesystem check (no symlinked component) is
+/// [`validate_source_components`], which needs the repo root.
+pub fn validate_sources(
+    sources: &BTreeMap<String, String>,
+    files: &[String],
+    context: &str,
+) -> Result<(), ConfigError> {
+    // Track normalized keys to detect silent collapse (e.g. "a//b" and "a/b").
+    let mut seen_normalized: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in sources {
+        if !is_safe_fragment(key) {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid sources key '{key}' in {context}: keys must be relative to the target and contain no '.', '..' or leading '/'"
+            )));
+        }
+        if !is_safe_fragment(value) {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid source '{value}' for '{key}' in {context}: sources must be repo-relative paths with no '.', '..' or leading '/'"
+            )));
+        }
+        let normalized_value = normalize_fragment(value, false);
+        if normalized_value == ".stitch"
+            || normalized_value.starts_with(".stitch/")
+            || normalized_value == ".git"
+            || normalized_value.starts_with(".git/")
+        {
+            return Err(ConfigError::InvalidPath(format!(
+                "invalid source '{value}' for '{key}' in {context}: sources must not live under .stitch/ or .git/"
+            )));
+        }
+        let normalized_key = normalize_fragment(key, false);
+        if let Some(prev) = seen_normalized.get(&normalized_key)
+            && prev != key
+        {
+            return Err(ConfigError::InvalidPath(format!(
+                "sources key '{key}' in {context} collides with '{prev}' after normalization (both become '{normalized_key}')"
+            )));
+        }
+        seen_normalized.insert(normalized_key, key.clone());
+        // Compare normalized files as well to catch "a" vs "./a" style collisions.
+        let normalized_files: BTreeSet<String> =
+            files.iter().map(|f| normalize_fragment(f, false)).collect();
+        if normalized_files.contains(&normalize_fragment(key, false)) {
+            return Err(ConfigError::InvalidPath(format!(
+                "sources key '{key}' in {context} is also listed in files; remove one — the two disagree about the source"
+            )));
+        }
+    }
+    // Reject ancestor/descendant conflicts: `foo` and `foo/bar` would require
+    // a file and a directory at the same path. Check sources vs sources and
+    // sources vs files.
+    let normalized_keys: Vec<String> = seen_normalized.keys().cloned().collect();
+    for i in 0..normalized_keys.len() {
+        for j in (i + 1)..normalized_keys.len() {
+            let a = &normalized_keys[i];
+            let b = &normalized_keys[j];
+            if b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/")) {
+                let orig_a = &seen_normalized[a];
+                let orig_b = &seen_normalized[b];
+                return Err(ConfigError::InvalidPath(format!(
+                    "sources keys '{orig_a}' and '{orig_b}' in {context} conflict: one is ancestor of the other — rename one"
+                )));
+            }
+        }
+    }
+    let normalized_files_vec: Vec<String> =
+        files.iter().map(|f| normalize_fragment(f, false)).collect();
+    for key_norm in &normalized_keys {
+        for file_norm in &normalized_files_vec {
+            if key_norm.starts_with(&format!("{file_norm}/"))
+                || file_norm.starts_with(&format!("{key_norm}/"))
+            {
+                let orig_key = &seen_normalized[key_norm];
+                // Find original file entry that normalizes to file_norm
+                let orig_file = files
+                    .iter()
+                    .find(|f| normalize_fragment(f, false) == *file_norm)
+                    .map(|s| s.as_str())
+                    .unwrap_or(file_norm);
+                return Err(ConfigError::InvalidPath(format!(
+                    "sources key '{orig_key}' in {context} conflicts with file '{orig_file}': one is ancestor of the other — rename one"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the filesystem shape of every declared source (v0.14): no
+/// component from the repo root down to the source may be a symlink.
+///
+/// The feature exists to delete repo-internal indirection, so a source that
+/// *is* a symlink (or is reached through one) is a load error — one hop only.
+/// Chained sources would rebuild the alias-symlink workaround in state form,
+/// with worse debugging. A missing source is fine here: `SourceMissing`
+/// fires at apply time with the repo-relative path in the error.
+pub fn validate_source_components(repo_root: &Path, config: &Config) -> Result<(), ConfigError> {
+    for (name, store) in &config.stores {
+        let store_ctx = format!("store '{name}'");
+        if !store.targets.is_empty() {
+            for (tname, target) in &store.targets {
+                let ctx = format!("{store_ctx} (target '{tname}')");
+                for (key, value) in &target.sources {
+                    validate_one_source_component(repo_root, value, key, &ctx)?;
+                }
+            }
+        } else {
+            for (key, value) in &store.sources {
+                validate_one_source_component(repo_root, value, key, &store_ctx)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_one_source_component(
+    repo_root: &Path,
+    value: &str,
+    key: &str,
+    context: &str,
+) -> Result<(), ConfigError> {
+    let mut current = repo_root.to_path_buf();
+    for component in Path::new(value).components() {
+        // `validate_sources` already rejected every non-normal component.
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ConfigError::InvalidPath(format!(
+                    "invalid source '{value}' for '{key}' in {context}: a source must be a real \
+                     repo file, not a symlink or a path through one (one hop only)"
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(ConfigError::Read(e, current));
+            }
+        }
+    }
+    // Final component must not be a directory (hand-edited directory sources
+    // would otherwise appear as a false-success apply that creates then removes
+    // the link).
+    if let Ok(meta) = std::fs::symlink_metadata(&current)
+        && meta.is_dir()
+    {
+        return Err(ConfigError::InvalidPath(format!(
+            "invalid source '{value}' for '{key}' in {context}: a source must be a file, not a directory"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a store that declares `files`/`patterns`/`sources` but has no
+/// target to link them into. Whole-directory stores and authored-only
+/// behavior are still allowed to have no target, but file/pattern/source mode
+/// requires one.
 fn validate_store_has_target(
     name: &str,
     files: &[String],
     patterns: &[String],
+    sources: &BTreeMap<String, String>,
     target: &Option<String>,
     has_targets: bool,
     source: &str,
 ) -> Result<(), ConfigError> {
-    if (!files.is_empty() || !patterns.is_empty()) && target.is_none() && !has_targets {
+    if (!files.is_empty() || !patterns.is_empty() || !sources.is_empty())
+        && target.is_none()
+        && !has_targets
+    {
         return Err(ConfigError::InvalidPath(format!(
-            "invalid store '{name}' in {source}: store with files/patterns must have a target"
+            "invalid store '{name}' in {source}: store with files/patterns/sources must have a target"
         )));
     }
     Ok(())
@@ -879,6 +1206,7 @@ mod tests {
                     target: Some("~/.config/nvim".into()),
                     files: vec![],
                     patterns: vec![],
+                    sources: std::collections::BTreeMap::new(),
                     targets: BTreeMap::new(),
                 },
             )]),
@@ -906,11 +1234,12 @@ mod tests {
         let at: BTreeMap<String, AuthoredTarget> = a.targets.clone();
         let gt: BTreeMap<String, GeneratedTarget> = g.targets.clone();
         let mut warnings = Vec::new();
-        let targets = merge_targets("s", Some(&at), Some(&gt), &mut warnings);
+        let targets = merge_targets("s", Some(&at), Some(&gt), &a.ignore, &mut warnings);
         let store = Store {
             target: g.target,
             files: g.files,
             patterns: g.patterns,
+            sources: std::collections::BTreeMap::new(),
             ignore: a.ignore,
             when: a.when,
             hooks: a.hooks,
@@ -935,6 +1264,7 @@ mod tests {
                 target: Some("~/.config/nvim".into()),
                 files: vec!["init.lua".into()],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 targets: BTreeMap::new(),
             },
         );
@@ -954,6 +1284,7 @@ mod tests {
                 target: Some("~".into()),
                 files: vec![".bashrc".into()],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 targets: BTreeMap::new(),
             },
         );
@@ -995,7 +1326,7 @@ mod tests {
         )]);
         let gt: BTreeMap<String, GeneratedTarget> = BTreeMap::new();
         let mut warnings = Vec::new();
-        let targets = merge_targets("helix", Some(&at), Some(&gt), &mut warnings);
+        let targets = merge_targets("helix", Some(&at), Some(&gt), &[], &mut warnings);
         assert!(
             targets.is_empty(),
             "authored-only target contributes no link"
@@ -1015,10 +1346,11 @@ mod tests {
                 target: "~/.config/h".into(),
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
             },
         )]);
         let mut warnings = Vec::new();
-        let targets = merge_targets("helix", Some(&at), Some(&gt), &mut warnings);
+        let targets = merge_targets("helix", Some(&at), Some(&gt), &[], &mut warnings);
         assert!(warnings.is_empty());
         assert_eq!(targets["server"].target, "~/.config/h");
         assert_eq!(targets["server"].when, WhenClause::default());
@@ -1303,6 +1635,7 @@ patterns = ["./work*//"]
                 target: None,
                 files: vec![],
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1312,6 +1645,7 @@ patterns = ["./work*//"]
                         target: "~/.config/x".into(),
                         files: vec!["../escape".into()],
                         patterns: vec![],
+                        sources: std::collections::BTreeMap::new(),
                         ignore: vec![],
                         when: WhenClause::default(),
                     },
@@ -1341,6 +1675,7 @@ patterns = ["./work*//"]
                 target: Some("~".into()),
                 files,
                 patterns: vec![],
+                sources: std::collections::BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1358,6 +1693,7 @@ patterns = ["./work*//"]
                 target: Some("~".into()),
                 files: vec![],
                 patterns,
+                sources: BTreeMap::new(),
                 ignore: vec![],
                 when: WhenClause::default(),
                 hooks: Hooks::default(),
@@ -1556,7 +1892,7 @@ patterns = ["./work*//"]
             a_targets.insert("t".into(), AuthoredTarget { ignore: vec![], when: WhenClause::default() });
             let g_targets: BTreeMap<String, GeneratedTarget> = BTreeMap::new();
             let mut warnings = Vec::new();
-            let merged = merge_targets(&name, Some(&a_targets), Some(&g_targets), &mut warnings);
+            let merged = merge_targets(&name, Some(&a_targets), Some(&g_targets), &[], &mut warnings);
             prop_assert!(merged.is_empty(), "authored-only target contributes no link");
             prop_assert_eq!(warnings.len(), 1);
         }

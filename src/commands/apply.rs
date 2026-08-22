@@ -145,7 +145,7 @@ pub(crate) fn cmd_apply(
             target: None,
             action: "apply",
         };
-        hooks::run_global_hook(root, "pre-apply", &env, &platform)
+        hooks::run_global_hook(root, "pre-apply", &env, &platform, json)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
         global_ancestors
             .revalidate()
@@ -197,7 +197,7 @@ pub(crate) fn cmd_apply(
             target: None,
             action: "apply",
         };
-        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform) {
+        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform, json) {
             eprintln!("warning: post-apply hook: {e}");
         }
     }
@@ -235,7 +235,7 @@ pub(crate) fn cmd_apply_plan(
         )));
     }
 
-    let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run, force);
+    let result = plan_exec::execute_plan(root, &loaded, &plan, dry_run, force, json);
 
     if json {
         match result {
@@ -248,6 +248,7 @@ pub(crate) fn cmd_apply_plan(
             Err(e) => {
                 let mut warnings = loaded.warnings;
                 warnings.extend(e.report.warnings.iter().cloned());
+                crate::audit::append_command_result(root, "apply", Err(&e.error));
                 report::write_data_error("apply", e.report, &e.error, warnings);
             }
         }
@@ -329,6 +330,13 @@ fn apply_json(
         )));
     }
 
+    // Build the `desired` half of the composite envelope from the pre-apply
+    // config. This is the host-evaluated merge — what the world should look
+    // like — so the agent doesn't need a separate `explain` call. The same
+    // `--only` filter that applies to the plan also applies here so composite
+    // output is consistent.
+    let desired = super::explain::build_explain_data(root, &filtered_config, &platform, false);
+
     if !opts.dry_run {
         // Pin $HOME identity (including the resolved directory behind a
         // symlinked $HOME) across the global pre-apply hook.
@@ -358,7 +366,7 @@ fn apply_json(
             target: None,
             action: "apply",
         };
-        hooks::run_global_hook(root, "pre-apply", &env, &platform)
+        hooks::run_global_hook(root, "pre-apply", &env, &platform, true)
             .map_err(|e| StitchError::hook("pre-apply", e))?;
         global_ancestors
             .revalidate()
@@ -396,18 +404,105 @@ fn apply_json(
             target: None,
             action: "apply",
         };
-        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform) {
+        if let Err(e) = hooks::run_global_hook(root, "post-apply", &env, &platform, true) {
             warnings.push(format!("post-apply hook: {e}"));
         }
     }
 
+    // Build `result`: per-op execution outcome. On dry-run, `result` is null.
+    let result = if opts.dry_run {
+        None
+    } else {
+        Some(build_apply_result(&plan))
+    };
+
+    // Build `post_status`: re-run status for the applied stores after
+    // execution. On dry-run this reflects pre-apply state (still useful —
+    // it shows the agent what's already converged). Filtered to `--only`
+    // so the composite output is consistent with the plan.
+    let post_status = build_post_status(root, &filtered_config, &platform);
+
+    let data = report::ApplyData {
+        desired,
+        plan: plan.clone(),
+        result,
+        post_status,
+    };
+
     if plan.summary.errors > 0 || plan.summary.conflicts > 0 {
         let error = plan_error(&plan, command);
-        report::write_data_error(command, plan, &error, warnings);
+        crate::audit::append_command_result(root, command, Err(&error));
+        report::write_data_error(command, data, &error, warnings);
     }
 
-    report::write(command, plan, warnings);
+    // `write_data_error` calls `process::exit`, so this is only reached when
+    // the plan has no errors or conflicts (the success path).
+    report::write(command, data, warnings);
     Ok(())
+}
+
+/// Build the per-store execution result summary from the plan.
+fn build_apply_result(plan: &plan::Plan) -> report::ApplyResult {
+    let stores = plan
+        .stores
+        .iter()
+        .map(|s| {
+            let mut ok = 0;
+            let mut conflicts = 0;
+            let mut errors = 0;
+            let mut skipped = 0;
+            for op in &s.ops {
+                match op {
+                    plan::PlanOp::Conflict { .. } => conflicts += 1,
+                    plan::PlanOp::Error { .. } => errors += 1,
+                    plan::PlanOp::SkippedPlatform => skipped += 1,
+                    // StageRender is a staging side-effect, not a link
+                    // mutation. PlanSummary excludes it from all counts, so
+                    // the per-store ok count must too — otherwise per-store
+                    // totals disagree with the top-level totals.
+                    plan::PlanOp::StageRender { .. } => {}
+                    _ => ok += 1,
+                }
+            }
+            report::ApplyResultStore {
+                store: s.store_name.clone(),
+                ok,
+                conflicts,
+                errors,
+                skipped,
+            }
+        })
+        .collect();
+    report::ApplyResult {
+        ops_executed: plan.summary.created
+            + plan.summary.replaced
+            + plan.summary.backed_up
+            + plan.summary.removed
+            + plan.summary.content_changed
+            + plan.summary.already_linked,
+        ops_total: plan.summary.created
+            + plan.summary.replaced
+            + plan.summary.backed_up
+            + plan.summary.removed
+            + plan.summary.content_changed
+            + plan.summary.already_linked
+            + plan.summary.conflicts
+            + plan.summary.errors
+            + plan.summary.skipped,
+        conflicts: plan.summary.conflicts,
+        errors: plan.summary.errors,
+        stores,
+    }
+}
+
+/// Build `post_status` by re-running status for all stores after apply.
+fn build_post_status(
+    root: &std::path::Path,
+    config: &Config,
+    platform: &Platform,
+) -> Vec<report::StatusRow> {
+    let entries = store::status_all(root, config, platform);
+    report::status(root, &entries)
 }
 
 pub(crate) fn pending_change_count(plan: &plan::Plan) -> usize {
@@ -593,6 +688,7 @@ files = ["regular", "alias"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -609,7 +705,7 @@ files = ["regular", "alias"]
         );
 
         // `remove` must remove the target link and the state, then exit 0.
-        cmd_remove(repo, "app", false, false).unwrap();
+        cmd_remove(repo, "app", false, false, false).unwrap();
 
         assert!(
             !target_dir.join("alias").exists(),
@@ -664,6 +760,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             &mut Vec::new(),
         );
@@ -676,7 +773,7 @@ files = ["regular"]
 
         // `remove` must still succeed and delete the state, not error with a
         // foreign-symlink conflict.
-        cmd_remove(repo, "app", false, false).unwrap();
+        cmd_remove(repo, "app", false, false, false).unwrap();
 
         let state_text = fs::read_to_string(stitch.join("state.toml")).unwrap();
         assert!(
@@ -743,6 +840,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: true,
                 force: false,
+                json: false,
             },
         );
         assert_eq!(
@@ -757,6 +855,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         )
@@ -816,6 +915,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         )
@@ -907,6 +1007,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         );
@@ -957,6 +1058,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             true,
         );
@@ -1024,6 +1126,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             false,
         );
@@ -1079,6 +1182,7 @@ files = ["regular"]
             ApplyOpts {
                 dry_run: false,
                 force: false,
+                json: false,
             },
             true,
         );

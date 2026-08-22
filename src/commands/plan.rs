@@ -24,6 +24,8 @@ pub(crate) fn cmd_plan(
     }
 
     let platform = Platform::detect();
+    store::check_link_path_collisions(root, &filtered_config, &platform)
+        .map_err(StitchError::from)?;
     let plan = store::compute_plan(
         root,
         &filtered_config,
@@ -31,6 +33,7 @@ pub(crate) fn cmd_plan(
         store::ApplyOpts {
             dry_run: true,
             force,
+            json: false,
         },
     );
     let plan_file = plan_exec::build_plan_file(root, &loaded, &plan, &platform)?;

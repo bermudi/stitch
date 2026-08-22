@@ -5,7 +5,7 @@ use crate::report;
 
 pub(crate) fn cmd_list(root: &std::path::Path, json: bool) -> Result<(), StitchError> {
     if json {
-        return report::run_json("list", || {
+        return report::run_json("list", None, || {
             let loaded =
                 Config::load(root).map_err(|e| Box::new((StitchError::from(e), Vec::new())))?;
             let data = report::list(&loaded.config);
