@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.14.1 — 2026-08-21
+
+### Fixed
+
+- **Sweep stops at other stores' target directories.** The v0.14 sources sweep broke the hub fan-in layout: a store owning `~/.config` declaring `agents/AGENTS.md` via `sources`, while nested stores owning `~/.config/kilo` and `~/.config/mimocode` link the same real file by its own name. The ancestor's declared-source ownership check classified the nested stores' healthy links as its own stale, repointed entries and deleted them — every apply fought the previous one, so repeated applies never converged. `reconcile_store_links` now prunes any strictly-nested configured target dir before descending; ancestor and equal targets are filtered out so they cannot prune the entire walk. Inactive (`when`-gated) stores are included so a platform-skipped store's links are not swept by an ancestor either.
+
 ## 0.14.0 — 2026-08-21
 
 ### Added
