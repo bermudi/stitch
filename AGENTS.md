@@ -93,9 +93,10 @@ attaches the artifacts. Supported build targets: `x86_64-unknown-linux-gnu` and
 Artifacts: `stitch-vX.Y.Z-<target>.tar.gz` plus a `.sha256` sidecar.
 
 `stitch self-update` depends on that exact asset naming and treats published
-assets as immutable. The release workflow must never clobber a published
-asset (a partial draft may be resumed). Publication is serialized per tag and
-rechecks draft status at the upload boundary. It validates tag/package-version
+assets as immutable. GitHub's **Immutable releases** repository setting is a
+required part of the trust boundary and must remain enabled. The release
+workflow never clobbers an asset or resumes an existing draft. Publication is
+serialized per tag and rechecks draft status at the upload boundary. It validates tag/package-version
 agreement, builds on the pinned Ubuntu 22.04 glibc baseline, and publishes the
 archive + checksum together.
 The updater checks the checksum, archive shape, ELF architecture, and staged

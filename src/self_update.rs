@@ -369,6 +369,7 @@ struct InstallTarget {
     parent: PathBuf,
     file_identity: Identity,
     parent_identity: Identity,
+    parent_uid: u32,
     mode: u32,
     gid: u32,
 }
@@ -405,6 +406,12 @@ impl InstallTarget {
                 path.display()
             ));
         }
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "running executable {} is writable by another user or group",
+                path.display()
+            ));
+        }
         let mut attributes = xattr::list(path)
             .map_err(|error| {
                 format!(
@@ -428,11 +435,40 @@ impl InstallTarget {
         if !parent_metadata.is_dir() {
             return Err(format!("{} is not a directory", parent.display()));
         }
+        if parent_metadata.uid() != effective_uid {
+            return Err(format!(
+                "executable directory {} is owned by uid {}, not effective uid {effective_uid}",
+                parent.display(),
+                parent_metadata.uid()
+            ));
+        }
+        if parent_metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "executable directory {} is writable by another user or group",
+                parent.display()
+            ));
+        }
+        if xattr::list(&parent)
+            .map_err(|error| {
+                format!(
+                    "cannot inspect extended attributes on {}: {error}",
+                    parent.display()
+                )
+            })?
+            .next()
+            .is_some()
+        {
+            return Err(format!(
+                "executable directory {} has extended attributes (including possible access ACLs)",
+                parent.display()
+            ));
+        }
         Ok(Self {
             path: path.to_path_buf(),
             parent,
             file_identity: Identity::from(&metadata),
             parent_identity: Identity::from(&parent_metadata),
+            parent_uid: parent_metadata.uid(),
             mode: mode & 0o777,
             gid: metadata.gid(),
         })
@@ -445,12 +481,15 @@ impl InstallTarget {
             .map_err(|error| format!("cannot revalidate {}: {error}", self.parent.display()))?;
         if Identity::from(&file) != self.file_identity
             || Identity::from(&parent) != self.parent_identity
+            || parent.uid() != self.parent_uid
+            || parent.mode() & 0o022 != 0
             || !file.file_type().is_file()
             || file.uid() != effective_uid()
             || file.gid() != self.gid
             || file.nlink() != 1
             || file.mode() & 0o777 != self.mode
             || file.mode() & 0o7000 != 0
+            || file.mode() & 0o022 != 0
         {
             return Err(
                 "the executable or its parent directory changed during the update; retry".into(),
@@ -468,6 +507,21 @@ impl InstallTarget {
         {
             return Err(
                 "the executable gained extended attributes during the update; retry".into(),
+            );
+        }
+        if xattr::list(&self.parent)
+            .map_err(|error| {
+                format!(
+                    "cannot revalidate extended attributes on {}: {error}",
+                    self.parent.display()
+                )
+            })?
+            .next()
+            .is_some()
+        {
+            return Err(
+                "the executable directory gained extended attributes during the update; retry"
+                    .into(),
             );
         }
         Ok(())
@@ -1036,6 +1090,34 @@ mod tests {
             xattr::get(&executable, "user.stitch-test").unwrap(),
             Some(b"preserve-me".to_vec())
         );
+    }
+
+    #[test]
+    fn executable_writable_by_other_users_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("stitch");
+        fs::write(&executable, b"old").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let error = InstallTarget::preflight(&executable)
+            .err()
+            .expect("group-writable executable must be refused");
+        assert!(error.contains("writable by another user or group"));
+    }
+
+    #[test]
+    fn directory_writable_by_other_users_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("stitch");
+        fs::write(&executable, b"old").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o775)).unwrap();
+
+        let error = InstallTarget::preflight(&executable)
+            .err()
+            .expect("group-writable executable directory must be refused");
+        assert!(error.contains("directory"));
+        assert!(error.contains("writable by another user or group"));
     }
 
     #[test]

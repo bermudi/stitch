@@ -158,6 +158,9 @@ The probe catches malformed binaries, version/tag mismatches, and binaries
 that cannot run against the host's C library. Ordinary mode and group ownership
 are preserved; executables carrying ACLs, capabilities, security labels, or
 other extended attributes are refused rather than silently losing metadata.
+Executables and their parent directories must not be group/world-writable or
+grant access through extended ACLs, so another user cannot replace verified
+staging content.
 Equal versions are a no-op; a locally newer version is never downgraded.
 `--check` fetches metadata only and never downloads or writes the binary.
 

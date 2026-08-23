@@ -27,6 +27,7 @@ concurrency:
 jobs:
   build:
     name: build (${{ matrix.target }})
+    timeout-minutes: 30
     # Pin the oldest supported glibc build baseline. The updater also runs the
     # staged binary before replacement, so an incompatible artifact cannot
     # displace a working install.
@@ -116,6 +117,7 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -178,28 +180,32 @@ jobs:
             expected_names+=("$(basename "$archive")" "$(basename "$checksum")")
           done
 
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            is_draft="$(
-              gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft'
-            )"
-            [ "$is_draft" = true ] || {
-              echo "error: published release $GITHUB_REF_NAME already exists; refusing to replace its assets" >&2
-              exit 1
-            }
-            # A previous attempt may have left a partial draft. Draft assets
-            # are not visible to self-update, so refreshing them is safe.
-            gh release edit "$GITHUB_REF_NAME" \
-              --title "$GITHUB_REF_NAME — $SUMMARY" \
-              --notes-file "$NOTES_PATH"
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --draft \
-              --title "$GITHUB_REF_NAME — $SUMMARY" \
-              --notes-file "$NOTES_PATH"
+          lookup="$RUNNER_TEMP/stitch-release-lookup"
+          lookup_error="$RUNNER_TEMP/stitch-release-lookup-error"
+          if gh api --include \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            >"$lookup" 2>"$lookup_error"
+          then
+            echo "error: release $GITHUB_REF_NAME already exists; refusing to mutate it" >&2
+            exit 1
+          fi
+          http_status="$(awk 'NR == 1 { print $2 }' "$lookup")"
+          if [ "$http_status" != 404 ]; then
+            cat "$lookup_error" >&2
+            cat "$lookup" >&2
+            echo "error: could not determine whether release $GITHUB_REF_NAME exists" >&2
+            exit 1
           fi
 
-          # Recheck at the mutation boundary. This also catches a maintainer
-          # publishing the draft while this job was preparing the files.
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME — $SUMMARY" \
+            --notes-file "$NOTES_PATH"
+
+          # Repository setting "Immutable releases" is enabled and required.
+          # It is the server-side guard that makes an external publish racing
+          # this check cause the upload to fail instead of changing public
+          # assets. This workflow never replaces even draft assets.
           is_draft="$(
             gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft'
           )"
@@ -207,7 +213,7 @@ jobs:
             echo "error: release $GITHUB_REF_NAME is no longer a draft; refusing to replace its assets" >&2
             exit 1
           }
-          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}"
 
           expected="$(
             printf '%s\n' "${expected_names[@]}" | sort
