@@ -7,26 +7,23 @@ pub(crate) fn cmd_self_update(check_only: bool, json: bool) -> Result<(), Stitch
         report::write("self-update", &data, Vec::new());
     } else {
         match data.status {
-            "up-to-date" => println!("stitch v{} is already up to date.", data.current_version),
-            "newer" => println!(
+            self_update::UpdateStatus::UpToDate => {
+                println!("stitch v{} is already up to date.", data.current_version)
+            }
+            self_update::UpdateStatus::Newer => println!(
                 "stitch v{} is newer than the latest published release (v{}); not downgrading.",
                 data.current_version, data.latest_version
             ),
-            "update-available" => println!(
+            self_update::UpdateStatus::UpdateAvailable => println!(
                 "Update available: stitch v{} → v{}",
                 data.current_version, data.latest_version
             ),
-            "updated" => println!(
+            self_update::UpdateStatus::Updated => println!(
                 "Updated stitch v{} → v{} at {}",
                 data.current_version,
                 data.latest_version,
                 data.installed_path.as_deref().unwrap_or("<unknown path>")
             ),
-            status => {
-                return Err(StitchError::internal(format!(
-                    "unknown update status {status}"
-                )));
-            }
         }
     }
     Ok(())

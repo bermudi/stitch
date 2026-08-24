@@ -182,25 +182,28 @@ jobs:
 
           lookup="$RUNNER_TEMP/stitch-release-lookup"
           lookup_error="$RUNNER_TEMP/stitch-release-lookup-error"
+          release_exists=false
           if gh api --include \
             "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
             >"$lookup" 2>"$lookup_error"
           then
-            echo "error: release $GITHUB_REF_NAME already exists; refusing to mutate it" >&2
-            exit 1
-          fi
-          http_status="$(awk 'NR == 1 { print $2 }' "$lookup")"
-          if [ "$http_status" != 404 ]; then
-            cat "$lookup_error" >&2
-            cat "$lookup" >&2
-            echo "error: could not determine whether release $GITHUB_REF_NAME exists" >&2
-            exit 1
+            release_exists=true
+          else
+            http_status="$(awk 'NR == 1 { print $2 }' "$lookup")"
+            if [ "$http_status" != 404 ]; then
+              cat "$lookup_error" >&2
+              cat "$lookup" >&2
+              echo "error: could not determine whether release $GITHUB_REF_NAME exists" >&2
+              exit 1
+            fi
           fi
 
-          gh release create "$GITHUB_REF_NAME" \
-            --draft \
-            --title "$GITHUB_REF_NAME — $SUMMARY" \
-            --notes-file "$NOTES_PATH"
+          if [ "$release_exists" = false ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "$GITHUB_REF_NAME — $SUMMARY" \
+              --notes-file "$NOTES_PATH"
+          fi
 
           # Repository setting "Immutable releases" is enabled and required.
           # It is the server-side guard that makes an external publish racing
@@ -210,10 +213,47 @@ jobs:
             gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft'
           )"
           [ "$is_draft" = true ] || {
-            echo "error: release $GITHUB_REF_NAME is no longer a draft; refusing to replace its assets" >&2
+            echo "error: release $GITHUB_REF_NAME is already published; refusing to mutate it" >&2
             exit 1
           }
-          gh release upload "$GITHUB_REF_NAME" "${files[@]}"
+
+          existing_assets="$(
+            gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'
+          )"
+          existing_names=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && existing_names+=("$name")
+          done <<< "$existing_assets"
+          for name in "${existing_names[@]}"; do
+            expected_asset=false
+            for expected_name in "${expected_names[@]}"; do
+              if [ "$name" = "$expected_name" ]; then
+                expected_asset=true
+                break
+              fi
+            done
+            [ "$expected_asset" = true ] || {
+              echo "error: draft release has unexpected asset $name; refusing to replace it" >&2
+              exit 1
+            }
+          done
+          missing_files=()
+          for index in "${!files[@]}"; do
+            name="${expected_names[$index]}"
+            existing_asset=false
+            for existing_name in "${existing_names[@]}"; do
+              if [ "$name" = "$existing_name" ]; then
+                existing_asset=true
+                break
+              fi
+            done
+            if [ "$existing_asset" = false ]; then
+              missing_files+=("${files[$index]}")
+            fi
+          done
+          if [ "${#missing_files[@]}" -gt 0 ]; then
+            gh release upload "$GITHUB_REF_NAME" "${missing_files[@]}"
+          fi
 
           expected="$(
             printf '%s\n' "${expected_names[@]}" | sort

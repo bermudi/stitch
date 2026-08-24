@@ -10,10 +10,13 @@ use flate2::read::GzDecoder;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,9 +30,18 @@ const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
 const BINARY_LIMIT: u64 = 128 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum UpdateStatus {
+    UpToDate,
+    Newer,
+    UpdateAvailable,
+    Updated,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct UpdateData {
-    pub status: &'static str,
+    pub status: UpdateStatus,
     pub current_version: String,
     pub latest_version: String,
     pub target: String,
@@ -151,7 +163,7 @@ fn run_with(
     let current = parse_version(current_version, "current binary version")?;
     let release = resolve_release(transport, target)?;
     let base = UpdateData {
-        status: "up-to-date",
+        status: UpdateStatus::UpToDate,
         current_version: current.to_string(),
         latest_version: release.version.to_string(),
         target: target.to_string(),
@@ -165,13 +177,13 @@ fn run_with(
     }
     if release.version < current {
         return Ok(UpdateData {
-            status: "newer",
+            status: UpdateStatus::Newer,
             ..base
         });
     }
     if check_only {
         return Ok(UpdateData {
-            status: "update-available",
+            status: UpdateStatus::UpdateAvailable,
             ..base
         });
     }
@@ -202,7 +214,7 @@ fn run_with(
     install_target.install(&archive, target, &release.version, probe)?;
 
     Ok(UpdateData {
-        status: "updated",
+        status: UpdateStatus::Updated,
         sha256: Some(actual_hash),
         installed_path: Some(executable.display().to_string()),
         ..base
@@ -343,6 +355,68 @@ impl Identity {
     }
 }
 
+type ExtendedAttributes = BTreeMap<OsString, Vec<u8>>;
+
+fn read_extended_attributes(path: &Path) -> Result<ExtendedAttributes, String> {
+    let mut attributes = ExtendedAttributes::new();
+    for name in xattr::list(path).map_err(|error| {
+        format!(
+            "cannot inspect extended attributes on {}: {error}",
+            path.display()
+        )
+    })? {
+        if name == OsStr::new("security.ima") || name == OsStr::new("security.evm") {
+            return Err(format!(
+                "{} has integrity attribute {}; self-update cannot create a valid replacement",
+                path.display(),
+                name.to_string_lossy()
+            ));
+        }
+        let value = xattr::get(path, &name)
+            .map_err(|error| {
+                format!(
+                    "cannot read extended attribute {} on {}: {error}",
+                    name.to_string_lossy(),
+                    path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "extended attributes on {} changed during inspection; retry",
+                    path.display()
+                )
+            })?;
+        attributes.insert(name, value);
+    }
+    Ok(attributes)
+}
+
+fn apply_extended_attributes(path: &Path, expected: &ExtendedAttributes) -> Result<(), String> {
+    let current = read_extended_attributes(path)?;
+    for name in current.keys().filter(|name| !expected.contains_key(*name)) {
+        xattr::remove(path, name).map_err(|error| {
+            format!(
+                "cannot remove inherited extended attribute {} from staged update: {error}",
+                name.to_string_lossy()
+            )
+        })?;
+    }
+    for (name, value) in expected {
+        if current.get(name) != Some(value) {
+            xattr::set(path, name, value).map_err(|error| {
+                format!(
+                    "cannot preserve extended attribute {} on staged update: {error}",
+                    name.to_string_lossy()
+                )
+            })?;
+        }
+    }
+    if read_extended_attributes(path)? != *expected {
+        return Err("staged update did not preserve extended attributes".into());
+    }
+    Ok(())
+}
+
 fn effective_uid() -> libc::uid_t {
     // SAFETY: `geteuid` has no arguments, dereferences no pointers, and only
     // returns process credentials maintained by the kernel.
@@ -372,6 +446,8 @@ struct InstallTarget {
     parent_uid: u32,
     mode: u32,
     gid: u32,
+    file_attributes: ExtendedAttributes,
+    parent_attributes: ExtendedAttributes,
 }
 
 impl InstallTarget {
@@ -412,20 +488,7 @@ impl InstallTarget {
                 path.display()
             ));
         }
-        let mut attributes = xattr::list(path)
-            .map_err(|error| {
-                format!(
-                    "cannot inspect extended attributes on {}: {error}",
-                    path.display()
-                )
-            })?
-            .peekable();
-        if attributes.peek().is_some() {
-            return Err(format!(
-                "running executable {} has extended attributes (ACLs, capabilities, or security labels); refusing to discard them",
-                path.display()
-            ));
-        }
+        let file_attributes = read_extended_attributes(path)?;
         let parent = path
             .parent()
             .ok_or_else(|| format!("running executable {} has no parent", path.display()))?
@@ -448,21 +511,7 @@ impl InstallTarget {
                 parent.display()
             ));
         }
-        if xattr::list(&parent)
-            .map_err(|error| {
-                format!(
-                    "cannot inspect extended attributes on {}: {error}",
-                    parent.display()
-                )
-            })?
-            .next()
-            .is_some()
-        {
-            return Err(format!(
-                "executable directory {} has extended attributes (including possible access ACLs)",
-                parent.display()
-            ));
-        }
+        let parent_attributes = read_extended_attributes(&parent)?;
         Ok(Self {
             path: path.to_path_buf(),
             parent,
@@ -471,6 +520,8 @@ impl InstallTarget {
             parent_uid: parent_metadata.uid(),
             mode: mode & 0o777,
             gid: metadata.gid(),
+            file_attributes,
+            parent_attributes,
         })
     }
 
@@ -495,32 +546,14 @@ impl InstallTarget {
                 "the executable or its parent directory changed during the update; retry".into(),
             );
         }
-        if xattr::list(&self.path)
-            .map_err(|error| {
-                format!(
-                    "cannot revalidate extended attributes on {}: {error}",
-                    self.path.display()
-                )
-            })?
-            .next()
-            .is_some()
-        {
+        if read_extended_attributes(&self.path)? != self.file_attributes {
             return Err(
-                "the executable gained extended attributes during the update; retry".into(),
+                "the executable's extended attributes changed during the update; retry".into(),
             );
         }
-        if xattr::list(&self.parent)
-            .map_err(|error| {
-                format!(
-                    "cannot revalidate extended attributes on {}: {error}",
-                    self.parent.display()
-                )
-            })?
-            .next()
-            .is_some()
-        {
+        if read_extended_attributes(&self.parent)? != self.parent_attributes {
             return Err(
-                "the executable directory gained extended attributes during the update; retry"
+                "the executable directory's extended attributes changed during the update; retry"
                     .into(),
             );
         }
@@ -564,22 +597,16 @@ impl InstallTarget {
                 .map_err(|error| format!("cannot set update permissions: {error}"))?;
             temp.sync_all()
                 .map_err(|error| format!("cannot sync staged update: {error}"))?;
+            probe.probe(&temp_path, expected_version)?;
+            apply_extended_attributes(&temp_path, &self.file_attributes)?;
+            temp.sync_all()
+                .map_err(|error| format!("cannot sync staged update metadata: {error}"))?;
             let staged_metadata = temp
                 .metadata()
                 .map_err(|error| format!("cannot inspect staged update: {error}"))?;
             if staged_metadata.gid() != self.gid || staged_metadata.mode() & 0o777 != self.mode {
                 return Err("staged update did not preserve ownership and permissions".into());
             }
-            if xattr::list(&temp_path)
-                .map_err(|error| format!("cannot inspect staged update attributes: {error}"))?
-                .next()
-                .is_some()
-            {
-                return Err(
-                    "staged update inherited extended attributes; refusing metadata drift".into(),
-                );
-            }
-            probe.probe(&temp_path, expected_version)?;
             self.revalidate()?;
             fs::rename(&temp_path, &self.path).map_err(|error| {
                 format!("cannot replace {} atomically: {error}", self.path.display())
@@ -621,117 +648,99 @@ trait CandidateProbe {
 
 struct VersionProbe;
 
+fn terminate_process_group(pid: u32) -> Result<(), String> {
+    let pid = i32::try_from(pid).map_err(|_| "staged binary pid is out of range".to_string())?;
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not terminate staged binary process group: {error}"
+        ))
+    }
+}
+
 impl CandidateProbe for VersionProbe {
     fn probe(&self, path: &Path, expected_version: &Version) -> Result<(), String> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| "staged binary has no parent directory".to_string())?;
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let output_path = parent.join(format!(
-            ".stitch-update.{}.{}.version",
-            std::process::id(),
-            sequence
-        ));
-        let mut output_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&output_path)
-            .map_err(|error| format!("cannot stage version probe output: {error}"))?;
-
-        let result = (|| {
-            let mut child = Command::new(path)
-                .arg("--version")
-                .env_clear()
-                .stdin(Stdio::null())
-                .stdout(
-                    output_file
-                        .try_clone()
-                        .map_err(|error| format!("cannot capture staged version: {error}"))?,
-                )
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|error| format!("staged binary cannot start on this host: {error}"))?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            enum WaitResult {
-                Exited(std::process::ExitStatus),
-                Failed(String),
-            }
-            let wait_result = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break WaitResult::Exited(status),
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => {
-                        break WaitResult::Failed(
-                            "staged binary did not answer `--version` within 5 seconds".into(),
-                        );
-                    }
-                    Err(error) => {
-                        break WaitResult::Failed(format!(
-                            "could not wait for staged binary: {error}"
-                        ));
-                    }
-                }
-            };
-            let status = match wait_result {
-                WaitResult::Exited(status) => status,
-                WaitResult::Failed(mut message) => {
-                    if let Err(error) = child.kill() {
-                        message.push_str(&format!("; could not kill it: {error}"));
-                    }
-                    if let Err(error) = child.wait() {
-                        message.push_str(&format!("; could not reap it: {error}"));
-                    }
-                    return Err(message);
-                }
-            };
-            if !status.success() {
-                return Err(format!(
-                    "staged binary failed its `--version` probe with {status}"
-                ));
-            }
-            output_file
-                .seek(SeekFrom::Start(0))
-                .map_err(|error| format!("cannot read staged binary version: {error}"))?;
+        let mut command = Command::new(path);
+        command
+            .arg("--version")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("staged binary cannot start on this host: {error}"))?;
+        let pid = child.id();
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "could not capture staged binary version".to_string())?;
+        let output_reader = std::thread::spawn(move || {
             let mut output = Vec::new();
-            output_file
+            stdout
                 .by_ref()
                 .take(1025)
                 .read_to_end(&mut output)
-                .map_err(|error| format!("could not read staged binary version: {error}"))?;
-            if output.len() > 1024 {
-                return Err("staged binary returned oversized version output".into());
+                .map(|_| output)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let wait_result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    break Err(
+                        "staged binary did not answer `--version` within 5 seconds".to_string()
+                    );
+                }
+                Err(error) => break Err(format!("could not wait for staged binary: {error}")),
             }
-            let output = std::str::from_utf8(&output)
-                .map_err(|_| "staged binary returned non-UTF-8 version output".to_string())?;
-            let expected = format!("stitch {expected_version}");
-            if output.trim() != expected {
-                return Err(format!(
-                    "staged binary reported version `{}`, expected `{expected}`",
-                    output.trim()
-                ));
+        };
+
+        let cleanup_result = terminate_process_group(pid);
+        let reap_result = child.wait();
+        let output = output_reader
+            .join()
+            .map_err(|_| "staged binary output reader panicked".to_string())?
+            .map_err(|error| format!("could not read staged binary version: {error}"))?;
+        if output.len() > 1024 {
+            let mut error = "staged binary returned oversized version output".to_string();
+            if let Err(cleanup_error) = cleanup_result {
+                error.push_str(&format!("; {cleanup_error}"));
             }
-            Ok(())
-        })();
-        drop(output_file);
-        if let Err(cleanup_error) = fs::remove_file(&output_path)
-            && cleanup_error.kind() != std::io::ErrorKind::NotFound
-        {
-            return match result {
-                Ok(()) => Err(format!(
-                    "could not remove version probe output {}: {cleanup_error}",
-                    output_path.display()
-                )),
-                Err(error) => Err(format!(
-                    "{error}; also could not remove version probe output {}: {cleanup_error}",
-                    output_path.display()
-                )),
-            };
+            if let Err(reap_error) = reap_result {
+                error.push_str(&format!("; could not reap staged binary: {reap_error}"));
+            }
+            return Err(error);
         }
-        result
+
+        let status = wait_result?;
+        cleanup_result?;
+        reap_result.map_err(|error| format!("could not reap staged binary: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "staged binary failed its `--version` probe with {status}"
+            ));
+        }
+        let output = std::str::from_utf8(&output)
+            .map_err(|_| "staged binary returned non-UTF-8 version output".to_string())?;
+        let expected = format!("stitch {expected_version}");
+        if output.trim() != expected {
+            return Err(format!(
+                "staged binary reported version `{}`, expected `{expected}`",
+                output.trim()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -890,14 +899,17 @@ mod tests {
             .insert(LATEST_RELEASE_URL.into(), release_json("9.0.0", target));
         let result =
             run_with(&transport, true, false, "1.0.0", target, None, &AcceptProbe).unwrap();
-        assert_eq!(result.status, "update-available");
+        assert_eq!(result.status, UpdateStatus::UpdateAvailable);
         assert_eq!(result.latest_version, "9.0.0");
     }
 
     #[test]
     fn equal_and_older_releases_never_download_or_install() {
         let target = "x86_64-unknown-linux-gnu";
-        for (latest, status) in [("1.0.0", "up-to-date"), ("0.9.0", "newer")] {
+        for (latest, status) in [
+            ("1.0.0", UpdateStatus::UpToDate),
+            ("0.9.0", UpdateStatus::Newer),
+        ] {
             let mut transport = FakeTransport::default();
             transport
                 .responses
@@ -992,6 +1004,82 @@ mod tests {
         bytes
     }
 
+    fn shell_candidate(directory: &Path, body: &str) -> PathBuf {
+        let path = directory.join("candidate");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn update_status_serializes_to_stable_json_values() {
+        for (status, expected) in [
+            (UpdateStatus::UpToDate, "up-to-date"),
+            (UpdateStatus::Newer, "newer"),
+            (UpdateStatus::UpdateAvailable, "update-available"),
+            (UpdateStatus::Updated, "updated"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn version_probe_accepts_exact_bounded_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = shell_candidate(directory.path(), "printf 'stitch 2.0.0\\n'");
+        VersionProbe
+            .probe(&candidate, &Version::new(2, 0, 0))
+            .unwrap();
+    }
+
+    #[test]
+    fn version_probe_rejects_oversized_output_without_a_capture_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = shell_candidate(
+            directory.path(),
+            "i=0; while [ \"$i\" -lt 2048 ]; do printf x; i=$((i + 1)); done",
+        );
+        let error = VersionProbe
+            .probe(&candidate, &Version::new(2, 0, 0))
+            .unwrap_err();
+        assert!(error.contains("oversized version output"));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn version_probe_terminates_descendants_after_parent_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("descendant.pid");
+        let candidate = shell_candidate(
+            directory.path(),
+            &format!(
+                "(while :; do sleep 1; done) & descendant=$!; echo \"$descendant\" > '{}'",
+                pid_path.display()
+            ),
+        );
+        VersionProbe
+            .probe(&candidate, &Version::new(2, 0, 0))
+            .unwrap_err();
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let proc_stat = PathBuf::from(format!("/proc/{pid}/stat"));
+        for _ in 0..100 {
+            match fs::read_to_string(&proc_stat) {
+                Ok(stat) if !stat.rsplit_once(") ").unwrap().1.starts_with('Z') => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return,
+            }
+        }
+        panic!("staged binary descendant {pid} remained running");
+    }
+
     #[test]
     fn extraction_accepts_only_one_root_regular_file() {
         let good = tar_gz(&[("stitch", tar::EntryType::Regular, b"binary")]);
@@ -1064,7 +1152,7 @@ mod tests {
             &AcceptProbe,
         )
         .unwrap();
-        assert_eq!(result.status, "updated");
+        assert_eq!(result.status, UpdateStatus::Updated);
         assert_eq!(fs::read(&executable).unwrap(), candidate);
         assert_eq!(
             fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
@@ -1075,20 +1163,34 @@ mod tests {
     }
 
     #[test]
-    fn executable_with_extended_attributes_is_refused() {
+    fn update_preserves_file_xattrs_and_accepts_directory_xattrs() {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("stitch");
         fs::write(&executable, b"old").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         xattr::set(&executable, "user.stitch-test", b"preserve-me").unwrap();
+        xattr::set(directory.path(), "user.stitch-test", b"directory-label").unwrap();
+        let candidate = elf(62, b"new");
+        let archive = tar_gz(&[("stitch", tar::EntryType::Regular, &candidate)]);
 
-        let error = InstallTarget::preflight(&executable)
-            .err()
-            .expect("extended attributes must be refused");
-        assert!(error.contains("extended attributes"));
+        InstallTarget::preflight(&executable)
+            .unwrap()
+            .install(
+                &archive,
+                "x86_64-unknown-linux-gnu",
+                &Version::new(2, 0, 0),
+                &AcceptProbe,
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(&executable).unwrap(), candidate);
         assert_eq!(
             xattr::get(&executable, "user.stitch-test").unwrap(),
             Some(b"preserve-me".to_vec())
+        );
+        assert_eq!(
+            xattr::get(directory.path(), "user.stitch-test").unwrap(),
+            Some(b"directory-label".to_vec())
         );
     }
 
@@ -1118,6 +1220,19 @@ mod tests {
             .expect("group-writable executable directory must be refused");
         assert!(error.contains("directory"));
         assert!(error.contains("writable by another user or group"));
+    }
+
+    #[test]
+    fn revalidation_rejects_changed_extended_attributes() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("stitch");
+        fs::write(&executable, b"old").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = InstallTarget::preflight(&executable).unwrap();
+
+        xattr::set(&executable, "user.stitch-test", b"changed").unwrap();
+        let error = target.revalidate().unwrap_err();
+        assert!(error.contains("extended attributes changed"));
     }
 
     #[test]

@@ -155,12 +155,13 @@ root archive entry named `stitch`, validates the ELF architecture, writes an
 exclusive temporary file beside the current executable, and runs the staged
 binary's `--version` with a timeout before atomically renaming it into place.
 The probe catches malformed binaries, version/tag mismatches, and binaries
-that cannot run against the host's C library. Ordinary mode and group ownership
-are preserved; executables carrying ACLs, capabilities, security labels, or
-other extended attributes are refused rather than silently losing metadata.
-Executables and their parent directories must not be group/world-writable or
-grant access through extended ACLs, so another user cannot replace verified
-staging content.
+that cannot run against the host's C library. Ordinary mode, group ownership,
+and recreatable executable extended attributes (including ACLs, capabilities,
+security labels, and `user.*` attributes) are preserved and verified on the
+staged inode. Integrity attributes (`security.ima` and `security.evm`) are
+refused because the updater cannot create a valid replacement. Executable and
+directory metadata is revalidated before replacement; neither may grant write
+access to another user through mode bits or extended ACLs.
 Equal versions are a no-op; a locally newer version is never downgraded.
 `--check` fetches metadata only and never downloads or writes the binary.
 
