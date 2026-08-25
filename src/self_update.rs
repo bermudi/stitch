@@ -135,7 +135,7 @@ fn read_limited(reader: impl Read, url: &str, limit: usize) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 
-pub(crate) fn run(check_only: bool, progress: bool) -> Result<UpdateData, String> {
+pub(crate) fn run(check_only: bool, progress: bool) -> Result<(UpdateData, Vec<String>), String> {
     let target = release_target()?;
     if progress {
         eprintln!("Checking GitHub Releases for stitch updates...");
@@ -159,7 +159,7 @@ fn run_with(
     target: &str,
     install_path: Option<&Path>,
     probe: &dyn CandidateProbe,
-) -> Result<UpdateData, String> {
+) -> Result<(UpdateData, Vec<String>), String> {
     let current = parse_version(current_version, "current binary version")?;
     let release = resolve_release(transport, target)?;
     let base = UpdateData {
@@ -173,19 +173,25 @@ fn run_with(
     };
 
     if release.version == current {
-        return Ok(base);
+        return Ok((base, Vec::new()));
     }
     if release.version < current {
-        return Ok(UpdateData {
-            status: UpdateStatus::Newer,
-            ..base
-        });
+        return Ok((
+            UpdateData {
+                status: UpdateStatus::Newer,
+                ..base
+            },
+            Vec::new(),
+        ));
     }
     if check_only {
-        return Ok(UpdateData {
-            status: UpdateStatus::UpdateAvailable,
-            ..base
-        });
+        return Ok((
+            UpdateData {
+                status: UpdateStatus::UpdateAvailable,
+                ..base
+            },
+            Vec::new(),
+        ));
     }
 
     let executable = match install_path {
@@ -211,14 +217,17 @@ fn run_with(
     if progress {
         eprintln!("Checksum verified; installing atomically...");
     }
-    install_target.install(&archive, target, &release.version, probe)?;
+    let warnings = install_target.install(&archive, target, &release.version, probe)?;
 
-    Ok(UpdateData {
-        status: UpdateStatus::Updated,
-        sha256: Some(actual_hash),
-        installed_path: Some(executable.display().to_string()),
-        ..base
-    })
+    Ok((
+        UpdateData {
+            status: UpdateStatus::Updated,
+            sha256: Some(actual_hash),
+            installed_path: Some(executable.display().to_string()),
+            ..base
+        },
+        warnings,
+    ))
 }
 
 fn release_target() -> Result<&'static str, String> {
@@ -310,11 +319,8 @@ fn parse_version(value: &str, label: &str) -> Result<Version, String> {
 fn parse_checksum(bytes: &[u8], artifact_name: &str) -> Result<String, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "release checksum is not valid UTF-8".to_string())?;
-    let line = text
-        .strip_suffix('\n')
-        .unwrap_or(text)
-        .strip_suffix('\r')
-        .unwrap_or_else(|| text.strip_suffix('\n').unwrap_or(text));
+    let without_lf = text.strip_suffix('\n').unwrap_or(text);
+    let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
     if line.contains('\n') || line.contains('\r') {
         return Err("release checksum must contain exactly one line".into());
     }
@@ -566,7 +572,7 @@ impl InstallTarget {
         target: &str,
         expected_version: &Version,
         probe: &dyn CandidateProbe,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         self.revalidate()?;
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp_path = self.parent.join(format!(
@@ -612,14 +618,19 @@ impl InstallTarget {
                 format!("cannot replace {} atomically: {error}", self.path.display())
             })?;
             committed = true;
-            File::open(&self.parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| {
-                    format!(
-                        "updated {}, but could not sync its directory: {error}; the new binary remains installed",
-                        self.path.display()
-                    )
-                })
+            // The rename committed the new binary; a directory-sync failure
+            // after this point is a durability concern, not an update failure.
+            // Surface it as a warning so agents see `status: "updated"` and a
+            // non-zero exit would not mislead them into retrying a no-op.
+            let mut warnings = Vec::new();
+            if let Err(error) = File::open(&self.parent).and_then(|directory| directory.sync_all())
+            {
+                warnings.push(format!(
+                    "updated {}, but could not sync its directory: {error}; the new binary remains installed",
+                    self.path.display()
+                ));
+            }
+            Ok(warnings)
         })();
         drop(temp);
 
@@ -628,7 +639,7 @@ impl InstallTarget {
             && cleanup_error.kind() != std::io::ErrorKind::NotFound
         {
             return match result {
-                Ok(()) => Err(format!(
+                Ok(_) => Err(format!(
                     "could not remove staged update {}: {cleanup_error}",
                     temp_path.display()
                 )),
@@ -897,10 +908,11 @@ mod tests {
         transport
             .responses
             .insert(LATEST_RELEASE_URL.into(), release_json("9.0.0", target));
-        let result =
+        let (result, warnings) =
             run_with(&transport, true, false, "1.0.0", target, None, &AcceptProbe).unwrap();
         assert_eq!(result.status, UpdateStatus::UpdateAvailable);
         assert_eq!(result.latest_version, "9.0.0");
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -914,7 +926,7 @@ mod tests {
             transport
                 .responses
                 .insert(LATEST_RELEASE_URL.into(), release_json(latest, target));
-            let result = run_with(
+            let (result, warnings) = run_with(
                 &transport,
                 false,
                 false,
@@ -925,6 +937,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(result.status, status);
+            assert!(warnings.is_empty());
         }
     }
 
@@ -1142,7 +1155,7 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let original_gid = fs::metadata(&executable).unwrap().gid();
 
-        let result = run_with(
+        let (result, warnings) = run_with(
             &transport,
             false,
             false,
@@ -1153,6 +1166,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.status, UpdateStatus::Updated);
+        assert!(warnings.is_empty());
         assert_eq!(fs::read(&executable).unwrap(), candidate);
         assert_eq!(
             fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
@@ -1173,7 +1187,7 @@ mod tests {
         let candidate = elf(62, b"new");
         let archive = tar_gz(&[("stitch", tar::EntryType::Regular, &candidate)]);
 
-        InstallTarget::preflight(&executable)
+        let warnings = InstallTarget::preflight(&executable)
             .unwrap()
             .install(
                 &archive,
@@ -1182,6 +1196,7 @@ mod tests {
                 &AcceptProbe,
             )
             .unwrap();
+        assert!(warnings.is_empty());
 
         assert_eq!(fs::read(&executable).unwrap(), candidate);
         assert_eq!(

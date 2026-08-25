@@ -2,10 +2,13 @@ use crate::error::StitchError;
 use crate::{report, self_update};
 
 pub(crate) fn cmd_self_update(check_only: bool, json: bool) -> Result<(), StitchError> {
-    let data = self_update::run(check_only, !json).map_err(StitchError::self_update)?;
+    let (data, warnings) = self_update::run(check_only, !json).map_err(StitchError::self_update)?;
     if json {
-        report::write("self-update", &data, Vec::new());
+        report::write("self-update", &data, warnings);
     } else {
+        for w in &warnings {
+            eprintln!("warning: {w}");
+        }
         match data.status {
             self_update::UpdateStatus::UpToDate => {
                 println!("stitch v{} is already up to date.", data.current_version)

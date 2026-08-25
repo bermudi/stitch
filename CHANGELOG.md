@@ -11,6 +11,16 @@
   ownership/mode metadata. `--check` is metadata-only, and JSON output reports
   `up-to-date`, `newer`, `update-available`, or `updated`.
 
+### Fixed
+
+- **Post-rename directory-sync failure no longer reports a failed update.**
+  When the atomic rename succeeds but `fsync` on the parent directory fails,
+  the command now exits 0 with `status: "updated"` and a warning in the JSON
+  envelope (and `warning:` on stderr in text mode). Previously this returned a
+  non-zero exit with no success JSON, which could mislead an agent into
+  retrying a no-op or reporting a failed update despite the binary being
+  installed.
+
 ## 0.14.2 — 2026-08-22
 
 ### Fixed
