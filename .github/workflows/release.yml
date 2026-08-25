@@ -44,6 +44,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Fetch annotated tag object
+        # actions/checkout fetches with --no-tags and force-updates the tag
+        # ref to point directly at the commit, so git cat-file -t reports
+        # "commit" not "tag". Re-fetch the annotated tag object so the
+        # validation below and the release-title extraction both see it.
+        run: git fetch origin tag "$GITHUB_REF_NAME" --force
+
       - name: Validate release tag and package version
         run: |
           set -euo pipefail

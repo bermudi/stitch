@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.15.0 — 2026-08-24
+
 ### Added
 
 - **`stitch self-update`** — checks the latest stable GitHub release, verifies
