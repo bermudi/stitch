@@ -530,6 +530,12 @@ pub struct AddData {
     /// Omitted on dry-run previews.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_entry: Option<String>,
+    /// `add --source` only: true when a `files` entry for the same target
+    /// name was removed and replaced by this `sources` entry in the same
+    /// atomic state write (the files→sources fan-in migration). Omitted
+    /// (false) for plain adds and when no `files` entry existed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub migrated_from_files: bool,
 }
 
 /// Render the `[stores.<name>]` slice that was (or would be) written to
@@ -1968,6 +1974,7 @@ mod tests {
                 state_entry: Some(
                     "[stores.git]\ntarget = \"~/.gitconfig\"\nfiles = [\"gitconfig\"]\n".into(),
                 ),
+                migrated_from_files: true,
             })
             .unwrap(),
         ));

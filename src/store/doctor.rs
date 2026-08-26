@@ -289,16 +289,28 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
             });
         }
 
-        if store_dir
-            .read_dir()
-            .map_or(true, |mut d| d.next().is_none())
+        // A sources-only store (the v0.14 fan-in consumer shape) has an
+        // intentionally empty store dir — every file it links lives elsewhere
+        // in the repo, declared via `sources`. The directory's emptiness is
+        // the correct state, not a degenerate one, so the warning must key off
+        // declared inventory, not directory geometry. A store with `sources`
+        // at the top level or on any named target is not "empty" even when its
+        // own dir has no files.
+        let has_sources =
+            !store.sources.is_empty() || store.targets.values().any(|t| !t.sources.is_empty());
+        if !has_sources
+            && store_dir
+                .read_dir()
+                .map_or(true, |mut d| d.next().is_none())
         {
             findings.push(DoctorFinding {
                 id: "empty-store",
                 severity: Severity::Warning,
                 message: format!("store '{}': directory is empty", name),
                 path: Some(store_dir.clone()),
-                hint: Some("add files or remove the store".into()),
+                hint: Some(
+                    "add files/patterns, declare a `sources` entry, or remove the store".into(),
+                ),
             });
         }
 

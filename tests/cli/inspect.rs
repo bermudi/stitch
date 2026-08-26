@@ -834,6 +834,82 @@ fn doctor_warns_on_empty_store() {
 }
 
 #[test]
+fn doctor_does_not_warn_on_sources_only_store() {
+    // A sources-only store (the v0.14 fan-in consumer shape) has an
+    // intentionally empty store dir — every file it links lives elsewhere in
+    // the repo. The `empty-store` warning is a false positive here, and its
+    // hint ("add files or remove the store") points at the wrong remediation.
+    // Doctor must suppress it when the store declares `sources`.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    // Hub file lives outside the consumer store dir.
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub").unwrap();
+
+    // Consumer store dir is intentionally empty — no files inside it.
+    fs::create_dir_all(repo.path().join("consumer")).unwrap();
+    let consumer_target = home_path.join(".consumer");
+    fs::create_dir_all(&consumer_target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.consumer]
+target = "{}"
+
+[stores.consumer.sources]
+"alias.txt" = "shared/hub.txt"
+"#,
+        consumer_target.to_string_lossy(),
+    ));
+
+    // Doctor must not warn about the empty store dir. (The link is not yet
+    // created, so `missing-link` may appear — that is correct and orthogonal.
+    // The precise fix is the absence of the `empty-store` finding.)
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("directory is empty").not());
+}
+
+#[test]
+fn doctor_does_not_warn_on_sources_only_named_target() {
+    // Same as above but the `sources` declaration is on a named target, not
+    // the store top level. The suppress check must cover both.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub").unwrap();
+
+    fs::create_dir_all(repo.path().join("agents")).unwrap();
+    let target = home_path.join(".kilocode").join("rules");
+    fs::create_dir_all(&target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.agents.targets.kilocode]
+target = "{}"
+
+[stores.agents.targets.kilocode.sources]
+"rules.md" = "shared/hub.txt"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("directory is empty").not());
+}
+
+#[test]
 fn doctor_warns_on_duplicate_targets() {
     let repo = Repo::new();
     let target = repo.path().join("home").join(".config").join("shared");

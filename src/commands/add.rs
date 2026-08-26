@@ -304,17 +304,27 @@ pub(crate) fn cmd_add_source(
             "store '{store_name}' has no generated inventory in state.toml"
         ))
     })?;
-    let inventory_sources: &mut BTreeMap<String, String> = match &tname {
-        Some(t) => {
-            let entry = gen_store.targets.get_mut(t).ok_or_else(|| {
-                StitchError::usage(format!(
-                    "store '{store_name}' has no target '{t}' in state.toml"
-                ))
-            })?;
-            &mut entry.sources
-        }
-        None => &mut gen_store.sources,
-    };
+    // Files→sources migration: if `rel` is currently a `files` entry, its
+    // implicit source is `<store_dir>/<rel>`. Adding a `sources` entry for the
+    // same name with a different (or same) repo-relative source is the fan-in
+    // conversion the v0.14 plan §9 envisioned `stitch add` performing. Without
+    // this, the user had to hand-edit state.toml or do a remove+add round-trip
+    // that briefly unlinks the live target link. Removing the `files` entry
+    // and inserting the `sources` entry in one state.toml write is atomic and
+    // never touches the filesystem link — the next `apply` repoints it.
+    let mut migrated_from_files = false;
+    let (inventory_files, inventory_sources): (&mut Vec<String>, &mut BTreeMap<String, String>) =
+        match &tname {
+            Some(t) => {
+                let entry = gen_store.targets.get_mut(t).ok_or_else(|| {
+                    StitchError::usage(format!(
+                        "store '{store_name}' has no target '{t}' in state.toml"
+                    ))
+                })?;
+                (&mut entry.files, &mut entry.sources)
+            }
+            None => (&mut gen_store.files, &mut gen_store.sources),
+        };
     if let Some(existing) = inventory_sources.get(&rel)
         && existing != source
     {
@@ -323,6 +333,15 @@ pub(crate) fn cmd_add_source(
              remove the entry first to change it",
             rel
         )));
+    }
+    // If `rel` is currently a files entry, drop it — the sources entry takes
+    // over the target name. Compare normalized fragments so "a" and "./a" are
+    // treated as the same entry (matches load-time collision detection).
+    let rel_normalized = config::normalize_fragment(&rel, false);
+    let before_len = inventory_files.len();
+    inventory_files.retain(|f| config::normalize_fragment(f, false) != rel_normalized);
+    if inventory_files.len() < before_len {
+        migrated_from_files = true;
     }
     inventory_sources.insert(rel.clone(), source.to_string());
     config::validate_merged_with_repo(&loaded.authored, &candidate, root)?;
@@ -383,6 +402,7 @@ pub(crate) fn cmd_add_source(
         link_created: None,
         moved_from: None,
         state_entry: None,
+        migrated_from_files,
     };
     if dry_run {
         if json {
@@ -395,6 +415,11 @@ pub(crate) fn cmd_add_source(
                 source,
                 target_path.display()
             );
+            if migrated_from_files {
+                println!(
+                    "  removes the existing `files` entry for '{rel}' (files→sources migration)"
+                );
+            }
             println!("  no files are moved; run `stitch apply` to create the link");
         }
         return Ok(());
@@ -417,10 +442,14 @@ pub(crate) fn cmd_add_source(
             "Registered '{}' ← {} on store '{}'",
             rel, source, store_name
         );
-        println!(
-            "  run `stitch apply` to create the link at {}",
-            target_path.display()
-        );
+        if migrated_from_files {
+            println!("  migrated from `files` entry (run `stitch apply` to repoint the link)");
+        } else {
+            println!(
+                "  run `stitch apply` to create the link at {}",
+                target_path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1528,6 +1557,7 @@ fn cmd_add_to_store(
             link_created: None,
             moved_from: None,
             state_entry: None,
+            migrated_from_files: false,
         };
         if json {
             report::write("add", data, loaded.warnings.clone());
@@ -1793,6 +1823,7 @@ fn cmd_add_to_store(
             link_created,
             moved_from,
             state_entry,
+            migrated_from_files: false,
         };
         report::write("add", data, loaded.warnings.clone());
     } else {
@@ -2127,6 +2158,7 @@ pub(crate) fn cmd_add(
                 link_created: None,
                 moved_from: None,
                 state_entry: None,
+                migrated_from_files: false,
             };
             if json {
                 report::write("add", data, loaded.warnings);
@@ -2159,6 +2191,7 @@ pub(crate) fn cmd_add(
                 link_created: None,
                 moved_from: None,
                 state_entry: None,
+                migrated_from_files: false,
             };
             // Dry-run must validate the same target ancestry as the real
             // operation, while still leaving the filesystem untouched.
@@ -2574,6 +2607,7 @@ pub(crate) fn cmd_add(
                 link_created,
                 moved_from,
                 state_entry,
+                migrated_from_files: false,
             };
             report::write("add", data, loaded.warnings);
         } else {
@@ -2911,6 +2945,7 @@ pub(crate) fn cmd_add(
                 link_created,
                 moved_from: None,
                 state_entry,
+                migrated_from_files: false,
             };
             report::write("add", data, loaded.warnings);
         } else {

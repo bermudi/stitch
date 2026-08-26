@@ -714,7 +714,7 @@ fn merge_targets(
 /// components and repeated separators disappear through `Path::components()`;
 /// directory patterns retain one trailing separator so their recursive meaning
 /// survives normalization.
-fn normalize_fragment(fragment: &str, preserve_trailing_separator: bool) -> String {
+pub(crate) fn normalize_fragment(fragment: &str, preserve_trailing_separator: bool) -> String {
     let mut normalized = Path::new(fragment)
         .components()
         .filter(|c| !matches!(c, Component::CurDir))

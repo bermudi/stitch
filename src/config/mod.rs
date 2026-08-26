@@ -30,7 +30,7 @@ pub use types::{
     Store, WhenClause,
 };
 
-pub(crate) use load::{hash_config_bytes, revalidate_config_hash};
+pub(crate) use load::{hash_config_bytes, normalize_fragment, revalidate_config_hash};
 pub(crate) use paths::{canonical_home, canonical_target_for_comparison, normalized_target_path};
 pub(crate) use state::{validate_authored_file, validate_state_file, validate_stitch_dir};
 

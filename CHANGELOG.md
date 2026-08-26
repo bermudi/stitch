@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`doctor` no longer warns "directory is empty" on sources-only stores.** A
+  sources-only store (the v0.14 fan-in consumer shape) has an intentionally
+  empty store dir — every file it links lives elsewhere in the repo, declared
+  via `sources`. The `empty-store` check keyed off directory geometry, so it
+  fired a false-positive warning whose hint ("add files or remove the store")
+  pointed at the wrong remediation. It now suppresses when the store (or any
+  named target) declares `sources`, and the hint for a genuinely empty store
+  mentions `sources` as a third option.
+- **`add --source` now migrates an existing `files` entry in one atomic write.**
+  Adding a `sources` entry for a target name that was previously a `files`
+  entry used to error with "sources key is also listed in files; remove one" —
+  the only path was hand-editing `state.toml` or a `remove` + `add --source`
+  round-trip that briefly unlinks the live target link. `add --source` now
+  drops the matching `files` entry and inserts the `sources` entry in a single
+  `state.toml` write (the files→sources fan-in conversion the v0.14 plan
+  envisioned), prints a "migrated from `files` entry" notice, and reports
+  `migrated_from_files: true` in JSON. The filesystem link is untouched; the
+  next `apply` repoints it.
+
 ## 0.15.0 — 2026-08-24
 
 ### Added

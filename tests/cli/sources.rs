@@ -958,3 +958,499 @@ target = "{config}"
         .assert()
         .success();
 }
+
+#[test]
+fn add_source_migrates_existing_files_entry() {
+    // The fan-in conversion the v0.14 plan §9 envisioned `stitch add`
+    // performing: a target name previously served by a `files` entry
+    // (implicit source <store_dir>/<name>) is repointed at a repo-relative
+    // `sources` entry. `add --source` must drop the `files` entry and insert
+    // the `sources` entry in one atomic state.toml write — no hand-edit, no
+    // remove+add round-trip that briefly unlinks the live target link.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    // Hub file lives outside the consumer store dir.
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub contents").unwrap();
+
+    // Consumer store currently links AGENTS.md from its own dir (files entry).
+    let consumer_dir = repo.make_store("consumer", &["AGENTS.txt"]);
+    fs::write(consumer_dir.join("AGENTS.txt"), "old in-store contents").unwrap();
+    let consumer_target = home_path.join(".consumer");
+    fs::create_dir_all(&consumer_target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.consumer]
+target = "{}"
+files = ["AGENTS.txt"]
+"#,
+        consumer_target.to_string_lossy(),
+    ));
+
+    // Apply so the link exists and points at the in-store file.
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .success();
+    let link = consumer_target.join("AGENTS.txt");
+    assert!(link.is_symlink(), "link must exist before migration");
+    assert_eq!(
+        fs::read_to_string(&link).unwrap(),
+        "old in-store contents",
+        "link must read the in-store file before migration"
+    );
+
+    // Migrate: same target name, new repo-relative source.
+    repo.cmd()
+        .env("HOME", home_path)
+        .args(["add", link.to_str().unwrap(), "--source", "shared/hub.txt"])
+        .assert()
+        .success()
+        .stdout(contains("Registered"))
+        .stdout(contains("migrated from `files` entry"));
+
+    // State.toml: sources entry present, files entry gone — one atomic write.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("shared/hub.txt"),
+        "state must contain the new source:\n{state}"
+    );
+    assert!(
+        !state.contains("files"),
+        "state must no longer contain a files entry:\n{state}"
+    );
+
+    // The link was NOT unlinked by the migration (no round-trip gap).
+    assert!(
+        link.is_symlink(),
+        "link must remain a symlink through the migration"
+    );
+
+    // Apply repoints the link to the hub.
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(&link).unwrap(),
+        "hub contents",
+        "link must read through to the hub after apply"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        fs::canonicalize(&hub).unwrap(),
+        "link must point at the hub after apply"
+    );
+
+    // Doctor is clean: no empty-store (store dir still has AGENTS.txt, but
+    // more importantly the store declares sources), no missing-link.
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(contains("0 errors"))
+        .stdout(contains("0 warnings"));
+}
+
+#[test]
+fn add_source_migrates_existing_files_entry_dry_run_and_json() {
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub").unwrap();
+
+    repo.make_store("consumer", &["AGENTS.txt"]);
+    let consumer_target = home_path.join(".consumer");
+    fs::create_dir_all(&consumer_target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.consumer]
+target = "{}"
+files = ["AGENTS.txt"]
+"#,
+        consumer_target.to_string_lossy(),
+    ));
+
+    let link = consumer_target.join("AGENTS.txt");
+
+    // Dry-run reports the migration would happen but does not write state.
+    let before = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    repo.cmd()
+        .env("HOME", home_path)
+        .args([
+            "add",
+            link.to_str().unwrap(),
+            "--source",
+            "shared/hub.txt",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Would register"))
+        .stdout(contains("files→sources migration"));
+    let after = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert_eq!(before, after, "dry run must not change state");
+
+    // JSON dry-run reports migrated_from_files: true.
+    let output = repo
+        .cmd()
+        .env("HOME", home_path)
+        .args([
+            "--json",
+            "add",
+            link.to_str().unwrap(),
+            "--source",
+            "shared/hub.txt",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_eq!(value["data"]["migrated_from_files"], true);
+}
+
+#[test]
+fn add_source_without_files_entry_reports_no_migration() {
+    // When there is no files entry to migrate, migrated_from_files must be
+    // absent (false) in JSON and the text output must not mention migration.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub").unwrap();
+
+    repo.make_store("consumer", &["existing.txt"]);
+    let consumer_target = home_path.join(".consumer");
+    fs::create_dir_all(&consumer_target).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.consumer]
+target = "{}"
+files = ["existing.txt"]
+"#,
+        consumer_target.to_string_lossy(),
+    ));
+
+    let alias_target = consumer_target.join("alias.txt");
+    let output = repo
+        .cmd()
+        .env("HOME", home_path)
+        .args([
+            "--json",
+            "add",
+            alias_target.to_str().unwrap(),
+            "--source",
+            "shared/hub.txt",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert!(
+        value["data"].get("migrated_from_files").is_none(),
+        "migrated_from_files must be absent when no files entry was migrated: {:?}",
+        value["data"]
+    );
+}
+
+#[test]
+fn add_source_migrates_files_entry_on_named_target() {
+    // The migration's `Some(t)` arm (src/commands/add.rs) handles a `files`
+    // entry declared on a named target of a multi-target store, not just a
+    // top-level store. The existing migration tests only exercise top-level
+    // stores, so a regression in the named-target path — wrong target
+    // selected, panic on missing target, files entry left behind on the
+    // target — would not be caught. This test covers that path end to end.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub contents").unwrap();
+
+    // Multi-target store "app". The "inner" target currently links config.txt
+    // from the store dir via a files entry on the named target.
+    repo.make_store("app", &["config.txt"]);
+    fs::write(repo.path().join("app").join("config.txt"), "old in-store").unwrap();
+    let outer = home_path.join(".config").join("app");
+    let inner = home_path.join(".other").join("app");
+    fs::create_dir_all(&outer).unwrap();
+    fs::create_dir_all(&inner).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.app.targets.outer]
+target = "{}"
+files = ["base.txt"]
+
+[stores.app.targets.inner]
+target = "{}"
+files = ["config.txt"]
+"#,
+        outer.to_string_lossy(),
+        inner.to_string_lossy(),
+    ));
+    // base.txt must exist for the outer target to apply cleanly.
+    fs::write(repo.path().join("app").join("base.txt"), "base").unwrap();
+
+    // Apply so the inner link exists and points at the in-store file.
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .success();
+    let link = inner.join("config.txt");
+    assert!(link.is_symlink(), "link must exist before migration");
+    assert_eq!(
+        fs::read_to_string(&link).unwrap(),
+        "old in-store",
+        "link must read the in-store file before migration"
+    );
+
+    // Migrate the named-target files entry to a repo-relative source.
+    repo.cmd()
+        .env("HOME", home_path)
+        .args(["add", link.to_str().unwrap(), "--source", "shared/hub.txt"])
+        .assert()
+        .success()
+        .stdout(contains("Registered"))
+        .stdout(contains("migrated from `files` entry"));
+
+    // State: sources under the inner named target, files entry gone on inner.
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("[stores.app.targets.inner.sources]"),
+        "state must have inner sources section:\n{state}"
+    );
+    assert!(
+        state.contains("shared/hub.txt"),
+        "state must contain the new source:\n{state}"
+    );
+    // The inner target's files entry for config.txt must be gone. The outer
+    // target's files = ["base.txt"] must remain undisturbed. The name
+    // "config.txt" still appears as the sources map key, so check for the
+    // files-list syntax specifically.
+    assert!(
+        !state.contains(r#"files = ["config.txt"]"#),
+        "state must no longer list config.txt as a files entry:\n{state}"
+    );
+    assert!(
+        state.contains(r#"files = ["base.txt"]"#),
+        "outer target's files entry must remain:\n{state}"
+    );
+
+    // The link was NOT unlinked by the migration.
+    assert!(
+        link.is_symlink(),
+        "link must remain a symlink through the migration"
+    );
+
+    // Apply repoints the inner link to the hub; outer is undisturbed.
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(&link).unwrap(),
+        "hub contents",
+        "inner link must read through to the hub after apply"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        fs::canonicalize(&hub).unwrap(),
+        "inner link must point at the hub after apply"
+    );
+
+    // JSON reports the migration.
+    // (Re-check via dry-run on a fresh setup to inspect the field directly.)
+    let repo2 = Repo::new();
+    let home2 = tempfile::tempdir().unwrap();
+    let hub2 = repo2.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub2.parent().unwrap()).unwrap();
+    fs::write(&hub2, "hub").unwrap();
+    repo2.make_store("app", &["config.txt"]);
+    let inner2 = home2.path().join(".other").join("app");
+    fs::create_dir_all(&inner2).unwrap();
+    repo2.write_state(&format!(
+        r#"
+[stores.app.targets.inner]
+target = "{}"
+files = ["config.txt"]
+"#,
+        inner2.to_string_lossy(),
+    ));
+    let link2 = inner2.join("config.txt");
+    let output = repo2
+        .cmd()
+        .env("HOME", home2.path())
+        .args([
+            "--json",
+            "add",
+            link2.to_str().unwrap(),
+            "--source",
+            "shared/hub.txt",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_eq!(
+        value["data"]["migrated_from_files"], true,
+        "named-target migration must report migrated_from_files: true"
+    );
+}
+
+#[test]
+fn add_source_migrates_files_entry_with_noncanonical_fragment() {
+    // The migration compares normalized fragments so a `files` entry written
+    // as "./AGENTS.txt" (legal, pre-normalization) and a target name of
+    // "AGENTS.txt" are treated as the same entry. A regression that compared
+    // raw strings would silently fail to drop the files entry, leaving both a
+    // files and a sources entry for the same name — which load-time
+    // validation would reject on the next load, surfacing as a confusing
+    // error rather than the intended migration.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub").unwrap();
+
+    let consumer_dir = repo.make_store("consumer", &["AGENTS.txt"]);
+    fs::write(consumer_dir.join("AGENTS.txt"), "old in-store").unwrap();
+    let consumer_target = home_path.join(".consumer");
+    fs::create_dir_all(&consumer_target).unwrap();
+    // Note the non-canonical "./AGENTS.txt" files entry.
+    repo.write_state(&format!(
+        r#"
+[stores.consumer]
+target = "{}"
+files = ["./AGENTS.txt"]
+"#,
+        consumer_target.to_string_lossy(),
+    ));
+
+    let link = consumer_target.join("AGENTS.txt");
+    let output = repo
+        .cmd()
+        .env("HOME", home_path)
+        .args([
+            "--json",
+            "add",
+            link.to_str().unwrap(),
+            "--source",
+            "shared/hub.txt",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = json_output(&output);
+    assert_eq!(
+        value["data"]["migrated_from_files"], true,
+        "non-canonical './AGENTS.txt' files entry must match target name 'AGENTS.txt' after normalization"
+    );
+
+    // Real run: the files entry must be dropped and the sources entry inserted.
+    repo.cmd()
+        .env("HOME", home_path)
+        .args(["add", link.to_str().unwrap(), "--source", "shared/hub.txt"])
+        .assert()
+        .success()
+        .stdout(contains("migrated from `files` entry"));
+
+    let state = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert!(
+        state.contains("shared/hub.txt"),
+        "state must contain the new source:\n{state}"
+    );
+    // No files entry should remain for AGENTS.txt — neither "./AGENTS.txt"
+    // nor "AGENTS.txt". The name still appears as the sources map key, so
+    // check for the files-list syntax specifically. The consumer store has
+    // no other files entries, so the whole `files = ` line should be absent.
+    assert!(
+        !state.contains("files = ["),
+        "state must no longer have a files list on the consumer store:\n{state}"
+    );
+
+    // The state must reload cleanly (no files/sources collision).
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("doctor")
+        .assert()
+        .success();
+}
+
+#[test]
+fn add_source_already_mapped_guard_preserves_files_entries() {
+    // The "already mapped" rejection (src/commands/add.rs) fires when a
+    // sources entry for the target name already exists with a different
+    // source. The guard runs before the files-entry removal step, so a
+    // rejection must not partially mutate state — no files entry may be
+    // dropped. This test confirms the guard is all-or-nothing in the
+    // presence of other files entries on the same store.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    let hub = repo.path().join("shared").join("hub.txt");
+    fs::create_dir_all(hub.parent().unwrap()).unwrap();
+    fs::write(&hub, "hub").unwrap();
+    let other = repo.path().join("shared").join("other.txt");
+    fs::write(&other, "other").unwrap();
+
+    repo.make_store("consumer", &["existing.txt"]);
+    let consumer_target = home_path.join(".consumer");
+    fs::create_dir_all(&consumer_target).unwrap();
+    // alias.txt already has a sources entry; existing.txt is a files entry.
+    repo.write_state(&format!(
+        r#"
+[stores.consumer]
+target = "{}"
+files = ["existing.txt"]
+
+[stores.consumer.sources]
+"alias.txt" = "shared/hub.txt"
+"#,
+        consumer_target.to_string_lossy(),
+    ));
+
+    let before = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+
+    // Attempt to repoint alias.txt at a different source — must be rejected.
+    let alias_target = consumer_target.join("alias.txt");
+    repo.cmd()
+        .env("HOME", home_path)
+        .args([
+            "add",
+            alias_target.to_str().unwrap(),
+            "--source",
+            "shared/other.txt",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("already mapped"));
+
+    // State is byte-for-byte unchanged — no partial mutation.
+    let after = fs::read_to_string(repo.path().join(".stitch").join("state.toml")).unwrap();
+    assert_eq!(
+        before, after,
+        "rejected migration must not change state.toml"
+    );
+}

@@ -501,7 +501,8 @@
         "patterns": "string[]|absent (omitted when empty)",
         "link_created": "string|absent (real mutations only; omitted on dry-run)",
         "moved_from": "string|absent (original path for adopt modes; omitted for create modes and on dry-run)",
-        "state_entry": "string|absent (the [stores.<name>] slice written to state.toml; omitted on dry-run)"
+        "state_entry": "string|absent (the [stores.<name>] slice written to state.toml; omitted on dry-run)",
+        "migrated_from_files": "bool|absent (add --source only; true when a files entry for the same target name was dropped and replaced by this sources entry in the same atomic write; omitted when false)"
       }
     },
     "RemoveData": {
