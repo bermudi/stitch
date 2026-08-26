@@ -10,6 +10,11 @@ See `SPEC.md` for the full command/feature contract.
 Rust 2024 edition. `clap` (CLI), `serde`/`toml` (config), `walkdir` + `globset`
 (file resolution), `dirs`, `thiserror`. `tempfile`/`assert_cmd`/`predicates` for tests.
 
+## End user
+This tool is not precisely for humans, it's more geared towards agents that help humans
+organize their dotfiles. As such, there's little to consult with humans on the design or
+direction of the project and questions should be resolved by agents as well using good taste.
+
 ## Architecture
 A store is a top-level repo dir symlinked to an explicit target — whole-directory mode
 (one symlink) or file mode (`files`/`patterns` link individual files in). `when` clauses

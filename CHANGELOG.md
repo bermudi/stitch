@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.15.1 — 2026-08-25
+
 ### Fixed
 
 - **`doctor` no longer warns "directory is empty" on sources-only stores.** A
