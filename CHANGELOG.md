@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.15.2 — 2026-09-12
+
 ### Fixed
 
 - **`self-update` no longer aborts with `Text file busy` when verifying the
