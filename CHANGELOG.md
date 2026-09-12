@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`self-update` no longer aborts with `Text file busy` when verifying the
+  staged binary.** The installer held its own `O_RDWR` staging handle open
+  while trying to execute the staged file, and Linux refuses `execve` on any
+  file with an open write descriptor (`ETXTBSY`) — so every install failed
+  with `staged binary cannot start on this host: Text file busy`, left the
+  previous binary untouched, and suggested retrying, which could never help.
+  The write handle is now dropped and the staged file reopened read-only
+  before the probe runs. Production always used the real exec-based probe,
+  but the tests stubbed it out, which is why the bug survived review; a new
+  regression test mirrors the `ETXTBSY` precondition by rejecting the install
+  while any write descriptor still points at the staged file.
+
 ## 0.15.1 — 2026-08-25
 
 ### Fixed

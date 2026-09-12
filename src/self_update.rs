@@ -580,21 +580,20 @@ impl InstallTarget {
             std::process::id(),
             sequence
         ));
-        let mut temp = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp_path)
-            .map_err(|error| {
-                format!(
-                    "cannot stage update beside {}: {error}",
-                    self.path.display()
-                )
-            })?;
-
         let mut committed = false;
         let result = (|| {
+            let mut temp = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)
+                .map_err(|error| {
+                    format!(
+                        "cannot stage update beside {}: {error}",
+                        self.path.display()
+                    )
+                })?;
             extract_binary(archive, &mut temp)?;
             validate_elf(&mut temp, target)?;
             set_file_owner_and_group(&temp, effective_uid(), self.gid)
@@ -603,6 +602,15 @@ impl InstallTarget {
                 .map_err(|error| format!("cannot set update permissions: {error}"))?;
             temp.sync_all()
                 .map_err(|error| format!("cannot sync staged update: {error}"))?;
+            // execve(2) refuses with ETXTBSY while the file has any open write
+            // descriptor — including this process's own staging handle — so
+            // the staged binary can never start until the write handle is
+            // gone. Drop it and reopen the staged file read-only.
+            drop(temp);
+            let temp = OpenOptions::new()
+                .read(true)
+                .open(&temp_path)
+                .map_err(|error| format!("cannot reopen staged update: {error}"))?;
             probe.probe(&temp_path, expected_version)?;
             apply_extended_attributes(&temp_path, &self.file_attributes)?;
             temp.sync_all()
@@ -632,7 +640,6 @@ impl InstallTarget {
             }
             Ok(warnings)
         })();
-        drop(temp);
 
         if !committed
             && let Err(cleanup_error) = fs::remove_file(&temp_path)
@@ -1037,6 +1044,71 @@ mod tests {
                 format!("\"{expected}\"")
             );
         }
+    }
+
+    /// Mirrors execve(2): a binary with an open write descriptor answers
+    /// ETXTBSY, so a candidate that still has one at probe time could never
+    /// have started. Catches the bug where the updater held its own O_RDWR
+    /// staging handle open while probing.
+    struct NoWriteDescriptorProbe;
+
+    impl CandidateProbe for NoWriteDescriptorProbe {
+        fn probe(&self, path: &Path, _expected_version: &Version) -> Result<(), String> {
+            let staged = path
+                .canonicalize()
+                .map_err(|error| format!("cannot resolve staged path: {error}"))?;
+            for entry in fs::read_dir("/proc/self/fd")
+                .map_err(|error| format!("cannot list descriptors: {error}"))?
+            {
+                let entry = entry.map_err(|error| format!("cannot list descriptors: {error}"))?;
+                let fd = entry.file_name().to_string_lossy().to_string();
+                let Ok(target) = fs::read_link(format!("/proc/self/fd/{fd}")) else {
+                    continue;
+                };
+                if target != staged {
+                    continue;
+                }
+                let info = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+                    .map_err(|error| format!("cannot inspect descriptor {fd}: {error}"))?;
+                let flags = info
+                    .lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+                    .ok_or_else(|| format!("descriptor {fd} has no parseable flags"))?;
+                // O_ACCMODE: O_WRONLY = 1, O_RDWR = 2.
+                if flags & 0o3 != 0 {
+                    return Err(format!(
+                        "staged binary has write descriptor {fd} open (flags {flags:o}); \
+                         execve would fail with ETXTBSY"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn install_probes_the_staged_file_with_no_write_descriptor_open() {
+        let target = "x86_64-unknown-linux-gnu";
+        let candidate = elf(62, b"new");
+        let archive = tar_gz(&[("stitch", tar::EntryType::Regular, &candidate)]);
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("stitch");
+        fs::write(&executable, b"old").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let install_target = InstallTarget::preflight(&executable).unwrap();
+        install_target
+            .install(
+                &archive,
+                target,
+                &Version::new(2, 0, 0),
+                &NoWriteDescriptorProbe,
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(&executable).unwrap(), candidate);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
