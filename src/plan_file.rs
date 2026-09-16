@@ -666,8 +666,14 @@ fn stage_render_for_op(
         )));
     }
 
-    let content = render::render_file(&tmpl_source, &source_rel, platform, &loaded.config.vars)
-        .map_err(|e| StitchError::render(&tmpl_source, e))?;
+    let content = render::render_file(
+        repo_root,
+        &tmpl_source,
+        &source_rel,
+        platform,
+        &loaded.config.vars,
+    )
+    .map_err(|e| StitchError::render(&tmpl_source, e))?;
 
     let staged_path = render::staging_path(repo_root, store_name, &link_rel);
 
@@ -921,8 +927,14 @@ pub(crate) fn verify_stage_render(
             expected_staged.display()
         ));
     }
-    let content = render::render_file(&source_path, source_rel, platform, &loaded.config.vars)
-        .map_err(|e| format!("render failed: {e}"))?;
+    let content = render::render_file(
+        repo_root,
+        &source_path,
+        source_rel,
+        platform,
+        &loaded.config.vars,
+    )
+    .map_err(|e| format!("render failed: {e}"))?;
     if sha256_hex(&content) != sha256 {
         return Err("render hash mismatch".into());
     }

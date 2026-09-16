@@ -66,11 +66,14 @@ pub(crate) fn cmd_render(
                 )));
             }
             let platform = Platform::detect();
-            let content =
-                render::render_file(&source_path, source_rel, &platform, &loaded.config.vars)
-                    .map_err(|e| {
-                        Box::new((StitchError::render(&source_path, e), warnings.clone()))
-                    })?;
+            let content = render::render_file(
+                root,
+                &source_path,
+                source_rel,
+                &platform,
+                &loaded.config.vars,
+            )
+            .map_err(|e| Box::new((StitchError::render(&source_path, e), warnings.clone())))?;
             let data = report::render(&source_path, source_rel, &content);
             Ok((data, warnings))
         });
@@ -88,8 +91,14 @@ pub(crate) fn cmd_render(
         )));
     }
     let platform = Platform::detect();
-    let content = render::render_file(&source_path, source_rel, &platform, &loaded.config.vars)
-        .map_err(|e| StitchError::render(&source_path, e))?;
+    let content = render::render_file(
+        root,
+        &source_path,
+        source_rel,
+        &platform,
+        &loaded.config.vars,
+    )
+    .map_err(|e| StitchError::render(&source_path, e))?;
     print!("{content}");
     Ok(())
 }

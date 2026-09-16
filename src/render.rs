@@ -367,7 +367,86 @@ impl Object for StrictVars {
     }
 }
 
-fn make_env() -> Environment<'static> {
+/// Resolve an `include()` argument to the text of a real repo file.
+///
+/// The path is repo-relative and must satisfy the same rules as `add
+/// --source` sources: a safe fragment (no `..`, no leading `/`), not under
+/// `.stitch/` or `.git/`, and reaching a regular file without passing
+/// through a single symlink (one hop only, checked per component against
+/// `repo_root`). `.tmpl` sources are rejected: included text is embedded
+/// verbatim and never rendered, so a nested template would leak its
+/// unrendered syntax into the output — and because inclusion never renders
+/// the inner text, recursion is impossible by construction.
+fn include_from_repo(repo_root: &Path, path: &str) -> Result<String, String> {
+    if !config::is_safe_fragment(path) {
+        return Err(format!(
+            "include('{path}'): the path must be repo-relative, with no '..' components and no leading '/'"
+        ));
+    }
+    // Normalize so `./.stitch/...` cannot bypass the protected-prefix check.
+    let mut normalized = PathBuf::new();
+    for c in Path::new(path).components() {
+        if let Component::Normal(part) = c {
+            normalized.push(part);
+        }
+    }
+    let norm = normalized.to_string_lossy();
+    if norm == ".stitch"
+        || norm.starts_with(".stitch/")
+        || norm == ".git"
+        || norm.starts_with(".git/")
+    {
+        return Err(format!(
+            "include('{path}'): content under `.stitch/` or `.git/` cannot be included"
+        ));
+    }
+    if is_template(path) {
+        return Err(format!(
+            "include('{path}'): templates cannot include other templates; include() embeds raw file text, so a `.tmpl` source would leak unrendered template syntax"
+        ));
+    }
+    let mut current = repo_root.to_path_buf();
+    let mut final_meta = None;
+    for c in Path::new(path).components() {
+        let Component::Normal(part) = c else {
+            continue;
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "include('{path}'): must name a real repo file, not a symlink or a path through one (one hop only)"
+                    ));
+                }
+                final_meta = Some(meta);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "include('{path}'): cannot read {}: {e}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    match final_meta {
+        Some(meta) if meta.file_type().is_file() => {}
+        Some(_) => {
+            return Err(format!("include('{path}'): not a regular file"));
+        }
+        None => {
+            return Err(format!("include('{path}'): names no file"));
+        }
+    }
+    std::fs::read_to_string(&current).map_err(|e| {
+        format!(
+            "include('{path}'): could not read {}: {e}",
+            current.display()
+        )
+    })
+}
+
+fn make_env(repo_root: &Path) -> Environment<'static> {
     let mut env = Environment::new();
     // Dotfiles are plaintext; never HTML-escape `&` → `&amp;`.
     env.set_auto_escape_callback(|_| AutoEscape::None);
@@ -381,6 +460,11 @@ fn make_env() -> Environment<'static> {
     // specific key.
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.add_function("env", env_fn);
+    let include_root = repo_root.to_path_buf();
+    env.add_function("include", move |path: String| -> Result<String, MjError> {
+        include_from_repo(&include_root, &path)
+            .map_err(|msg| MjError::new(MjErrorKind::InvalidOperation, msg))
+    });
     env
 }
 
@@ -389,12 +473,13 @@ fn make_env() -> Environment<'static> {
 /// `name` is the template identity used in error messages (typically the
 /// store-relative path). Returns the rendered string; never writes to disk.
 pub fn render_string(
+    repo_root: &Path,
     name: &str,
     source: &str,
     platform: &Platform,
     vars: &BTreeMap<String, String>,
 ) -> Result<String, String> {
-    let mut env = make_env();
+    let mut env = make_env(repo_root);
     env.add_template(name, source)
         .map_err(|e| format_mj_error(name, &e))?;
     let tmpl = env
@@ -433,6 +518,7 @@ fn format_mj_error(name: &str, err: &MjError) -> String {
 
 /// Read a `.tmpl` source file and render it in memory.
 pub fn render_file(
+    repo_root: &Path,
     source_path: &Path,
     template_name: &str,
     platform: &Platform,
@@ -465,7 +551,7 @@ pub fn render_file(
     }
     let source = std::fs::read_to_string(source_path)
         .map_err(|e| format!("could not read template {}: {e}", source_path.display()))?;
-    render_string(template_name, &source, platform, vars)
+    render_string(repo_root, template_name, &source, platform, vars)
 }
 
 // ---------------------------------------------------------------------------
@@ -828,7 +914,7 @@ pub fn stage_template(
             "repo .gitignore does not safely cover `{RENDER_GITIGNORE_ENTRY}`"
         ));
     }
-    let rendered = render_file(source_path, source_rel, platform, vars)?;
+    let rendered = render_file(repo_root, source_path, source_rel, platform, vars)?;
     let paths = staged_paths(repo_root, store_name, link_rel)?;
 
     if let Some((existing, meta)) = read_staged_file(&paths)?
@@ -861,7 +947,7 @@ pub fn staged_differs(
     platform: &Platform,
     vars: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
-    let rendered = render_file(source_path, source_rel, platform, vars)?;
+    let rendered = render_file(repo_root, source_path, source_rel, platform, vars)?;
     let paths = staged_paths(repo_root, store_name, link_rel)?;
     match read_staged_file(&paths)? {
         Some((existing, meta)) => Ok(existing != rendered
@@ -1453,6 +1539,7 @@ mod tests {
         let p = test_platform();
         let vars = BTreeMap::from([("editor".into(), "nvim".into())]);
         let out = render_string(
+            Path::new("/"),
             "t.tmpl",
             "os={{ os }} host={{ hostname }} ed={{ vars.editor }}",
             &p,
@@ -1466,9 +1553,17 @@ mod tests {
     fn absent_distro_renders_as_none() {
         let mut p = test_platform();
         p.distro = None;
-        let out = render_string("t.tmpl", "{{ distro }}", &p, &BTreeMap::new()).unwrap();
+        let out = render_string(
+            Path::new("/"),
+            "t.tmpl",
+            "{{ distro }}",
+            &p,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(out, "none");
         let fallback = render_string(
+            Path::new("/"),
             "t.tmpl",
             r#"{{ distro or "unknown" }}"#,
             &p,
@@ -1484,6 +1579,7 @@ mod tests {
         let p = test_platform();
         let vars = BTreeMap::new();
         let err = render_string(
+            Path::new("/"),
             "t.tmpl",
             r#"{{ env("STITCH_TEST_UNSET_VAR_XYZ_999") }}"#,
             &p,
@@ -1501,6 +1597,7 @@ mod tests {
         let p = test_platform();
         let vars = BTreeMap::new();
         let out = render_string(
+            Path::new("/"),
             "t.tmpl",
             r#"{{ env("STITCH_TEST_UNSET_VAR_XYZ_999", "fallback") }}"#,
             &p,
@@ -1514,8 +1611,175 @@ mod tests {
     fn no_html_autoescape() {
         let p = test_platform();
         let vars = BTreeMap::from([("x".into(), "a & b".into())]);
-        let out = render_string("t.tmpl", "{{ vars.x }}", &p, &vars).unwrap();
+        let out = render_string(Path::new("/"), "t.tmpl", "{{ vars.x }}", &p, &vars).unwrap();
         assert_eq!(out, "a & b");
+    }
+
+    // --- include() ---
+
+    #[test]
+    fn include_embeds_repo_file_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("hub.md"), "hub line\n{{ vars.editor }}\n").unwrap();
+        let p = test_platform();
+        let out = render_string(
+            repo,
+            "t.tmpl",
+            "{{ include(\"hub.md\") }}",
+            &p,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // Raw text: the hub's own template-like syntax must NOT interpolate.
+        assert_eq!(out, "hub line\n{{ vars.editor }}\n");
+    }
+
+    #[test]
+    fn include_composes_hub_and_delta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("hub.md"), "shared rules\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        let tmpl = "{{ include(\"hub.md\") }}delta line\n";
+        let out = render_string(repo, "AGENTS.md.tmpl", tmpl, &p, &vars).unwrap();
+        assert_eq!(out, "shared rules\ndelta line\n");
+    }
+
+    #[test]
+    fn include_rejects_unsafe_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("hub.md"), "x").unwrap();
+        std::fs::create_dir_all(repo.join(".stitch/render")).unwrap();
+        std::fs::write(repo.join(".stitch/render/staged"), "s").unwrap();
+        std::fs::write(repo.join(".gitconfig"), "g").unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/config"), "g").unwrap();
+        std::fs::write(repo.join("part.tmpl"), "{{ hostname }}").unwrap();
+        let p = test_platform();
+        for (path, expect) in [
+            ("../outside", "repo-relative"),
+            ("/etc/hostname", "repo-relative"),
+            ("", "repo-relative"),
+            ("./.stitch/render/staged", "`.stitch/`"),
+            (".git/config", "`.stitch/`"),
+            ("part.tmpl", "cannot include other templates"),
+            ("missing.md", "cannot read"),
+            (".", "repo-relative"),
+        ] {
+            let err = render_string(
+                repo,
+                "t.tmpl",
+                &format!(r#"{{{{ include("{path}") }}}}"#),
+                &p,
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+            assert!(err.contains(expect), "include('{path}'): got: {err}");
+        }
+    }
+
+    #[test]
+    fn include_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.md");
+        std::fs::write(&secret, "secret").unwrap();
+        let repo = tmp.path();
+        std::os::unix::fs::symlink(&secret, repo.join("link.md")).unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&secret, repo.join("sub/link.md")).unwrap();
+        let p = test_platform();
+        for path in ["link.md", "sub/link.md"] {
+            let err = render_string(
+                repo,
+                "t.tmpl",
+                &format!(r#"{{{{ include("{path}") }}}}"#),
+                &p,
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("one hop only"),
+                "include('{path}'): got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn include_rejects_directory_and_non_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join("adir")).unwrap();
+        std::fs::write(repo.join("bin.md"), [0xff, 0xfe, 0x00]).unwrap();
+        let p = test_platform();
+        let err = render_string(
+            repo,
+            "t.tmpl",
+            r#"{{ include("adir") }}"#,
+            &p,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+        let err = render_string(
+            repo,
+            "t.tmpl",
+            r#"{{ include("bin.md") }}"#,
+            &p,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("UTF-8"), "got: {err}");
+    }
+
+    #[test]
+    fn staging_tracks_include_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+        std::fs::write(repo.join("hub.md"), "shared rules\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let src = store.join("AGENTS.md.tmpl");
+        std::fs::write(&src, "{{ include(\"hub.md\") }}delta\n").unwrap();
+
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        let r1 =
+            stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        assert!(matches!(r1, StageOutcome::Written(_)));
+        let dest = staging_path(repo, "amp", "AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "shared rules\ndelta\n"
+        );
+
+        // Unchanged hub → Unchanged.
+        let r2 =
+            stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        assert!(matches!(r2, StageOutcome::Unchanged(_)));
+        assert!(
+            !staged_differs(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap()
+        );
+
+        // The drift story: hub edit is invisible to the template file, but the
+        // fresh render in stage/differs re-reads it and picks it up.
+        std::fs::write(repo.join("hub.md"), "shared rules v2\n").unwrap();
+        assert!(
+            staged_differs(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap()
+        );
+        let r3 =
+            stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        assert!(matches!(r3, StageOutcome::Written(_)));
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "shared rules v2\ndelta\n"
+        );
     }
 
     #[test]

@@ -489,6 +489,7 @@ only — no content sniffing. Secrets (`{{ secret }}`) are planned for v0.9.
 | `{{ distro }}` | Distro ID; renders `none` when unavailable |
 | `{{ shell }}` | Login shell basename |
 | `{{ vars.key }}` | User-defined variable (`[vars]` in `stitch.toml`) |
+| `{{ include("path/from/repo/root") }}` | Raw text of a real repo file, embedded verbatim (never rendered). Path must be a safe repo-relative fragment, not under `.stitch/`/`.git/`, no symlinked components, not a `.tmpl` source |
 | `{{ secret("name") }}` | Encrypted secret (planned for v0.9 — same render context) |
 
 Rendered files go to `.stitch/render/<store>/...` — **inside the repo**, so the
@@ -508,6 +509,7 @@ Contract (rationale in `docs/plans/v0.6-templates.md`):
 - **`diff` gains a content dimension for templated entries only**: a fresh in-memory render compared against the staged file — "would `apply` change anything?" Non-templated entries remain link-state-only.
 - **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed. The stale-link sweep walks the target directory but never descends into the repository itself, so a file-mode store with `target = "~"` (whose target contains the repo) does not classify or remove repo-internal organizational symlinks. Hand-edits inside `.stitch/render/` are unsupported and overwritten on the next `apply`; `doctor` flags drift (staged ≠ fresh render) so this is never silent. Writes are hash-gated: unchanged content preserves mtime.
 - **Authoring is by hand.** Write `gitconfig.tmpl` in the store and `apply` — whole-dir stores pick it up via promotion; file-mode stores list the source name in `files`. There is no `add --template` in v0.6.
+- **`include()` composes from repo files.** `{{ include("agents/hub.md") }}` embeds the file's text verbatim at render time. There is no nested rendering: recursion is impossible by construction, and a hub file's own template-like syntax stays literal text in the output. The argument reuses the `add --source` safety rule — safe repo-relative fragment (no `..`, no leading `/`), not under `.stitch/` or `.git/`, regular file reached without passing through a symlink (one hop only), valid UTF-8 — and `.tmpl` arguments are rejected, since including a template would leak unrendered source. Drift detection is free: apply, `diff`, and `doctor` re-read included files on every fresh render, so editing an included hub surfaces as a `content` diff and a staging-drift warning until the next `apply` converges it.
 
 ## Hooks (v0.2)
 

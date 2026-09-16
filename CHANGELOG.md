@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- **Templates can include repo files: `{{ include("path/from/repo/root") }}`.**
+  The motivating case is the AGENTS.md fan-in (one shared "hub" file linked
+  into many agent config dirs): a tool that reads exactly one file and has no
+  import syntax previously forced a choice between linking the hub verbatim
+  or forking it — and a fork silently stops receiving hub edits. A `.tmpl`
+  source can now compose hub + delta (`{{ include("agents/AGENTS.md") }}`
+  followed by tool-specific lines), rendered into the staged file the target
+  links. Include semantics are deliberately narrow: the argument must be a
+  safe repo-relative fragment (no `..`, no leading `/`), must not live under
+  `.stitch/` or `.git/`, must reach a regular file without passing through a
+  symlink (one hop only, the same rule as `add --source`), and must be valid
+  UTF-8. Included text is embedded verbatim — never rendered — so recursion
+  cannot occur and `.tmpl` arguments are rejected outright. Fresh renders
+  re-read included files on every `apply`/`diff`/`doctor`, so editing an
+  included hub shows up as a `content` diff and a doctor staging-drift
+  warning until the next apply converges it.
+
 ## 0.15.2 — 2026-09-12
 
 ### Fixed
