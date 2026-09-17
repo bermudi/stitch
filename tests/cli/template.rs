@@ -822,6 +822,56 @@ files = ["gitconfig.tmpl"]
     );
 }
 
+/// End-to-end for `include()`: a .tmpl composing hub + delta must apply, and a
+/// later hub edit — invisible to the .tmpl file itself — must surface in
+/// `diff` and converge on the next `apply`. Pins that every CLI render path
+/// (apply/diff) passes the repo root, not a store dir or CWD.
+#[test]
+fn template_include_tracks_hub_drift_end_to_end() {
+    let repo = Repo::new();
+    fs::write(repo.path().join("hub.md"), "shared rules\n").unwrap();
+    let store = repo.path().join("amp");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(
+        store.join("AGENTS.md.tmpl"),
+        "{{ include(\"hub.md\") }}delta line\n",
+    )
+    .unwrap();
+    let target = repo.path().join("home").join(".config").join("amp");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.amp]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let composed = fs::read_to_string(target.join("AGENTS.md")).unwrap();
+    assert_eq!(composed, "shared rules\ndelta line\n");
+
+    // Edit the hub without applying. The .tmpl is unchanged; only a render
+    // that re-reads the hub can see this.
+    fs::write(repo.path().join("hub.md"), "shared rules v2\n").unwrap();
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .success()
+        .stdout(contains("content:"));
+
+    repo.cmd().arg("apply").assert().success();
+    let composed = fs::read_to_string(target.join("AGENTS.md")).unwrap();
+    assert_eq!(composed, "shared rules v2\ndelta line\n");
+    let out = repo.cmd().arg("diff").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(
+        !stdout.contains("content:"),
+        "diff should be empty after apply: {stdout}"
+    );
+}
+
 #[test]
 fn apply_removes_target_link_for_deleted_template() {
     let repo = Repo::new();

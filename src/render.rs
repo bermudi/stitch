@@ -377,6 +377,14 @@ impl Object for StrictVars {
 /// verbatim and never rendered, so a nested template would leak its
 /// unrendered syntax into the output — and because inclusion never renders
 /// the inner text, recursion is impossible by construction.
+///
+/// TOCTOU note: the per-component walk and the final read are separate
+/// syscalls. The leaf is pinned with `O_NOFOLLOW`, but an interior component
+/// could in principle be swapped to a symlink between walk and read. Within
+/// this tool's same-UID threat model such a racer can already edit the hub
+/// file directly, so no privilege boundary is crossed; the walk exists to
+/// reject configured escapes, not active adversaries (same stance as the
+/// render staging docs).
 fn include_from_repo(repo_root: &Path, path: &str) -> Result<String, String> {
     if !config::is_safe_fragment(path) {
         return Err(format!(
@@ -434,16 +442,35 @@ fn include_from_repo(repo_root: &Path, path: &str) -> Result<String, String> {
         Some(_) => {
             return Err(format!("include('{path}'): not a regular file"));
         }
+        // Unreachable: `is_safe_fragment` guarantees at least one normal
+        // component, so the walk above always captured final metadata.
         None => {
-            return Err(format!("include('{path}'): names no file"));
+            return Err(format!(
+                "include('{path}'): internal: path resolved to no components"
+            ));
         }
     }
-    std::fs::read_to_string(&current).map_err(|e| {
+    // `O_NOFOLLOW` pins the leaf against a walk→read swap; interior
+    // components are covered by the TOCTOU note above.
+    use std::io::Read;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&current)
+        .map_err(|e| {
+            format!(
+                "include('{path}'): could not open {}: {e}",
+                current.display()
+            )
+        })?;
+    let mut text = String::new();
+    (&file).read_to_string(&mut text).map_err(|e| {
         format!(
             "include('{path}'): could not read {}: {e}",
             current.display()
         )
-    })
+    })?;
+    Ok(text)
 }
 
 fn make_env(repo_root: &Path) -> Environment<'static> {
@@ -1640,13 +1667,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         std::fs::write(repo.join("hub.md"), "shared rules\n").unwrap();
+        // Nested, multi-component path: include() is not leaf-only.
+        std::fs::create_dir_all(repo.join("notes")).unwrap();
+        std::fs::write(repo.join("notes/more.md"), "nested rules\n").unwrap();
         let store = repo.join("amp");
         std::fs::create_dir_all(&store).unwrap();
         let p = test_platform();
         let vars = BTreeMap::new();
-        let tmpl = "{{ include(\"hub.md\") }}delta line\n";
+        let tmpl = "{{ include(\"hub.md\") }}{{ include(\"notes/more.md\") }}delta line\n";
         let out = render_string(repo, "AGENTS.md.tmpl", tmpl, &p, &vars).unwrap();
-        assert_eq!(out, "shared rules\ndelta line\n");
+        assert_eq!(out, "shared rules\nnested rules\ndelta line\n");
     }
 
     #[test]
@@ -1666,7 +1696,7 @@ mod tests {
             ("/etc/hostname", "repo-relative"),
             ("", "repo-relative"),
             ("./.stitch/render/staged", "`.stitch/`"),
-            (".git/config", "`.stitch/`"),
+            (".git/config", "`.git/`"),
             ("part.tmpl", "cannot include other templates"),
             ("missing.md", "cannot read"),
             (".", "repo-relative"),
@@ -1689,12 +1719,16 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let secret = outside.path().join("secret.md");
         std::fs::write(&secret, "secret").unwrap();
+        // A reachable target behind an interior symlink: if the walk only
+        // checked the leaf, include("dirlink/hub.md") would read this.
+        std::fs::write(outside.path().join("hub.md"), "outside").unwrap();
         let repo = tmp.path();
         std::os::unix::fs::symlink(&secret, repo.join("link.md")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.join("dirlink")).unwrap();
         std::fs::create_dir_all(repo.join("sub")).unwrap();
         std::os::unix::fs::symlink(&secret, repo.join("sub/link.md")).unwrap();
         let p = test_platform();
-        for path in ["link.md", "sub/link.md"] {
+        for path in ["link.md", "sub/link.md", "dirlink/hub.md"] {
             let err = render_string(
                 repo,
                 "t.tmpl",
