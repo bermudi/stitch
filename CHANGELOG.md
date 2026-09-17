@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.0 — 2026-09-17
+
 ### Added
 
 - **Templates can include repo files: `{{ include("path/from/repo/root") }}`.**
