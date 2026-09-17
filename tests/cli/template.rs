@@ -861,6 +861,14 @@ files = ["AGENTS.md.tmpl"]
         .success()
         .stdout(contains("content:"));
 
+    // doctor's staging-drift check shares staged_differs with diff, but its
+    // call site is distinct — pin that it too re-renders with the repo root.
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(contains("is stale"));
+
     repo.cmd().arg("apply").assert().success();
     let composed = fs::read_to_string(target.join("AGENTS.md")).unwrap();
     assert_eq!(composed, "shared rules v2\ndelta line\n");
