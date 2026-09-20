@@ -177,6 +177,26 @@ pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
     let errors = plan.summary.errors;
     let classes_vec: Vec<FailureClass> = classes.into_iter().collect();
 
+    // Carry the first error op's message into the aggregate so stderr (and
+    // the exit-code docs) point at the actual failure — e.g. a hand-edited
+    // staged render refusal — instead of a bare count. The per-entry lines
+    // on stdout and the JSON ops remain the complete record; this is the
+    // flavor, not the source of truth.
+    let first_error = plan
+        .stores
+        .iter()
+        .flat_map(|s| s.ops.iter())
+        .find_map(|op| match op {
+            plan::PlanOp::Error { message, .. } => Some(message.as_str()),
+            _ => None,
+        });
+    let summary = match first_error {
+        Some(m) => {
+            format!("{command} reported {conflicts} conflict(s), {errors} error(s): {m}")
+        }
+        None => format!("{command} reported {conflicts} conflict(s), {errors} error(s)"),
+    };
+
     // When the only error class is Hook, populate structured details with
     // the store and hook name from the plan ops.
     let details = if classes_vec.as_slice() == [FailureClass::Hook] {
@@ -196,10 +216,7 @@ pub(crate) fn plan_error(plan: &plan::Plan, command: &str) -> StitchError {
         None
     };
 
-    let mut error = StitchError::apply(
-        classes_vec,
-        format!("{command} reported {conflicts} conflict(s), {errors} error(s)"),
-    );
+    let mut error = StitchError::apply(classes_vec, summary);
     // Populate details on the Apply variant directly.
     if let StitchError::Apply { details: d, .. } = &mut error {
         *d = details;

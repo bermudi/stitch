@@ -140,7 +140,8 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Open stitch.toml (or an entry's repo source) in $EDITOR
+    /// Open stitch.toml (or an entry's repo source) in $EDITOR, then apply so
+    /// renders converge
     Edit {
         /// Store name or target path. Opens the repo source (the `.tmpl` for a
         /// templated entry, the plain file otherwise) — never the staged render.
@@ -148,7 +149,8 @@ pub enum Commands {
         entry: Option<String>,
 
         /// Print the resolved repo source path instead of opening $EDITOR.
-        /// Useful for agents that open files with their own tools.
+        /// Useful for agents that open files with their own tools. No apply
+        /// runs on this path — run `stitch apply` after editing.
         #[arg(long)]
         print_path: bool,
     },

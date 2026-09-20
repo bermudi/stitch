@@ -1579,3 +1579,238 @@ files = ["f"]
     );
     assert!(root_dir.is_symlink(), "root symlink must be untouched");
 }
+
+// ---------------------------------------------------------------------------
+// Render journal: hand-edited staged renders
+//
+
+/// The trust hole this guards: `.stitch/render/` is gitignored, so a render
+/// edited through its target symlink exists nowhere else. Before the journal,
+/// the next apply silently destroyed it. Now apply refuses (render class),
+/// the edit survives, and deleting the staged file — a deliberate act named
+/// in the error — is the explicit discard path.
+#[test]
+fn hand_edited_render_blocks_apply_and_survives() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("agent")
+        .join("AGENTS.md");
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "shared\n");
+
+    // Hand-edit through the target symlink — append through the link, never
+    // write-temp-then-rename (which would fork the link).
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(target.join("AGENTS.md"))
+            .unwrap();
+        writeln!(f, "hand-edited line").unwrap();
+    }
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(8)
+        // The per-entry detail lives on stdout (plan line); stderr carries
+        // the aggregate error — the established split for all plan errors.
+        .stdout(contains("modified outside stitch"))
+        .stderr(contains("1 error(s)"));
+    // The refusal must not have clobbered the only copy of the edit.
+    assert!(
+        fs::read_to_string(&staged)
+            .unwrap()
+            .contains("hand-edited line")
+    );
+
+    // Recovery is explicit: delete the staged file, re-apply from sources.
+    fs::remove_file(&staged).unwrap();
+    repo.cmd().arg("apply").assert().success();
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "shared\n");
+}
+
+/// Attribution must reach the read-only surfaces too: `diff` mirrors the
+/// refusal (it must not promise a render apply would refuse to make), and
+/// `doctor` names hand-edits as errors instead of plain staging drift.
+#[test]
+fn hand_edit_visible_in_diff_and_doctor() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("agent")
+        .join("AGENTS.md");
+    fs::write(&staged, "shared\nhand-edited\n").unwrap();
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .stdout(contains("modified outside stitch"));
+
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(contains("[error]"))
+        .stdout(contains("refuse to overwrite"));
+}
+
+/// A source edit that legitimately re-renders (hub edit, template edit, env
+/// change) must keep flowing: the journal only refuses *unattributed*
+/// overwrites. Covers the include() fan-in case end to end.
+#[test]
+fn source_edits_still_re_render_with_journal_present() {
+    let repo = Repo::new();
+    fs::write(repo.path().join("hub.md"), "hub v1\n").unwrap();
+    let store = repo.make_store("agent", &[]);
+    fs::write(
+        store.join("AGENTS.md.tmpl"),
+        "{{ include(\"hub.md\") }}delta\n",
+    )
+    .unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("agent")
+        .join("AGENTS.md");
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "hub v1\ndelta\n");
+
+    // Hub edit: template file untouched, render must still refresh.
+    fs::write(repo.path().join("hub.md"), "hub v2\n").unwrap();
+    repo.cmd().arg("apply").assert().success();
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "hub v2\ndelta\n");
+
+    // And convergence is quiet: no drift, no findings.
+    repo.cmd()
+        .args(["diff"])
+        .assert()
+        .success()
+        .stdout(contains("no differences"));
+    repo.cmd().arg("doctor").assert().success();
+}
+
+/// `stitch edit <target>` is the full round-trip: editor on the repo source,
+/// then apply, so renders converge without remembering to run it by hand.
+#[test]
+fn edit_round_trip_renders_and_converges() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+
+    // Fake editor: appends a delta line to whatever path it is given.
+    let editor = repo.path().join("editor.sh");
+    fs::write(&editor, "#!/bin/sh\nprintf 'delta line\\n' >> \"$1\"\n").unwrap();
+    make_executable(&editor);
+
+    let entry = target.join("AGENTS.md");
+    let entry_str = entry.to_string_lossy().into_owned();
+    repo.cmd()
+        .env("EDITOR", &editor)
+        .args(["edit", &entry_str])
+        .assert()
+        .success()
+        .stdout(contains("edited"));
+
+    // The round-trip converged: staged render and target both carry the delta.
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("agent")
+        .join("AGENTS.md");
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "shared\ndelta line\n");
+    assert_eq!(fs::read_to_string(&entry).unwrap(), "shared\ndelta line\n");
+}
+
+/// A failing editor must not trigger the apply half of the round-trip —
+/// the edit is presumed not saved, and converge-on-failure would mask the
+/// editor error.
+#[test]
+fn edit_failed_editor_skips_apply() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+
+    // Editor exits non-zero without touching the file.
+    let editor = repo.path().join("fail-editor.sh");
+    fs::write(&editor, "#!/bin/sh\nexit 3\n").unwrap();
+    make_executable(&editor);
+
+    let entry = target.join("AGENTS.md");
+    let entry_str = entry.to_string_lossy().into_owned();
+    repo.cmd()
+        .env("EDITOR", &editor)
+        .args(["edit", &entry_str])
+        .assert()
+        .failure()
+        .stderr(contains("exited with status 3"));
+}

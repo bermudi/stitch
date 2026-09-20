@@ -1708,6 +1708,20 @@ fn apply_file_entry(
             Ok(d) => d,
             Err(e) => return ApplyAction::Error(StitchError::render(&source_path, e)),
         };
+        // Mirror the write path's refusal: a hand-edited staged render makes
+        // apply fail, so a dry run must say so instead of promising a render.
+        if content_differs {
+            match render::staged_hand_edited(repo_root, store_name, &link.name) {
+                Ok(true) => {
+                    return ApplyAction::Error(StitchError::render(
+                        &source_path,
+                        render::hand_edit_message(&staged, &source_path),
+                    ));
+                }
+                Ok(false) => {}
+                Err(e) => return ApplyAction::Error(StitchError::render(&source_path, e)),
+            }
+        }
         let staged_dir = render::store_render_dir(repo_root, store_name);
         let link_action = apply_single_link(&staged, &target, repo_root, &staged_dir, opts);
         if content_differs && matches!(link_action, ApplyAction::AlreadyLinked(_)) {

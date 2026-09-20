@@ -6,6 +6,7 @@
 //! files are written atomically at mode `0600` under a `0700` directory.
 
 use crate::config;
+use crate::journal;
 use crate::linker;
 use crate::platform::Platform;
 use minijinja::value::{Enumerator, Object};
@@ -195,10 +196,14 @@ pub fn repo_gitignore_covers_render(repo_root: &Path) -> bool {
 /// pre-created by `init`, so its existence alone does not imply template use.
 pub fn has_staged_output(repo_root: &Path) -> bool {
     let root = render_root(repo_root);
+    let journal = journal::journal_path(repo_root);
     walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
+        // The render journal is bookkeeping, not staged output — otherwise it
+        // would keep reporting output after every staged render is gone.
+        .filter(|entry| entry.path() != journal)
         .any(|entry| entry.file_type().is_file())
 }
 
@@ -826,7 +831,7 @@ fn random_temp_name() -> Result<String, String> {
     ))
 }
 
-fn create_secure_temp(dir: &Path) -> Result<(std::fs::File, PathBuf), String> {
+pub(crate) fn create_secure_temp(dir: &Path) -> Result<(std::fs::File, PathBuf), String> {
     for _ in 0..TEMP_NAME_ATTEMPTS {
         let path = dir.join(random_temp_name()?);
         let mut opts = std::fs::OpenOptions::new();
@@ -943,8 +948,24 @@ pub fn stage_template(
     }
     let rendered = render_file(repo_root, source_path, source_rel, platform, vars)?;
     let paths = staged_paths(repo_root, store_name, link_rel)?;
+    let existing = read_staged_file(&paths)?;
 
-    if let Some((existing, meta)) = read_staged_file(&paths)?
+    // Attribution guard. An overwrite is imminent when content differs. If
+    // the staged file no longer matches what stitch last wrote (per the
+    // render journal), someone edited the render through its target symlink —
+    // and the render tree is gitignored, so an overwrite destroys the only
+    // copy. Refuse; the edit stays on disk. A missing entry (pre-journal
+    // repo, or a crash between write and journal) is trusted once, matching
+    // the historical behavior.
+    if let Some((content, _)) = &existing
+        && content != &rendered
+        && let Some(expected) = journal::expected(repo_root, store_name, link_rel)?
+        && expected != journal::sha256_hex(content)
+    {
+        return Err(hand_edit_message(&paths.dest, source_path));
+    }
+
+    if let Some((existing, meta)) = existing
         && existing == rendered
         && meta.nlink() == 1
         && meta.permissions().mode() & 0o777 == RENDER_FILE_MODE
@@ -952,11 +973,62 @@ pub fn stage_template(
         // Do not chmod an equal file in place: it could be hard-linked to an
         // external inode. Any mode or link-count drift is repaired by replacing
         // the leaf atomically below.
+        //
+        // Bootstrap the journal entry when missing (pre-journal repos);
+        // steady-state applies hit the no-op fast path in `record`.
+        journal::record(
+            repo_root,
+            store_name,
+            link_rel,
+            &journal::sha256_hex(&rendered),
+        )?;
         return Ok(StageOutcome::Unchanged(paths.dest));
     }
 
     atomic_write_secure(&paths, &rendered)?;
+    // After the write, not before: a crash between the two leaves the journal
+    // stale, which the next apply resolves by trusting sources once — never
+    // by refusing convergence.
+    journal::record(
+        repo_root,
+        store_name,
+        link_rel,
+        &journal::sha256_hex(&rendered),
+    )?;
     Ok(StageOutcome::Written(paths.dest))
+}
+
+/// Refusal text for a staged render that was modified outside stitch.
+/// Shared by the write path (`stage_template`) and the dry-run mirrors in
+/// `apply`/`doctor` so all surfaces say the same thing.
+pub fn hand_edit_message(staged: &Path, source: &Path) -> String {
+    format!(
+        "refusing to overwrite staged render {} — it was modified outside stitch, so the edit \
+         exists only there (the render tree is gitignored). Port the change into {} \
+         (or `stitch edit <target-path>`), or delete the staged file to discard it, then re-run \
+         `stitch apply`",
+        staged.display(),
+        source.display()
+    )
+}
+
+/// Whether the staged render for `<store>/<link>` was modified outside
+/// stitch: the file exists and no longer matches its journal entry. This is
+/// attribution only — a hand-edit that happens to equal the fresh render is
+/// converged, not a conflict; callers combine this with [`staged_differs`]
+/// (as `stage_template` does implicitly by refusing only when an overwrite
+/// is imminent).
+pub fn staged_hand_edited(
+    repo_root: &Path,
+    store_name: &str,
+    link_rel: &str,
+) -> Result<bool, String> {
+    let paths = staged_paths(repo_root, store_name, link_rel)?;
+    let Some((content, _)) = read_staged_file(&paths)? else {
+        return Ok(false);
+    };
+    let expected = journal::expected(repo_root, store_name, link_rel)?;
+    Ok(matches!(expected, Some(h) if h != journal::sha256_hex(&content)))
 }
 
 /// Fresh in-memory render and required metadata compared against the staged file.
@@ -1255,6 +1327,7 @@ pub fn remove_staged(repo_root: &Path, store_name: &str, link_rel: &str) -> Resu
             ));
         }
     }
+    journal::forget(repo_root, store_name, link_rel)?;
     remove_empty_staging_parents(paths.dest.parent().map(Path::to_path_buf), &paths.store_dir)
 }
 
@@ -1357,7 +1430,10 @@ pub fn remove_store_staging(repo_root: &Path, store_name: &str) -> Result<Vec<Pa
         removed.push(entry.path().to_path_buf());
     }
     match std::fs::remove_dir_all(&store.store_dir) {
-        Ok(()) => Ok(removed),
+        Ok(()) => {
+            journal::forget_store(repo_root, store_name)?;
+            Ok(removed)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(
             "could not remove staging {}: {e}",
@@ -1813,6 +1889,171 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&dest).unwrap(),
             "shared rules v2\ndelta\n"
+        );
+        // Source-driven re-renders journal the new content: the next apply
+        // can attribute any later change.
+        assert_eq!(
+            journal::expected(repo, "amp", "AGENTS.md").unwrap(),
+            Some(journal::sha256_hex("shared rules v2\ndelta\n"))
+        );
+    }
+
+    #[test]
+    fn stage_refuses_hand_edited_render() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let src = store.join("AGENTS.md.tmpl");
+        std::fs::write(&src, "shared\n").unwrap();
+
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        assert!(matches!(
+            stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap(),
+            StageOutcome::Written(_)
+        ));
+
+        // Hand-edit the staged render (the target symlink lands here).
+        let dest = staging_path(repo, "amp", "AGENTS.md");
+        std::fs::write(&dest, "shared\nhand-edited\n").unwrap();
+
+        let err = stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars)
+            .unwrap_err();
+        assert!(err.contains("modified outside stitch"), "got: {err}");
+        assert!(
+            err.contains("delete the staged file"),
+            "recovery hint missing: {err}"
+        );
+        // The edit survives the refusal — nothing was overwritten.
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "shared\nhand-edited\n"
+        );
+    }
+
+    #[test]
+    fn hand_edit_equal_to_fresh_render_is_not_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let src = store.join("AGENTS.md.tmpl");
+        std::fs::write(&src, "v1\n").unwrap();
+
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+
+        // Edit the render AND the template to the same content: converged,
+        // not a conflict — the guard only fires when an overwrite is imminent.
+        let dest = staging_path(repo, "amp", "AGENTS.md");
+        std::fs::write(&dest, "v2\n").unwrap();
+        std::fs::write(&src, "v2\n").unwrap();
+        let outcome =
+            stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        assert!(matches!(outcome, StageOutcome::Unchanged(_)));
+        assert_eq!(
+            journal::expected(repo, "amp", "AGENTS.md").unwrap(),
+            Some(journal::sha256_hex("v2\n"))
+        );
+    }
+
+    #[test]
+    fn missing_journal_entry_is_trusted_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let src = store.join("AGENTS.md.tmpl");
+        std::fs::write(&src, "v1\n").unwrap();
+
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+
+        // Pre-journal repo (or a crash between write and journal): no entry.
+        std::fs::remove_file(journal::journal_path(repo)).unwrap();
+        // Sources changed since the (now unattributable) staged file.
+        std::fs::write(&src, "v2\n").unwrap();
+
+        // Trusted once: re-render, then journaled — never blocks convergence.
+        let outcome =
+            stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        assert!(matches!(outcome, StageOutcome::Written(_)));
+        assert_eq!(
+            std::fs::read_to_string(staging_path(repo, "amp", "AGENTS.md")).unwrap(),
+            "v2\n"
+        );
+        assert_eq!(
+            journal::expected(repo, "amp", "AGENTS.md").unwrap(),
+            Some(journal::sha256_hex("v2\n"))
+        );
+    }
+
+    #[test]
+    fn unchanged_stage_bootstraps_journal_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let src = store.join("AGENTS.md.tmpl");
+        std::fs::write(&src, "v1\n").unwrap();
+
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        std::fs::remove_file(journal::journal_path(repo)).unwrap();
+
+        // Same content, missing entry: bootstrap without touching the file.
+        let outcome =
+            stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        assert!(matches!(outcome, StageOutcome::Unchanged(_)));
+        assert_eq!(
+            journal::expected(repo, "amp", "AGENTS.md").unwrap(),
+            Some(journal::sha256_hex("v1\n"))
+        );
+    }
+
+    #[test]
+    fn remove_staged_and_store_staging_forget_journal_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let src = store.join("AGENTS.md.tmpl");
+        std::fs::write(&src, "v1\n").unwrap();
+
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        assert!(
+            journal::expected(repo, "amp", "AGENTS.md")
+                .unwrap()
+                .is_some()
+        );
+
+        remove_staged(repo, "amp", "AGENTS.md").unwrap();
+        assert!(
+            journal::expected(repo, "amp", "AGENTS.md")
+                .unwrap()
+                .is_none()
+        );
+        // The journal file itself is gone once the last entry drops.
+        assert!(!journal::journal_path(repo).exists());
+
+        // Whole-tree removal drops the store's entries too.
+        stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+        remove_store_staging(repo, "amp").unwrap();
+        assert!(
+            journal::expected(repo, "amp", "AGENTS.md")
+                .unwrap()
+                .is_none()
         );
     }
 

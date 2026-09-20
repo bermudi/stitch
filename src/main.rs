@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod fsutil;
 mod hooks;
+mod journal;
 mod linker;
 mod plan;
 mod plan_exec;

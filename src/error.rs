@@ -127,9 +127,10 @@ impl FailureClass {
             FailureClass::ConflictForeign => {
                 Some("remove or repoint the conflicting symlink yourself".into())
             }
-            FailureClass::Render => {
-                Some("set missing environment variables or fix the template".into())
-            }
+            FailureClass::Render => Some(
+                "address the render error above — full per-entry details in the plan output (JSON: ops[].message)"
+                    .into(),
+            ),
             FailureClass::PathValidation => {
                 Some("use relative paths without `..` and no leading `/`".into())
             }

@@ -55,7 +55,26 @@ pub(crate) fn cmd_edit(
             "editor '{editor}' exited with status {code}"
         )));
     }
-    Ok(())
+
+    // Round-trip: converge after a successful edit. Editing one source can
+    // affect many consumers (the AGENTS.md hub fan-in: a hub edit must
+    // re-render every template that includes it), so the honest converge
+    // step is a full apply, not a re-render of just this entry. A plain-file
+    // edit applies as a no-op for the link but still picks up anything else
+    // that drifted — same contract as running apply by hand, minus the
+    // remembering. The edit itself is already saved on disk; an apply
+    // failure after it is reported as an apply error, not an edit loss.
+    println!("edited {}; applying", path.display());
+    super::apply::cmd_apply(
+        root,
+        &[],
+        crate::store::ApplyOpts {
+            dry_run: false,
+            force: false,
+            json: false,
+        },
+        false,
+    )
 }
 
 fn resolve_editor() -> Result<String, StitchError> {

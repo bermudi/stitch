@@ -593,17 +593,55 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                         &config.vars,
                     ) {
                         Ok(true) => {
-                            findings.push(DoctorFinding {
-                                id: "staging-drift",
-                                severity: Severity::Warning,
-                                message: format!(
-                                    "store '{}': staged render for {} is stale (run `stitch apply`)",
-                                    name,
-                                    entry.target.display()
-                                ),
-                                path: Some(entry.target.clone()),
-                                hint: Some("run `stitch apply`".into()),
-                            });
+                            // Attribution: a staged render that no longer
+                            // matches the journal entry was hand-edited —
+                            // apply will refuse to overwrite it, so say that
+                            // instead of promising a plain re-render.
+                            match render::staged_hand_edited(repo_root, name, &link_rel) {
+                                Ok(true) => {
+                                    findings.push(DoctorFinding {
+                                        id: "staging-hand-edited",
+                                        severity: Severity::Error,
+                                        message: format!(
+                                            "store '{}': staged render for {} was modified outside \
+                                             stitch — apply will refuse to overwrite it",
+                                            name,
+                                            entry.target.display()
+                                        ),
+                                        path: Some(entry.target.clone()),
+                                        hint: Some(
+                                            "port the edit into the template (stitch edit) or delete \
+                                             the staged render"
+                                                .into(),
+                                        ),
+                                    });
+                                }
+                                Ok(false) => {
+                                    findings.push(DoctorFinding {
+                                        id: "staging-drift",
+                                        severity: Severity::Warning,
+                                        message: format!(
+                                            "store '{}': staged render for {} is stale (run `stitch apply`)",
+                                            name,
+                                            entry.target.display()
+                                        ),
+                                        path: Some(entry.target.clone()),
+                                        hint: Some("run `stitch apply`".into()),
+                                    });
+                                }
+                                Err(e) => {
+                                    findings.push(DoctorFinding {
+                                        id: "render-error",
+                                        severity: Severity::Error,
+                                        message: format!("store '{name}': {e}"),
+                                        path: Some(entry.source.clone()),
+                                        hint: Some(
+                                            "the render journal is unreadable — delete it to rebuild"
+                                                .into(),
+                                        ),
+                                    });
+                                }
+                            }
                         }
                         Ok(false) => {}
                         Err(e) => {

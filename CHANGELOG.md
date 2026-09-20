@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Added
+
+- **`stitch edit` is now a full round-trip: edit, then apply.** After the
+  editor exits successfully, `stitch apply` runs automatically, so renders
+  converge without remembering a second command. The apply is the full one,
+  not a single-entry re-render, because one source edit can affect many
+  consumers — the motivating case is the AGENTS.md hub fan-in, where an
+  `include()`d hub edit must re-render every template that includes it. The
+  edit is saved before apply runs; an apply failure afterwards surfaces as an
+  apply error, never a lost edit. A non-zero editor exit skips the apply
+  entirely. `--print-path` is unchanged: print, exit, no editor, no apply.
+
+### Changed
+
+- **Hand-edited staged renders are refused, not silently overwritten.** A
+  templated target (e.g. `~/.zcode/AGENTS.md`) symlinks into the gitignored
+  `.stitch/render/` tree, so editing it through the target creates the only
+  copy of that edit — and until now the next `stitch apply` destroyed it
+  without a word. stitch now journals the sha256 of every render it writes
+  (`.stitch/render/.journal.toml`). When a staged file differs from a fresh
+  render *and* no longer matches its journal entry, apply exits non-zero with
+  the recovery paths in the message (port the edit with `stitch edit`, or
+  delete the staged file to discard it deliberately); `diff`'s dry run
+  mirrors the refusal, and `doctor` reports `staging-hand-edited` as an error
+  instead of plain staging drift. Missing journal entries (pre-journal
+  repos, or a crash between write and journal) are trusted once, so the
+  journal never blocks convergence — it only refuses *unattributed*
+  overwrites. Journal entries die with their staged files and stores.
+- **Apply/`diff` plan-error aggregates now carry the first per-entry error
+  message** instead of a bare count, and the render-class hint no longer
+  blames missing environment variables for every failure class member
+  (a hand-edit refusal is not an env problem).
+
 ## 0.16.0 — 2026-09-17
 
 ### Added
