@@ -952,11 +952,13 @@ pub fn stage_template(
 
     // Attribution guard. An overwrite is imminent when content differs. If
     // the staged file no longer matches what stitch last wrote (per the
-    // render journal), someone edited the render through its target symlink —
-    // and the render tree is gitignored, so an overwrite destroys the only
-    // copy. Refuse; the edit stays on disk. A missing entry (pre-journal
-    // repo, or a crash between write and journal) is trusted once, matching
-    // the historical behavior.
+    // render journal), it was modified outside stitch — through the target
+    // symlink — or stitch crashed between writing the render and journaling
+    // it; the two states are indistinguishable on disk. Either way the
+    // render tree is gitignored, so an overwrite may destroy the only copy.
+    // Refuse (safe direction); the content stays on disk. A *missing* entry
+    // (pre-journal repo, or a crash that left no entry) is trusted once;
+    // a *stale* entry is not — it is indistinguishable from a hand-edit.
     if let Some((content, _)) = &existing
         && content != &rendered
         && let Some(expected) = journal::expected(repo_root, store_name, link_rel)?
@@ -1000,13 +1002,18 @@ pub fn stage_template(
 
 /// Refusal text for a staged render that was modified outside stitch.
 /// Shared by the write path (`stage_template`) and the dry-run mirrors in
-/// `apply`/`doctor` so all surfaces say the same thing.
+/// `apply`/`doctor` so all surfaces say the same thing. The recovery text is
+/// deliberately explicit that porting alone is not always enough: a port
+/// that is not byte-identical re-triggers this refusal, so the staged file
+/// must go once the change lives in the template.
 pub fn hand_edit_message(staged: &Path, source: &Path) -> String {
     format!(
-        "refusing to overwrite staged render {} — it was modified outside stitch, so the edit \
-         exists only there (the render tree is gitignored). Port the change into {} \
-         (or `stitch edit <target-path>`), or delete the staged file to discard it, then re-run \
-         `stitch apply`",
+        "refusing to overwrite staged render {} — it was modified outside stitch (or stitch \
+         crashed mid-render), so the change exists only there: the render tree is gitignored. \
+         To keep it, port the change into {} (`stitch edit <target-path>` opens it), then re-run \
+         `stitch apply`; if apply still refuses because the port is not byte-identical, delete the \
+         staged file — the change lives in the template now — and apply again. To discard the \
+         change, delete the staged file and apply",
         staged.display(),
         source.display()
     )
@@ -1336,6 +1343,12 @@ pub fn remove_staged(repo_root: &Path, store_name: &str, link_rel: &str) -> Resu
 ///
 /// This is shared by `diff` and `apply` so an exact-state check includes stale
 /// rendered content, not just target links.
+///
+/// A stale render that was hand-edited (per the render journal) is a refusal,
+/// not a removal candidate: the config-driven sweep must not silently delete
+/// the only copy of an edit made through a target link (e.g. after a template
+/// rename). Both the dry-run listing and the real reconcile fail loudly
+/// through this shared path.
 pub fn stale_store_staging(
     repo_root: &Path,
     store_name: &str,
@@ -1382,6 +1395,15 @@ pub fn stale_store_staging(
             .to_str()
             .ok_or_else(|| format!("staged path is not valid UTF-8: {}", entry.path().display()))?;
         if !keep_link_rels.contains(rel) {
+            if staged_hand_edited(repo_root, store_name, rel)? {
+                return Err(format!(
+                    "refusing to remove stale staged render {} — it was modified outside stitch, \
+                     so the change exists only there (the render tree is gitignored). \
+                     Restore its source entry to keep the change, or delete the staged file \
+                     to discard it",
+                    entry.path().display()
+                ));
+            }
             stale.push((rel.to_string(), entry.path().to_path_buf()));
         }
     }
@@ -2614,5 +2636,43 @@ mod tests {
             prop_assert_eq!(link_name(&once), once.as_str());
         }
 
+    }
+
+    #[test]
+    fn stale_journal_entry_after_simulated_crash_refuses() {
+        // The crash window: stitch wrote v2 but crashed before journaling it, so
+        // the journal still holds h(v1) while the staged file is stitch's own v2.
+        // On disk this is indistinguishable from a hand-edit, and the next apply
+        // (with sources at v3) must refuse — the safe direction. A *missing*
+        // entry is trusted once; a *stale* one is not.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join(".gitignore"), ".stitch/render/\n").unwrap();
+        let store = repo.join("amp");
+        std::fs::create_dir_all(&store).unwrap();
+        let src = store.join("AGENTS.md.tmpl");
+        std::fs::write(&src, "v1\n").unwrap();
+
+        let p = test_platform();
+        let vars = BTreeMap::new();
+        stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars).unwrap();
+
+        // Simulate the crash: the journal regresses to an older hash while the
+        // staged file advances (v2) and sources advance again (v3).
+        journal::record(
+            repo,
+            "amp",
+            "AGENTS.md",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let dest = staging_path(repo, "amp", "AGENTS.md");
+        std::fs::write(&dest, "v2\n").unwrap();
+        std::fs::write(&src, "v3\n").unwrap();
+
+        let err = stage_template(repo, "amp", "AGENTS.md.tmpl", &src, "AGENTS.md", &p, &vars)
+            .unwrap_err();
+        assert!(err.contains("modified outside stitch"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "v2\n");
     }
 }

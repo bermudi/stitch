@@ -13,11 +13,15 @@
 //! (or missing entirely, for pre-journal repos) re-render as before.
 //!
 //! Crash semantics: the journal is written *after* the staged file it
-//! describes. A crash between the two leaves a stale or missing entry, which
-//! the next apply treats as unattributable and resolves by trusting sources —
-//! the exact pre-journal behavior — then journals the result. The journal
-//! therefore never blocks convergence; it only refuses *unattributed*
-//! overwrites, which is the safe direction.
+//! describes, so a crash between the two leaves one of two states. A
+//! **missing** entry (pre-journal repo, or a crash before any entry existed)
+//! is trusted once and converges as before. A **stale** entry (journal holds
+//! the previous render's hash while the staged file is a newer stitch
+//! render) is indistinguishable on disk from a hand-edit and refuses on the
+//! next apply — the safe direction; deleting the staged file is harmless in
+//! that case, because stitch rendered it. The journal therefore only ever
+//! refuses *unattributable* overwrites; it cannot make convergence quieter,
+//! only safer.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

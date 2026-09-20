@@ -1814,3 +1814,278 @@ files = ["AGENTS.md.tmpl"]
         .failure()
         .stderr(contains("exited with status 3"));
 }
+
+/// P1-2 regression: the config-driven stale-staging sweep (template renamed
+/// out of the config) must not silently delete a hand-edited render — that
+/// is the exact harm the journal exists to prevent. Both `diff` and `apply`
+/// refuse; deleting the staged file is the explicit discard.
+#[test]
+fn sweep_refuses_to_delete_hand_edited_stale_render() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("agent")
+        .join("AGENTS.md");
+    fs::write(&staged, "shared\nhand-edited\n").unwrap();
+
+    // Routine config edit: rename the template out of the config.
+    fs::rename(store.join("AGENTS.md.tmpl"), store.join("RULES.md.tmpl")).unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["RULES.md.tmpl"]
+"#
+    ));
+
+    // The dry run reports the refusal instead of promising a removal.
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .stdout(contains("refusing to remove stale staged render"));
+
+    // The real sweep refuses too, and the edit survives.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("refusing to remove stale staged render"));
+    assert_eq!(
+        fs::read_to_string(&staged).unwrap(),
+        "shared\nhand-edited\n",
+        "the sweep must not delete the hand-edited render"
+    );
+
+    // Explicit discard: delete the staged file, apply converges.
+    fs::remove_file(&staged).unwrap();
+    repo.cmd().arg("apply").assert().success();
+}
+
+/// P2-4 regression: the whole-dir → file-mode promotion preview (`diff`,
+/// `plan`) must mirror the write path's hand-edit refusal instead of
+/// promising a transition apply will refuse to make.
+#[test]
+fn promotion_preview_mirrors_hand_edit_refusal() {
+    let repo = Repo::new();
+    let store = repo.make_store("vim", &["vimrc"]);
+    let target = repo.path().join("home").join(".vim");
+    repo.write_state(&format!(
+        r#"
+[stores.vim]
+target = "{}"
+"#,
+        target.to_string_lossy(),
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    // Add a template: the next apply is a whole-dir → file-mode promotion.
+    fs::write(store.join("extra.conf.tmpl"), "extra\n").unwrap();
+    repo.write_state(&format!(
+        r#"
+[stores.vim]
+target = "{}"
+files = ["vimrc", "extra.conf.tmpl"]
+"#,
+        target.to_string_lossy(),
+    ));
+
+    // Hand-edit the staged render before the promotion runs.
+    repo.cmd().arg("apply").assert().success();
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("vim")
+        .join("extra.conf");
+    assert_eq!(fs::read_to_string(&staged).unwrap(), "extra\n");
+    fs::write(&staged, "extra\nhand-edited\n").unwrap();
+
+    // Change the template so a re-render (overwrite) is imminent.
+    fs::write(store.join("extra.conf.tmpl"), "extra v2\n").unwrap();
+
+    repo.cmd()
+        .arg("diff")
+        .assert()
+        .failure()
+        .stdout(contains("modified outside stitch"));
+}
+
+/// P2-5 regression: a corrupt journal fails apply even on a converged store
+/// (the Unchanged path loads the journal) — doctor must explain that, not
+/// report a clean bill of health.
+#[test]
+fn doctor_flags_corrupt_journal_on_converged_store() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    fs::write(
+        repo.path()
+            .join(".stitch")
+            .join("render")
+            .join(".journal.toml"),
+        "{{not toml",
+    )
+    .unwrap();
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("unreadable"));
+    repo.cmd()
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(contains("unreadable"))
+        .stdout(contains(".journal.toml"));
+}
+
+/// `apply --plan` must refuse to stage over a hand-edited render, exactly
+/// like a direct apply (SPEC claims it; this pins it).
+#[test]
+fn apply_plan_refuses_hand_edited_render() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    // Capture a plan that wants to re-stage (template changed post-capture).
+    fs::write(store.join("AGENTS.md.tmpl"), "shared v2\n").unwrap();
+    let plan_path = repo.path().join("p.json");
+    let output = repo
+        .cmd()
+        .args(["plan", "--only", "agent"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "plan capture must succeed");
+    fs::write(&plan_path, &output.stdout).unwrap();
+
+    // Hand-edit the render after capture.
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("agent")
+        .join("AGENTS.md");
+    fs::write(&staged, "shared\nhand-edited\n").unwrap();
+
+    repo.cmd()
+        .arg("apply")
+        .arg("--plan")
+        .arg(&plan_path)
+        .assert()
+        .failure()
+        .code(12)
+        // The refusal surfaces at plan validation (the freshly computed
+        // plan contains an error op instead of the stage op) — the detailed
+        // hand-edit message lives on the direct-apply path.
+        .stderr(contains("plan not executable"));
+    assert_eq!(
+        fs::read_to_string(&staged).unwrap(),
+        "shared\nhand-edited\n",
+        "plan replay must not clobber the hand-edited render"
+    );
+
+    // And the direct apply says exactly why, with the recovery paths.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .code(8)
+        .stdout(contains("modified outside stitch"));
+}
+
+/// P1-3 regression: the documented recovery — port the change via
+/// `stitch edit`, then delete the staged file when the port is not
+/// byte-identical — must actually converge.
+#[test]
+fn edit_port_then_delete_recovers() {
+    let repo = Repo::new();
+    let store = repo.make_store("agent", &[]);
+    fs::write(store.join("AGENTS.md.tmpl"), "shared\n").unwrap();
+
+    let target = repo.path().join("home").join(".agent");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.agent]
+target = "{target_str}"
+files = ["AGENTS.md.tmpl"]
+"#
+    ));
+    repo.cmd().arg("apply").assert().success();
+
+    // Hand-edit through the target, then port it non-byte-exactly: the
+    // editor script rewrites the whole template (different bytes, same idea).
+    let staged = repo
+        .path()
+        .join(".stitch")
+        .join("render")
+        .join("agent")
+        .join("AGENTS.md");
+    fs::write(&staged, "shared\nhand-edited line\n").unwrap();
+    let editor = repo.path().join("editor.sh");
+    fs::write(
+        &editor,
+        "#!/bin/sh\nprintf 'shared\\nhand-edited line (ported)\\n' > \"$1\"\n",
+    )
+    .unwrap();
+    make_executable(&editor);
+
+    let entry = target.join("AGENTS.md");
+    let entry_str = entry.to_string_lossy().into_owned();
+    repo.cmd()
+        .env("EDITOR", &editor)
+        .args(["edit", &entry_str])
+        .assert()
+        .failure()
+        .stdout(contains("modified outside stitch"));
+
+    // Per the message: the change lives in the template now — delete the
+    // staged file and apply.
+    fs::remove_file(&staged).unwrap();
+    repo.cmd().arg("apply").assert().success();
+    assert_eq!(
+        fs::read_to_string(&entry).unwrap(),
+        "shared\nhand-edited line (ported)\n"
+    );
+}

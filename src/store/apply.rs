@@ -1216,7 +1216,18 @@ fn preflight_file_mode_promotion(
                 platform,
                 vars,
             )
-            .map(|_| ())
+            .and_then(|differs| {
+                // Mirror the write path's refusal: a hand-edited staged
+                // render must fail the promotion preview too, or `diff` and
+                // `plan` promise a transition apply will refuse to make.
+                if differs && render::staged_hand_edited(repo_root, store_name, &link.name)? {
+                    return Err(render::hand_edit_message(
+                        &render::staging_path(repo_root, store_name, &link.name),
+                        source_path,
+                    ));
+                }
+                Ok(())
+            })
         } else {
             render::stage_template(
                 repo_root,

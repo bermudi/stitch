@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 — 2026-09-20
 
 ### Added
 
@@ -23,13 +23,17 @@
   without a word. stitch now journals the sha256 of every render it writes
   (`.stitch/render/.journal.toml`). When a staged file differs from a fresh
   render *and* no longer matches its journal entry, apply exits non-zero with
-  the recovery paths in the message (port the edit with `stitch edit`, or
-  delete the staged file to discard it deliberately); `diff`'s dry run
-  mirrors the refusal, and `doctor` reports `staging-hand-edited` as an error
-  instead of plain staging drift. Missing journal entries (pre-journal
-  repos, or a crash between write and journal) are trusted once, so the
-  journal never blocks convergence — it only refuses *unattributed*
-  overwrites. Journal entries die with their staged files and stores.
+  the recovery paths in the message (port the edit with `stitch edit` — and
+  delete the staged render when the port is not byte-identical — or delete
+  the staged file to discard it deliberately); `diff`'s dry run mirrors the
+  refusal on both the re-render and promotion paths, `apply --plan` aborts at
+  validation, the stale-staging sweep refuses to delete a hand-edited render
+  (a template rename no longer destroys it), and `doctor` reports
+  `staging-hand-edited` as an error instead of plain staging drift. A missing
+  journal entry (pre-journal repos, or a crash that left no entry) is trusted
+  once; a stale entry (crash between render write and journal write) is
+  indistinguishable from a hand-edit and refuses — the safe direction. Journal
+  entries die with their staged files and stores.
 - **Apply/`diff` plan-error aggregates now carry the first per-entry error
   message** instead of a bare count, and the render-class hint no longer
   blames missing environment variables for every failure class member

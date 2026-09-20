@@ -583,6 +583,12 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                     .ok()
                     .and_then(|rel| rel.to_str().map(str::to_owned));
                 if let Some(link_rel) = link_rel {
+                    // The journal check runs for every template entry, not
+                    // only drifted ones: a converged store whose journal is
+                    // corrupt still fails apply (the Unchanged path loads the
+                    // journal), and doctor is the surface that must explain
+                    // a failing apply.
+                    let hand_edit = render::staged_hand_edited(repo_root, name, &link_rel);
                     match render::staged_differs(
                         repo_root,
                         name,
@@ -597,7 +603,7 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                             // matches the journal entry was hand-edited —
                             // apply will refuse to overwrite it, so say that
                             // instead of promising a plain re-render.
-                            match render::staged_hand_edited(repo_root, name, &link_rel) {
+                            match hand_edit {
                                 Ok(true) => {
                                     findings.push(DoctorFinding {
                                         id: "staging-hand-edited",
@@ -636,14 +642,29 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
                                         message: format!("store '{name}': {e}"),
                                         path: Some(entry.source.clone()),
                                         hint: Some(
-                                            "the render journal is unreadable — delete it to rebuild"
+                                            "the staging tree or render journal is unreadable — \
+                                             delete .stitch/render/.journal.toml to rebuild it"
                                                 .into(),
                                         ),
                                     });
                                 }
                             }
                         }
-                        Ok(false) => {}
+                        Ok(false) => {
+                            if let Err(e) = hand_edit {
+                                findings.push(DoctorFinding {
+                                    id: "render-error",
+                                    severity: Severity::Error,
+                                    message: format!("store '{name}': {e}"),
+                                    path: Some(entry.source.clone()),
+                                    hint: Some(
+                                        "the staging tree or render journal is unreadable — \
+                                         delete .stitch/render/.journal.toml to rebuild it"
+                                            .into(),
+                                    ),
+                                });
+                            }
+                        }
                         Err(e) => {
                             // A template that fails to render is an error — same
                             // class as a broken link.
