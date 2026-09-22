@@ -21,24 +21,44 @@ pub(crate) fn render_plan(plan: &plan::Plan, dry_run: bool) {
     }
 
     for store in &plan.stores {
-        print!("  {} ", store.store_name);
+        // One self-contained line per op, each prefixed with the store name.
+        // The old format printed a single dangling `  <name> ` prefix per
+        // store, so every link after the first printed a bare continuation
+        // line (`ok` with no owner) and a store whose ops printed nothing
+        // left the prefix dangling into the next store's line. A store
+        // whose every link is already healthy collapses to one `ok` line,
+        // so a converged repo stays a per-store list instead of a link-count
+        // wall of noise.
+        let mut lines: Vec<String> = Vec::new();
         for op in &store.ops {
             match op {
-                plan::PlanOp::CreateLink { target, .. } => println!("create: {target}"),
-                plan::PlanOp::ReplaceLink { target, .. } => println!("replace: {target}"),
+                plan::PlanOp::CreateLink { target, .. } => lines.push(format!("create: {target}")),
+                plan::PlanOp::ReplaceLink { target, .. } => {
+                    lines.push(format!("replace: {target}"))
+                }
                 plan::PlanOp::BackupAndLink { target, backup, .. } => {
-                    println!("backed up: {target} → {backup}");
+                    lines.push(format!("backed up: {target} → {backup}"));
                 }
-                plan::PlanOp::Conflict { target, .. } => {
-                    println!("conflict: {target}");
+                plan::PlanOp::Conflict { target, .. } => lines.push(format!("conflict: {target}")),
+                plan::PlanOp::SkippedPlatform => lines.push("(skipped: platform)".into()),
+                plan::PlanOp::AlreadyLinked { .. } => lines.push("ok".into()),
+                plan::PlanOp::ContentChanged { target, .. } => {
+                    lines.push(format!("content: {target}"))
                 }
-                plan::PlanOp::SkippedPlatform => println!("(skipped: platform)"),
-                plan::PlanOp::AlreadyLinked { .. } => println!("ok"),
-                plan::PlanOp::ContentChanged { target, .. } => println!("content: {target}"),
-                plan::PlanOp::RemoveLink { target, .. } => println!("remove: {target}"),
-                plan::PlanOp::RemoveStaged { path } => println!("remove staged: {path}"),
-                plan::PlanOp::Error { message, .. } => println!("error: {message}"),
+                plan::PlanOp::RemoveLink { target, .. } => lines.push(format!("remove: {target}")),
+                plan::PlanOp::RemoveStaged { path } => lines.push(format!("remove staged: {path}")),
+                plan::PlanOp::Error { message, .. } => lines.push(format!("error: {message}")),
                 plan::PlanOp::StageRender { .. } => {}
+            }
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        if lines.iter().all(|line| line == "ok") {
+            println!("  {} ok", store.store_name);
+        } else {
+            for line in lines {
+                println!("  {} {}", store.store_name, line);
             }
         }
     }

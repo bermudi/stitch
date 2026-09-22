@@ -1146,14 +1146,33 @@ pub fn reconcile_store_links(
     // the target itself is inside the repo, the whole walk is the target's
     // own subtree and must not be pruned.
     let target_in_repo = walk_root.starts_with(&repo_canon);
+    // Byte form of the repo root for the per-entry prune below: `Path`
+    // equality re-parses components, and this compare runs once per walked
+    // entry. Both sides are canonicalized single-separator forms, where
+    // byte equality and path equality coincide.
+    let repo_boundary = repo_canon.clone().into_os_string();
     // Foreign target directories *beneath* this walk root are hard sweep
     // boundaries: pruned before descending, so neither their stale check nor
     // their keep-set comparison ever runs for another target's subtree.
     // Ancestor targets (e.g. `~` for a `~/.config` target) are irrelevant
     // here and filtered out so they cannot prune the entire walk.
-    let nested_targets: Vec<&PathBuf> = boundaries
+    //
+    // The prune below tests set membership, not prefix-matching: walkdir
+    // visits parents before children and never descends into a pruned
+    // directory, so any *visited* entry that lexically starts with a
+    // boundary must BE that boundary. Membership turns a hot-path O(b×n)
+    // component-parsing scan (a `target = "~"` store walks all of `$HOME`,
+    // once per entry × per boundary) into one byte comparison — same prune,
+    // a fraction of the cost. Keys are byte strings (not `Path`) because
+    // `Path`'s ordering re-parses components on every comparison; both sides
+    // here are single-separator normalized forms, where byte equality and
+    // path equality coincide.
+    let nested_targets: BTreeSet<std::ffi::OsString> = boundaries
         .iter()
         .filter(|b| **b != walk_root && b.starts_with(&walk_root))
+        // Normalize away `.` components so membership matches walkdir's
+        // component-built paths even if a target string contains them.
+        .map(|b| -> std::ffi::OsString { b.components().collect::<PathBuf>().into_os_string() })
         .collect();
     let staging_dir = store_render_dir(repo_root, store_name);
     let mut stale = Vec::new();
@@ -1161,10 +1180,14 @@ pub fn reconcile_store_links(
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
-            if !target_in_repo && e.path().starts_with(&repo_canon) {
+            // Same parents-before-children argument as `nested_targets`:
+            // a visited entry that starts with the repo root must BE the
+            // repo root (its parent chain was not pruned), so an equality
+            // check prunes the identical set for a byte compare's cost.
+            if !target_in_repo && e.path().as_os_str() == repo_boundary.as_os_str() {
                 return false;
             }
-            !nested_targets.iter().any(|t| e.path().starts_with(*t))
+            !nested_targets.contains(e.path().as_os_str())
         })
     {
         let entry = match entry {
