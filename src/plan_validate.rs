@@ -609,11 +609,17 @@ fn validate_link_op(
         }
         match std::fs::symlink_metadata(source_path) {
             Ok(meta) if meta.is_dir() => {
-                // Whole-directory link: the source must be the store directory itself.
+                // Whole-directory link: either the store directory itself
+                // (whole-dir mode) or a directory entry inside the store
+                // (subdir link). Sources-map entries point outside the store
+                // by definition, so they stay file-only.
                 let store_dir = ctx.repo_root.join(store);
-                if source_path != store_dir {
+                let inside_store = source_path
+                    .strip_prefix(&store_dir)
+                    .is_ok_and(|rel| !rel.as_os_str().is_empty());
+                if source_path != store_dir && !inside_store {
                     return Err(format!(
-                        "op {idx}: whole-dir source must be the store directory"
+                        "op {idx}: whole-dir source must be the store directory or a directory inside it"
                     ));
                 }
                 if !source_path.is_dir() {

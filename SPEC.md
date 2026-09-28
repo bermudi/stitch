@@ -108,7 +108,7 @@ Multi-target array entries get deterministic names during migration (hostname-fi
 - **Store** — a top-level directory in the repo. One unit of config.
 - **Target** — where the symlink(s) land on disk. Declared explicitly.
 - **Whole-directory mode** — no `files` or `patterns` → the entire store dir is one symlink.
-- **File mode** — `files` and/or `patterns` → individual files are symlinked into the target dir.
+- **File mode** — `files` and/or `patterns` → individual files are symlinked into the target dir. A `files` entry that names a store *directory* links the whole directory as one symlink at the same path under the target (a **subdir link**): files dropped into the repo dir afterwards appear under the target with no `apply`. A `.tmpl` anywhere in such a subtree is a resolution error (templates cannot render through a directory symlink — list the file individually instead); a non-empty real directory at the link path is a conflict (user content is never moved aside silently); and no other claim may exist at or under the dir entry's path.
 - **when** — platform filter. All specified fields must match. Omit = always applies.
 - **Hooks** — `pre` and `post` shell commands per store.
 - **Authored vs generated** — `stitch.toml` is human-authored and never rewritten by the tool (after `init`); `.stitch/state.toml` is generated and tool-owned. The split exists so mutations to inventory never clobber your comments and formatting.

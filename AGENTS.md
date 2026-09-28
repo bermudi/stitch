@@ -17,7 +17,8 @@ direction of the project and questions should be resolved by agents as well usin
 
 ## Architecture
 A store is a top-level repo dir symlinked to an explicit target — whole-directory mode
-(one symlink) or file mode (`files`/`patterns` link individual files in). `when` clauses
+(one symlink) or file mode (`files`/`patterns` link individual files in; a `files` entry
+may name a directory for one whole-subtree symlink, v0.18). `when` clauses
 filter by platform/hostname/shell. Defining choice: symlinks point target→repo, so edits
 always land in the repo directly — no source/target drift, no re-add step.
 

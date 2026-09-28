@@ -2126,3 +2126,138 @@ fn apply_multi_target_canonical_equivalent_symlinked_home_union() {
         .assert()
         .success();
 }
+
+// --- Whole-dir entries in `files` (subdir links) ---------------------------
+//
+// A `files` entry naming a directory *inside* the store creates one symlink at
+// the same link path under the target. Files dropped into the repo directory
+// afterwards appear under the target with no `apply` — that is the point of
+// the shape (e.g. `~/.pi/agent/prompts` → `dots/pi/prompts`).
+
+#[test]
+fn apply_dir_entry_links_whole_subdirectory() {
+    let repo = Repo::new();
+    let store_dir = repo.path().join("mystore");
+    fs::create_dir_all(store_dir.join("subdir")).unwrap();
+    fs::write(store_dir.join("top.conf"), "root\n").unwrap();
+    fs::write(store_dir.join("subdir").join("a.conf"), "a\n").unwrap();
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.mystore]
+target = "{target_str}"
+files = ["top.conf", "subdir"]
+"#
+    ));
+
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("created"));
+
+    let link = target.join("subdir");
+    assert!(link.is_symlink(), "subdir entry must be one symlink");
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        store_dir.join("subdir").canonicalize().unwrap()
+    );
+    assert!(target.join("top.conf").is_symlink());
+
+    // Headline: a file dropped into the repo dir is live with no apply.
+    fs::write(store_dir.join("subdir").join("dropped.conf"), "x\n").unwrap();
+    assert!(
+        link.join("dropped.conf").exists(),
+        "dropped-in file must be visible through the link without apply"
+    );
+
+    // Second apply is idempotent; diff and status agree it is converged.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("ok"));
+    repo.cmd().args(["diff", "--exit-code"]).assert().success();
+}
+
+#[test]
+fn apply_dir_entry_refuses_template_in_subtree() {
+    let repo = Repo::new();
+    let store_dir = repo.path().join("mystore");
+    fs::create_dir_all(store_dir.join("subdir")).unwrap();
+    fs::write(store_dir.join("subdir").join("a.tmpl"), "x = {{ var }}\n").unwrap();
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.mystore]
+target = "{target_str}"
+files = ["subdir"]
+"#
+    ));
+
+    // A `.tmpl` inside a whole-dir entry would ride along as a literal
+    // `.tmpl` file — the exact trap whole-dir→file-mode promotion exists to
+    // prevent. Refuse loudly instead.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains(".tmpl"));
+}
+
+#[test]
+fn apply_dir_entry_conflicts_with_nonempty_real_dir() {
+    let repo = Repo::new();
+    let store_dir = repo.path().join("mystore");
+    fs::create_dir_all(store_dir.join("subdir")).unwrap();
+    fs::write(store_dir.join("subdir").join("a.conf"), "a\n").unwrap();
+    let target = repo.path().join("home");
+    fs::create_dir_all(target.join("subdir")).unwrap();
+    fs::write(target.join("subdir").join("user-data.conf"), "mine\n").unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.mystore]
+target = "{target_str}"
+files = ["subdir"]
+"#
+    ));
+
+    // Never move a real directory tree aside silently — the user's content
+    // stays put until they reconcile by hand.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stdout(contains("conflict"));
+
+    assert!(target.join("subdir").join("user-data.conf").exists());
+    assert!(!target.join("subdir").is_symlink());
+}
+
+#[test]
+fn collision_dir_entry_vs_nested_file_entry_is_rejected() {
+    let repo = Repo::new();
+    let store_dir = repo.path().join("mystore");
+    fs::create_dir_all(store_dir.join("subdir")).unwrap();
+    fs::write(store_dir.join("subdir").join("a.conf"), "a\n").unwrap();
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.mystore]
+target = "{target_str}"
+files = ["subdir", "subdir/a.conf"]
+"#
+    ));
+
+    // A whole-dir symlink cannot coexist with a link nested inside it —
+    // rejected at either the config-collision or the path-validation layer.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("subdir/a.conf"));
+}

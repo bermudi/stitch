@@ -135,9 +135,9 @@ pub(crate) fn collect_reconciliation_keeps(
         // live even when their render or resolution subsequently fails.
         // Use `symlink_metadata` (which does not follow symlinks) so a dangling
         // symlink source is still considered present.
-        if let Ok(meta) = std::fs::symlink_metadata(&link.source)
-            && !meta.is_dir()
-        {
+        // Directory sources (whole-dir entries) keep their links too — a
+        // present source is never stale, regardless of entry type.
+        if std::fs::symlink_metadata(&link.source).is_ok() {
             target_links.insert(link.name.clone());
             if link.is_template() {
                 staging_keep_links.insert(link.name);
@@ -166,9 +166,55 @@ pub(super) fn resolve_targets(
     let targets =
         resolve_target_names(repo_root, store_dir, files, patterns, sources, store_ignore);
     if let LinkTargets::Files(ref links) = targets {
+        reject_templates_under_dir_entries(store_dir, links)?;
         check_link_name_collisions(links)?;
     }
     Ok(targets)
+}
+
+/// A `files` entry naming a store directory links the whole directory as one
+/// symlink. Any `.tmpl` inside would ride along as a literal template file
+/// instead of rendering — the exact trap whole-dir→file-mode promotion exists
+/// to prevent — so a dir entry containing one is refused. Pattern- and
+/// promotion-resolved links are always files (plain directories are
+/// represented by their children), so this can only fire on explicit entries.
+fn reject_templates_under_dir_entries(store_dir: &Path, links: &[FileLink]) -> Result<(), String> {
+    for link in links {
+        let source_path = store_dir.join(&link.source_rel);
+        let Ok(meta) = std::fs::symlink_metadata(&source_path) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&source_path)
+            .follow_links(false)
+            .into_iter()
+        {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "could not inspect whole-dir entry '{}' under {}: {e}",
+                    link.name,
+                    source_path.display()
+                )
+            })?;
+            if entry.depth() > 0
+                && entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(render::TMPL_SUFFIX))
+            {
+                return Err(format!(
+                    "whole-dir entry '{}' contains template {}: templates cannot render \
+                     through a directory symlink — list the file individually in `files` instead",
+                    link.name,
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compile trailing-slash patterns as directory roots. A root match applies to
