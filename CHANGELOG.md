@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.18.0 — 2026-09-27
+
+### Added
+
+- **Whole-dir entries in `files` (subdir links).** A `files` entry that names a
+  directory inside the store links the entire directory as one symlink at the
+  same path under the target — the shape between whole-dir stores and per-file
+  links. Files dropped into the repo directory afterwards appear under the
+  target immediately, with no `apply`: the motivating case is prompt
+  directories (`~/.pi/agent/prompts` → repo `pi/prompts`), where authoring a
+  prompt should not require a stitch command. Previously a directory entry
+  half-worked: `apply` created the link and the stale-link sweep immediately
+  removed it again, because the reconciliation keep-set deliberately excluded
+  directory sources (a pre-`store/`-split assumption that dirs are never link
+  sources).
+- **Guards that make the shape safe.** A `.tmpl` anywhere inside a dir entry's
+  subtree is a resolution error — templates cannot render through a directory
+  symlink, so the file must be listed individually in `files` instead (the
+  same trap whole-dir→file-mode promotion exists to prevent). The plan-file
+  validator accepts directory sources only when they are the store directory
+  itself or inside it; `sources`-map entries stay file-only. Nested claims at
+  or under a dir entry's path were already rejected (ancestor-collision and
+  cross-store collision checks), and a non-empty real directory at the link
+  path remains a conflict — user content is never moved aside silently.
+
 ## 0.17.0 — 2026-09-20
 
 ### Added
