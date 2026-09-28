@@ -120,3 +120,10 @@ Existing tags: `v0.2.0` (d35496a), `v0.3.0` (76fc01f), `v0.3.1` (6d10de3),
 (d56aa75), `v0.8.0`, `v0.9.0`, `v0.10.0`, `v0.11.0`, `v0.11.1`, `v0.11.2`,
 `v0.11.3`, `v0.11.4`, `v0.11.5`, `v0.11.6`, `v0.12.0`, `v0.13.0`, `v0.14.0`,
 `v0.14.1`, `v0.14.2`.
+
+## Roadmap
+- `stitch add <dir>` (0.19 candidate): `add` refuses directories ("must be an
+  existing regular file"), so minting a whole-dir `files` entry still requires
+  hand-editing `state.toml` — fine once, but the refusal message should point
+  at the whole-dir option, and `add` should support adopting a live directory
+  into the shape directly.

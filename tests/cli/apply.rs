@@ -2261,3 +2261,62 @@ files = ["subdir", "subdir/a.conf"]
         .failure()
         .stderr(contains("subdir/a.conf"));
 }
+
+#[test]
+fn apply_removing_dir_entry_unlinks_target_keeps_repo() {
+    let repo = Repo::new();
+    let store_dir = repo.path().join("mystore");
+    fs::create_dir_all(store_dir.join("subdir")).unwrap();
+    fs::write(store_dir.join("top.conf"), "root\n").unwrap();
+    fs::write(store_dir.join("subdir").join("a.conf"), "a\n").unwrap();
+    let target = repo.path().join("home");
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        r#"
+[stores.mystore]
+target = "{target_str}"
+files = ["top.conf", "subdir"]
+"#
+    ));
+
+    repo.cmd().arg("apply").assert().success();
+    let link = target.join("subdir");
+    assert!(link.is_symlink());
+
+    // Drop the dir entry from the config: the target symlink must go, and
+    // nothing else — the repo subtree is the store's own content and the
+    // sweep only ever unlinks target-side links pointing into the store.
+    repo.write_state(&format!(
+        r#"
+[stores.mystore]
+target = "{target_str}"
+files = ["top.conf"]
+"#
+    ));
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("removed"));
+
+    assert!(
+        !link.symlink_metadata().is_ok(),
+        "target symlink must be removed"
+    );
+    assert!(
+        store_dir.join("subdir").join("a.conf").is_file(),
+        "repo subtree must be untouched"
+    );
+    assert!(
+        target.join("top.conf").is_symlink(),
+        "sibling links must survive"
+    );
+
+    // Idempotent: second apply changes nothing, diff agrees.
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("ok"));
+    repo.cmd().args(["diff", "--exit-code"]).assert().success();
+}
