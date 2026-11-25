@@ -43,6 +43,17 @@ files = [".bashrc", ".zshrc"]
 target = "~/.config/git"
 ```
 
+### `.stitch/links.toml` — hidden, **machine-local cleanup state**
+
+stitch writes this during real applies while holding the state lock. It records
+the desired file-mode link inventory apply last saw on this machine, so stale
+cleanup can inspect only disappeared exact paths instead of recursively walking
+every target directory. `init` seeds an empty file and ignores it in git. A repo
+upgraded from a pre-journal version gets one legacy recursive sweep on its first
+file-mode apply, then writes the journal. `diff` and other dry runs read it but
+never write it. It is not a second source of truth: the config still decides
+what is desired, and ownership checks still decide what may be unlinked.
+
 ### Field ownership
 
 | Field | Lives in | Kind |
@@ -139,7 +150,7 @@ Most read/plan commands support a global `--json` flag. See [Agent interface (v0
 
 ### `stitch init`
 
-Create `stitch.toml` (empty, with a header documenting it is authored/read-only to the tool) and `.stitch/state.toml` (empty, generated) in the current directory. Also appends `.stitch/render/` to the repo's `.gitignore` (creating the file if needed) and pre-creates `.stitch/render/` at mode `0700`. Refuses if either config file exists, or if a v0.2 `.stitch/config.toml` is present (pointing at `migrate` instead).
+Create `stitch.toml` (empty, with a header documenting it is authored/read-only to the tool), `.stitch/state.toml` (empty, generated), and `.stitch/links.toml` (empty, machine-local cleanup state) in the current directory. Also appends `.stitch/render/`, `.stitch/state.lock`, and `.stitch/links.toml` to the repo's `.gitignore` (creating the file if needed) and pre-creates `.stitch/render/` at mode `0700`. Refuses if either config file exists, or if a v0.2 `.stitch/config.toml` is present (pointing at `migrate` instead).
 
 ### `stitch self-update`
 
@@ -509,7 +520,7 @@ Contract (rationale in `docs/plans/v0.6-templates.md`):
 - **Staging is locked down from day one.** `.stitch/render/` is `0700`, rendered files `0600`. All rendering (apply and diff) happens in memory — no tempfile ever holds rendered plaintext under a default umask. Threat model: multi-user machines, shared CI runners, `env()` pulling tokens in v0.6, and encrypted secrets planned for v0.9 all read through these files. `init` appends `.stitch/render/` to the repo's `.gitignore`; an upgraded repo must add the entry manually before its first template apply. `apply` refuses to render without it, and `doctor` errors when templates or staged output make the entry relevant.
 - **Failure model is per-entry.** A template error (parse failure, missing `env` key) fails that entry and skips its link — never created, never broken. Render is atomic and happens before linking, so staging is never half-written. `apply` continues with other entries and stores, exiting non-zero at the end if anything failed (same aggregation as conflicts).
 - **`diff` gains a content dimension for templated entries only**: a fresh in-memory render compared against the staged file — "would `apply` change anything?" Non-templated entries remain link-state-only.
-- **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed. The stale-link sweep walks the target directory but never descends into the repository itself, so a file-mode store with `target = "~"` (whose target contains the repo) does not classify or remove repo-internal organizational symlinks. Writes are hash-gated: unchanged content preserves mtime.
+- **Staging and target links are reconciled and tool-owned.** `apply` removes staged renders and their stitch-owned target links when a source no longer resolves; `remove` deletes the store's staging tree alongside its links. Links to foreign destinations are never removed.  Stale target cleanup is inventory-driven: `.stitch/links.toml` records the file-mode links apply last saw on this machine, and disappeared entries are the only exact paths inspected. A pre-journal repo gets one legacy recursive sweep; journaled applies do not walk unrelated target trees. Writes are hash-gated: unchanged content preserves mtime.
 - **Hand-edited renders are refused, never overwritten (the render journal).** A target symlink points into `.stitch/render/`, so `$EDITOR <target>` edits the staged file directly — and the render tree is gitignored, making that edit the only copy. stitch records the sha256 of every render it writes in `.stitch/render/.journal.toml`; when a staged file differs from a fresh render *and* no longer matches its journal entry, `apply` (and `apply --plan`, which aborts at plan validation) refuses with the recovery paths and exits non-zero, `diff`'s dry run mirrors the refusal (both the re-render path and the whole-dir promotion preview), and `doctor` reports a `staging-hand-edited` error finding instead of plain drift. The stale-staging sweep refuses to *delete* a hand-edited render (e.g. after a template rename) — restore the source entry or delete the staged file deliberately. Crash semantics, stated precisely: a **missing** journal entry (pre-journal repo, or a crash that left none) is trusted once; a **stale** entry (crash between render write and journal write) is indistinguishable from a hand-edit and refuses — the safe direction, and deleting the staged file is harmless there because stitch rendered it. Journal entries are dropped when their staged file or store is removed. Honest limits: attribution is by content hash, so a hand edit that exactly matches the fresh render is converged, not a conflict; and recovery from a refusal requires porting the change into the source *and* deleting the staged file whenever the port is not byte-identical (the refusal message says so).
 - **Authoring is by hand.** Write `gitconfig.tmpl` in the store and `apply` — whole-dir stores pick it up via promotion; file-mode stores list the source name in `files`. There is no `add --template` in v0.6.
 - **`include()` composes from repo files.** `{{ include("agents/hub.md") }}` embeds the file's text verbatim at render time. There is no nested rendering: recursion is impossible by construction, and a hub file's own template-like syntax stays literal text in the output. The argument reuses the `add --source` safety rule — safe repo-relative fragment (no `..`, no leading `/`), not under `.stitch/` or `.git/`, regular file reached without passing through a symlink (one hop only), valid UTF-8 — and `.tmpl` arguments are rejected, since including a template would leak unrendered source. Drift detection is free: apply, `diff`, and `doctor` re-read included files on every fresh render, so editing an included hub surfaces as a `content` diff and a staging-drift warning until the next `apply` converges it.

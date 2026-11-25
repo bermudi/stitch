@@ -888,6 +888,28 @@ pub fn execute_plan(
                 }
             }
         }
+
+        // Advance the same stale-cleanup inventory that direct apply writes.
+        // Plan execution mutates individual ops rather than calling
+        // `apply_store`; without this, plan-only workflows would keep replaying
+        // old cleanup candidates and would not learn newly managed links.
+        if !dry_run {
+            let Some(store) = locked_loaded.config.stores.get(store_name) else {
+                sync_ops_remaining(&mut report, plan, &remaining);
+                return Err(PlanExecError::new(
+                    report,
+                    StitchError::internal(format!(
+                        "store '{store_name}' disappeared while executing plan"
+                    )),
+                ));
+            };
+            if let Err(error) =
+                crate::store::record_desired_inventory(repo_root, store_name, store, &platform)
+            {
+                sync_ops_remaining(&mut report, plan, &remaining);
+                return Err(PlanExecError::new(report, StitchError::internal(error)));
+            }
+        }
         drop(_state_lock);
 
         if let Some(warning) = run_store_post_hook(

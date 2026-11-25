@@ -7,6 +7,7 @@ mod error;
 mod fsutil;
 mod hooks;
 mod journal;
+mod link_inventory;
 mod linker;
 mod plan;
 mod plan_exec;

@@ -969,3 +969,18 @@ fn migrate_json_nothing_to_migrate() {
     assert!(!dir.path().join(".stitch").join("state.toml").exists());
     assert!(!dir.path().join(".stitch").join("config.toml.bak").exists());
 }
+
+#[test]
+fn init_seeds_machine_local_link_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stitch")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    assert!(dir.path().join(".stitch/links.toml").exists());
+    let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|line| line == ".stitch/links.toml"));
+}
