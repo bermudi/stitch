@@ -78,6 +78,21 @@ fn config_error(message: impl Into<String>) -> ApplyAction {
     )))
 }
 
+/// Whether the store directory is safe to use for this store's inventory.
+/// Explicit-source-only stores may have no directory at all (fresh clones do
+/// not preserve empty directories), but an existing path must still be a real
+/// directory: a file or symlink there is hostile or contradictory state.
+fn store_dir_usable(store_dir: &Path, store: &Store) -> bool {
+    if linker::is_real_directory(store_dir) {
+        return true;
+    }
+    !store.needs_store_dir()
+        && matches!(
+            std::fs::symlink_metadata(store_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
 /// Wrap a config revalidation failure as a config-class error (exit 3), not
 /// an internal error (exit 1), preserving the original failed path and
 /// adding checkpoint/store context to the message. A config reread failure
@@ -201,7 +216,7 @@ pub fn apply_all(
         };
         let legacy_link_sweep = link_inventory::needs_legacy_sweep(recorded_inventory, name);
         let store_dir = repo_root.join(name);
-        if !linker::is_real_directory(&store_dir) {
+        if !store_dir_usable(&store_dir, store) {
             results.push(ApplyResult {
                 store_name: name.clone(),
                 actions: vec![internal_error(format!(
@@ -361,7 +376,7 @@ pub fn apply_all(
             let current_store_identity = std::fs::symlink_metadata(&store_dir)
                 .map(|meta| (meta.dev(), meta.ino()))
                 .ok();
-            if !linker::is_real_directory(&store_dir) || current_store_identity != store_identity {
+            if !store_dir_usable(&store_dir, store) || current_store_identity != store_identity {
                 results.push(ApplyResult {
                     store_name: name.clone(),
                     actions: vec![internal_error(format!(
@@ -905,7 +920,7 @@ fn apply_store_inner(
     }
 
     let store_dir = repo_root.join(name);
-    if !linker::is_real_directory(&store_dir) {
+    if !store_dir_usable(&store_dir, store) {
         return ApplyResult {
             store_name: name.to_string(),
             actions: vec![internal_error(format!(

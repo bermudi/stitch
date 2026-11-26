@@ -224,7 +224,7 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
     for (name, store) in &config.stores {
         let store_dir = repo_root.join(name);
 
-        if !store_dir.exists() {
+        if !store_dir.exists() && store.needs_store_dir() {
             findings.push(DoctorFinding {
                 id: "missing-store-dir",
                 severity: Severity::Error,
@@ -380,44 +380,48 @@ pub fn doctor(repo_root: &Path, loaded: &Loaded, platform: &Platform) -> DoctorR
              sources: &BTreeMap<String, String>,
              ignore: &[String]| {
                 // Non-regular template sources (symlink/dir named *.tmpl) must be
-                // reported separately from source-name collisions.
-                match render::unsupported_template_source(&store_dir) {
-                    Err(msg) => {
-                        // The top-level permission-denied case is already handled
-                        // by the `unreadable-source` check above (it `continue`s).
-                        // Deeper I/O errors from the walk are reported here.
-                        findings.push(DoctorFinding {
-                        id: "store-dir-unreadable",
-                        severity: Severity::Error,
-                        message: match tname {
-                            Some(t) => format!("store '{name}' target '{t}': {msg}"),
-                            None => format!("store '{name}': {msg}"),
-                        },
-                        path: Some(target_path.to_path_buf()),
-                        hint: Some("check permissions on the store directory and its descendants; apply will fail".into()),
-                    });
-                        return;
+                // reported separately from source-name collisions. A target whose
+                // entries all come from `sources` never reads the store directory,
+                // so a missing one is valid and must not fail this scan.
+                if config::inventory_needs_store_dir(files, patterns, sources) {
+                    match render::unsupported_template_source(&store_dir) {
+                        Err(msg) => {
+                            // The top-level permission-denied case is already handled
+                            // by the `unreadable-source` check above (it `continue`s).
+                            // Deeper I/O errors from the walk are reported here.
+                            findings.push(DoctorFinding {
+                            id: "store-dir-unreadable",
+                            severity: Severity::Error,
+                            message: match tname {
+                                Some(t) => format!("store '{name}' target '{t}': {msg}"),
+                                None => format!("store '{name}': {msg}"),
+                            },
+                            path: Some(target_path.to_path_buf()),
+                            hint: Some("check permissions on the store directory and its descendants; apply will fail".into()),
+                        });
+                            return;
+                        }
+                        Ok(Some(path)) => {
+                            findings.push(DoctorFinding {
+                            id: "unsupported-template-source",
+                            severity: Severity::Error,
+                            message: match tname {
+                                Some(t) => format!(
+                                    "store '{name}' target '{t}': template source {} must be a direct regular file",
+                                    path.display()
+                                ),
+                                None => format!(
+                                    "store '{name}': template source {} must be a direct regular file",
+                                    path.display()
+                                ),
+                            },
+                            path: Some(target_path.to_path_buf()),
+                            hint: Some("ensure the `.tmpl` entry is a regular file, not a symlink or directory".into()),
+                        });
+                            return;
+                        }
+                        Ok(None) => {}
                     }
-                    Ok(Some(path)) => {
-                        findings.push(DoctorFinding {
-                        id: "unsupported-template-source",
-                        severity: Severity::Error,
-                        message: match tname {
-                            Some(t) => format!(
-                                "store '{name}' target '{t}': template source {} must be a direct regular file",
-                                path.display()
-                            ),
-                            None => format!(
-                                "store '{name}': template source {} must be a direct regular file",
-                                path.display()
-                            ),
-                        },
-                        path: Some(target_path.to_path_buf()),
-                        hint: Some("ensure the `.tmpl` entry is a regular file, not a symlink or directory".into()),
-                    });
-                        return;
-                    }
-                    Ok(None) => {}
                 }
 
                 let resolved =
