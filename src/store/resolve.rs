@@ -157,7 +157,9 @@ pub(super) fn resolve_targets(
     sources: &BTreeMap<String, String>,
     store_ignore: &[String],
 ) -> Result<LinkTargets, String> {
-    if let Some(path) = render::unsupported_template_source(store_dir)? {
+    if config::inventory_needs_store_dir(files, patterns, sources)
+        && let Some(path) = render::unsupported_template_source(store_dir)?
+    {
         return Err(format!(
             "template source {} must be a direct regular file",
             path.display()

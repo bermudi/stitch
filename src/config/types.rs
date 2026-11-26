@@ -234,9 +234,34 @@ pub const AUTHORED_TEMPLATE: &str = "\
 # Link inventory (target, files, patterns) is tool-managed in .stitch/state.toml.
 ";
 
+/// Whether one target's inventory resolves entries from the store directory
+/// itself. A target with only `sources` entries is independent of that
+/// directory; empty inventory is whole-dir mode, so it always needs it.
+pub(crate) fn inventory_needs_store_dir(
+    files: &[String],
+    patterns: &[String],
+    sources: &BTreeMap<String, String>,
+) -> bool {
+    !files.is_empty() || !patterns.is_empty() || sources.is_empty()
+}
+
 impl Store {
     pub fn is_multi_target(&self) -> bool {
         !self.targets.is_empty()
+    }
+
+    /// Whether any target resolves entries from the store directory itself.
+    /// Explicit-source-only stores may lack that directory on a fresh clone:
+    /// git cannot preserve empty directories, and no implicit or globbed
+    /// source needs it.
+    pub fn needs_store_dir(&self) -> bool {
+        if self.is_multi_target() {
+            self.targets.values().any(|target| {
+                inventory_needs_store_dir(&target.files, &target.patterns, &target.sources)
+            })
+        } else {
+            inventory_needs_store_dir(&self.files, &self.patterns, &self.sources)
+        }
     }
 }
 

@@ -704,23 +704,35 @@ pub fn execute_plan(
         }
 
         let store_dir = repo_root.join(store_name);
-        if !std::fs::symlink_metadata(&store_dir)
-            .is_ok_and(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
-        {
-            sync_ops_remaining(&mut report, plan, &remaining);
-            return Err(PlanExecError::new(
-                report,
-                StitchError::plan_stale(format!(
-                    "store directory {} is missing, symlinked, or not a directory",
-                    store_dir.display()
-                )),
-            ));
-        }
-        let store_identity = match directory_identity(&store_dir) {
-            Ok(identity) => identity,
-            Err(e) => {
+        let missing_store_dir_allowed = pre_hook_loaded
+            .config
+            .stores
+            .get(store_name)
+            .is_some_and(|store| !store.needs_store_dir());
+        let store_identity = match std::fs::symlink_metadata(&store_dir) {
+            Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
+                match directory_identity(&store_dir) {
+                    Ok(identity) => Some(identity),
+                    Err(e) => {
+                        sync_ops_remaining(&mut report, plan, &remaining);
+                        return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
+                    }
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && missing_store_dir_allowed =>
+            {
+                None
+            }
+            _ => {
                 sync_ops_remaining(&mut report, plan, &remaining);
-                return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
+                return Err(PlanExecError::new(
+                    report,
+                    StitchError::plan_stale(format!(
+                        "store directory {} is missing, symlinked, or not a directory",
+                        store_dir.display()
+                    )),
+                ));
             }
         };
 
@@ -775,11 +787,21 @@ pub fn execute_plan(
                 StitchError::plan_stale(e.to_string()),
             ));
         }
-        if let Err(e) = require_directory_identity(
-            &store_dir,
-            store_identity,
-            "store directory changed during pre-hook",
-        ) {
+        let store_dir_check = match store_identity {
+            Some(identity) => require_directory_identity(
+                &store_dir,
+                identity,
+                "store directory changed during pre-hook",
+            ),
+            None => match std::fs::symlink_metadata(&store_dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(format!(
+                    "store directory changed during pre-hook: {}",
+                    store_dir.display()
+                )),
+            },
+        };
+        if let Err(e) = store_dir_check {
             sync_ops_remaining(&mut report, plan, &remaining);
             return Err(PlanExecError::new(report, StitchError::plan_stale(e)));
         }

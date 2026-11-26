@@ -116,7 +116,7 @@ Multi-target array entries get deterministic names during migration (hostname-fi
 
 ## Core concepts
 
-- **Store** — a top-level directory in the repo. One unit of config.
+- **Store** — one unit of config, usually backed by a top-level directory in the repo. A store whose inventory is entirely `sources` entries has no in-store source files, so its directory may be absent (for example on a fresh clone, where git cannot preserve an empty directory); if the path exists, it must still be a real directory.
 - **Target** — where the symlink(s) land on disk. Declared explicitly.
 - **Whole-directory mode** — no `files` or `patterns` → the entire store dir is one symlink.
 - **File mode** — `files` and/or `patterns` → individual files are symlinked into the target dir. A `files` entry that names a store *directory* links the whole directory as one symlink at the same path under the target (a **subdir link**): files dropped into the repo dir afterwards appear under the target with no `apply`. A `.tmpl` anywhere in such a subtree is a resolution error (templates cannot render through a directory symlink — list the file individually instead); a non-empty real directory at the link path is a conflict (user content is never moved aside silently); and no other claim may exist at or under the dir entry's path.
@@ -401,7 +401,7 @@ After the editor exits successfully, `stitch apply` runs so everything converges
 
 ### `stitch doctor`
 
-Health check: missing store dirs, broken symlinks, conflicting targets, empty stores (suppressed for sources-only stores, whose empty store dir is the intended fan-in consumer shape), orphaned behavior (store in `stitch.toml` with no `state.toml` entry), staging permission drift, template staging content drift (staged ≠ fresh render; attributed as a `staging-hand-edited` error when the render no longer matches the render journal — apply will refuse to overwrite it), template render errors. It errors on a missing `.stitch/render/` gitignore entry only when configured templates are active on this platform or staged output exists; plain pre-template repos need no migration.
+Health check: missing store dirs (except sources-only stores, whose directory may be absent), broken symlinks, conflicting targets, empty stores (suppressed for sources-only stores, whose empty or absent store dir is the intended fan-in consumer shape), orphaned behavior (store in `stitch.toml` with no `state.toml` entry), staging permission drift, template staging content drift (staged ≠ fresh render; attributed as a `staging-hand-edited` error when the render no longer matches the render journal — apply will refuse to overwrite it), template render errors. It errors on a missing `.stitch/render/` gitignore entry only when configured templates are active on this platform or staged output exists; plain pre-template repos need no migration.
 
 ### `stitch migrate`
 

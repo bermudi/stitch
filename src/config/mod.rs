@@ -33,6 +33,7 @@ pub use types::{
 pub(crate) use load::{hash_config_bytes, normalize_fragment, revalidate_config_hash};
 pub(crate) use paths::{canonical_home, canonical_target_for_comparison, normalized_target_path};
 pub(crate) use state::{validate_authored_file, validate_state_file, validate_stitch_dir};
+pub(crate) use types::inventory_needs_store_dir;
 
 #[cfg(test)]
 pub(crate) use paths::{TestHomeGuard, set_test_home, test_home_guard};
