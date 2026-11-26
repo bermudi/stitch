@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.19.1 — 2026-11-26
+
+### Fixed
+
+- **Fresh clones can apply sources-only stores.** A store whose entries all use
+  repo-relative `sources` no longer requires its own empty consumer directory to
+  exist. Git cannot preserve that directory, so a valid clone previously failed
+  with `store directory ... is missing` even when every declared source was
+  present. Missing declared sources are still reported, and an existing file or
+  symlink at the store path is still rejected. `diff`, `doctor`, `plan`, and
+  `apply --plan` follow the same rule.
+
 ## 0.19.0 — 2026-11-26
 
 ### Fixed
