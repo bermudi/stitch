@@ -199,7 +199,7 @@ pub fn apply_all(
                 continue;
             }
         };
-        let legacy_link_sweep = recorded_inventory.is_none();
+        let legacy_link_sweep = link_inventory::needs_legacy_sweep(recorded_inventory, name);
         let store_dir = repo_root.join(name);
         if !linker::is_real_directory(&store_dir) {
             results.push(ApplyResult {
@@ -874,7 +874,7 @@ pub fn apply_store(
             opts,
             warnings,
             boundaries,
-            inventory.is_none(),
+            link_inventory::needs_legacy_sweep(inventory.as_ref(), name),
             inventory.as_ref(),
         ),
         Err(error) => ApplyResult {

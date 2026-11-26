@@ -29,6 +29,11 @@ type InventoryMap = BTreeMap<String, StoreInventory>;
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InventoryFile {
+    // True only for a journal seeded by `init`. Migrated pre-journal files
+    // deliberately keep this false until every store has either been swept
+    // or recorded, so a filtered first apply cannot skip other stores.
+    #[serde(default)]
+    seeded: bool,
     #[serde(default)]
     stores: InventoryMap,
 }
@@ -78,6 +83,16 @@ fn save(repo_root: &Path, inventory: &InventoryFile) -> Result<(), String> {
         .map_err(|e| format!("could not write link inventory: {e}"))
 }
 
+/// Whether this store still needs the pre-journal recursive sweep. A missing
+/// journal always does. A migrated journal does until the store has an entry;
+/// an init-seeded journal never does, even for a store first added later.
+pub(crate) fn needs_legacy_sweep(inventory: Option<&InventoryFile>, store_name: &str) -> bool {
+    match inventory {
+        None => true,
+        Some(inventory) => !inventory.seeded && !inventory.stores.contains_key(store_name),
+    }
+}
+
 /// Whether the journal file exists, independent of its parsed contents.
 pub(crate) fn exists(repo_root: &Path) -> bool {
     std::fs::symlink_metadata(inventory_path(repo_root))
@@ -91,7 +106,13 @@ pub(crate) fn initialize(repo_root: &Path) -> Result<(), String> {
     if exists(repo_root) {
         return Ok(());
     }
-    save(repo_root, &InventoryFile::default())
+    save(
+        repo_root,
+        &InventoryFile {
+            seeded: true,
+            stores: InventoryMap::default(),
+        },
+    )
 }
 
 /// The recorded links for one canonical target directory.

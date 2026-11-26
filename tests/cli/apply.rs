@@ -2392,3 +2392,43 @@ fn pre_journal_repo_uses_legacy_sweep_once_then_journals() {
     repo.cmd().arg("apply").assert().success();
     assert!(target.join("manual").is_symlink());
 }
+
+#[test]
+fn filtered_first_apply_does_not_skip_prejournal_sweep_for_other_stores() {
+    let repo = Repo::new();
+    repo.make_store("alpha", &["keep"]);
+    repo.make_store("beta", &["keep"]);
+    let home = repo.path().join("home");
+    let alpha_target = home.join("a");
+    let beta_target = home.join("b");
+    fs::create_dir_all(&alpha_target).unwrap();
+    fs::create_dir_all(&beta_target).unwrap();
+    repo.write_state(&format!(
+        "[stores.alpha]\ntarget = \"{}\"\nfiles = [\"keep\"]\n\n[stores.beta]\ntarget = \"{}\"\nfiles = [\"keep\"]\n",
+        alpha_target.display(),
+        beta_target.display()
+    ));
+    std::os::unix::fs::symlink(
+        repo.path().join("alpha").join("keep"),
+        alpha_target.join("old-alpha"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        repo.path().join("beta").join("keep"),
+        beta_target.join("old-beta"),
+    )
+    .unwrap();
+
+    repo.cmd()
+        .args(["apply", "--only", "alpha"])
+        .assert()
+        .success();
+    assert!(repo.path().join(".stitch/links.toml").exists());
+    assert!(!alpha_target.join("old-alpha").exists());
+
+    // beta was outside the filtered apply, so writing alpha's inventory must
+    // not mark the pre-journal migration complete. The later full apply still
+    // owes beta its one legacy sweep.
+    repo.cmd().arg("apply").assert().success();
+    assert!(!beta_target.join("old-beta").exists());
+}
