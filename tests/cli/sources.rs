@@ -119,6 +119,121 @@ files = ["existing.txt"]
 }
 
 #[test]
+fn apply_sources_only_store_without_store_dir() {
+    // A fresh clone cannot preserve an empty consumer store directory. When
+    // every entry has an explicit repo-relative source, that directory is not
+    // part of the desired state and apply must still create the links.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+
+    let shared = repo.path().join("shared").join("rules.md");
+    fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    fs::write(&shared, "rules").unwrap();
+
+    let target = home_path.join(".config").join("demo");
+    repo.write_state(&format!(
+        r#"
+[stores.sink]
+target = "{}"
+
+[stores.sink.sources]
+"rules.md" = "shared/rules.md"
+"#,
+        target.to_string_lossy(),
+    ));
+    assert!(
+        !repo.path().join("sink").exists(),
+        "test requires the consumer store directory to be absent"
+    );
+
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .success();
+
+    let link = target.join("rules.md");
+    assert!(link.is_symlink(), "apply must create the source link");
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        fs::canonicalize(&shared).unwrap(),
+        "link must point at the repo-relative source"
+    );
+    assert_eq!(fs::read_to_string(&link).unwrap(), "rules");
+}
+
+#[test]
+fn apply_sources_only_store_without_store_dir_reports_missing_source() {
+    // Bypassing the missing consumer directory must not hide a missing
+    // declared source: the entry itself is still reported honestly.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let target = home_path.join(".config").join("demo");
+    repo.write_state(&format!(
+        r#"
+[stores.sink]
+target = "{}"
+
+[stores.sink.sources]
+"rules.md" = "shared/rules.md"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    let output = repo
+        .cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("source does not exist"),
+        "missing source must be reported, not the absent consumer dir: {stderr}"
+    );
+    assert!(
+        !stderr.contains("store directory 'sink' is missing"),
+        "the absent consumer dir must not mask the source error: {stderr}"
+    );
+}
+
+#[test]
+fn apply_sources_only_store_rejects_non_directory_store_path() {
+    // Missing is legal for this shape; occupied by a file or symlink is not.
+    // The exception exists because git cannot preserve empty directories, not
+    // because the store path stopped being a trust boundary when it exists.
+    let repo = Repo::new();
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path();
+    let shared = repo.path().join("shared").join("rules.md");
+    fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    fs::write(&shared, "rules").unwrap();
+    fs::write(repo.path().join("sink"), "not a directory").unwrap();
+
+    let target = home_path.join(".config").join("demo");
+    repo.write_state(&format!(
+        r#"
+[stores.sink]
+target = "{}"
+
+[stores.sink.sources]
+"rules.md" = "shared/rules.md"
+"#,
+        target.to_string_lossy(),
+    ));
+
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("store directory"));
+}
+
+#[test]
 fn add_source_dry_run_and_json() {
     let repo = Repo::new();
     let home = tempfile::tempdir().unwrap();
