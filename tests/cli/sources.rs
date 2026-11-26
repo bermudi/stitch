@@ -161,6 +161,37 @@ target = "{}"
         "link must point at the repo-relative source"
     );
     assert_eq!(fs::read_to_string(&link).unwrap(), "rules");
+
+    // The same absence is valid across the other apply surfaces: a converged
+    // diff, a captured plan execution, and doctor's health check.
+    repo.cmd()
+        .env("HOME", home_path)
+        .args(["diff", "--exit-code"])
+        .assert()
+        .success();
+    repo.cmd()
+        .env("HOME", home_path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(contains("0 errors"));
+
+    fs::remove_file(&link).unwrap();
+    let plan_output = repo
+        .cmd()
+        .env("HOME", home_path)
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert!(plan_output.status.success());
+    let plan_path = repo.path().join("plan.json");
+    fs::write(&plan_path, &plan_output.stdout).unwrap();
+    repo.cmd()
+        .env("HOME", home_path)
+        .args(["apply", "--plan", plan_path.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(link.is_symlink(), "apply --plan must recreate the link");
 }
 
 #[test]
