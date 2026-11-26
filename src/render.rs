@@ -211,7 +211,7 @@ pub fn has_staged_output(repo_root: &Path) -> bool {
 /// it is already ignored, creating the file if needed. Refuses a non-regular or
 /// symlinked `.gitignore`. Shared by the render and lock ensurers so the
 /// open-check-append scaffolding (and its `O_NOFOLLOW` guard) lives once.
-fn append_gitignore_entry(
+pub(crate) fn append_gitignore_entry(
     repo_root: &Path,
     covered: impl Fn(&str) -> bool,
     entry: &str,

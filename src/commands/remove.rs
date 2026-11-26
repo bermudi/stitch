@@ -4,6 +4,7 @@ use crate::config::{self, Config, Loaded};
 use crate::error::StitchError;
 use crate::fsutil::{ensure_filesystem_identity, filesystem_identity};
 use crate::hooks;
+use crate::link_inventory;
 use crate::linker;
 use crate::platform::Platform;
 use crate::render;
@@ -724,6 +725,11 @@ pub(crate) fn cmd_remove(
         .collect();
 
     loaded.generated.save(root)?;
+    if let Err(error) = link_inventory::forget_store(root, name) {
+        loaded.warnings.push(format!(
+            "could not forget stale-link journal for store {name}: {error}"
+        ));
+    }
 
     // The state write is committed; release the lock before the post-remove
     // hook so a hook may invoke a mutating stitch command.

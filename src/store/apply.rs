@@ -16,6 +16,7 @@ use crate::ancestor::{TargetAncestorRedirect, TargetAncestorSnapshot};
 use crate::config::{self, Config, ConfigSnapshot, Store};
 use crate::error::StitchError;
 use crate::hooks::{self, HookEnv};
+use crate::link_inventory;
 use crate::linker::{self, LinkError, LinkStatus};
 use crate::plan::Plan;
 use crate::platform::Platform;
@@ -179,11 +180,26 @@ pub fn apply_all(
     // Computed once so each store's stale-link walk stops at every other
     // store's target directory (see `render::reconcile_store_links`).
     let boundaries = sweep_boundaries(config);
+    // Load the stale-cleanup inventory once for the whole command. Otherwise
+    // the first store in a pre-journal repo would create the file and every
+    // later store would skip its one legacy scan without ever being swept.
+    let inventory_state = link_inventory::load(repo_root);
 
     for (name, store) in sorted {
         if !only.is_empty() && !only.contains(name) {
             continue;
         }
+        let recorded_inventory = match &inventory_state {
+            Ok(inventory) => inventory.as_ref(),
+            Err(error) => {
+                results.push(ApplyResult {
+                    store_name: name.clone(),
+                    actions: vec![internal_error(error.clone())],
+                });
+                continue;
+            }
+        };
+        let legacy_link_sweep = link_inventory::needs_legacy_sweep(recorded_inventory, name);
         let store_dir = repo_root.join(name);
         if !linker::is_real_directory(&store_dir) {
             results.push(ApplyResult {
@@ -457,7 +473,7 @@ pub fn apply_all(
             continue;
         }
         let mut result = if opts.dry_run {
-            apply_store(
+            apply_store_inner(
                 repo_root,
                 name,
                 store,
@@ -466,6 +482,8 @@ pub fn apply_all(
                 opts,
                 &mut warnings,
                 &boundaries,
+                legacy_link_sweep,
+                recorded_inventory,
             )
         } else {
             // Reload a fresh snapshot under the lock and require the same hash
@@ -477,7 +495,7 @@ pub fn apply_all(
                     match locked_snap.loaded.config.stores.get(name) {
                         Some(store) => {
                             let locked_store = store.clone();
-                            let result = apply_store(
+                            let result = apply_store_inner(
                                 repo_root,
                                 name,
                                 &locked_store,
@@ -486,6 +504,8 @@ pub fn apply_all(
                                 opts,
                                 &mut warnings,
                                 &boundaries,
+                                legacy_link_sweep,
+                                recorded_inventory,
                             );
                             locked_stores.insert(name.clone(), locked_store);
                             result
@@ -719,7 +739,120 @@ pub fn sweep_boundaries(config: &Config) -> BTreeSet<PathBuf> {
     config.stores.values().flat_map(store_target_dirs).collect()
 }
 
-/// Apply a single store.
+/// Reconcile stale file-mode links for one target. Pre-journal repos use the
+/// legacy recursive sweep once; journaled repos diff the recorded desired
+/// inventory and inspect only those exact candidate paths.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_file_mode_links(
+    target_path: &Path,
+    canonical_target: &Path,
+    repo_root: &Path,
+    store_dir: &Path,
+    store_name: &str,
+    declared_sources: &[PathBuf],
+    boundaries: &BTreeSet<PathBuf>,
+    keep_link_rels: &BTreeSet<String>,
+    dry_run: bool,
+    legacy_link_sweep: bool,
+    recorded_inventory: Option<&link_inventory::InventoryFile>,
+) -> Result<Vec<PathBuf>, String> {
+    if legacy_link_sweep {
+        return render::reconcile_store_links(
+            target_path,
+            repo_root,
+            store_dir,
+            store_name,
+            declared_sources,
+            boundaries,
+            keep_link_rels,
+            dry_run,
+        );
+    }
+
+    let recorded = recorded_inventory
+        .map(|inventory| link_inventory::recorded_links(inventory, store_name, canonical_target))
+        .unwrap_or_default();
+    let stale = recorded.difference(keep_link_rels).cloned().collect();
+    link_inventory::remove_recorded_stale_links(
+        target_path,
+        repo_root,
+        store_dir,
+        store_name,
+        declared_sources,
+        &stale,
+        dry_run,
+    )
+}
+
+/// Record the active file-mode inventory for a store without applying it.
+/// `apply --plan` executes individual ops rather than `apply_store`, but both
+/// mutation paths must advance the same stale-cleanup journal.
+pub(crate) fn record_desired_inventory(
+    repo_root: &Path,
+    name: &str,
+    store: &Store,
+    platform: &Platform,
+) -> Result<(), String> {
+    if !platform.matches_when(&store.when) {
+        return Ok(());
+    }
+    let store_dir = repo_root.join(name);
+    let mut staging_keep = BTreeSet::new();
+    let mut target_keep_links: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    let mut active_canonical: BTreeSet<PathBuf> = BTreeSet::new();
+
+    if store.is_multi_target() {
+        for target_entry in store.targets.values() {
+            let target_path =
+                config::expand_home(&target_entry.target).map_err(|e| e.to_string())?;
+            collect_reconciliation_keeps(
+                repo_root,
+                &store_dir,
+                &target_path,
+                &target_entry.files,
+                &target_entry.patterns,
+                &target_entry.sources,
+                &target_entry.ignore,
+                &mut staging_keep,
+                &mut target_keep_links,
+            );
+            if platform.matches_when(&target_entry.when) {
+                active_canonical.insert(config::canonical_target_for_comparison(&target_path));
+            }
+        }
+    } else if let Some(ref target_str) = store.target {
+        let target_path = config::expand_home(target_str).map_err(|e| e.to_string())?;
+        collect_reconciliation_keeps(
+            repo_root,
+            &store_dir,
+            &target_path,
+            &store.files,
+            &store.patterns,
+            &store.sources,
+            &store.ignore,
+            &mut staging_keep,
+            &mut target_keep_links,
+        );
+        active_canonical.insert(config::canonical_target_for_comparison(&target_path));
+    }
+
+    let mut canonical_keep: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    for (raw, rels) in target_keep_links {
+        canonical_keep
+            .entry(config::canonical_target_for_comparison(&raw))
+            .or_default()
+            .extend(rels);
+    }
+    canonical_keep.retain(|canon, _| active_canonical.contains(canon));
+    if canonical_keep.is_empty() {
+        return Ok(());
+    }
+    link_inventory::update_store(repo_root, name, &canonical_keep)
+}
+
+/// Apply a single store, loading its stale-cleanup inventory for this one
+/// operation. `apply_all` uses `apply_store_inner` so a pre-journal repo keeps
+/// the same legacy-sweep decision across every store in one command.
 #[allow(clippy::too_many_arguments)] // plumbing: boundaries join the apply context
 pub fn apply_store(
     repo_root: &Path,
@@ -728,8 +861,41 @@ pub fn apply_store(
     platform: &Platform,
     vars: &BTreeMap<String, String>,
     opts: ApplyOpts,
+    warnings: &mut Vec<String>,
+    boundaries: &BTreeSet<PathBuf>,
+) -> ApplyResult {
+    match link_inventory::load(repo_root) {
+        Ok(inventory) => apply_store_inner(
+            repo_root,
+            name,
+            store,
+            platform,
+            vars,
+            opts,
+            warnings,
+            boundaries,
+            link_inventory::needs_legacy_sweep(inventory.as_ref(), name),
+            inventory.as_ref(),
+        ),
+        Err(error) => ApplyResult {
+            store_name: name.to_string(),
+            actions: vec![internal_error(error)],
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_store_inner(
+    repo_root: &Path,
+    name: &str,
+    store: &Store,
+    platform: &Platform,
+    vars: &BTreeMap<String, String>,
+    opts: ApplyOpts,
     _warnings: &mut Vec<String>,
     boundaries: &BTreeSet<PathBuf>,
+    legacy_link_sweep: bool,
+    recorded_inventory: Option<&link_inventory::InventoryFile>,
 ) -> ApplyResult {
     if !platform.matches_when(&store.when) {
         return ApplyResult {
@@ -754,6 +920,12 @@ pub fn apply_store(
     // function for the mutation phase only. Direct callers (`add`, `import`)
     // create stores with no hooks.
     let mut actions = Vec::new();
+
+    // Stale-link candidates normally come from the machine-local link
+    // inventory. A missing inventory means a pre-journal repo (or a test
+    // fixture that bypassed init): use the legacy recursive sweep once, then
+    // the real apply writes the inventory and later runs stay exact-path only.
+    let mut inventory_updates: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
 
     // Reconciliation is derived from desired sources, not successful entry
     // application. A render/resolution failure and a target skipped by `when`
@@ -876,12 +1048,14 @@ pub fn apply_store(
             .into_iter()
             .filter(|(canon, _)| active_canonical.contains(canon))
         {
+            inventory_updates.insert(canon.clone(), link_rels.clone());
             let declared: Vec<PathBuf> = canonical_declared
                 .remove(&canon)
                 .map(|set| set.into_iter().collect())
                 .unwrap_or_default();
-            match render::reconcile_store_links(
+            match reconcile_file_mode_links(
                 &representative,
+                &canon,
                 repo_root,
                 &store_dir,
                 name,
@@ -889,6 +1063,8 @@ pub fn apply_store(
                 boundaries,
                 &link_rels,
                 opts.dry_run,
+                legacy_link_sweep,
+                recorded_inventory,
             ) {
                 Ok(removed) => actions.extend(removed.into_iter().map(ApplyAction::Removed)),
                 Err(e) => {
@@ -950,8 +1126,11 @@ pub fn apply_store(
             .map(|value| repo_root.join(value))
             .collect();
         for (target_path, link_rels) in target_keep_links {
-            match render::reconcile_store_links(
+            let canonical_target = config::canonical_target_for_comparison(&target_path);
+            inventory_updates.insert(canonical_target.clone(), link_rels.clone());
+            match reconcile_file_mode_links(
                 &target_path,
+                &canonical_target,
                 repo_root,
                 &store_dir,
                 name,
@@ -959,6 +1138,8 @@ pub fn apply_store(
                 boundaries,
                 &link_rels,
                 opts.dry_run,
+                legacy_link_sweep,
+                recorded_inventory,
             ) {
                 Ok(removed) => actions.extend(removed.into_iter().map(ApplyAction::Removed)),
                 Err(e) => {
@@ -996,6 +1177,18 @@ pub fn apply_store(
             Ok(paths) => actions.extend(paths.into_iter().map(ApplyAction::StagedRemoved)),
             Err(e) => actions.push(internal_error(e)),
         }
+    }
+
+    // Real apply runs under the state lock. Record the desired inventory that
+    // was active for this store after the mutation phase; the next run uses it
+    // as the exact stale-candidate set instead of walking the target tree.
+    // Dry-run must not write bookkeeping, or `diff` would mutate the repo.
+    if !opts.dry_run
+        && !link_reconciliation_failed
+        && !inventory_updates.is_empty()
+        && let Err(error) = link_inventory::update_store(repo_root, name, &inventory_updates)
+    {
+        actions.push(internal_error(error));
     }
 
     ApplyResult {

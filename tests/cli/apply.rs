@@ -2320,3 +2320,115 @@ files = ["top.conf"]
         .stdout(contains("ok"));
     repo.cmd().args(["diff", "--exit-code"]).assert().success();
 }
+
+#[test]
+fn journaled_apply_removes_disappeared_inventory_without_target_scan() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc", ".zshrc"]);
+    let target = repo.path().join("home");
+    fs::create_dir_all(&target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    let write_state = |files: &str| {
+        repo.write_state(&format!(
+            "[stores.shells]\ntarget = \"{target_str}\"\nfiles = [{files}]\n"
+        ));
+    };
+    write_state("\".bashrc\", \".zshrc\"");
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.join(".zshrc").is_symlink());
+    assert!(repo.path().join(".stitch/links.toml").exists());
+
+    // A manually created repo-pointing link is outside stitch's managed
+    // inventory. Once the journal exists, apply must not rediscover it with a
+    // recursive target walk — that walk is the expensive behavior this test
+    // pins. The disappeared `.zshrc` entry is still cleaned up exactly.
+    write_state("\".bashrc\"");
+    std::os::unix::fs::symlink(
+        repo.path().join("shells").join(".zshrc"),
+        target.join("manual"),
+    )
+    .unwrap();
+    repo.cmd()
+        .arg("apply")
+        .assert()
+        .success()
+        .stdout(contains("remove:"));
+    assert!(!target.join(".zshrc").exists());
+    assert!(target.join("manual").is_symlink());
+}
+
+#[test]
+fn pre_journal_repo_uses_legacy_sweep_once_then_journals() {
+    let repo = Repo::new();
+    repo.make_store("shells", &[".bashrc", ".zshrc"]);
+    let target = repo.path().join("home");
+    fs::create_dir_all(&target).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    repo.write_state(&format!(
+        "[stores.shells]\ntarget = \"{target_str}\"\nfiles = [\".bashrc\"]\n"
+    ));
+    std::os::unix::fs::symlink(
+        repo.path().join("shells").join(".zshrc"),
+        target.join("old"),
+    )
+    .unwrap();
+
+    // Fixtures bypass init, so no links.toml exists: this models an upgraded
+    // pre-journal repo. The first apply retains the legacy sweep so stale
+    // stitch-created links from older versions are still cleaned up.
+    repo.cmd().arg("apply").assert().success();
+    assert!(!target.join("old").exists());
+    assert!(repo.path().join(".stitch/links.toml").exists());
+    let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|line| line == ".stitch/links.toml"));
+
+    // After that migration sweep, undeclared repo-pointing links are outside
+    // the owned inventory and no recursive sweep runs to find them.
+    std::os::unix::fs::symlink(
+        repo.path().join("shells").join(".zshrc"),
+        target.join("manual"),
+    )
+    .unwrap();
+    repo.cmd().arg("apply").assert().success();
+    assert!(target.join("manual").is_symlink());
+}
+
+#[test]
+fn filtered_first_apply_does_not_skip_prejournal_sweep_for_other_stores() {
+    let repo = Repo::new();
+    repo.make_store("alpha", &["keep"]);
+    repo.make_store("beta", &["keep"]);
+    let home = repo.path().join("home");
+    let alpha_target = home.join("a");
+    let beta_target = home.join("b");
+    fs::create_dir_all(&alpha_target).unwrap();
+    fs::create_dir_all(&beta_target).unwrap();
+    repo.write_state(&format!(
+        "[stores.alpha]\ntarget = \"{}\"\nfiles = [\"keep\"]\n\n[stores.beta]\ntarget = \"{}\"\nfiles = [\"keep\"]\n",
+        alpha_target.display(),
+        beta_target.display()
+    ));
+    std::os::unix::fs::symlink(
+        repo.path().join("alpha").join("keep"),
+        alpha_target.join("old-alpha"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        repo.path().join("beta").join("keep"),
+        beta_target.join("old-beta"),
+    )
+    .unwrap();
+
+    repo.cmd()
+        .args(["apply", "--only", "alpha"])
+        .assert()
+        .success();
+    assert!(repo.path().join(".stitch/links.toml").exists());
+    assert!(!alpha_target.join("old-alpha").exists());
+
+    // beta was outside the filtered apply, so writing alpha's inventory must
+    // not mark the pre-journal migration complete. The later full apply still
+    // owes beta its one legacy sweep.
+    repo.cmd().arg("apply").assert().success();
+    assert!(!beta_target.join("old-beta").exists());
+}

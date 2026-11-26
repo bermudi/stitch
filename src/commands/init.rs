@@ -1,5 +1,6 @@
 use crate::config::{self, ConfigError};
 use crate::error::StitchError;
+use crate::link_inventory;
 use crate::render;
 
 pub(crate) fn cmd_init() -> Result<(), StitchError> {
@@ -91,6 +92,14 @@ pub(crate) fn cmd_init() -> Result<(), StitchError> {
     render::ensure_lock_gitignore(&cwd).map_err(|e| {
         StitchError::io_context(format!("updating .gitignore in {}", cwd.display()), e)
     })?;
+
+    // The link inventory is machine-local bookkeeping too. New repos start
+    // with an empty journal, so they never need the pre-journal recursive
+    // stale-link sweep.
+    link_inventory::ensure_links_gitignore(&cwd).map_err(|e| {
+        StitchError::io_context(format!("updating .gitignore in {}", cwd.display()), e)
+    })?;
+    link_inventory::initialize(&cwd).map_err(StitchError::internal)?;
 
     // Pre-create the staging root at 0700 so the permission contract holds
     // before the first templated apply.
