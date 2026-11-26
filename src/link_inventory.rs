@@ -116,6 +116,8 @@ pub(crate) fn update_store(
     store_name: &str,
     active_targets: &BTreeMap<PathBuf, BTreeSet<String>>,
 ) -> Result<(), String> {
+    ensure_links_gitignore(repo_root)
+        .map_err(|e| format!("could not ignore link inventory in .gitignore: {e}"))?;
     let mut inventory = load(repo_root)?.unwrap_or_default();
     let store = inventory.stores.entry(store_name.to_string()).or_default();
     let mut changed = false;

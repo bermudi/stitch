@@ -12,7 +12,7 @@
   inspects only exact paths that disappeared from the next desired inventory.
   A pre-journal repo keeps the legacy recursive sweep for its first file-mode
   apply so stale links written by older versions are still cleaned up, then
-  writes the journal. New repos start with an empty journal and never use the
+  writes the journal and adds the gitignore entry if needed. New repos start with an empty journal and never use the
   legacy sweep. In the author's real dotfiles repo, a converged dry run drops
   from 31.6s warm / 5.65 million syscalls to about 0.09s.
 

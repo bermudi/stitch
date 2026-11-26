@@ -50,7 +50,7 @@ the desired file-mode link inventory apply last saw on this machine, so stale
 cleanup can inspect only disappeared exact paths instead of recursively walking
 every target directory. `init` seeds an empty file and ignores it in git. A repo
 upgraded from a pre-journal version gets one legacy recursive sweep on its first
-file-mode apply, then writes the journal. `diff` and other dry runs read it but
+file-mode apply, then writes the journal and adds the gitignore entry if needed. `diff` and other dry runs read it but
 never write it. It is not a second source of truth: the config still decides
 what is desired, and ownership checks still decide what may be unlinked.
 

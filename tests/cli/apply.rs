@@ -2379,6 +2379,8 @@ fn pre_journal_repo_uses_legacy_sweep_once_then_journals() {
     repo.cmd().arg("apply").assert().success();
     assert!(!target.join("old").exists());
     assert!(repo.path().join(".stitch/links.toml").exists());
+    let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|line| line == ".stitch/links.toml"));
 
     // After that migration sweep, undeclared repo-pointing links are outside
     // the owned inventory and no recursive sweep runs to find them.
