@@ -235,8 +235,15 @@ pub(crate) fn remove_recorded_stale_links(
             }
         }
 
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "could not inspect stale link {}: {e}",
+                    path.display()
+                ));
+            }
         };
         if !meta.file_type().is_symlink() {
             continue;

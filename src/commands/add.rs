@@ -1801,6 +1801,8 @@ fn cmd_add_to_store(
             ),
         ));
     }
+    store::record_desired_inventory(root, store_name, &candidate_store, &platform)
+        .map_err(StitchError::internal)?;
 
     // Post-op report: emit JSON or text. Reflect what actually happened:
     // the apply action tells us the created link path; fall back to the

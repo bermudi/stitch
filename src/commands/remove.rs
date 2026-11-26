@@ -725,7 +725,11 @@ pub(crate) fn cmd_remove(
         .collect();
 
     loaded.generated.save(root)?;
-    link_inventory::forget_store(root, name).map_err(StitchError::internal)?;
+    if let Err(error) = link_inventory::forget_store(root, name) {
+        loaded.warnings.push(format!(
+            "could not forget stale-link journal for store {name}: {error}"
+        ));
+    }
 
     // The state write is committed; release the lock before the post-remove
     // hook so a hook may invoke a mutating stitch command.
